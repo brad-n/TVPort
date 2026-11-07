@@ -949,8 +949,8 @@ def astc_block(args) -> int:
     return 6 if getattr(args, 'astc_block', 4) == 6 else 4
 
 
-def prebuild_astc(game: Game, block: int, python: str, texture_cap: int = 0) -> Optional[Path]:
-    """Run the engine's prebuild (dm/gfx/tools/bntx_astc.py) over the extracted game: every BC1/2/3/7 texture encoded to ASTC on this Mac and packed into one astc-ro.pack. It is incremental: with the same game files, engine and block size it
+def prebuild_astc(game: Game, block: int, python: str, texture_cap: int) -> Optional[Path]:
+    """Run the engine's prebuild (dm/gfx/tools/bntx_astc.py) over the extracted game: every BC1/2/3/7 texture encoded to ASTC on this Mac and packed into one astc-ro.pack. The game's texture cap (DM_BC_MAX_DIM in the app's env, 0 = none) goes along: only the mip levels the app keeps under it are packed. It is incremental: with the same game files, engine, block size and cap it
     returns the pack it made before at once. A failure is not fatal: the game then encodes textures while it runs (slower the first time, and the textures stay uncompressed until it has)."""
     stage('Preparing compressed textures')
     out = game.build / 'tvport-astc'

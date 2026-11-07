@@ -133,18 +133,19 @@ class CompressedTextures(unittest.TestCase):
         made.mkdir()
         (made / 'astc-ro.pack').write_bytes(b'x')
         with patch.object(backend, 'stream') as stream, redirect_stdout(io.StringIO()):
-            self.assertEqual(backend.prebuild_astc(game, 6, 'python3'), made / 'astc-ro.pack')
+            self.assertEqual(backend.prebuild_astc(game, 6, 'python3', 512), made / 'astc-ro.pack')
         argv = [str(a) for a in stream.call_args.args[0]]
         self.assertEqual(argv[:2], ['python3', '-I'])
         self.assertTrue(argv[2].endswith('dm/gfx/tools/bntx_astc.py'))
         self.assertEqual(argv[argv.index('--block') + 1], '6')
+        self.assertEqual(argv[argv.index('--max-dim') + 1], '512')   # the game's texture cap, the same number write_env gives the app as DM_BC_MAX_DIM
         self.assertIn('--drop-cache', argv)
 
     def test_a_failed_prebuild_does_not_fail_the_build(self):
         game = SimpleNamespace(build=Path(self.tmp.name) / 'nothing', romfs=Path(self.tmp.name) / 'romfs.img')
         out = io.StringIO()
         with patch.object(backend, 'stream', side_effect=backend.Failure('clang: not found')), redirect_stdout(out):
-            self.assertIsNone(backend.prebuild_astc(game, 4, 'python3'))
+            self.assertIsNone(backend.prebuild_astc(game, 4, 'python3', 0))
         self.assertIn('could not be prepared', out.getvalue())
 
     def test_the_pack_is_sent_beside_the_game_files_and_its_size_verified(self):
