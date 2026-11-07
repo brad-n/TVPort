@@ -876,13 +876,14 @@ def prepare_game(game: Game, keys: Optional[Path], team: str, python: str, args=
     return game
 
 
-def generate_project(game: Game, args, team: str, bundle: str, python: str) -> Path:
+def generate_project(game: Game, args, team: str, bundle: str, python: str, romfs: Optional[Path] = None) -> Path:
+    """romfs: the image the app is built against when it is not game.romfs (the sparse image of Store textures once)"""
     stage('Generating the Apple TV project')
     restore_tables(game)
     pso_mtl4 = bool(getattr(args, 'pso_mtl4', False))
     env = profile_env(game)
     aoc = game.build / 'aoc'
-    env.update(GAME=game.title_id, W=str(game.build), PATCHED=str(game.build / f'patched_{game.package}'), ROMFS=str(game.romfs), MSL_IOS=str(game.shaders), AOC=str(aoc) if aoc.is_dir() and game.prepared_content().get('dlc', True) else '',
+    env.update(GAME=game.title_id, W=str(game.build), PATCHED=str(game.build / f'patched_{game.package}'), ROMFS=str(romfs or game.romfs), MSL_IOS=str(game.shaders), AOC=str(aoc) if aoc.is_dir() and game.prepared_content().get('dlc', True) else '',
                DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players, args.render_scale, not args.no_thermal_cap, args.fps_target, args.swap_ab_xy, args.swap_ab, args.swap_xy, pso_mtl4, getattr(args, 'extra_env', None), getattr(args, 'guest_file', None), astc_block(args))), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
                DM_XCODE_PROJECT_DIR=str(game.build / 'tvport-xcode'), DM_XCODE_DERIVED_DATA=str(game.build / 'tvport-derived'), FONT_PY=python)
     env.update(artwork_env(args))
@@ -967,6 +968,42 @@ def prebuild_astc(game: Game, block: int, python: str, texture_cap: int) -> Opti
     return pack if pack.is_file() else None
 
 
+TEXTURE_ONCE_CHOICES = ('auto', 'on', 'off')
+BESIDE_ROMFS = ('control.nacp', 'icon.jpg', 'html', 'jit')   # what build_ipa.sh / stage_resources.sh look for next to the RomFS image they are given
+
+
+def texture_once_enabled(args, block: int) -> bool:
+    """Store textures once (docs/texture_once.md): Automatic is On whenever Compressed textures resolves to on (block > 0). The stripped image carries the ASTC pack, so with ASTC off there is nothing to strip against and even On does nothing."""
+    return block > 0 and (getattr(args, 'texture_once', None) or 'auto') != 'off'
+
+
+def store_textures_once(game: Game, pack: Optional[Path], block: int, python: str, texture_cap: int) -> Optional[Path]:
+    """Run the engine's tex_once.py over RomFS.img and the ASTC pack: every plane the pack covers is zeroed in the game files (the pack holds it) and the result is one sparse image with the pack embedded. Returns that romfs.img, or None when it cannot be made, with one warning line: the feature never fails a build, and the game then goes as before with the plain RomFS.img and astc-ro.pack."""
+    stage('Storing textures once')
+    tool = REPO / 'dm/gfx/tools/tex_once.py'
+    out = game.build / 'tvport-once'
+    image = out / 'romfs.img'
+    if not (game.romfs and pack and pack.is_file()):
+        emit('log', line='Textures are stored twice: there is no compressed texture pack to store them once against.')
+        return None
+    if not tool.is_file():
+        emit('log', line='Textures are stored twice: this engine has no tex_once.py.')
+        return None
+    try:
+        stream([python, '-I', tool, game.romfs, '--pack', pack, '--out', out, '--max-dim', str(texture_cap), '--block', str(block)], cwd=REPO)
+    except Failure as failure:
+        emit('log', line=f'Textures are stored twice: they could not be stored once ({str(failure).splitlines()[-1][:300] if str(failure) else "no reason given"}).')
+        return None
+    if not image.is_file():
+        emit('log', line='Textures are stored twice: the tool finished without an image.')
+        return None
+    for name in BESIDE_ROMFS:   # the build script finds control.nacp, the icon, html and jit beside the image it is given
+        source, link = game.romfs.parent / name, out / name
+        if source.exists() and not link.exists() and not link.is_symlink():
+            link.symlink_to(source)
+    return image
+
+
 def pack_fingerprint(pack: Path) -> str:
     """The input fingerprint in an astc-ro.pack's header (dm/gfx/tex/nvn_astc_cache.m): which game files, engine and block size made it; '' for a file that is not a pack"""
     with pack.open('rb') as file:
@@ -1004,7 +1041,8 @@ def send_file(what: str, source: Path, name: str, device: str, bundle: str) -> N
     with_retries(f'Sending {what}', attempt)
 
 
-def install(game: Game, device: str, bundle: str, astc_pack: Optional[Path] = None) -> None:
+def install(game: Game, device: str, bundle: str, astc_pack: Optional[Path] = None, once: Optional[Path] = None) -> None:
+    """once: the sparse image of Store textures once. It goes as romfs.img and carries the ASTC pack, so astc_pack is not sent and a stale astc-ro.pack is emptied."""
     stage('Installing on the Apple TV')
     if not game.app or not (game.app / 'embedded.mobileprovision').is_file():
         raise Failure('Build the app first: there is no signed app to install')
@@ -1015,19 +1053,48 @@ def install(game: Game, device: str, bundle: str, astc_pack: Optional[Path] = No
 
     with_retries('The install', install_app)
     stage('Checking the game files on the Apple TV')
-    size = game.romfs.stat().st_size
+    image = once or game.romfs
+    size = image.stat().st_size
     files = installed_files(device, bundle)
-    if files.get('romfs.img') == size:
+    # A stripped image of the same size can hold other textures (another cap or block size), so its size alone is not enough: the stamp names the file that last arrived whole.
+    stamp = image.with_name(image.name + '.sent') if once else None
+    mine = f'{device} {bundle} {size} {image.stat().st_mtime_ns}'
+    if files.get('romfs.img') == size and (not stamp or (stamp.is_file() and stamp.read_text() == mine)):
         emit('log', line='The game files are already on the Apple TV.')
     else:
+        if stamp:
+            stamp.unlink(missing_ok=True)
         emit('log', line=f'Sending the game files ({size / 2**30:.1f} GB). This takes a few minutes over the network.')
-        send_file('the game files', game.romfs, 'romfs.img', device, bundle)
+        send_file('the game files', image, 'romfs.img', device, bundle)
         there = installed_files(device, bundle).get('romfs.img')
         if there != size:
             raise Failure(f'The game files did not arrive whole: the Apple TV has {there if there is not None else "no"} bytes of romfs.img, this Mac has {size}. Build & Install again to resend them.')
+        if stamp:
+            stamp.write_text(mine)
         emit('log', line='The game files on the Apple TV match this Mac.')
-    if astc_pack:
+    if once:
+        empty_stale_pack(once, device, bundle, files.get('astc-ro.pack'))
+    elif astc_pack:
         install_astc_pack(astc_pack, device, bundle, files.get('astc-ro.pack'))
+
+
+def empty_stale_pack(once: Path, device: str, bundle: str, there: Optional[int]) -> None:
+    """The sparse image embeds the pack, so an astc-ro.pack from an earlier build is dead weight (several GB). devicectl (Xcode 26: device copy to/from, device info files, no delete or move for a file in an app container) cannot remove it, so it is overwritten with an empty file: the engine's pack reader (dm/gfx/tex/nvn_astc_cache.m pack_open) ignores a file shorter than its 80-byte header, and the embedded pack takes precedence over it anyway. Never fatal: a leftover costs only space."""
+    if not there:   # absent, or already emptied
+        return
+    empty = once.with_name('astc-ro.pack.empty')
+    empty.write_bytes(b'')
+    emit('log', line=f'Emptying the old compressed textures on the Apple TV ({there / 2**30:.1f} GB): the game files carry them now.')
+    try:
+        send_file('the empty file', empty, 'astc-ro.pack', device, bundle)
+    except Failure as failure:
+        emit('log', line=f'The old compressed textures could not be emptied ({str(failure).splitlines()[-1][:200] if str(failure) else "no reason given"}); they only take space. Build & Install again to retry.')
+        return
+    left = installed_files(device, bundle).get('astc-ro.pack')
+    if left:
+        emit('log', line=f'The old compressed textures are still on the Apple TV ({left} bytes); they only take space.')
+    else:
+        emit('log', line='The old compressed textures are gone from the Apple TV.')   # (a later build without Store textures once sees size 0 there and resends the pack)
 
 
 def install_astc_pack(pack: Path, device: str, bundle: str, there: Optional[int]) -> None:
@@ -1113,12 +1180,13 @@ def cmd_build(args) -> None:
         emit('log', line={'backed-up': f'{backup["files"]} save files backed up.', 'unchanged': 'The saves on this Mac are already up to date.', 'none': 'No saves on the Apple TV yet.',
                           'unavailable': 'The saves on the Apple TV could not be read, so this build goes ahead without a new backup.',
                           'busy': 'The game kept saving during each copy, so this build goes ahead without a new backup.'}[backup['state']])
-    project = generate_project(game, args, team, bundle, python)
+    once = store_textures_once(game, pack, block, python, args.texture_cap) if pack and texture_once_enabled(args, block) else None
+    project = generate_project(game, args, team, bundle, python, once)
     bundle_shaders(game, project)
     compile_app(game, project, args.device)
     game.save_state(bundle_id=bundle, art=str(args.art) if args.art else None, mode=args.mode, texture_cap=args.texture_cap, render_scale=args.render_scale, source_signature=signature)
     if args.device:
-        install(game, args.device, bundle, pack)
+        install(game, args.device, bundle, pack, once)
         restored = restore_saves(game, args.device, bundle)
         if restored:
             emit('log', line=f'The Apple TV had lost its saves: {restored} files put back from this Mac.')
@@ -1532,6 +1600,7 @@ def main() -> int:
     build.add_argument('--pso-mtl4', action='store_true')
     build.add_argument('--guest-file', choices=('on', 'off'))   # unset: the engine's default for the target
     build.add_argument('--astc', choices=ASTC_CHOICES, default='auto')   # Compressed textures: auto is on for the Apple TV
+    build.add_argument('--texture-once', choices=TEXTURE_ONCE_CHOICES, default='auto')   # Store textures once: auto is on whenever Compressed textures is
     build.add_argument('--astc-block', type=int, choices=(4, 6), default=4)   # the ASTC block size: 4x4 (sharper, 1 byte a texel) or 6x6 (smaller, 0.44)
     build.add_argument('--gpu', default='')
     build.add_argument('--extra-env', action='append', default=[])   # KEY=VALUE
