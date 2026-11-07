@@ -88,5 +88,10 @@ Counters join the existing ASTC counters line after each `memory up to frame` li
 - If tex_once.py fails, log one warning and install exactly as today (plain RomFS.img + astc-ro.pack). The feature never fails a build.
 
 ## 6. Verification before Brad's TV
-Mac, DM_TEST_NO_BC=1, Smash (cap 512) and MK8 (cap 0) from their stripped images: boots to gameplay, `tagged unresolved` = 0, `tagged decoded` = 0,
-tagged hits > 0. Then on the Apple TV with Brad.
+Mac, on the real stripped images (Smash cap 512, MK8 cap 0): the engine's C sparse reader reads each whole logical image and its SHA-256
+matches the tool's logical image; the DMROMFS1 index, file count and RomFS identity match the original RomFS.img; every tag the tool wrote
+resolves uniquely, at the expected ASTC size, through the engine's C tag lookup in the embedded pack (`tex_once_verify`). Plus the tool's
+self-check and the engine's GPU tests (a tagged plane gives the same ASTC blocks as the hashed path).
+Then on the Apple TV (Smash first): `tagged unresolved` = 0, `tagged decoded` = 0, tagged hits > 0 in the counters line, no `[RED] ASTC: tagged`
+lines, and Brad sees no black or wrong textures. Fallback: "Store textures once: Off" and rebuild.
+(Mac gameplay runs with DM_TEST_NO_BC=1 were dropped: they need macOS shader libraries for each game, hours of shader builds.)
