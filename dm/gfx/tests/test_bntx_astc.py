@@ -190,7 +190,7 @@ class PrebuildTests(unittest.TestCase):
         (d / 'data.bin').write_bytes(bytes(1000))
         return d, ts
 
-    def runtime_finds(self, ts, pack, cap=0, absent=None):
+    def runtime_finds(self, ts, pack, cap=0, absent=None, block=4, bc1_block=None):
         """Every plane of every texture, as the RUNTIME enumerates and looks it up (nvn_astc_walk_planes + nvn_bc_astc_learn / fetch with the pack as the read-only cache).
         cap is DM_BC_MAX_DIM: the runtime skips nvn_bc_skip_levels(d, cap) levels (its bc_skip calls that function); the walk here starts there. Every plane of a skipped level is appended to `absent` when the pack lacks it"""
         L = self.lib
@@ -216,13 +216,14 @@ class PrebuildTests(unittest.TestCase):
                 def cb(_, level, layer, w, h, bc, size):
                     plane = ctypes.string_at(bc, size)
                     seen.append((level, layer, plane == t.planes[(level, layer)]))   # deswizzle(swizzle(x)) == x: the runtime's walk sees the texture's planes
-                    ok = L.nvn_bc_astc_learn(fmt, bc, size, w, h, 4, None) == 1
-                    astc = ((w + 3) // 4) * 16 * ((h + 3) // 4)
+                    blk = (bc1_block or block) if fmt in (0x41, 0x42, 0x45, 0x46) else block   # the runtime's astc_block_for(format)
+                    ok = L.nvn_bc_astc_learn(fmt, bc, size, w, h, blk, None) == 1
+                    astc = ((w + blk - 1) // blk) * 16 * ((h + blk - 1) // blk)
                     got, want = ctypes.create_string_buffer(astc), ctypes.create_string_buffer(astc)
-                    ok = ok and L.nvn_bc_astc_fetch(fmt, bc, size, w, h, 4, got, astc) == 1
+                    ok = ok and L.nvn_bc_astc_fetch(fmt, bc, size, w, h, blk, got, astc) == 1
                     hit = ctypes.c_int()
                     # the encoder given the texture's own linear plane (not the deswizzled copy): the blocks the pack holds are the ones this encoder makes
-                    ok = ok and L.nvn_bc_astc_encode(fmt, t.planes[(level, layer)], size, w, h, 4, want, astc, None, None, ctypes.byref(hit)) == 0 and got.raw == want.raw
+                    ok = ok and L.nvn_bc_astc_encode(fmt, t.planes[(level, layer)], size, w, h, blk, want, astc, None, None, ctypes.byref(hit)) == 0 and got.raw == want.raw
                     found.append(ok)
                     return 0
                 fn = PLANE_FN(cb)
@@ -266,6 +267,29 @@ class PrebuildTests(unittest.TestCase):
         found = self.runtime_finds(ts, pack)
         self.assertEqual(len(found), expect_planes + sum(t.mips * t.layers for t in ts if t.fmt == 0x1a01))   # BC1 is looked up under both of its NVN formats
         self.assertTrue(all(found), 'a plane the runtime walks is missing from the pack or differs from the runtime encoder')
+
+    def test_per_format_blocks_are_the_ones_the_runtime_looks_up(self):
+        # BC1 at its own block, every other format at --block: the prebuild keys and encodes each plane at its format's block, as astc_block_for does
+        for block, bc1 in ((4, 6), (4, 5), (6, 5)):
+            d, ts = self.build_tree(f'tree_pf{block}{bc1}')
+            out = self.root / f'out_pf{block}{bc1}'
+            rep = tool.prebuild(str(d), str(out), block, workers=2, log=lambda *_: None, bc1_block=bc1)
+            self.assertEqual(rep['bc1_block'], bc1)
+            self.assertEqual(rep['plane_errors'], 0)
+            found = self.runtime_finds(ts, out / 'astc-ro.pack', block=block, bc1_block=bc1)
+            self.assertTrue(found and all(found), (block, bc1))
+        # looked up at the wrong BC1 block (the global one), the BC1 planes are not in the pack
+        wrong = self.runtime_finds(ts, out / 'astc-ro.pack', block=block)
+        self.assertFalse(all(wrong))
+        self.assertTrue(any(wrong))   # the other formats are
+        # the BC1 block is part of the pack's fingerprint
+        same = tool.prebuild(str(d), str(out), block, workers=2, log=lambda *_: None, bc1_block=bc1)
+        self.assertTrue(same['up_to_date'])
+        other = tool.prebuild(str(d), str(out), block, workers=2, log=lambda *_: None, bc1_block=4 if bc1 != 4 else 6)
+        self.assertFalse(other['up_to_date'])
+        default = tool.prebuild(str(d), str(self.root / 'out_pf_default'), 4, workers=2, log=lambda *_: None)
+        self.assertEqual(default['bc1_block'], 4)
+        with self.assertRaises(SystemExit): tool.prebuild(str(d), str(self.root / 'out_pf_bad'), 4, bc1_block=3, log=lambda *_: None)
 
     def test_texture_cap_packs_only_the_levels_the_runtime_keeps(self):
         lib = self.lib

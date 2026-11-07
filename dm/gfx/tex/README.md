@@ -53,7 +53,7 @@ On a GPU without BC formats (the Apple TV 4K's A15) BC textures are stored decod
 
 `nvn_astc_cache.m` decodes the deswizzled BC plane (stripes of at most 4 MB), encodes it with Arm's astc-encoder at ASTCENC_PRE_FASTEST, and keeps the result in a content-addressed cache: `<sha256(version tag, format, width, height, block, BC bytes)>.astc` under `DM_NVN_ASTC_CACHE` (written on a miss), read first from `DM_NVN_ASTC_CACHE_RO` if set. The key depends on the BC bytes, never on the machine, so a cache filled on a Mac is valid on the Apple TV. A buffer-to-texture copy into a BC texture is transcoded the same way (ASTC 4x4: any block-aligned region; 6x6: only regions on the 6x6 grid), a new texture reads zero blocks as the BC format would (void-extent blocks), and views of an ASTC texture are the ASTC format of the BC view format. Algorithm and cache layout follow [yuchanns/nxnative-tvos](https://github.com/yuchanns/nxnative-tvos) (MIT, `LICENSE.nxnative-tvos`).
 
-Tests: `dm/gfx/tests/t_astc_cache` (CPU, ASan/UBSan), `t_astc_upload` (Mac GPU: formats, sampled error against the CPU decode, the cache, buffer-to-texture copies; `T_ASTC_BLOCK=6` runs the 6x6 case; `T_ASTC_MODE=maxdim` runs it with `DM_BC_MAX_DIM=64`).
+Tests: `dm/gfx/tests/t_astc_cache` (CPU, ASan/UBSan), `t_astc_upload` (Mac GPU: formats, sampled error against the CPU decode, the cache, buffer-to-texture copies; `T_ASTC_BLOCK=6` runs the 6x6 case, `T_ASTC_BC1_BLOCK=5|6` stores BC1 at its own block beside the others (`T_ASTC_MODE=background|tagged|tagged_mixed` for the miss and stripped-plane paths); `T_ASTC_MODE=maxdim` runs it with `DM_BC_MAX_DIM=64`).
 
 ### Texture cap (`DM_BC_MAX_DIM`)
 

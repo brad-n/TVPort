@@ -15,6 +15,15 @@ uint64_t now_ns(void) { return bp_now(); }
 static int checks, failed;
 #define CHECK(c, ...) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: "); fprintf(stderr, __VA_ARGS__); fprintf(stderr, " (line %d)\n", __LINE__); } } while (0)
 
+// The ASTC block each format is stored at (DM_NVN_BC_ASTC for BC2/3/7, DM_NVN_BC1_ASTC for BC1): T_ASTC_BLOCK and T_ASTC_BC1_BLOCK
+static unsigned g_blk = 4, g_bc1_blk = 4;
+static int is_bc1(uint32_t f) { return f == 0x41 || f == 0x42 || f == 0x45 || f == 0x46; }
+static int is_srgb_fmt(uint32_t f) { return f == 0x45 || f == 0x46 || f == 0x47 || f == 0x48 || f == 0x4e; }
+static unsigned blk_for(uint32_t f) { return is_bc1(f) ? g_bc1_blk : g_blk; }
+static MTLPixelFormat astc_pf_of(unsigned blk, int srgb) {
+    return blk == 4 ? (srgb ? MTLPixelFormatASTC_4x4_sRGB : MTLPixelFormatASTC_4x4_LDR) : blk == 5 ? (srgb ? MTLPixelFormatASTC_5x5_sRGB : MTLPixelFormatASTC_5x5_LDR) : (srgb ? MTLPixelFormatASTC_6x6_sRGB : MTLPixelFormatASTC_6x6_LDR);
+}
+static double slack_of(unsigned blk) { return blk == 6 ? 6.0 : blk == 5 ? 4.0 : 1.0; }   // a bigger block holds fewer bits a texel and the fixture is noise at every 4x4 block: the bounds only catch a wrong layout
 static unsigned g_seed_base;   // added to every fixture seed: another set of bytes for the same texture
 static void fill_blocks(uint8_t *data, size_t size, uint32_t format, unsigned seed) {
     int bb = (format == 0x41 || format == 0x42 || format == 0x45 || format == 0x46 || format == 0x49 || format == 0x4a) ? 8 : 16;
@@ -538,13 +547,172 @@ static void run_background(const char *dir, int six) {
     }
 }
 
+
+// ---- BC1 and the other formats at different blocks in one run (T_ASTC_BC1_BLOCK=5|6 with T_ASTC_BLOCK=4): sync mode ----
+// A buffer-to-texture copy of BC blocks into a texture of `fmt`: when the region lines up with the ASTC blocks of that format's block it lands, otherwise it is skipped (RED_ONCE 158) and the texture keeps its zero fill
+static void mixed_copy_case(uint32_t fmt, unsigned SW, unsigned OX, unsigned OY, unsigned RW, unsigned RH) {
+    unsigned blk = blk_for(fmt); int bb = is_bc1(fmt) ? 8 : 16;
+    int aligned = !(OX % blk || OY % blk || ((RW % blk) && OX + RW != SW) || ((RH % blk) && OY + RH != SW));
+    void *tmem; nvn_texdesc d = {.target = NVN_TEXTURE_TARGET_2D, .format = fmt, .width = SW, .height = SW, .depth = 1, .levels = 1, .samples = 1};
+    tex_t t = {.magic = MAGIC('T','E','X',0), .serial = nvn_new_serial(), .d = d}; nvn_tex_layout(&d, &t.L);
+    if (posix_memalign(&tmem, getpagesize(), (t.L.size + 16383) & ~(size_t)16383)) abort();
+    static unsigned seq; t.off = 0x10000u * (100 + ++seq);   // a guest address of its own
+    memset(tmem, 0, t.L.size); t.mem = tmem; mtl_pool_add(tmem, (t.L.size + 16383) & ~(size_t)16383);
+    void *smem; if (posix_memalign(&smem, getpagesize(), 16384)) abort(); mtl_pool_add(smem, 16384);
+    size_t row = RW / 4 * bb, rows = RH / 4; fill_blocks(smem, row * rows, fmt, 99);
+    mtl_tex_init(&t); mtl_sub_begin(); id<MTLTexture> mt = tex_mtl(&t);
+    CHECK(mtl_wait(mtl_sub_commit(), 20000000000ull), "the new texture's zero fill completes");
+    CHECK(mt && mt.pixelFormat == astc_pf_of(blk, is_srgb_fmt(fmt)), "format %#x made for copies is ASTC %ux%u", fmt, blk, blk);
+    p_copy_b2t c = {.src = (uint64_t)(uintptr_t)smem, .tex = &t, .r = {(int)OX, (int)OY, 0, (int)RW, (int)RH, 1}};
+    mtl_sub_begin(); copy_b2t(&c, sizeof c); up_flush();   // a skipped copy leaves the zero fill queued; the next draw would flush it
+    CHECK(mtl_wait(mtl_sub_commit(), 20000000000ull), "the copy's submission completes");
+    uint8_t *expected = malloc((size_t)RW * RH * 4); uint8_t zero_bc[16] = {0}, zero_px[4 * 4 * 4];
+    CHECK(!nvn_bc_decode(fmt, smem, row, RW, RH, expected, (size_t)RW * 4) && !nvn_bc_decode(fmt, zero_bc, 16, 4, 4, zero_px, 16), "CPU decode of the copy source");
+    id<MTLBuffer> out = [g_dev newBufferWithLength:(size_t)SW * SW * 16 options:MTLResourceStorageModeShared]; uint32_t sel[2] = {0, 0};
+    id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:sampler_pipeline(0)]; [e setTexture:mt atIndex:0]; [e setBuffer:out offset:0 atIndex:0]; [e setBytes:sel length:sizeof sel atIndex:1];
+    [e dispatchThreads:MTLSizeMake(SW, SW, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    const float *got = out.contents; double inside = 0, outside = 0; size_t nin = 0, nout = 0;
+    for (unsigned y = 0; y < SW; y++) for (unsigned x = 0; x < SW; x++) for (unsigned ch = 0; ch < 4; ch++) {
+        int in = x >= OX && x < OX + RW && y >= OY && y < OY + RH;
+        double want = in && aligned ? expected[((y - OY) * RW + (x - OX)) * 4 + ch] / 255.0 : zero_px[ch] / 255.0;   // not copied: the zero blocks' colour
+        double err = fabs(got[((size_t)y * SW + x) * 4 + ch] - want);
+        if (in) { inside += err; nin++; } else { outside += err; nout++; }
+    }
+    inside /= nin; outside /= nout;
+    if (getenv("T_DEBUG")) for (unsigned y = 0; y < SW; y += 6) { for (unsigned x = 0; x < SW; x += 6) printf("%.2f/%.2f ", got[((size_t)y * SW + x) * 4], got[((size_t)y * SW + x) * 4 + 3]); printf("\n"); }
+    printf("copy_b2t format %#x ASTC %ux%u, region %u,%u %ux%u of %u (%s): mean error inside %.4f, outside %.4f\n", fmt, blk, blk, OX, OY, RW, RH, SW, aligned ? "lines up" : "does not line up, skipped", inside, outside);
+    CHECK(inside < 0.04 * slack_of(blk), "the region %s", aligned ? "samples like its BC decode" : "is untouched");
+    CHECK(outside < 0.001, "the rest of the texture is untouched");
+    free(expected); defer_obj_release(mt); release_fixture(smem); release_fixture(tmem);
+}
+// A view with another BC format of the same family takes the base texture's ASTC block, not the block of the view's format (Metal cannot change the block in a view)
+static void mixed_view_case(uint32_t base_fmt, uint32_t view_fmt, int tid) {
+    void *mem; nvn_texdesc d = {.target = NVN_TEXTURE_TARGET_2D, .format = base_fmt, .width = 32, .height = 32, .depth = 1, .levels = 2, .samples = 1};
+    tex_t t = fixture(d, &mem); id<MTLTexture> mt = upload(&t);
+    CHECK(mt && mt.pixelFormat == astc_pf_of(blk_for(base_fmt), is_srgb_fmt(base_fmt)), "view base %#x is ASTC %ux%u", base_fmt, blk_for(base_fmt), blk_for(base_fmt));
+    view_t v = {0}; v.set_format = 1; v.format = view_fmt;
+    mtl_reg_tex(tid, &t, &v);
+    os_unfair_lock_lock(&g_rmu); id<MTLTexture> view = tex_by_id(tid); os_unfair_lock_unlock(&g_rmu);
+    CHECK(view && view.pixelFormat == astc_pf_of(blk_for(base_fmt), is_srgb_fmt(view_fmt)), "a %#x view of the %#x texture has the base's block %u (got pixel format %lu)", view_fmt, base_fmt, blk_for(base_fmt), view ? (unsigned long)view.pixelFormat : 0ul);
+    CHECK(view && view.width == 32, "and its size");
+    defer_obj_release(mt); release_fixture(mem);
+}
+static void run_mixed_sync(const char *dir) {
+    (void)dir;
+    // the two textures in one run, each at its own block
+    {
+        void *m1, *m7; nvn_texdesc d1 = {.target = NVN_TEXTURE_TARGET_2D, .format = 0x42, .width = 64, .height = 48, .depth = 1, .levels = 5, .samples = 1}, d7 = d1; d7.format = 0x4d;
+        tex_t t1 = fixture(d1, &m1), t7 = fixture(d7, &m7); id<MTLTexture> mt1 = upload(&t1), mt7 = upload(&t7);
+        CHECK(mt1 && mt1.pixelFormat == astc_pf_of(g_bc1_blk, 0) && mt7 && mt7.pixelFormat == astc_pf_of(g_blk, 0), "BC1 at %ux%u and BC7 at %ux%u in the same run", g_bc1_blk, g_bc1_blk, g_blk, g_blk);
+        for (unsigned l = 0; l < 5; l++) {
+            double m, p; if (mt1) { compare_level(mt1, &t1, d1, l, 0, &m, &p); CHECK(m < 0.02 * slack_of(g_bc1_blk), "BC1 level %u samples like its decode (%.4f)", l, m); }
+            if (mt7) { compare_level(mt7, &t7, d7, l, 0, &m, &p); CHECK(m < 0.04 * slack_of(g_blk), "BC7 level %u samples like its decode (%.4f)", l, m); }
+        }
+        defer_obj_release(mt1); defer_obj_release(mt7); release_fixture(m1); release_fixture(m7);
+    }
+    // 2D array of BC1
+    {
+        void *mem; nvn_texdesc d = {.target = NVN_TEXTURE_TARGET_2D_ARRAY, .format = 0x42, .width = 24, .height = 24, .depth = 3, .levels = 2, .samples = 1};
+        tex_t t = fixture(d, &mem); id<MTLTexture> mt = upload(&t);
+        CHECK(mt && mt.pixelFormat == astc_pf_of(g_bc1_blk, 0) && mt.arrayLength == 3, "a BC1 2D array is ASTC at the BC1 block");
+        for (unsigned layer = 0; mt && layer < 3; layer++) { double m, p; compare_level(mt, &t, d, 1, layer, &m, &p); CHECK(m < 0.02 * slack_of(g_bc1_blk), "BC1 layer %u samples like its decode", layer); }
+        defer_obj_release(mt); release_fixture(mem);
+    }
+    mixed_view_case(0x42, 0x46, 97001); mixed_view_case(0x46, 0x42, 97002); mixed_view_case(0x44, 0x48, 97003); mixed_view_case(0x4d, 0x4e, 97004);
+    // copies (block-aligned for each block; for 5x5 and 6x6 the aligned region starts on a multiple of 20 / 12 so both the BC and ASTC grids line up)
+    unsigned b1 = g_bc1_blk; unsigned al = b1 == 6 ? 12 : b1 == 5 ? 20 : 4;
+    mixed_copy_case(0x42, al * 4, al, al, al * 2, al * 2);      // lines up
+    mixed_copy_case(0x42, al * 4, 4, 4, 8, 8);                  // 4,4 8x8: only a 4x4 block lines up
+    if (b1 != 4) mixed_copy_case(0x42, al * 4, al, 4, al, 8);   // starts on the grid in x only
+    mixed_copy_case(0x44, 32, 8, 4, 16, 12);                    // BC3 at its own block
+    mixed_copy_case(0x4d, 24, 12, 12, 12, 12);
+}
+// ---- the same, DM_NVN_ASTC_MISS=background ----
+static void run_background_mixed(const char *dir) {
+    char rw[512]; subdir(rw, sizeof rw, dir, "mixed_rw"); configure(rw, 64u << 20, 1ull << 30, 0, 2);
+    nvn_texdesc d1 = {.target = NVN_TEXTURE_TARGET_2D, .format = 0x42, .width = 64, .height = 64, .depth = 1, .levels = 4, .samples = 1}, d7 = d1; d7.format = 0x4d;
+    nvn_astc_bg_stats s0 = stats();
+    void *m1, *m7, *n1, *n7; tex_t t1 = fixture(d1, &m1), t7 = fixture(d7, &m7);
+    id<MTLTexture> mt1 = upload(&t1), mt7 = upload(&t7);
+    CHECK(mt1 && mt1.pixelFormat == MTLPixelFormatRGBA8Unorm && mt7 && mt7.pixelFormat == MTLPixelFormatRGBA8Unorm, "misses upload decoded");
+    CHECK(nvn_bc_astc_bg_wait(120), "the queue drains");
+    nvn_astc_bg_stats s = stats(); CHECK(s.misses - s0.misses == 8 && s.written - s0.written == 8 && cache_files(rw) == 8, "eight planes (4 BC1, 4 BC7) were missed and written");
+    // each plane was stored at its format's block: a look-up at the other block finds nothing, at its own it is found
+    {
+        uint32_t row, rows, depth, bpb; uint64_t base; unsigned th, td; nvn_deswizzle_geom(&d1, 0, 0, &row, &rows, &depth, &base, &th, &td, &bpb);
+        uint8_t *lin = malloc((size_t)row * rows); fill_blocks(lin, (size_t)row * rows, 0x42, 0 + g_seed_base);
+        CHECK(nvn_bc_astc_has_plane(0x42, lin, (size_t)row * rows, 64, 64, g_bc1_blk) == 1, "the BC1 plane is in the cache at the BC1 block");
+        if (g_bc1_blk != g_blk) CHECK(nvn_bc_astc_has_plane(0x42, lin, (size_t)row * rows, 64, 64, g_blk) == 0, "and not at the other block");
+        free(lin);
+    }
+    tex_t u1 = fixture(d1, &n1), u7 = fixture(d7, &n7); id<MTLTexture> nt1 = upload(&u1), nt7 = upload(&u7);
+    CHECK(nt1 && nt1.pixelFormat == astc_pf_of(g_bc1_blk, 0), "a BC1 texture whose planes are cached is ASTC %ux%u", g_bc1_blk, g_bc1_blk);
+    CHECK(nt7 && nt7.pixelFormat == astc_pf_of(g_blk, 0), "a BC7 texture whose planes are cached is ASTC %ux%u", g_blk, g_blk);
+    for (unsigned l = 0; l < 4; l++) { double m, p;
+        if (nt1) { compare_level(nt1, &u1, d1, l, 0, &m, &p); CHECK(m < 0.03 * slack_of(g_bc1_blk), "BC1 level %u samples like its decode (%.4f)", l, m); }
+        if (nt7) { compare_level(nt7, &u7, d7, l, 0, &m, &p); CHECK(m < 0.04 * slack_of(g_blk), "BC7 level %u samples like its decode (%.4f)", l, m); } }
+    s = stats(); CHECK(s.hits - s0.hits >= 8 && s.fetch_misses == s0.fetch_misses, "the ASTC uploads were eight cache hits");
+    defer_obj_release(mt1); defer_obj_release(mt7); defer_obj_release(nt1); defer_obj_release(nt7); release_fixture(m1); release_fixture(m7); release_fixture(n1); release_fixture(n7);
+}
+// ---- the same, stripped planes read by tag from an embedded pack ----
+typedef struct { uint32_t format; unsigned block; uint8_t key[8][32]; unsigned n; } mtag_keys;
+static int mtag_collect(void *ctx, unsigned level, unsigned layer, uint32_t w, uint32_t h, const void *bc, size_t size) {
+    (void)layer; mtag_keys *k = ctx; nvn_astc_cache_key key; nvn_bc_astc_plane_key(k->format, w, h, k->block, bc, size, &key);
+    for (int i = 0; i < 32; i++) { unsigned v; sscanf(key.hex + 2 * i, "%2x", &v); k->key[level][i] = (uint8_t)v; }
+    k->n = level + 1; return 0;
+}
+static void run_tagged_mixed(const char *dir) {
+    char rw[512]; subdir(rw, sizeof rw, dir, "mtag_rw"); configure(rw, 64u << 20, 1ull << 30, 0, 2);
+    nvn_texdesc d1 = {.target = NVN_TEXTURE_TARGET_2D, .format = 0x42, .width = 64, .height = 64, .depth = 1, .levels = 4, .samples = 1}, d7 = d1; d7.format = 0x4d;
+    void *m1, *m7; tex_t t1 = fixture(d1, &m1), t7 = fixture(d7, &m7);
+    mtag_keys k1 = {0x42, blk_for(0x42), {{0}}, 0}, k7 = {0x4d, blk_for(0x4d), {{0}}, 0};
+    CHECK(nvn_astc_walk_planes(&t1.d, t1.mem, 0, mtag_collect, &k1) == 0 && k1.n == 4 && nvn_astc_walk_planes(&t7.d, t7.mem, 0, mtag_collect, &k7) == 0 && k7.n == 4, "the plane keys, each at its format's block");
+    id<MTLTexture> mt1 = upload(&t1), mt7 = upload(&t7); CHECK(nvn_bc_astc_bg_wait(120), "seed drains"); CHECK(cache_files(rw) == 8, "eight entries");
+    char pk[600]; snprintf(pk, sizeof pk, "%s/mixed.pack", dir); pack_dir(rw, pk);
+    NSData *pkd = [NSData dataWithContentsOfFile:@(pk)]; uint8_t logical[20000]; for (int i = 0; i < 20000; i++) logical[i] = (uint8_t)(i * 31 + 1);
+    memset(logical + 3000, 0, 9000);
+    uint8_t *wrapped; size_t wn; CHECK(fx_write_sparse(NULL, logical, sizeof logical, 4096, 0, pkd.bytes, pkd.length, &wrapped, &wn) >= 2, "the image");
+    char img[600]; snprintf(img, sizeof img, "%s/mixed_romfs.img", dir); { FILE *f = fopen(img, "wb"); fwrite(wrapped, 1, wn, f); fclose(f); } free(wrapped);
+    CHECK(embedded_pack_setup(img) == 1 && g_embedded, "a DMSPARS1 with a pack is a stripped image");
+    uint64_t entries, bytes; CHECK(nvn_bc_astc_pack_info(NVN_ASTC_EMBEDDED_ROOT, &entries, &bytes, NULL) && entries == 8, "eight entries in the pack (%llu)", (unsigned long long)entries);
+    char rw2[512]; subdir(rw2, sizeof rw2, dir, "mtag_rw2");
+    nvn_astc_bg_config c = {.cache = rw2, .readonly = NVN_ASTC_EMBEDDED_ROOT, .queue_cap = 64u << 20, .cache_max = 1ull << 30, .min_free = 0, .threads = 1};
+    nvn_bc_astc_bg_configure(&c);
+    void *r1, *r7; tex_t h1 = fixture(d1, &r1), h7 = fixture(d7, &r7); id<MTLTexture> hm1 = upload(&h1), hm7 = upload(&h7);   // the hashed path
+    CHECK(hm1 && hm1.pixelFormat == astc_pf_of(g_bc1_blk, 0) && hm7 && hm7.pixelFormat == astc_pf_of(g_blk, 0), "the hashed path resolves each from the pack at its block");
+    float *ref1[4], *ref7[4]; for (unsigned l = 0; l < 4; l++) { ref1[l] = read_level(hm1, l, 64 >> l, 64 >> l); ref7[l] = read_level(hm7, l, 64 >> l, 64 >> l); }
+    nvn_astc_bg_stats before = stats(); uint64_t th0, tu0, td0; tag_counts(&th0, &tu0, &td0);
+    void *s1, *s7; tex_t x1 = fixture(d1, &s1), x7 = fixture(d7, &s7);
+    for (unsigned l = 0; l < 4; l++) { strip_plane(&x1, l, k1.key[l]); strip_plane(&x7, l, k7.key[l]); }
+    id<MTLTexture> xm1 = upload(&x1), xm7 = upload(&x7);
+    CHECK(xm1 && xm1.pixelFormat == astc_pf_of(g_bc1_blk, 0), "a stripped BC1 texture is ASTC %ux%u", g_bc1_blk, g_bc1_blk);
+    CHECK(xm7 && xm7.pixelFormat == astc_pf_of(g_blk, 0), "a stripped BC7 texture is ASTC %ux%u", g_blk, g_blk);
+    uint64_t th1, tu1, td1; tag_counts(&th1, &tu1, &td1); nvn_astc_bg_stats after = stats();
+    CHECK(th1 - th0 == 8 && tu1 == tu0 && td1 == td0, "eight tagged hits, nothing unresolved or decoded (%llu/%llu/%llu)", (unsigned long long)(th1 - th0), (unsigned long long)(tu1 - tu0), (unsigned long long)(td1 - td0));
+    CHECK(after.hits == before.hits && after.misses == before.misses && after.queued == before.queued, "no hashed lookup for a tagged plane");
+    for (unsigned l = 0; l < 4; l++) {
+        float *g1 = xm1 ? read_level(xm1, l, 64 >> l, 64 >> l) : NULL, *g7 = xm7 ? read_level(xm7, l, 64 >> l, 64 >> l) : NULL;
+        CHECK(g1 && !memcmp(g1, ref1[l], (size_t)(64 >> l) * (64 >> l) * 16), "BC1 level %u: the tagged plane is the hashed path's blocks", l);
+        CHECK(g7 && !memcmp(g7, ref7[l], (size_t)(64 >> l) * (64 >> l) * 16), "BC7 level %u: the tagged plane is the hashed path's blocks", l);
+        free(g1); free(g7);
+        double m, p; if (xm1) { compare_level(xm1, &x1, d1, l, 0, &m, &p); CHECK(m < 0.03 * slack_of(g_bc1_blk), "stripped BC1 level %u samples like the original (%.4f)", l, m); }
+    }
+    g_embedded = 0;
+    defer_obj_release(mt1); defer_obj_release(mt7); defer_obj_release(hm1); defer_obj_release(hm7); defer_obj_release(xm1); defer_obj_release(xm7);
+    release_fixture(m1); release_fixture(m7); release_fixture(r1); release_fixture(r7); release_fixture(s1); release_fixture(s7);
+    for (int i = 0; i < 4; i++) { free(ref1[i]); free(ref7[i]); }
+    CHECK(nvn_bc_astc_bg_wait(120), "drains");
+}
 int main(int argc, char **argv) { @autoreleasepool {
     (void)argc; (void)argv;
     char dir[] = "/tmp/t_astc_upload.XXXXXX";
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
-    setenv("DM_TEST_NO_BC", "1", 1); const char *mode = getenv("T_ASTC_MODE"); int maxdim = mode && !strcmp(mode, "maxdim"), tagged = mode && !strcmp(mode, "tagged"), background = (mode && !strcmp(mode, "background")) || maxdim || tagged; if (maxdim) setenv("DM_BC_MAX_DIM", "64", 1); setenv("DM_NVN_ASTC_MISS", background ? "background" : "sync", 1); const char *which = getenv("T_ASTC_BLOCK"); int six = which && atoi(which) == 6; setenv("DM_NVN_BC_ASTC", six ? "6" : "4", 1); setenv("DM_NVN_ASTC_CACHE", dir, 1); unsetenv("DM_NVN_ASTC_CACHE_RO");
+    setenv("DM_TEST_NO_BC", "1", 1); const char *mode = getenv("T_ASTC_MODE"); int maxdim = mode && !strcmp(mode, "maxdim"), tagged = mode && (!strcmp(mode, "tagged") || !strcmp(mode, "tagged_mixed")), background = (mode && !strcmp(mode, "background")) || maxdim || tagged; if (maxdim) setenv("DM_BC_MAX_DIM", "64", 1); setenv("DM_NVN_ASTC_MISS", background ? "background" : "sync", 1); const char *which = getenv("T_ASTC_BLOCK"); int six = which && atoi(which) == 6; setenv("DM_NVN_BC_ASTC", six ? "6" : "4", 1); g_blk = six ? 6 : 4; { const char *b1 = getenv("T_ASTC_BC1_BLOCK"); g_bc1_blk = b1 && *b1 ? (unsigned)atoi(b1) : g_blk; if (b1 && *b1) setenv("DM_NVN_BC1_ASTC", b1, 1); else unsetenv("DM_NVN_BC1_ASTC"); } setenv("DM_NVN_ASTC_CACHE", dir, 1); unsetenv("DM_NVN_ASTC_CACHE_RO");
     mtl_init();
     CHECK(astc_block() == (six ? 6u : 4u), "DM_NVN_BC_ASTC is on (with DM_TEST_NO_BC)");
+    CHECK(astc_block_for(0x42) == g_bc1_blk && astc_block_for(0x46) == g_bc1_blk && astc_block_for(0x41) == g_bc1_blk && astc_block_for(0x45) == g_bc1_blk, "BC1 (and sRGB) uses DM_NVN_BC1_ASTC");
+    CHECK(astc_block_for(0x43) == g_blk && astc_block_for(0x44) == g_blk && astc_block_for(0x4d) == g_blk && astc_block_for(0x4e) == g_blk, "BC2/3/7 use DM_NVN_BC_ASTC");
     if (maxdim) {
         run_maxdim(dir);
         mtl_drain();
@@ -553,7 +721,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         return failed ? 1 : 0;
     }
     if (tagged) {
-        run_tagged(dir);
+        if (getenv("T_ASTC_MODE") && !strcmp(getenv("T_ASTC_MODE"), "tagged_mixed")) run_tagged_mixed(dir); else run_tagged(dir);   // the embedded pack registers once per process
         mtl_drain();
         { char cmd[128]; snprintf(cmd, sizeof cmd, "rm -rf %s", dir); system(cmd); }
         printf("ASTC upload (tagged planes): %d checks, %d failures\n", checks, failed);
@@ -561,12 +729,13 @@ int main(int argc, char **argv) { @autoreleasepool {
     }
     if (background) {
         run_background(dir, six);
+        run_background_mixed(dir);
         mtl_drain();
         { char cmd[128]; snprintf(cmd, sizeof cmd, "rm -rf %s", dir); system(cmd); }
         printf("ASTC upload (background, %s): %d checks, %d failures\n", six ? "6x6" : "4x4", checks, failed);
         return failed ? 1 : 0;
     }
-    double slack = six ? 6.0 : 1.0;   // 6x6 holds 3.56 bits a texel against 8 for 4x4, and the fixture is noise at every 4x4 block: the bounds only catch a wrong layout (a run with T_ASTC_BLOCK=6)
+    double slack = slack_of(g_blk);   // (a run with T_ASTC_BLOCK=6)
 
     struct { uint32_t format; MTLPixelFormat expect; double mean_max; const char *name; } cases[] = {
         {0x42, MTLPixelFormatASTC_4x4_LDR, 0.02, "BC1"}, {0x46, MTLPixelFormatASTC_4x4_sRGB, 0.02, "BC1 sRGB"}, {0x43, MTLPixelFormatASTC_4x4_LDR, 0.04, "BC2"},
@@ -576,7 +745,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         void *memory; nvn_texdesc d = {.target = NVN_TEXTURE_TARGET_2D, .format = cases[c].format, .width = 37, .height = 21, .depth = 1, .levels = 4, .samples = 1};
         tex_t t = fixture(d, &memory);
         id<MTLTexture> mt = upload(&t);
-        MTLPixelFormat want_pf = cases[c].expect; if (six) want_pf = want_pf == MTLPixelFormatASTC_4x4_sRGB ? MTLPixelFormatASTC_6x6_sRGB : MTLPixelFormatASTC_6x6_LDR;
+        MTLPixelFormat want_pf = astc_pf_of(blk_for(cases[c].format), is_srgb_fmt(cases[c].format)); double slack = slack_of(blk_for(cases[c].format));
         CHECK(mt && mt.pixelFormat == want_pf, cases[c].name);
         CHECK(mt && mt.width == 37 && mt.height == 21 && mt.mipmapLevelCount == 4, "size and levels are the NVN texture's");
         for (unsigned level = 0; mt && level < 4; level++) {
@@ -650,6 +819,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         free(expected); defer_obj_release(mt); release_fixture(smem); release_fixture(tmem);
         // 6x6 would need grid-aligned regions; 4x4 has none to refuse
     }
+    run_mixed_sync(dir);
     mtl_drain();
     { char cmd[128]; snprintf(cmd, sizeof cmd, "rm -rf %s", dir); system(cmd); }
     printf("ASTC upload: %d checks, %d failures\n", checks, failed);

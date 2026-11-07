@@ -121,8 +121,31 @@ class CompressedTextures(unittest.TestCase):
             self.assertEqual(text.count('DM_NVN_BC_ASTC'), 1)   # the player's own switch replaces the generated one
             self.assertIn('DM_NVN_BC_ASTC=6\n', text)
 
+    def test_the_block_size_picker_maps_to_blocks_flags_and_env(self):
+        # Matched to the original (the default: nothing saved), 4x4, 6x6 -> (block, bc1_block)
+        for choice, want in ((None, (4, 6)), ('matched', (4, 6)), ('4', (4, 4)), (4, (4, 4)), ('6', (6, 6)), (6, (6, 6)), ('weird', (4, 6))):
+            self.assertEqual(backend.astc_blocks(SimpleNamespace(astc='auto', astc_block=choice)), want, choice)
+        self.assertEqual(backend.astc_blocks(SimpleNamespace()), (4, 6))
+        self.assertEqual(backend.astc_blocks(SimpleNamespace(astc='off', astc_block='matched')), (0, 0))
+        self.assertEqual(backend.astc_block(SimpleNamespace(astc='on', astc_block='matched')), 4)
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / '0100000000010000_build').mkdir()
+            game = backend.Game(Path(folder))
+            text = backend.write_env(game, 'handheld', 512, astc_block=4, bc1_block=6).read_text()
+            self.assertIn('DM_NVN_BC_ASTC=4\n', text)
+            self.assertIn('DM_NVN_BC1_ASTC=6\n', text)
+            self.assertIn('DM_NVN_BC1_ASTC=4\n', backend.write_env(game, 'handheld', 512, astc_block=4, bc1_block=4).read_text())
+            self.assertNotIn('DM_NVN_BC1_ASTC', backend.write_env(game, 'handheld', 512, astc_block=4).read_text())
+            self.assertNotIn('DM_NVN_BC1_ASTC', backend.write_env(game, 'handheld', 512, astc_block=0, bc1_block=0).read_text())
+        game = SimpleNamespace(build=Path(self.tmp.name), romfs=Path(self.tmp.name) / 'romfs.img')
+        (Path(self.tmp.name) / 'tvport-astc').mkdir(exist_ok=True); (Path(self.tmp.name) / 'tvport-astc' / 'astc-ro.pack').write_bytes(b'x')
+        with patch.object(backend, 'stream') as stream, redirect_stdout(io.StringIO()):
+            backend.prebuild_astc(game, 4, 'python3', 512, 6)
+        argv = [str(a) for a in stream.call_args.args[0]]
+        self.assertEqual((argv[argv.index('--block') + 1], argv[argv.index('--bc1-block') + 1]), ('4', '6'))
+
     def test_the_build_command_takes_both_choices(self):
-        for argv, expected in ((['--astc', 'off'], ('off', 4)), (['--astc', 'on', '--astc-block', '6'], ('on', 6)), ([], ('auto', 4))):
+        for argv, expected in ((['--astc', 'off'], ('off', 'matched')), (['--astc', 'on', '--astc-block', '6'], ('on', '6')), (['--astc-block', '4'], ('auto', '4')), (['--astc-block', 'matched'], ('auto', 'matched')), ([], ('auto', 'matched'))):
             with patch.object(sys, 'argv', ['backend.py', 'build', '/x'] + argv), patch.object(backend, 'cmd_build') as build, patch.object(backend, 'BUNDLED', False):
                 backend.main()
             self.assertEqual((build.call_args.args[0].astc, build.call_args.args[0].astc_block), expected)
@@ -138,6 +161,7 @@ class CompressedTextures(unittest.TestCase):
         self.assertEqual(argv[:2], ['python3', '-I'])
         self.assertTrue(argv[2].endswith('dm/gfx/tools/bntx_astc.py'))
         self.assertEqual(argv[argv.index('--block') + 1], '6')
+        self.assertEqual(argv[argv.index('--bc1-block') + 1], '6')   # no BC1 block given: the same
         self.assertEqual(argv[argv.index('--max-dim') + 1], '512')   # the game's texture cap, the same number write_env gives the app as DM_BC_MAX_DIM
         self.assertIn('--drop-cache', argv)
 
@@ -256,6 +280,7 @@ class StoreTexturesOnce(unittest.TestCase):
         self.assertEqual(argv[:2], ['python3', '-I'])
         self.assertTrue(argv[2].endswith('dm/gfx/tools/tex_once.py'))
         self.assertEqual(argv[3], str(self.game.romfs))
+        self.assertEqual(argv[argv.index('--bc1-block') + 1], '6')   # tex_once.py takes the same BC1 block as the prebuild
         self.assertEqual(argv[argv.index('--pack') + 1], str(self.pack))
         self.assertEqual(argv[argv.index('--out') + 1], str(self.root / 'build/tvport-once'))
         self.assertEqual(argv[argv.index('--max-dim') + 1], '512')
@@ -300,7 +325,7 @@ class StoreTexturesOnce(unittest.TestCase):
 
     def build(self, **options):
         """cmd_build up to the install with everything heavy replaced: returns (generate_project call, install call, store call)"""
-        args = SimpleNamespace(folder=str(self.root), team='T', keys=None, device='dev', texture_cap=512, astc=options.get('astc', 'auto'), astc_block=4, texture_once=options.get('once', 'auto'), icloud=False, art=None, mode='handheld', render_scale=1)
+        args = SimpleNamespace(folder=str(self.root), team='T', keys=None, device='dev', texture_cap=512, astc=options.get('astc', 'auto'), astc_block=options.get('block', 4), texture_once=options.get('once', 'auto'), icloud=False, art=None, mode='handheld', render_scale=1)
         game = SimpleNamespace(build=self.root / 'build', romfs=self.game.romfs, app=self.game.app, prepared=True, addons=[], input_signature=lambda: 's', state=lambda: {'source_signature': 's'},
                                bundle_id=lambda team: 'b', save_state=lambda **kw: None)
         out = io.StringIO()
@@ -313,9 +338,13 @@ class StoreTexturesOnce(unittest.TestCase):
             backend.cmd_build(args)
         return generate, install, store
 
+    def test_the_build_passes_the_same_blocks_to_the_prebuild_and_to_texture_once(self):
+        generate, install, store = self.build(image=self.once, block='matched')
+        self.assertEqual(store.call_args.args[1:], (self.pack, 4, 'python3', 512, 6))
+
     def test_the_build_uses_the_stripped_image_for_the_app_and_the_install(self):
         generate, install, store = self.build(image=self.once)
-        self.assertEqual(store.call_args.args[1:], (self.pack, 4, 'python3', 512))
+        self.assertEqual(store.call_args.args[1:], (self.pack, 4, 'python3', 512, 4))
         self.assertEqual(generate.call_args.args[5], self.once)
         self.assertEqual(install.call_args.args[3:], (self.pack, self.once))
 
