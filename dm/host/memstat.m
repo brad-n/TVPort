@@ -18,6 +18,7 @@
 #include <os/proc.h>
 #endif
 #include "dm.h"
+#include "diag_path.h"
 
 void svc_guest_range(uint8_t **base, size_t *size);
 enum { C_GUEST, C_CODE, C_MALLOC, C_GPU, C_STACK, C_FILE, C_OTHER, NC };
@@ -113,17 +114,18 @@ static void *memstat_thread(void *p) {
     return NULL;
 }
 
-__attribute__((constructor)) static void memstat_start(void) {
+static int g_memstat_started;   // set once by whichever start comes first (constructor or dm_diag_start): the sampler thread must not run twice
+static void memstat_begin(const char *datadir) {
     const char *p = getenv("DM_MEMSTAT");
     if (!p || !*p) return;
-    char *path = strdup(p);
-#if TARGET_OS_IPHONE
-    if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; path = malloc(n); snprintf(path, n, "%s/Documents/%s", getenv("HOME"), p); }   // Relative name → the container's Documents (the container path is not known before launch)
-#endif
-    pthread_t th; pthread_create(&th, NULL, memstat_thread, path); pthread_detach(th);
+    char path[1100];
+    if (!dm_diag_resolve(p, datadir, path, sizeof path)) return;   // iOS/tvOS relative name before the data directory is known: dm_diag_start places it
+    if (__atomic_exchange_n(&g_memstat_started, 1, __ATOMIC_ACQ_REL)) return;
+    pthread_t th; pthread_create(&th, NULL, memstat_thread, strdup(path)); pthread_detach(th);
 }
+__attribute__((constructor)) static void memstat_start(void) { memstat_begin(NULL); }   // Mac and launch-environment case (absolute path on iOS)
 
-// ---------- Per-thread CPU: DM_THRCPU=<tsv path>[,interval in seconds (default 10)] (common to Mac / iOS; on iOS a relative name → the container's Documents) ----------
+// ---------- Per-thread CPU: DM_THRCPU=<tsv path>[,interval in seconds (default 10)] (common to Mac / iOS; on iOS/tvOS a relative name → the app data directory, started by dm_diag_start after env.txt is read) ----------
 // Every interval, walk all threads of this process (task_threads), take the thread name and user + system CPU time (ns) from THREAD_EXTENDED_INFO, and difference them by thread id:
 // each line is "seconds, thread id, thread name, CPU% (100 = one core)"; the last line is "seconds, -, total, CPU%". Used for heat attribution (which thread eats CPU); enable together with DM_HEAT to compare against thermal state.
 #include <mach/thread_info.h>
@@ -155,12 +157,16 @@ static void *thrcpu_thread(void *p) {
     }
     return NULL;
 }
-__attribute__((constructor)) static void thrcpu_start(void) {
+static int g_thrcpu_started;
+static void thrcpu_begin(const char *datadir) {
     const char *p = getenv("DM_THRCPU");
     if (!p || !*p) return;
-    char *spec = strdup(p);
-#if TARGET_OS_IPHONE
-    if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; spec = malloc(n); snprintf(spec, n, "%s/Documents/%s", getenv("HOME"), p); }
-#endif
-    pthread_t th; pthread_create(&th, NULL, thrcpu_thread, spec); pthread_detach(th);
+    char spec[1100];
+    if (!dm_diag_resolve(p, datadir, spec, sizeof spec)) return;   // the optional ",interval" rides along after the path
+    if (__atomic_exchange_n(&g_thrcpu_started, 1, __ATOMIC_ACQ_REL)) return;
+    pthread_t th; pthread_create(&th, NULL, thrcpu_thread, strdup(spec)); pthread_detach(th);
 }
+__attribute__((constructor)) static void thrcpu_start(void) { thrcpu_begin(NULL); }
+
+// iOS/tvOS: main.m calls this after boot_env has read env.txt, so DM_MEMSTAT / DM_THRCPU set there are seen, and relative names land in the app data directory (Caches on tvOS, which can be written; Documents is not).
+void dm_diag_start(const char *datadir) { memstat_begin(datadir); thrcpu_begin(datadir); }
