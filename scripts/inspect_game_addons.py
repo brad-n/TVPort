@@ -61,10 +61,16 @@ def main():
         nsp.configure_dotnet(env)
         bases, extras = source_files([args.folder]), source_files(args.source)
         # Extractor progress belongs on stderr; stdout is one JSON response.
-        with contextlib.redirect_stdout(sys.stderr), nsp.package_title_reader(repo, args.keys, env) as reader:
-            base_records = [reader.contents(path) or [] for path in bases]
-            records = [(path, reader.contents(path) or []) for path in extras]
-            result = validate_records(base_records, records, args.expected)
+        # One nx_extract run reads every package's content metas: {path: [(type, title ID, version)]}, or {path: why} for one it cannot read
+        # (upstream replaced package_title_reader with package_reader; the old name raised AttributeError and every import failed)
+        with contextlib.redirect_stdout(sys.stderr), nsp.package_reader(repo, args.keys, env) as reader:
+            found = reader.contents(list(dict.fromkeys(bases + extras)))
+        for path in extras:
+            if isinstance(found.get(path), str):
+                raise ValueError(f'Could not read metadata from {path.name}: {found[path]}')
+        base_records = [found.get(path) if isinstance(found.get(path), list) else [] for path in bases]
+        records = [(path, found.get(path) if isinstance(found.get(path), list) else []) for path in extras]
+        result = validate_records(base_records, records, args.expected)
         print(json.dumps(result))
         return 0
     except (ValueError, OSError, nsp.BuildError) as error:
