@@ -4,7 +4,7 @@ import TVServices
 final class ContentProvider: TVTopShelfContentProvider {
     override func loadTopShelfContent(completionHandler: @escaping (TVTopShelfContent?) -> Void) {
         let store = SharedStore()
-        let sections = Shelf.sections(catalog: Catalog.load(), lastPlayed: store?.lastPlayed() ?? [:], launchable: store?.launchable() ?? [], imageFolder: Catalog.folder)
+        let sections = Shelf.sections(catalog: Catalog.load(), lastPlayed: store?.lastPlayed() ?? [:], launchable: store?.launchable(), imageFolder: Catalog.folder)
         guard !sections.isEmpty else { return completionHandler(nil) }   // nothing to show: the static Top Shelf image stays
         completionHandler(TVTopShelfSectionedContent(sections: sections.map { section in
             let items: [TVTopShelfSectionedItem] = section.items.map { entry in

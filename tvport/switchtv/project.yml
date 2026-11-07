@@ -75,6 +75,7 @@ targets:
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ContentProvider
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: ${SWITCHTV_BUNDLE_ID}.topshelf
+      LD_ENTRY_POINT: _NSExtensionMain   # the tv-app-extension default, _TVExtensionMain, is a bare "ret" in TVServices: the extension process returned at once (exit status 3) and never reached ContentProvider
       DEVELOPMENT_TEAM: ${SWITCHTV_TEAM}
       CODE_SIGN_STYLE: Automatic
       SWIFT_VERSION: "5.0"
