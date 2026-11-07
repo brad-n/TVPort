@@ -49,8 +49,50 @@ struct Game: Codable, Identifiable, Hashable {
     var swapsXY: Bool { swapXY ?? swapABXY ?? false }
     var showFPS = false
     var players: String?
+    // Advanced: all optional so library.json saved before them decodes as is; nil / empty / false = today's behaviour
+    var allowDamagedManual: Bool?
+    var extractorArguments: String?   // shell-style words for nx_extract's extraction calls
+    var metal4Pipelines: Bool?
+    var gameMemoryPaging: String?     // "on" / "off"; nil = Automatic (the engine's default for the target). A tri-state, not a tvOS flag, so other targets can share it
+    var pipelineGPU: String?          // GPU architectures for the pipeline archive (build script --gpu); empty = none
+    var extraEnvironment: String?     // KEY=VALUE lines for the app's env file
     var addons: [GameAddon]?
     var id: String { folder }
+
+    /// The build's options for the Advanced section; each is left out at its default.
+    var advancedArguments: [String] {
+        var arguments: [String] = []
+        if allowDamagedManual == true { arguments.append("--allow-damaged-manual") }
+        for word in Game.shellWords(extractorArguments ?? "") { arguments.append("--nx-extract-arg=\(word)") }
+        if metal4Pipelines == true { arguments.append("--pso-mtl4") }
+        if let paging = gameMemoryPaging, paging == "on" || paging == "off" { arguments += ["--guest-file", paging] }
+        let gpu = (pipelineGPU ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !gpu.isEmpty { arguments += ["--gpu", gpu] }
+        for line in (extraEnvironment ?? "").split(whereSeparator: \.isNewline) {
+            let text = line.trimmingCharacters(in: .whitespaces)
+            if !text.isEmpty, !text.hasPrefix("#") { arguments += ["--extra-env", text] }
+        }
+        return arguments
+    }
+
+    /// Splits like a shell would for the common cases: whitespace separates words, and single or double quotes keep spaces in one.
+    static func shellWords(_ text: String) -> [String] {
+        var words: [String] = [], current = "", quote: Character?, started = false
+        for character in text {
+            if let open = quote {
+                if character == open { quote = nil } else { current.append(character) }
+            } else if character == "\"" || character == "'" {
+                quote = character; started = true
+            } else if character.isWhitespace {
+                if started || !current.isEmpty { words.append(current) }
+                current = ""; started = false
+            } else {
+                current.append(character)
+            }
+        }
+        if started || !current.isEmpty { words.append(current) }
+        return words
+    }
 }
 
 struct BuildResult {
@@ -434,6 +476,7 @@ final class Library: ObservableObject {
         if !team.isEmpty { arguments += ["--team", team] }
         if let keys { arguments += ["--keys", keys] }
         if let players = game.players, !players.isEmpty { arguments += ["--players", players] }
+        arguments += game.advancedArguments
         if let art = artworkPath { arguments += ["--art", art] }
         arguments += game.artworkCrop?.arguments ?? []
         arguments += game.topShelfArguments

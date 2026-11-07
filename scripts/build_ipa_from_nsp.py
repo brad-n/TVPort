@@ -79,6 +79,8 @@ PROFILE_OUT = ''                        # where a provisional profile goes (empt
 PROGRAM_INDEX = 0                       # a multi-program application (Super Mario 3D All-Stars: a launcher and one program per game): which program to pack, 0 = the application's own; its title ID is the application's + the index.
                                         #   A game of several programs (its profile's key programs) is packed as one from program 0: this setting packs one of them alone, for bring-up
 ALLOW_DAMAGED = False                   # a damaged NSP (files failing the NCA's hash check: an incomplete copy or a broken download), or files whose bytes do not start as their names promise (a .zs that is no zstd stream: a NUP or a dump has no hashes), stop the build; True writes those files as read and goes on
+ALLOW_DAMAGED_MANUAL = False            # a damaged offline manual (the HtmlDocument NCAs) is written as read and the build goes on; damaged game data still stops it (--allow-damaged-manual)
+NX_EXTRACT_ARGS = []                    # extra arguments for every nx_extract extraction call (--nx-extract-arg, NX_EXTRACT_ARGS environment, shell words); never the --title / --contents / --keys probes
 ALLOW_SHADER_REGRESSIONS = False        # shaders that translated in this game's previous build and fail with the current translation chain stop the build (logs/shader_regressions.log lists them);
                                         #   True packs the app without them
 ALLOW_OTHER_METAL = False               # an NVN game's shaders are built only with the Metal compiler they were tested with (dm/gfx/tools/dmsh_chain.lock: Xcode 27.2); another one stops the build,
@@ -527,7 +529,12 @@ def files_with_suffix(folder, *suffixes):
 def extract_flags(app):   # nx_extract's options shared by its extraction calls: the application to read (--app), the program of a multi-program application and a damaged NSP.
     # With PROGRAM_INDEX, app is that program's title ID (set in main): its application is app - PROGRAM_INDEX, whose one Application content meta lists every program's NCAs
     return (['--app', f'{app - PROGRAM_INDEX:016x}'] + ([f'--program={app:016x}'] if PROGRAM_INDEX else [])
-            + (['--allow-damaged'] if ALLOW_DAMAGED else []))
+            + (['--allow-damaged'] if ALLOW_DAMAGED else []) + [a for a in NX_EXTRACT_ARGS if not (a == '--allow-damaged' and ALLOW_DAMAGED)])
+
+
+def html_flags(app):   # the HTML manual's extraction: --allow-damaged-manual lets a damaged manual through without letting damaged game data through
+    flags = extract_flags(app)
+    return flags + (['--allow-damaged'] if ALLOW_DAMAGED_MANUAL and '--allow-damaged' not in flags else [])
 
 
 def scan_nsps(nsp_dir, contents_of, want=None, extra_packages=()):
@@ -1248,7 +1255,7 @@ def extract_html(nx, keys, dst, base, upd, logs, app):
     out, tmp = dst / 'html', dst / 'html.partial'
     if out.is_dir(): return
     rmtree(tmp); tmp.mkdir(parents=True)
-    run([nx, keys, base, upd or '-', tmp, '--html'] + extract_flags(app), logs / f'extract_html_{dst.name}.log')
+    run([nx, keys, base, upd or '-', tmp, '--html'] + html_flags(app), logs / f'extract_html_{dst.name}.log')
     swap_in(tmp, out)
 
 
@@ -2832,6 +2839,8 @@ def parse_args(argv):
     ap.add_argument('--survey-only', action='store_true', help='a game with no profile: only the survey, no provisional profile and no IPA')
     ap.add_argument('--program', type=int, default=None, help='a multi-program application (Super Mario 3D All-Stars): pack program N of the NSPs as a game of its own, title ID = the application\'s + N (default: the PROGRAM_INDEX setting, 0; a game whose profile lists programs packs them all as one from program 0: this is for bring-up)')
     ap.add_argument('--allow-damaged', action='store_true', help='a damaged NSP (files failing the NCA hash check), or files whose bytes do not start as their names promise (a .zs file that is no zstd stream): write them as read and go on instead of stopping')
+    ap.add_argument('--allow-damaged-manual', action='store_true', help='a damaged offline HTML manual is extracted as read and the build goes on; damaged game data still stops it')
+    ap.add_argument('--nx-extract-arg', action='append', default=[], help='an extra argument for every nx_extract extraction call (repeatable, written --nx-extract-arg=--option; NX_EXTRACT_ARGS holds more, as shell words)')
     ap.add_argument('--allow-shader-regressions', action='store_true', help='shaders that translated in the game\'s previous build and fail with the current translation chain: '
                     'pack the app without them instead of stopping')
     ap.add_argument('--allow-other-metal', action='store_true', help='an NVN game: build its shaders with this Mac\'s Metal compiler when it is not the one they were tested with '
@@ -2918,10 +2927,18 @@ def provisional_version(have, builds, requested, profile_root):
     return version
 
 
+def nx_extract_args(given):   # --nx-extract-arg values, then NX_EXTRACT_ARGS (shell words) from the environment
+    return list(given or []) + shlex.split(os.environ.get('NX_EXTRACT_ARGS', ''))
+
+
 def main(args=None):
     args = args or parse_args([])
     PROG.mode = progress_mode(args.progress or PROGRESS)
     global ALLOW_DAMAGED; ALLOW_DAMAGED = args.allow_damaged or ALLOW_DAMAGED
+    global ALLOW_DAMAGED_MANUAL; ALLOW_DAMAGED_MANUAL = args.allow_damaged_manual or ALLOW_DAMAGED_MANUAL
+    global NX_EXTRACT_ARGS; NX_EXTRACT_ARGS = nx_extract_args(args.nx_extract_arg)
+    if '--allow-damaged' in NX_EXTRACT_ARGS: ALLOW_DAMAGED = True   # as --allow-damaged: no cache is reused
+    if NX_EXTRACT_ARGS: say(f'nx_extract gets the extra arguments: {shlex.join(NX_EXTRACT_ARGS)}')
     global PROGRAM_INDEX; PROGRAM_INDEX = args.program if args.program is not None else PROGRAM_INDEX
     global ALLOW_SHADER_REGRESSIONS; ALLOW_SHADER_REGRESSIONS = args.allow_shader_regressions or ALLOW_SHADER_REGRESSIONS
     global ALLOW_OTHER_METAL; ALLOW_OTHER_METAL = args.allow_other_metal or ALLOW_OTHER_METAL
