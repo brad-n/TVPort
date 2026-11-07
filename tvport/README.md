@@ -89,6 +89,10 @@ tvOS has no way for an app to put other apps in a home-screen folder: new apps a
 
 The one file to swap is `tvport/switchtv/Branding/switchtv-icon-source.png`: a square PNG (the owner's is 1254 x 1254) with the mark above a wordmark on a white background. `Branding/make_branding.swift` cuts the mark (the App Icon, centred on the logo's own white) and centres the whole logo (the Top Shelf images), and `dm/ios/tools/tv_icon.swift` (with `DM_ICON_BACKDROP`) lays them out as the layered tvOS assets, on every install. If the new logo has its mark somewhere else, change `markRect` in `make_branding.swift`; if its red differs, set `accent` and `ink` in `Sources/Theme.swift` (`make_branding.swift` writes the sampled colours to `colors.txt`).
 
+## Starting a build from a URL
+
+`tvport://build?title=<16 hex digits>[&install=1|0]` queues a build for the library game with that title ID, exactly as Build & Install (`install=1`, the default) or a build without install (`install=0`) would, using the game's saved settings and the selected Apple TV. It is refused with one line in the log, and no dialog, when the title is malformed or not in the library, no Apple TV is selected (install only), the game is already building or queued, or keys are missing. Any other host or path is logged as unsupported and ignored. Nothing else is reachable by URL. Check the URL parser with `swiftc -parse-as-library -o /tmp/url_command_check app/Sources/TVPortURLCommand.swift app/Tests/url_command_check.swift && /tmp/url_command_check`.
+
 ## The packed app
 
 `python3 scripts/package_tvport.py` makes `tvport/dist/TVPort.app` and `TVPort-<version>.zip` (about 50 MB), an app that runs on any Mac without this checkout. It carries:

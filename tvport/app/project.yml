@@ -18,6 +18,9 @@ targets:
         CFBundleDisplayName: TVPort
         CFBundleShortVersionString: "1.2.3"
         CFBundleVersion: "44"
+        CFBundleURLTypes:
+          - CFBundleURLName: dev.tvport.mac.build
+            CFBundleURLSchemes: [tvport]
         LSApplicationCategoryType: public.app-category.utilities
         TVPortRoot: $(SRCROOT)/../..   # where backend.py and the engine are; the app is not sandboxed because it runs Xcode's tools
     settings:

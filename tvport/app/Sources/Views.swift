@@ -5,11 +5,13 @@ import UniformTypeIdentifiers
 @main
 struct TVPortApp: App {
     @StateObject private var library = Library()
+    @NSApplicationDelegateAdaptor(URLBuildDelegate.self) private var urlDelegate
 
     var body: some Scene {
         WindowGroup("TVPort") {
             ContentView().environmentObject(library).frame(width: 1000).frame(minHeight: 620)
                 .background(InitialWindowSize())
+                .onAppear { URLBuildRouter.shared.attach(library) }
         }
         .windowResizability(.contentSize)
         .defaultSize(width: 1000, height: 670)

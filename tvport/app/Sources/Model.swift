@@ -705,7 +705,7 @@ final class Library: ObservableObject {
         return Calendar.current.isDateInToday(date) ? date.formatted(date: .omitted, time: .shortened) : date.formatted(date: .abbreviated, time: .shortened)
     }
 
-    private func append(_ line: String) {
+    func append(_ line: String) {
         log.append(line)
         if log.count > 4000 { log.removeFirst(log.count - 4000) }
     }
