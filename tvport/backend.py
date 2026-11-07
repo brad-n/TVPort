@@ -314,7 +314,11 @@ class Game:
         if not self.build:
             return None
         folder = self.build / 'shader/ios'
-        return folder if (folder / f'b-{chain()}/inputs.tsv').is_file() else None
+        library = folder / f'b-{chain()}'
+        # A finished library is either the folder with its stamp or, since upstream's dm/tools/shader_lib.py, one packed file b-<chain>.img
+        # (dmsh_build.py writes the image and removes the folder); build_ipa.sh reads either through MSL_IOS=<this folder>.
+        packed = library.with_name(library.name + '.img')
+        return folder if (library / 'inputs.tsv').is_file() or packed.is_file() else None
 
     @property
     def prepared(self) -> bool:

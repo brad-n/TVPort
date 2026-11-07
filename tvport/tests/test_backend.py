@@ -544,6 +544,20 @@ class GameFolder(unittest.TestCase):
             self.make(folder, '0100000000010000_build/patched_v1/main.patched.bin', '0100000000010000_build/extract/v1/RomFS.img', '0100000000010000_build/shader/ios/b-000000000000/inputs.tsv')
             self.assertFalse(backend.Game(Path(folder)).prepared)
 
+    def test_packed_shader_image_counts(self):
+        # dmsh_build.py now packs the finished library into one file, b-<chain>.img, and removes the folder (dm/tools/shader_lib.py)
+        chain = backend.chain()
+        with tempfile.TemporaryDirectory() as folder:
+            self.make(folder, '0100000000010000_build/patched_v1/main.patched.bin', '0100000000010000_build/extract/v1/RomFS.img', f'0100000000010000_build/shader/ios/b-{chain}.img')
+            game = backend.Game(Path(folder))
+            self.assertTrue(game.prepared)
+            self.assertEqual(game.shaders.resolve(), (Path(folder) / '0100000000010000_build/shader/ios').resolve())
+
+    def test_packed_shader_image_of_another_chain_does_not_count(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.make(folder, '0100000000010000_build/patched_v1/main.patched.bin', '0100000000010000_build/extract/v1/RomFS.img', '0100000000010000_build/shader/ios/b-000000000000.img')
+            self.assertFalse(backend.Game(Path(folder)).prepared)
+
     def test_new_bundle_id_comes_from_team_and_title(self):
         with tempfile.TemporaryDirectory() as folder:
             self.make(folder, '0100ABCD00000000_build/x')
