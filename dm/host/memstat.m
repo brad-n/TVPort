@@ -8,7 +8,7 @@
 //         malloc (host heap), gpu (IOAccelerator / IOSurface / Metal tagged regions), stack, file (file mappings), other
 //   The part where charged ≠ phys_footprint (GPU private memory accounted by IOKit is not in any VM region) is listed separately as "unattributed" = footprint − Σcharged.
 //   Paging, per second since the last line: this process's page faults and page-ins (TASK_EVENTS_INFO), the system's page-outs (HOST_VM_INFO64), the system's free and wired memory, and the guest's dirty
-//         pages (file-backed on tvOS, guest_block: the system writes them to flash before it can take their memory back), so a stall that is the system paging the guest shows as such
+//         pages (file-backed on tvOS, guest_file_init: the system writes them to flash before it can take their memory back), so a stall that is the system paging the guest shows as such
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <TargetConditionals.h>

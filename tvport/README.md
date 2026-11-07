@@ -118,7 +118,7 @@ Measured on the A15 with Super Mario Odyssey, before these changes:
 
 ## Getting past the memory limit
 
-tvOS ends an app at 2,097 MB of *footprint*, and the Switch gives a game about 3.2 GB of its own, so a large game cannot fit in anonymous memory, the kind footprint counts. Footprint leaves out file pages. So on tvOS the game's memory is a shared mapping of a sparse file (`guest_block` in `dm/host/hle_svc.c`), which the system pages to flash when it needs the room, as a swap file. This needs no entitlement and no paid account, only public APIs. `DM_GUEST_FILE=0` turns it off.
+tvOS ends an app at 2,097 MB of *footprint*, and the Switch gives a game about 3.2 GB of its own, so a large game cannot fit in anonymous memory, the kind footprint counts. Footprint leaves out file pages. So on tvOS the game's memory is a shared mapping of a sparse file (`guest_file_init` in `dm/host/hle_svc.c`, on by default on tvOS), which the system pages to flash when it needs the room, as a swap file. This needs no entitlement and no paid account, only public APIs. `DM_GUEST_FILE=0` turns it off.
 
 Super Mario Odyssey in Handheld at Medium texture detail, on an A15 Apple TV 4K, in MiB:
 
