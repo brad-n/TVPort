@@ -22,7 +22,7 @@ for toks in lines:
             d = os.path.normpath(os.path.join(host, t[2:]))
             if d not in incs: incs.append(d)
         elif t.startswith('-D'): defs.append(t)
-        elif t.endswith(('.c', '.m', '.S')): srcs.append(os.path.normpath(os.path.join(host, t)))
+        elif t.endswith(('.c', '.m', '.S', '.cpp', '.mm')): srcs.append(os.path.normpath(os.path.join(host, t)))
 assert srcs, 'no source files in the compile commands'
 ios_src = os.path.normpath(f'{ios}/Sources')
 srcs = [s for s in dict.fromkeys(srcs) if not os.path.splitext(s)[0].endswith('_mac') and os.path.dirname(s) != ios_src]

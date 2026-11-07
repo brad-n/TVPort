@@ -12,7 +12,10 @@ GAME_H = ../../host/gen/$(GAME)/game_profile.h
 # The host's shaders compiled for the Mac (host_msl_gen.h, made by the host Makefile from dm/gfx/msl; nvn/host_msl.m loads them)
 MSL_H = ../../host/gen/msl-macosx/host_msl_gen.h
 CFLAGS=-O1 -g -Wall -Wno-unused-function -I../nvn/include -I$(dir $(GAME_H)) -I$(dir $(MSL_H))
-GFX=$(filter-out ../nvn/hle_nvn.c,$(sort $(wildcard ../nvn/*.c ../nvn/*.m ../nvn/*.S ../tex/*.c ../tex/*.m)))
+ASTC_LIB=../../host/gen/astc/libastcenc.a
+$(ASTC_LIB): $(wildcard ../../third_party/astc-encoder/*.cpp ../../third_party/astc-encoder/*.h)
+	$(MAKE) -C ../../host GAME=$(GAME) gen/astc/libastcenc.a
+GFX=$(filter-out ../nvn/hle_nvn.c,$(sort $(wildcard ../nvn/*.c ../nvn/*.m ../nvn/*.S ../tex/*.c ../tex/*.m ../tex/*.mm)) $(ASTC_LIB))
 GFX_H=$(wildcard ../nvn/*.h ../nvn/*.inc ../nvn/include/*.h ../tex/*.h) $(GAME_H) $(MSL_H)
 .DEFAULT_GOAL := t_nvn   # the profile header rule comes first, so keep the default goal as before
 $(GAME_H):
@@ -21,7 +24,7 @@ $(MSL_H): $(wildcard ../msl/*.metal) ../tools/host_msl.py host_msl_force
 	$(MAKE) -C ../../host host_msl GAME=$(GAME)
 .PHONY: host_msl_force
 host_msl_force:
-FW=-framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework UniformTypeIdentifiers
+FW=-lc++ -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework UniformTypeIdentifiers
 # Host crash.c is linked in as well: the write-protect unit tests go through the same page-fault hook as production
 # Tests that #include nvn_mtl.m link the rest of the NVN layer beside it (hle_nvn.c: memory pools, sparse pools, serials) and the host's large stack, with weak stubs of what they need of the host (t_host_stubs.c)
 MTL_T_DEP=../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
@@ -51,6 +54,18 @@ t_gfx_suspend: t_gfx_suspend.c ../nvn/hle_nvn.c ../../host/crash.c ../../host/hl
 	clang $(CFLAGS) -fobjc-arc -o $@ t_gfx_suspend.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(FW)
 t_nvn: t_nvn.c ../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(FW)
+# ASTC cache (DM_NVN_BC_ASTC, dm/gfx/tex/nvn_astc_cache.m): the CPU half (decode, ASTC encode, content-addressed cache), under ASan and UBSan
+t_astc_cache: t_astc_cache.m ../tex/nvn_astc_cache.m ../tex/nvn_astc_cache.h ../tex/nvn_astc.mm ../tex/nvn_astc.h ../tex/nvn_bcdec.c ../tex/nvn_bcdec.h $(ASTC_LIB)
+	clang $(CFLAGS) -fobjc-arc -fsanitize=address,undefined -o $@ t_astc_cache.m ../tex/nvn_bcdec.c ../tex/nvn_astc.mm $(ASTC_LIB) -lc++ -framework Foundation -framework Metal
+# Encode throughput of the transcoder (prints numbers, not a test; no sanitizers): make t_astc_bench && ./t_astc_bench
+t_astc_bench: t_astc_bench.m ../tex/nvn_astc_cache.m ../tex/nvn_astc_cache.h ../tex/nvn_astc.mm ../tex/nvn_astc.h ../tex/nvn_bcdec.c ../tex/nvn_bcdec.h $(ASTC_LIB)
+	clang -O2 -g -Wall -Wno-unused-function -I../nvn/include -fobjc-arc -o $@ t_astc_bench.m ../tex/nvn_bcdec.c ../tex/nvn_astc.mm $(ASTC_LIB) -lc++ -framework Foundation -framework Metal
+# DM_NVN_BC_ASTC on the GPU: uploads of BC1/2/3/7 as ASTC against the CPU decode (DM_TEST_NO_BC and the variable are set by the test)
+t_astc_upload: t_astc_upload.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_astc_upload.m $(MTL_T_SRC) $(FW)
+# BC6H on a GPU without BC: unsigned as RG11B10Float (DM_BC6H_R11G11B10), signed as RGBA16Float. Runs on the Mac GPU with DM_TEST_NO_BC=1
+t_bc6h: t_bc6h.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_bc6h.m $(MTL_T_SRC) $(FW)
 t_dirty_slots: t_dirty_slots.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
 	clang $(CFLAGS) -o $@ t_dirty_slots.c ../../host/crash.c ../nvn/nvn_dirty.c
 t_dirty_race: t_dirty_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)

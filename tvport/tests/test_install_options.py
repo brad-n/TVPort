@@ -86,6 +86,122 @@ class InstallRetry(unittest.TestCase):
         self.assertIn('no bytes', str(error.exception))
 
 
+class CompressedTextures(unittest.TestCase):
+    """The per-game Compressed textures (ASTC) choice: Automatic / On / Off and the block size, the prebuild step, and the pack's trip to the Apple TV"""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        (root / 'App.app').mkdir(); (root / 'App.app/embedded.mobileprovision').write_text('x')
+        (root / 'romfs.img').write_bytes(b'x' * 100)
+        self.pack = root / 'astc-ro.pack'
+        self.pack.write_bytes(b'NXASTCPK' + bytes(32) + bytes(range(32)) + bytes(8) + b'p' * 20)   # 80 bytes of header with a fingerprint, 20 of body
+        self.game = SimpleNamespace(app=root / 'App.app', romfs=root / 'romfs.img')
+        patcher = patch('time.sleep'); self.sleep = patcher.start(); self.addCleanup(patcher.stop)
+
+    def install(self, listings, copy=None):
+        out = io.StringIO()
+        with patch.object(backend, 'run', return_value=done(0)), patch.object(backend, 'stream', side_effect=copy) as stream, patch.object(backend, 'installed_files', side_effect=listings), redirect_stdout(out):
+            backend.install(self.game, 'd', 'b', self.pack)
+        return stream, out.getvalue()
+
+    def test_automatic_is_on_with_4x4_and_off_writes_a_zero(self):
+        self.assertEqual(backend.astc_block(SimpleNamespace()), 4)
+        self.assertEqual(backend.astc_block(SimpleNamespace(astc='auto', astc_block=4)), 4)
+        self.assertEqual(backend.astc_block(SimpleNamespace(astc='on', astc_block=6)), 6)
+        self.assertEqual(backend.astc_block(SimpleNamespace(astc='auto', astc_block=6)), 6)
+        self.assertEqual(backend.astc_block(SimpleNamespace(astc='off', astc_block=6)), 0)
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / '0100000000010000_build').mkdir()
+            game = backend.Game(Path(folder))
+            self.assertNotIn('DM_NVN_BC_ASTC', backend.write_env(game, 'handheld', 512).read_text())   # nothing asked: nothing written
+            self.assertIn('DM_NVN_BC_ASTC=4\n', backend.write_env(game, 'handheld', 512, astc_block=4).read_text())
+            self.assertIn('DM_NVN_BC_ASTC=6\n', backend.write_env(game, 'handheld', 512, astc_block=6).read_text())
+            self.assertIn('DM_NVN_BC_ASTC=0\n', backend.write_env(game, 'handheld', 512, astc_block=0).read_text())
+            text = backend.write_env(game, 'handheld', 512, astc_block=4, extra_env=['DM_NVN_BC_ASTC=6']).read_text()
+            self.assertEqual(text.count('DM_NVN_BC_ASTC'), 1)   # the player's own switch replaces the generated one
+            self.assertIn('DM_NVN_BC_ASTC=6\n', text)
+
+    def test_the_build_command_takes_both_choices(self):
+        for argv, expected in ((['--astc', 'off'], ('off', 4)), (['--astc', 'on', '--astc-block', '6'], ('on', 6)), ([], ('auto', 4))):
+            with patch.object(sys, 'argv', ['backend.py', 'build', '/x'] + argv), patch.object(backend, 'cmd_build') as build, patch.object(backend, 'BUNDLED', False):
+                backend.main()
+            self.assertEqual((build.call_args.args[0].astc, build.call_args.args[0].astc_block), expected)
+
+    def test_the_prebuild_runs_the_engine_tool_and_returns_the_pack(self):
+        game = SimpleNamespace(build=Path(self.tmp.name), romfs=Path(self.tmp.name) / 'romfs.img')
+        made = Path(self.tmp.name) / 'tvport-astc'
+        made.mkdir()
+        (made / 'astc-ro.pack').write_bytes(b'x')
+        with patch.object(backend, 'stream') as stream, redirect_stdout(io.StringIO()):
+            self.assertEqual(backend.prebuild_astc(game, 6, 'python3', 512), made / 'astc-ro.pack')
+        argv = [str(a) for a in stream.call_args.args[0]]
+        self.assertEqual(argv[:2], ['python3', '-I'])
+        self.assertTrue(argv[2].endswith('dm/gfx/tools/bntx_astc.py'))
+        self.assertEqual(argv[argv.index('--block') + 1], '6')
+        self.assertEqual(argv[argv.index('--max-dim') + 1], '512')   # the game's texture cap, the same number write_env gives the app as DM_BC_MAX_DIM
+        self.assertIn('--drop-cache', argv)
+
+    def test_a_failed_prebuild_does_not_fail_the_build(self):
+        game = SimpleNamespace(build=Path(self.tmp.name) / 'nothing', romfs=Path(self.tmp.name) / 'romfs.img')
+        out = io.StringIO()
+        with patch.object(backend, 'stream', side_effect=backend.Failure('clang: not found')), redirect_stdout(out):
+            self.assertIsNone(backend.prebuild_astc(game, 4, 'python3', 0))
+        self.assertIn('could not be prepared', out.getvalue())
+
+    def test_the_pack_is_sent_beside_the_game_files_and_its_size_verified(self):
+        listings = [{'romfs.img': 100}, {'astc-ro.pack': 100}]
+        stream, text = self.install(listings)
+        self.assertEqual(stream.call_count, 1)
+        argv = [str(a) for a in stream.call_args.args[0]]
+        self.assertEqual(argv[argv.index('--destination') + 1], 'Library/Caches/astc-ro.pack')
+        self.assertEqual(argv[argv.index('--source') + 1], str(self.pack))
+        self.assertIn('compressed textures on the Apple TV match', text)
+        self.assertTrue(self.pack.with_name('astc-ro.pack.sent').is_file())
+
+    def test_the_game_files_and_the_pack_both_go_when_neither_is_there(self):
+        stream, _ = self.install([{}, {'romfs.img': 100}, {'romfs.img': 100, 'astc-ro.pack': 100}])
+        self.assertEqual([str(c.args[0][c.args[0].index('--destination') + 1]) for c in stream.call_args_list], ['Library/Caches/romfs.img', 'Library/Caches/astc-ro.pack'])
+
+    def test_a_pack_already_there_is_not_sent_again(self):
+        self.install([{'romfs.img': 100}, {'astc-ro.pack': 100}])
+        stream, text = self.install([{'romfs.img': 100, 'astc-ro.pack': 100}])
+        stream.assert_not_called()
+        self.assertIn('already on the Apple TV', text)
+
+    def test_a_pack_of_the_same_size_but_another_fingerprint_is_sent_again(self):
+        self.install([{'romfs.img': 100}, {'astc-ro.pack': 100}])
+        body = bytearray(self.pack.read_bytes()); body[40] ^= 1; self.pack.write_bytes(bytes(body))
+        stream, _ = self.install([{'romfs.img': 100, 'astc-ro.pack': 100}, {'astc-ro.pack': 100}])
+        self.assertEqual(stream.call_count, 1)
+
+    def test_the_pack_copy_is_retried_and_a_short_arrival_fails(self):
+        copies = [backend.Failure('Failed to locate coordinated install: connection lost'), None]
+
+        def copy(argv, **kwargs):
+            outcome = copies.pop(0)
+            if outcome:
+                raise outcome
+        stream, text = self.install([{'romfs.img': 100}, {'astc-ro.pack': 100}], copy)
+        self.assertEqual(stream.call_count, 2)
+        self.assertIn('Sending the compressed textures failed (attempt 1 of 3)', text)
+        with self.assertRaises(backend.Failure) as error:
+            self.install([{'romfs.img': 100}, {'astc-ro.pack': 60}])
+        self.assertIn('60 bytes', str(error.exception))
+        self.assertFalse(self.pack.with_name('astc-ro.pack.sent').exists())
+
+    def test_without_a_pack_the_install_is_unchanged(self):
+        with patch.object(backend, 'run', return_value=done(0)), patch.object(backend, 'stream') as stream, patch.object(backend, 'installed_files', return_value={'romfs.img': 100}) as files, redirect_stdout(io.StringIO()):
+            backend.install(self.game, 'd', 'b')
+        stream.assert_not_called()
+        self.assertEqual(files.call_count, 1)
+
+    def test_the_fingerprint_is_read_from_the_pack_header(self):
+        self.assertEqual(backend.pack_fingerprint(self.pack), bytes(range(32)).hex())
+        other = Path(self.tmp.name) / 'other'
+        other.write_bytes(b'not a pack')
+        self.assertEqual(backend.pack_fingerprint(other), '')
+
+
 class Advanced(unittest.TestCase):
     def make_game(self, folder):
         (Path(folder) / '0100000000010000_build').mkdir()
