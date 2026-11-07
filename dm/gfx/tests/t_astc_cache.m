@@ -35,6 +35,102 @@ static NSString *fixture(NSString *root, unsigned key, size_t size) {
 }
 static uint8_t stream_byte(size_t index) { return (uint8_t)(index ^ (index >> 7) ^ (index >> 15)); }
 
+// ---- background miss policy: learn / fetch, the bounded queue, the size cap, the free-disk floor, corrupt entries ----
+static void bg_configure(NSString *dir, size_t queue_cap, uint64_t cache_max, uint64_t min_free, unsigned threads) {
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
+    nvn_astc_bg_config c = {.cache = dir.fileSystemRepresentation, .readonly = NULL, .queue_cap = queue_cap, .cache_max = cache_max, .min_free = min_free, .threads = threads};
+    nvn_bc_astc_bg_configure(&c);
+}
+static void bc7_plane(uint8_t *data, size_t size, unsigned seed) {   // BC7 mode 6 blocks of noise
+    uint32_t state = seed * 2654435761u + 1;
+    for (size_t i = 0; i < size; i++) { state = state * 1664525u + 1013904223u; data[i] = state >> 24; }
+    for (size_t i = 0; i < size; i += 16) data[i] = (data[i] & ~0x7fu) | 0x40u;
+}
+static size_t count_entries(NSString *dir) {
+    size_t n = 0; for (NSString *f in [NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:NULL]) if (f.length == 69 && [f hasSuffix:@".astc"]) n++;
+    return n;
+}
+static void background_contract(NSString *root) {
+    const unsigned W = 128, H = 128; const size_t bytes = (size_t)W * H;   // BC7: 16 bytes a 4x4 block
+    const size_t astc_bytes = (size_t)((W + 3) / 4) * ((H + 3) / 4) * 16;
+    uint8_t *plane = malloc(bytes), *fetched = malloc(astc_bytes), *direct = malloc(astc_bytes);
+    // miss -> queued -> encoded by a worker -> hit; the entry is the one the synchronous encoder makes
+    NSString *a = [root stringByAppendingPathComponent:@"bg-a"];
+    bg_configure(a, 64u << 20, 1ull << 30, 0, 2);
+    bc7_plane(plane, bytes, 1);
+    nvn_astc_cache_key key;
+    CHECK(nvn_bc_astc_learn(0x4d, plane, bytes, W, H, 4, &key) == 0);
+    CHECK(nvn_bc_astc_fetch(0x4d, plane, bytes, W, H, 4, fetched, astc_bytes) >= 0);   // may or may not be there yet; either way never an error
+    CHECK(nvn_bc_astc_bg_wait(120));
+    nvn_astc_bg_stats s; nvn_bc_astc_bg_stats(&s);
+    CHECK(s.encoded == 1 && s.written == 1 && s.duplicates + s.queued >= 1 && count_entries(a) == 1);
+    CHECK(nvn_bc_astc_learn(0x4d, plane, bytes, W, H, 4, NULL) == 1);
+    CHECK(nvn_bc_astc_fetch(0x4d, plane, bytes, W, H, 4, fetched, astc_bytes) == 1);
+    NSString *b = [root stringByAppendingPathComponent:@"bg-sync"];
+    int hit; CHECK(!nvn_bc_astc_encode(0x4d, plane, bytes, W, H, 4, direct, astc_bytes, b.fileSystemRepresentation, NULL, &hit) && !hit);
+    CHECK(!memcmp(fetched, direct, astc_bytes));   // background and synchronous encodes are the same bytes
+    CHECK(nvn_bc_astc_learn(0x4d, plane, bytes, 64, 64, 4, NULL) == -1);   // wrong size for the format: invalid, not queued
+    CHECK(nvn_bc_astc_learn(0x49, plane, bytes, W, H, 4, NULL) == -1);    // BC4 has no ASTC form
+    // a plane already pending is not queued twice
+    NSString *d = [root stringByAppendingPathComponent:@"bg-dup"];
+    bg_configure(d, 64u << 20, 1ull << 30, 0, 1);
+    bc7_plane(plane, bytes, 2);
+    for (int i = 0; i < 5; i++) nvn_bc_astc_learn(0x4d, plane, bytes, W, H, 4, NULL);
+    CHECK(nvn_bc_astc_bg_wait(120)); nvn_bc_astc_bg_stats(&s);
+    CHECK(s.queued + s.duplicates + s.hits == 5 && s.queued >= 1 && s.encoded == s.queued);
+    // queue cap: a cap of a plane and a half holds one, the rest is dropped (counted); nothing over the cap is ever queued
+    NSString *q = [root stringByAppendingPathComponent:@"bg-queue"];
+    bg_configure(q, bytes + bytes / 2, 1ull << 30, 0, 1);
+    for (unsigned i = 0; i < 12; i++) { bc7_plane(plane, bytes, 100 + i); nvn_bc_astc_learn(0x4d, plane, bytes, W, H, 4, NULL); nvn_bc_astc_bg_stats(&s); CHECK(s.queued_bytes_now <= bytes + bytes / 2); }
+    nvn_bc_astc_bg_stats(&s);
+    CHECK(s.queued + s.dropped == 12 && s.dropped > 0 && s.dropped_bytes == s.dropped * bytes);
+    CHECK(nvn_bc_astc_bg_wait(120)); nvn_bc_astc_bg_stats(&s); CHECK(s.encoded == s.queued && s.queued_bytes_now == 0);
+    bg_configure(q, 0, 1ull << 30, 0, 1);   // no room at all: everything is dropped
+    bc7_plane(plane, bytes, 300); CHECK(nvn_bc_astc_learn(0x4d, plane, bytes, W, H, 4, NULL) == 0); nvn_bc_astc_bg_stats(&s); CHECK(s.dropped == 1 && s.queued == 0);
+    // two workers encode many planes: all are written, once each
+    NSString *m = [root stringByAppendingPathComponent:@"bg-many"];
+    bg_configure(m, 64u << 20, 1ull << 30, 0, 2);
+    for (unsigned i = 0; i < 24; i++) { bc7_plane(plane, bytes, 400 + i); nvn_bc_astc_learn(0x4d, plane, bytes, W, H, 4, NULL); }
+    CHECK(nvn_bc_astc_bg_wait(120)); nvn_bc_astc_bg_stats(&s);
+    CHECK(s.queued == 24 && s.written == 24 && count_entries(m) == 24 && s.cache_entries == 24);
+    // cache size cap: room for two entries
+    NSString *c = [root stringByAppendingPathComponent:@"bg-cap"];
+    bg_configure(c, 64u << 20, 2 * (astc_bytes + 40) + 10, 0, 1);
+    for (unsigned i = 0; i < 5; i++) { bc7_plane(plane, bytes, 500 + i); nvn_bc_astc_learn(0x4d, plane, bytes, W, H, 4, NULL); }
+    CHECK(nvn_bc_astc_bg_wait(120)); nvn_bc_astc_bg_stats(&s);
+    CHECK(s.encoded == 5 && s.written == 2 && s.skipped_cap == 3 && count_entries(c) == 2 && s.cache_bytes == 2 * (astc_bytes + 40));
+    // a restart counts what is already in the directory (the cap holds across launches), and stale temporaries of a crashed write are removed, nothing else
+    NSString *stale = [c stringByAppendingPathComponent:[NSString stringWithFormat:@"%064x.astc.AbCdEf", 7]], *other = [c stringByAppendingPathComponent:@"keep-me.txt"];
+    [NSData.data writeToFile:stale atomically:NO]; [NSData.data writeToFile:other atomically:NO];
+    struct timeval old[2] = {{time(NULL) - 7200, 0}, {time(NULL) - 7200, 0}}; utimes(stale.fileSystemRepresentation, old);
+    bg_configure(c, 64u << 20, 2 * (astc_bytes + 40) + 10, 0, 1);
+    nvn_bc_astc_bg_stats(&s); CHECK(s.cache_entries == 2 && s.cache_bytes == 2 * (astc_bytes + 40));
+    CHECK(![NSFileManager.defaultManager fileExistsAtPath:stale] && [NSFileManager.defaultManager fileExistsAtPath:other]);
+    bc7_plane(plane, bytes, 600); nvn_bc_astc_learn(0x4d, plane, bytes, W, H, 4, NULL);
+    CHECK(nvn_bc_astc_bg_wait(120)); nvn_bc_astc_bg_stats(&s); CHECK(s.written == 0 && s.skipped_cap == 1);
+    // free-disk floor
+    NSString *l = [root stringByAppendingPathComponent:@"bg-low"];
+    bg_configure(l, 64u << 20, 1ull << 30, 1ull << 60, 1);
+    bc7_plane(plane, bytes, 700); nvn_bc_astc_learn(0x4d, plane, bytes, W, H, 4, NULL);
+    CHECK(nvn_bc_astc_bg_wait(120)); nvn_bc_astc_bg_stats(&s); CHECK(s.encoded == 1 && s.written == 0 && s.skipped_lowdisk == 1 && count_entries(l) == 0);
+    // corrupt (same size, wrong payload) and short entries: not used, queued again, and the rewrite repairs them
+    NSString *r = [root stringByAppendingPathComponent:@"bg-corrupt"];
+    bg_configure(r, 64u << 20, 1ull << 30, 0, 1);
+    bc7_plane(plane, bytes, 800); CHECK(nvn_bc_astc_learn(0x4d, plane, bytes, W, H, 4, &key) == 0); CHECK(nvn_bc_astc_bg_wait(120));
+    NSString *path = [r stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.astc", key.hex]];
+    FILE *f = fopen(path.fileSystemRepresentation, "r+b"); fseek(f, 200, SEEK_SET); int byte = fgetc(f); fseek(f, 200, SEEK_SET); fputc(byte ^ 0x5a, f); fclose(f);
+    CHECK(nvn_bc_astc_fetch(0x4d, plane, bytes, W, H, 4, fetched, astc_bytes) == 0);   // the payload hash fails
+    CHECK(nvn_bc_astc_bg_wait(120)); CHECK(nvn_bc_astc_fetch(0x4d, plane, bytes, W, H, 4, fetched, astc_bytes) == 1);
+    truncate(path.fileSystemRepresentation, 100);
+    CHECK(nvn_bc_astc_learn(0x4d, plane, bytes, W, H, 4, NULL) == 0);   // the size no longer matches
+    CHECK(nvn_bc_astc_bg_wait(120)); CHECK(nvn_bc_astc_learn(0x4d, plane, bytes, W, H, 4, NULL) == 1);
+    // no writable cache: a miss is counted, nothing is queued
+    nvn_astc_bg_config none = {.cache = NULL, .readonly = NULL, .queue_cap = 1u << 20, .cache_max = 1ull << 30, .min_free = 0, .threads = 1};
+    nvn_bc_astc_bg_configure(&none);
+    bc7_plane(plane, bytes, 900); CHECK(nvn_bc_astc_learn(0x4d, plane, bytes, W, H, 4, NULL) == 0); nvn_bc_astc_bg_stats(&s); CHECK(s.misses == 1 && s.queued == 0 && s.dropped == 0);
+    free(plane); free(fetched); free(direct);
+}
+
 static void diagnostic_contract(NSString *root) {
     NSString *directory = [root stringByAppendingPathComponent:@"diagnostics"];
     const char *cache = directory.fileSystemRepresentation;
@@ -309,6 +405,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     CHECK(mapped_mode ? mapped_hits > 0 : mapped_hits == 0);
     nvn_bc_astc_cache_prepare(NULL, NULL, 2u << 20, 0);
     CHECK(g_cache_small[small].length == 16);
+    background_contract(root);
     CHECK([NSFileManager.defaultManager removeItemAtPath:root error:NULL]);
     printf("ASTC cache: %u checks, %u failures, %zu retained bytes\n", checks, failures, used);
     return failures != 0;

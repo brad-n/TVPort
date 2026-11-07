@@ -9,6 +9,9 @@ extern "C" {
 // blocks. Only 4x4 and 6x6 LDR blocks are supported; zero means success.
 int nvn_astc_encode_rgba8(const uint8_t *pixels, uint32_t width, uint32_t height,
                          int srgb, unsigned block, uint8_t *output, size_t output_size);
+// The same with the codec contexts of `slot` (0..4): threads that use different slots do not wait for each other
+int nvn_astc_encode_rgba8_slot(unsigned slot, const uint8_t *pixels, uint32_t width, uint32_t height,
+                              int srgb, unsigned block, uint8_t *output, size_t output_size);
 #ifdef __cplusplus
 }
 #endif

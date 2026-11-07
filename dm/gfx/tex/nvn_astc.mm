@@ -9,16 +9,23 @@ struct Codec {
     Codec() : context(NULL) {}
     ~Codec() { if (context) astcenc_context_free(context); }
 };
-Codec codecs[2][2];
+// Slot 0 is the calling thread of the synchronous mode; the background workers take slots 1.., each with contexts of its own, so planes encode in parallel
+const unsigned kSlots = 5;
+Codec codecs[kSlots][2][2];
 }
 
 int nvn_astc_encode_rgba8(const uint8_t *pixels, uint32_t width, uint32_t height,
                          int srgb, unsigned block, uint8_t *output, size_t output_size) {
-    if (!pixels || !output || !width || !height || width > 16384 || height > 16384 ||
+    return nvn_astc_encode_rgba8_slot(0, pixels, width, height, srgb, block, output, output_size);
+}
+
+int nvn_astc_encode_rgba8_slot(unsigned slot, const uint8_t *pixels, uint32_t width, uint32_t height,
+                              int srgb, unsigned block, uint8_t *output, size_t output_size) {
+    if (slot >= kSlots || !pixels || !output || !width || !height || width > 16384 || height > 16384 ||
         (block != 4 && block != 6)) return -1;
     uint64_t required = ((uint64_t)width + block - 1) / block * ((height + block - 1) / block) * 16;
     if (required != output_size) return -1;
-    Codec &codec = codecs[block == 6][srgb != 0];
+    Codec &codec = codecs[slot][block == 6][srgb != 0];
     std::lock_guard<std::mutex> lock(codec.mutex);
     astcenc_error result;
     if (!codec.context) {

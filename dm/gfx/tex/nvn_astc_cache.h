@@ -49,6 +49,24 @@ int nvn_bc_astc_encode_report(uint32_t format, const void *source, size_t source
                               void *output, size_t output_size, const char *cache,
                               const char *readonly_cache, int *cache_hit,
                               nvn_astc_cache_key *saved_key, nvn_astc_cache_report *report);
+// ---- Background miss policy (DM_NVN_ASTC_MISS=background) ----
+// A missed plane is never encoded on the caller's thread: nvn_bc_astc_learn copies its BC bytes into a bounded queue that low-priority workers
+// encode into the writable cache, so a later run hits. Everything defaults from the environment (DM_NVN_ASTC_CACHE, DM_NVN_ASTC_CACHE_RO,
+// DM_NVN_ASTC_QUEUE_MB, DM_NVN_ASTC_CACHE_MAX in MB, DM_NVN_ASTC_MIN_FREE_MB, DM_NVN_ASTC_THREADS) the first time anything needs it.
+typedef struct { const char *cache, *readonly; size_t queue_cap; uint64_t cache_max, min_free; unsigned threads; } nvn_astc_bg_config;
+typedef struct {
+    uint64_t hits, misses, queued, dropped, dropped_bytes, duplicates, encoded, encode_ns, encoded_rgba_bytes, written, skipped_cap, skipped_lowdisk,
+             write_errors, fetch_misses, cache_entries, cache_bytes, queued_bytes_now;
+} nvn_astc_bg_stats;
+void nvn_bc_astc_bg_start(void);                                 // starts the workers and logs the cache summary line (idempotent)
+void nvn_bc_astc_bg_configure(const nvn_astc_bg_config *config); // replaces the configuration and resets the counters (tests)
+int nvn_bc_astc_bg_wait(double seconds);                         // 1 once the queue is empty and the workers idle
+void nvn_bc_astc_bg_stats(nvn_astc_bg_stats *stats);
+int nvn_bc_astc_bg_format_stats(char *buffer, size_t size);      // one log line of counters
+// 1: the plane is in a cache (header size only, no payload read). 0: a miss, queued for the workers (or dropped, or already pending). -1: invalid plane.
+int nvn_bc_astc_learn(uint32_t format, const void *source, size_t source_size, uint32_t width, uint32_t height, unsigned block, nvn_astc_cache_key *saved_key);
+// 1: the plane's ASTC blocks were read (verified) into output. 0: not there, queued as above; output untouched. -1: invalid.
+int nvn_bc_astc_fetch(uint32_t format, const void *source, size_t source_size, uint32_t width, uint32_t height, unsigned block, void *output, size_t output_size);
 #ifdef __cplusplus
 }
 #endif

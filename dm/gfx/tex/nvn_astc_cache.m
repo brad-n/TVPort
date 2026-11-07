@@ -14,6 +14,11 @@
 #include <limits.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/mount.h>
+#include <dirent.h>
+#include <pthread.h>
+#include <pthread/qos.h>
 
 // BC1/2/3/7 (RGBA8 once decoded) are the formats ASTC LDR can stand in for. This tree's
 // decoder reports the decoded pixel format through nvn_bc_unpacked; the encoded block
@@ -58,6 +63,8 @@ static void payload_hash(const void *data, size_t size, uint8_t digest[CC_SHA256
 }
 #pragma clang diagnostic pop
 
+static int bg_write_allowed(const char *root, size_t size);
+static int cache_write_counted(const char *root, NSString *path, const void *output, size_t size);
 static NSString *cache_path(const char *root, const char *key) {
     if (!root || !*root) return nil;
     return [[NSString stringWithUTF8String:root] stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.astc", key]];
@@ -319,6 +326,31 @@ int nvn_bc_astc_cache_read(const nvn_astc_cache_key *key, void *output, size_t s
     }
 }
 
+// Decode the BC plane in stripes and encode it with the codec contexts of `slot`; no cache involved
+static int encode_plane(unsigned slot, uint32_t format, const void *source, uint32_t width, uint32_t height,
+                        unsigned block, const nvn_bc_format_info *info, void *output) {
+    size_t bc_pitch = ((size_t)width + 3) / 4 * info->block_bytes;
+    size_t astc_pitch = ((size_t)width + block - 1) / block * 16;
+    // Every stripe begins on both a BC and an ASTC block boundary. This bounds
+    // decoded scratch without adding seams or retaining a second full texture.
+    size_t row = (size_t)width * 4, alignment = block == 6 ? 12 : 4;
+    size_t rows = ((4u << 20) / row / alignment) * alignment;
+    if (!rows) rows = alignment;
+    if (rows > height) rows = height;
+    uint8_t *pixels = malloc(rows * row);
+    if (!pixels) return -1;
+    int result = 0;
+    for (uint32_t y = 0; y < height && !result; y += rows) {
+        uint32_t count = MIN(rows, height - y);
+        size_t offset = (size_t)y / 4 * bc_pitch;
+        result = nvn_bc_decode(format, (const uint8_t *)source + offset, bc_pitch, width, count, pixels, row);
+        if (!result) result = nvn_astc_encode_rgba8_slot(slot, pixels, width, count, info->pixel_format == MTLPixelFormatRGBA8Unorm_sRGB,
+            block, (uint8_t *)output + (size_t)y / block * astc_pitch, astc_pitch * ((count + block - 1) / block));
+    }
+    free(pixels);
+    return result;
+}
+
 int nvn_bc_astc_encode_report(uint32_t format, const void *source, size_t source_size,
                        uint32_t width, uint32_t height, unsigned block,
                        void *output, size_t output_size, const char *cache,
@@ -347,25 +379,9 @@ int nvn_bc_astc_encode_report(uint32_t format, const void *source, size_t source
             if (saved_key) memcpy(saved_key->hex, key, sizeof key);
             return 0;
         }
-        // Every stripe begins on both a BC and an ASTC block boundary. This bounds
-        // decoded scratch without adding seams or retaining a second full texture.
-        size_t row = (size_t)width * 4, alignment = block == 6 ? 12 : 4;
-        size_t rows = ((4u << 20) / row / alignment) * alignment;
-        if (!rows) rows = alignment;
-        if (rows > height) rows = height;
-        uint8_t *pixels = malloc(rows * row);
-        if (!pixels) return -1;
-        int result = 0;
-        for (uint32_t y = 0; y < height && !result; y += rows) {
-            uint32_t count = MIN(rows, height - y);
-            size_t offset = (size_t)y / 4 * bc_pitch;
-            result = nvn_bc_decode(format, (const uint8_t *)source + offset, bc_pitch, width, count, pixels, row);
-            if (!result) result = nvn_astc_encode_rgba8(pixels, width, count, info.pixel_format == MTLPixelFormatRGBA8Unorm_sRGB,
-                block, (uint8_t *)output + (size_t)y / block * astc_pitch, astc_pitch * ((count + block - 1) / block));
-        }
-        free(pixels);
+        int result = encode_plane(0, format, source, width, height, block, &info, output);
         if (!result) {
-            int error = cache_write(path, output, output_size);
+            int error = bg_write_allowed(cache, output_size) ? cache_write_counted(cache, path, output, output_size) : 0;   // the synchronous mode is limited like the workers
             if (report) { report->write_attempted = path != nil; report->write_error = error; }
             if (saved_key) memcpy(saved_key->hex, key, sizeof key);
         }
@@ -388,4 +404,288 @@ int nvn_bc_astc_encode(uint32_t format, const void *source, size_t source_size,
                        const char *readonly_cache, int *cache_hit) {
     return nvn_bc_astc_encode_key(format, source, source_size, width, height, block,
                                   output, output_size, cache, readonly_cache, cache_hit, NULL);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Background miss policy (DM_NVN_ASTC_MISS=background, the default). A cache miss never encodes on the
+// caller's thread: the texture goes up in its decoded format, the BC plane is copied into a bounded queue
+// (nvn_bc_astc_learn), and low-priority worker threads encode it and write the cache file, so the next
+// launch hits. The queue drops what does not fit; a cache size cap and a free-disk floor stop the writes.
+// ---------------------------------------------------------------------------------------------
+typedef struct bg_job {
+    struct bg_job *next;
+    char key[65];
+    uint32_t format, width, height;
+    unsigned block;
+    size_t size;
+    uint8_t data[];
+} bg_job;
+
+enum { BG_MAX_THREADS = 4 };
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t work, idle;
+    bg_job *head, *tail;
+    size_t queued_bytes, queue_cap;
+    unsigned active, threads, running;
+    int stop, configured;
+    char *cache, *readonly;
+    uint64_t cache_max, min_free;
+    pthread_t thread[BG_MAX_THREADS];
+    NSMutableSet<NSString *> *pending;
+} g_bg = {.mu = PTHREAD_MUTEX_INITIALIZER, .work = PTHREAD_COND_INITIALIZER, .idle = PTHREAD_COND_INITIALIZER};
+static _Atomic uint64_t st_hit, st_miss, st_queued, st_dropped, st_dropped_bytes, st_dups, st_encoded, st_encode_ns, st_encoded_rgba,
+    st_written, st_skipped_cap, st_skipped_disk, st_write_errors, st_fetch_miss, st_cache_entries, st_cache_bytes, st_ro_entries, st_ro_bytes;
+
+static uint64_t env_mb(const char *name, uint64_t fallback_mb) {
+    const char *e = getenv(name);
+    if (!e || !*e) return fallback_mb << 20;
+    return (uint64_t)strtoull(e, NULL, 10) << 20;
+}
+static void bg_free_config(void) {
+    free(g_bg.cache); free(g_bg.readonly); g_bg.cache = g_bg.readonly = NULL;
+}
+static void bg_set_config_locked(const nvn_astc_bg_config *c) {
+    bg_free_config();
+    g_bg.cache = c->cache && *c->cache ? strdup(c->cache) : NULL;
+    g_bg.readonly = c->readonly && *c->readonly ? strdup(c->readonly) : NULL;
+    g_bg.queue_cap = c->queue_cap; g_bg.cache_max = c->cache_max; g_bg.min_free = c->min_free;
+    g_bg.threads = c->threads < 1 ? 1 : c->threads > BG_MAX_THREADS ? BG_MAX_THREADS : c->threads;
+    g_bg.configured = 1;
+    if (!g_bg.pending) g_bg.pending = [NSMutableSet set];
+}
+static void bg_env_config_locked(void) {
+    if (g_bg.configured) return;
+    nvn_astc_bg_config c = {
+        .cache = getenv("DM_NVN_ASTC_CACHE"), .readonly = getenv("DM_NVN_ASTC_CACHE_RO"),
+#if TARGET_OS_IPHONE
+        .queue_cap = (size_t)env_mb("DM_NVN_ASTC_QUEUE_MB", 64),
+#else
+        .queue_cap = (size_t)env_mb("DM_NVN_ASTC_QUEUE_MB", 256),
+#endif
+        .cache_max = env_mb("DM_NVN_ASTC_CACHE_MAX", 2048), .min_free = env_mb("DM_NVN_ASTC_MIN_FREE_MB", 1024),
+        .threads = getenv("DM_NVN_ASTC_THREADS") ? (unsigned)atoi(getenv("DM_NVN_ASTC_THREADS")) : 2,
+    };
+    bg_set_config_locked(&c);
+}
+
+// Entries and bytes of one cache directory; stale temporary files of a crashed write (older than an hour,
+// named like one) are removed, and nothing else is ever deleted.
+static void bg_scan(const char *dir, uint64_t *entries, uint64_t *bytes, int clean) {
+    *entries = *bytes = 0;
+    DIR *d = dir ? opendir(dir) : NULL;
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        size_t n = strlen(e->d_name);
+        if (n < 69 || strncmp(e->d_name + 64, ".astc", 5)) continue;
+        char path[PATH_MAX];
+        if (snprintf(path, sizeof path, "%s/%s", dir, e->d_name) >= (int)sizeof path) continue;
+        struct stat st;
+        if (lstat(path, &st) || !S_ISREG(st.st_mode)) continue;
+        if (n == 69) { (*entries)++; *bytes += (uint64_t)st.st_size; }
+        else if (clean && n == 76 && e->d_name[69] == '.' && time(NULL) - st.st_mtime > 3600) unlink(path);
+    }
+    closedir(d);
+}
+static uint64_t bg_free_bytes(const char *dir) {
+    struct statfs fs;
+    return dir && !statfs(dir, &fs) ? (uint64_t)fs.f_bavail * fs.f_bsize : UINT64_MAX;
+}
+// Whether `size` more bytes may be written to `root`: only the configured writable cache is limited
+static int bg_write_allowed(const char *root, size_t size) {
+    if (!root || !g_bg.cache || strcmp(root, g_bg.cache)) return 1;
+    if (atomic_load(&st_cache_bytes) + size + 40 > g_bg.cache_max) { atomic_fetch_add(&st_skipped_cap, 1); return 0; }
+    if (g_bg.min_free && bg_free_bytes(root) < g_bg.min_free + size + 40) { atomic_fetch_add(&st_skipped_disk, 1); return 0; }
+    return 1;
+}
+
+// cache_write, and the size accounting of the configured writable directory
+static int cache_write_counted(const char *root, NSString *path, const void *output, size_t size) {
+    int error = cache_write(path, output, size);
+    if (!error && g_bg.cache && root && !strcmp(root, g_bg.cache)) { atomic_fetch_add(&st_cache_entries, 1); atomic_fetch_add(&st_cache_bytes, size + 40); }
+    return error;
+}
+static void *bg_worker(void *arg) {
+    unsigned slot = 1 + (unsigned)(uintptr_t)arg;
+    pthread_setname_np("dm-astc-encode");
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    for (;;) {
+        pthread_mutex_lock(&g_bg.mu);
+        while (!g_bg.head && !g_bg.stop) pthread_cond_wait(&g_bg.work, &g_bg.mu);
+        if (g_bg.stop) { pthread_mutex_unlock(&g_bg.mu); return NULL; }
+        bg_job *job = g_bg.head;
+        g_bg.head = job->next; if (!g_bg.head) g_bg.tail = NULL;
+        g_bg.active++;
+        pthread_mutex_unlock(&g_bg.mu);
+        @autoreleasepool {
+            nvn_bc_format_info info; nvn_bc_format(job->format, &info);
+            size_t out_size = ((size_t)job->width + job->block - 1) / job->block * 16 * (((size_t)job->height + job->block - 1) / job->block);
+            uint8_t *out = malloc(out_size);
+            uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+            if (out && !encode_plane(slot, job->format, job->data, job->width, job->height, job->block, &info, out)) {
+                atomic_fetch_add(&st_encode_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0);
+                atomic_fetch_add(&st_encoded, 1); atomic_fetch_add(&st_encoded_rgba, (uint64_t)job->width * job->height * 4);
+                const char *root = g_bg.cache;
+                if (root && bg_write_allowed(root, out_size)) {
+                    if (cache_write_counted(root, cache_path(root, job->key), out, out_size)) atomic_fetch_add(&st_write_errors, 1);
+                    else atomic_fetch_add(&st_written, 1);
+                }
+            } else atomic_fetch_add(&st_write_errors, 1);
+            free(out);
+        }
+        pthread_mutex_lock(&g_bg.mu);
+        g_bg.queued_bytes -= job->size;
+        [g_bg.pending removeObject:@(job->key)];
+        g_bg.active--;
+        if (!g_bg.head && !g_bg.active) pthread_cond_broadcast(&g_bg.idle);
+        pthread_mutex_unlock(&g_bg.mu);
+        free(job);
+    }
+}
+static _Atomic int g_scan_done;
+static void *bg_scan_main(void *unused) {
+    (void)unused;
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC), ce, cb, re, rb;
+    char *cache = NULL, *ro = NULL;
+    pthread_mutex_lock(&g_bg.mu); cache = g_bg.cache ? strdup(g_bg.cache) : NULL; ro = g_bg.readonly ? strdup(g_bg.readonly) : NULL; pthread_mutex_unlock(&g_bg.mu);
+    bg_scan(cache, &ce, &cb, 1); bg_scan(ro, &re, &rb, 0);
+    atomic_store(&st_cache_entries, ce); atomic_store(&st_cache_bytes, cb); atomic_store(&st_ro_entries, re); atomic_store(&st_ro_bytes, rb);
+    fprintf(stderr, "[dm] ASTC cache: writable %s: %llu entries, %.1f MB (cap %.0f MB, %.0f MB free on the disk, writes stop under %.0f MB); read-only %s: %llu entries, %.1f MB; "
+            "misses encode in the background (%u threads, queue cap %.0f MB); scan %.1f ms\n",
+            cache ?: "none", (unsigned long long)ce, cb / 1048576.0, g_bg.cache_max / 1048576.0, cache && bg_free_bytes(cache) != UINT64_MAX ? bg_free_bytes(cache) / 1048576.0 : -1.0, g_bg.min_free / 1048576.0,
+            ro ?: "none", (unsigned long long)re, rb / 1048576.0, g_bg.threads, g_bg.queue_cap / 1048576.0, (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1e6);
+    free(cache); free(ro);
+    atomic_store(&g_scan_done, 1);
+    return NULL;
+}
+// Start the worker threads (idempotent). Accounting of the writable directory is scanned first, on its own thread
+static void bg_start_locked(void) {
+    bg_env_config_locked();
+    if (g_bg.running) return;
+    g_bg.stop = 0; atomic_store(&g_scan_done, 0);
+    if (g_bg.cache) [[NSFileManager defaultManager] createDirectoryAtPath:@(g_bg.cache) withIntermediateDirectories:YES attributes:nil error:NULL];
+    pthread_t scanner; pthread_attr_t attr; pthread_attr_init(&attr); pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&scanner, &attr, bg_scan_main, NULL);
+    for (unsigned i = 0; i < g_bg.threads; i++)
+        if (!pthread_create(&g_bg.thread[g_bg.running], NULL, bg_worker, (void *)(uintptr_t)i)) g_bg.running++;
+}
+void nvn_bc_astc_bg_start(void) {
+    pthread_mutex_lock(&g_bg.mu); bg_start_locked(); pthread_mutex_unlock(&g_bg.mu);
+}
+void nvn_bc_astc_bg_configure(const nvn_astc_bg_config *config) {
+    nvn_bc_astc_bg_wait(600);
+    pthread_mutex_lock(&g_bg.mu);
+    g_bg.stop = 1; pthread_cond_broadcast(&g_bg.work);
+    unsigned n = g_bg.running; pthread_t threads[BG_MAX_THREADS]; memcpy(threads, g_bg.thread, sizeof threads);
+    pthread_mutex_unlock(&g_bg.mu);
+    for (unsigned i = 0; i < n; i++) pthread_join(threads[i], NULL);
+    pthread_mutex_lock(&g_bg.mu);
+    g_bg.running = 0; g_bg.stop = 0;
+    bg_set_config_locked(config);
+    [g_bg.pending removeAllObjects];
+    atomic_store(&st_hit, 0); atomic_store(&st_miss, 0); atomic_store(&st_queued, 0); atomic_store(&st_dropped, 0); atomic_store(&st_dropped_bytes, 0);
+    atomic_store(&st_dups, 0); atomic_store(&st_encoded, 0); atomic_store(&st_encode_ns, 0); atomic_store(&st_encoded_rgba, 0); atomic_store(&st_written, 0);
+    atomic_store(&st_skipped_cap, 0); atomic_store(&st_skipped_disk, 0); atomic_store(&st_write_errors, 0); atomic_store(&st_fetch_miss, 0);
+    bg_start_locked();
+    pthread_mutex_unlock(&g_bg.mu);
+    for (int i = 0; i < 5000 && !atomic_load(&g_scan_done); i++) usleep(1000);   // the scan is a detached thread: the accounting is current when the caller goes on
+}
+int nvn_bc_astc_bg_wait(double seconds) {
+    struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += (time_t)seconds; until.tv_nsec += (long)((seconds - (time_t)seconds) * 1e9); if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
+    pthread_mutex_lock(&g_bg.mu);
+    int ok = 1;
+    while (g_bg.running && (g_bg.head || g_bg.active)) if (pthread_cond_timedwait(&g_bg.idle, &g_bg.mu, &until)) { ok = 0; break; }
+    pthread_mutex_unlock(&g_bg.mu);
+    return ok;
+}
+void nvn_bc_astc_bg_stats(nvn_astc_bg_stats *s) {
+    memset(s, 0, sizeof *s);
+    s->hits = atomic_load(&st_hit); s->misses = atomic_load(&st_miss); s->queued = atomic_load(&st_queued); s->dropped = atomic_load(&st_dropped);
+    s->dropped_bytes = atomic_load(&st_dropped_bytes); s->duplicates = atomic_load(&st_dups); s->encoded = atomic_load(&st_encoded);
+    s->encode_ns = atomic_load(&st_encode_ns); s->encoded_rgba_bytes = atomic_load(&st_encoded_rgba); s->written = atomic_load(&st_written);
+    s->skipped_cap = atomic_load(&st_skipped_cap); s->skipped_lowdisk = atomic_load(&st_skipped_disk); s->write_errors = atomic_load(&st_write_errors);
+    s->fetch_misses = atomic_load(&st_fetch_miss); s->cache_entries = atomic_load(&st_cache_entries); s->cache_bytes = atomic_load(&st_cache_bytes);
+    pthread_mutex_lock(&g_bg.mu); s->queued_bytes_now = g_bg.queued_bytes; pthread_mutex_unlock(&g_bg.mu);
+}
+int nvn_bc_astc_bg_format_stats(char *buf, size_t size) {
+    nvn_astc_bg_stats s; nvn_bc_astc_bg_stats(&s);
+    double mb = s.encoded_rgba_bytes / 1048576.0;
+    return snprintf(buf, size, "ASTC planes: %llu cache hits, %llu misses (%llu queued, %llu dropped for a full queue [%.1f MB], %llu already pending), %llu encoded in the background (%.0f ms per MB of RGBA8), "
+        "%llu written, %llu not written for the size cap, %llu for low disk, %llu write errors; %.1f MB queued now; cache %llu entries %.1f MB; %llu corrupt-or-missing planes of ASTC textures",
+        (unsigned long long)s.hits, (unsigned long long)s.misses, (unsigned long long)s.queued, (unsigned long long)s.dropped, s.dropped_bytes / 1048576.0, (unsigned long long)s.duplicates,
+        (unsigned long long)s.encoded, mb > 0 ? s.encode_ns / 1e6 / mb : 0.0, (unsigned long long)s.written, (unsigned long long)s.skipped_cap, (unsigned long long)s.skipped_lowdisk,
+        (unsigned long long)s.write_errors, s.queued_bytes_now / 1048576.0, (unsigned long long)s.cache_entries, s.cache_bytes / 1048576.0, (unsigned long long)s.fetch_misses);
+}
+
+static int plane_valid(uint32_t format, const void *source, size_t source_size, uint32_t width, uint32_t height, unsigned block, size_t *astc_size) {
+    if (!source || !width || !height || width > 16384 || height > 16384 || !nvn_bc_astc_format(format, block, NULL)) return 0;
+    nvn_bc_format_info info; nvn_bc_format(format, &info);
+    if (source_size != ((size_t)width + 3) / 4 * info.block_bytes * (((size_t)height + 3) / 4)) return 0;
+    *astc_size = ((size_t)width + block - 1) / block * 16 * (((size_t)height + block - 1) / block);
+    return 1;
+}
+// Hand a missed plane to the workers: a copy of the BC bytes, unless it is already pending, there is no writable cache, or the queue is full
+static void bg_enqueue(uint32_t format, const void *source, size_t size, uint32_t width, uint32_t height, unsigned block, const char *key) {
+    pthread_mutex_lock(&g_bg.mu);
+    bg_start_locked();
+    NSString *k = @(key);
+    if (!g_bg.cache) { pthread_mutex_unlock(&g_bg.mu); return; }
+    if ([g_bg.pending containsObject:k]) { atomic_fetch_add(&st_dups, 1); pthread_mutex_unlock(&g_bg.mu); return; }
+    if (g_bg.queued_bytes + size > g_bg.queue_cap) {
+        atomic_fetch_add(&st_dropped, 1); atomic_fetch_add(&st_dropped_bytes, size);
+        pthread_mutex_unlock(&g_bg.mu); return;
+    }
+    g_bg.queued_bytes += size; [g_bg.pending addObject:k];
+    pthread_mutex_unlock(&g_bg.mu);
+    bg_job *job = malloc(sizeof *job + size);   // the copy is made off the lock: the bytes belong to the caller (guest memory) and are not kept
+    if (!job) {
+        pthread_mutex_lock(&g_bg.mu); g_bg.queued_bytes -= size; [g_bg.pending removeObject:k]; pthread_mutex_unlock(&g_bg.mu);
+        return;
+    }
+    job->next = NULL; memcpy(job->key, key, 65); job->format = format; job->width = width; job->height = height; job->block = block; job->size = size;
+    memcpy(job->data, source, size);
+    pthread_mutex_lock(&g_bg.mu);
+    if (g_bg.tail) g_bg.tail->next = job; else g_bg.head = job;
+    g_bg.tail = job;
+    atomic_fetch_add(&st_queued, 1);
+    pthread_cond_signal(&g_bg.work);
+    pthread_mutex_unlock(&g_bg.mu);
+}
+static int cache_has(const char *root, const char *key, size_t payload) {
+    if (!root || !*root) return 0;
+    @autoreleasepool {
+        NSString *path = cache_path(root, key);
+        if (atomic_load_explicit(&g_cache_small_ready, memory_order_acquire)) {
+            NSData *data = g_cache_small[path]; if (data && data.length == payload) return 1;
+            data = g_cache_mapped[path]; if (data && data.length == payload) return 1;
+        }
+        struct stat st;
+        return !stat(path.fileSystemRepresentation, &st) && S_ISREG(st.st_mode) && (uint64_t)st.st_size == payload + 40;
+    }
+}
+int nvn_bc_astc_learn(uint32_t format, const void *source, size_t source_size, uint32_t width, uint32_t height, unsigned block, nvn_astc_cache_key *saved_key) {
+    size_t astc_size;
+    if (!plane_valid(format, source, source_size, width, height, block, &astc_size)) return -1;
+    char key[65]; cache_key(format, width, height, block, source, source_size, key);
+    if (saved_key) memcpy(saved_key->hex, key, sizeof key);
+    pthread_mutex_lock(&g_bg.mu); bg_env_config_locked(); const char *ro = g_bg.readonly, *rw = g_bg.cache; pthread_mutex_unlock(&g_bg.mu);
+    if (cache_has(ro, key, astc_size) || cache_has(rw, key, astc_size)) { atomic_fetch_add(&st_hit, 1); return 1; }
+    atomic_fetch_add(&st_miss, 1);
+    bg_enqueue(format, source, source_size, width, height, block, key);
+    return 0;
+}
+int nvn_bc_astc_fetch(uint32_t format, const void *source, size_t source_size, uint32_t width, uint32_t height, unsigned block, void *output, size_t output_size) {
+    size_t astc_size;
+    if (!plane_valid(format, source, source_size, width, height, block, &astc_size) || output_size != astc_size) return -1;
+    char key[65]; cache_key(format, width, height, block, source, source_size, key);
+    pthread_mutex_lock(&g_bg.mu); bg_env_config_locked(); NSString *ro = g_bg.readonly ? @(g_bg.readonly) : nil, *rw = g_bg.cache ? @(g_bg.cache) : nil; pthread_mutex_unlock(&g_bg.mu);
+    @autoreleasepool {
+        if (cache_read(cache_path(ro.UTF8String, key), output, output_size) || cache_read(cache_path(rw.UTF8String, key), output, output_size)) { atomic_fetch_add(&st_hit, 1); return 1; }
+    }
+    atomic_fetch_add(&st_fetch_miss, 1);
+    bg_enqueue(format, source, source_size, width, height, block, key);
+    return 0;
 }
