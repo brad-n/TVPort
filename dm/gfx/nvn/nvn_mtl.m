@@ -2562,6 +2562,7 @@ static unsigned bc_skip(const tex_t *t) {
 typedef struct { uint64_t serial; uint8_t flags; } astc_dec;
 static pthread_mutex_t g_astc_mu = PTHREAD_MUTEX_INITIALIZER; static astc_dec *g_astc_tab; static size_t g_astc_cap, g_astc_n;
 static _Atomic uint64_t g_astc_n_astc, g_astc_n_decoded;
+static _Atomic uint64_t g_astc_copy_first, g_astc_copy_astc, g_astc_copy_partial, g_astc_copy_ns, g_astc_copy_bytes;   // textures created empty and filled by copy (astc_first_copy)
 static astc_dec *astc_slot(uint64_t serial, int add) {   // g_astc_mu held; the pointer is good until the next add
     if (add && (g_astc_n + 1) * 2 > g_astc_cap) {
         size_t ncap = g_astc_cap ? g_astc_cap * 2 : 4096; astc_dec *nt = calloc(ncap, sizeof *nt); if (!nt) MDIE("ASTC decision table of %zu entries", ncap);
@@ -4420,7 +4421,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
 #endif
     MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d, %llu of %llu MB; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total), retired but held by a serial %u; headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, (unsigned long long)(pres_b >> 20), (unsigned long long)(pool_b >> 20), peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, nwait, avail);
-    if (astc_block()) { char sb[900]; nvn_bc_astc_bg_format_stats(sb, sizeof sb); MLOG("%s; textures decided: %llu ASTC, %llu decoded%s", sb, (unsigned long long)atomic_load(&g_astc_n_astc), (unsigned long long)atomic_load(&g_astc_n_decoded), astc_sync() ? " (DM_NVN_ASTC_MISS=sync: all ASTC)" : ""); }
+    if (astc_block()) { char sb[900]; nvn_bc_astc_bg_format_stats(sb, sizeof sb); MLOG("%s; textures decided: %llu ASTC, %llu decoded%s; created empty, first filled by copy: %llu (ASTC via pack %llu, a piece of a level %llu; %.1f MB hashed in %.1f ms)", sb, (unsigned long long)atomic_load(&g_astc_n_astc), (unsigned long long)atomic_load(&g_astc_n_decoded), astc_sync() ? " (DM_NVN_ASTC_MISS=sync: all ASTC)" : "",
+                                                                  (unsigned long long)atomic_load(&g_astc_copy_first), (unsigned long long)atomic_load(&g_astc_copy_astc), (unsigned long long)atomic_load(&g_astc_copy_partial), atomic_load(&g_astc_copy_bytes) / 1048576.0, atomic_load(&g_astc_copy_ns) / 1e6); }
     { void mtl_vc_stats(unsigned *, uint64_t *, uint64_t *), mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); unsigned vn; uint64_t vh, vm, tb, tm, tf, tc, tcb;
       mtl_vc_stats(&vn, &vh, &vm); mtl_tb2_stats(&tb, &tm, &tf, &tc, &tcb);
       MLOG("texture views by texture (vc_get): %u textures hold cached views; %llu views reused, %llu made in total; texture buffers bound as 2D rows for wrapped 1D fetches %llu times, %llu made, %llu failed, %llu copied into aligned rows (%llu MB) "
@@ -13289,8 +13291,44 @@ static void mirror_rb_land(void *p) {   // the submission's completion handler
     mrbuf_put(b);
     free(m);
 }
+// DM_NVN_BC_ASTC, textures created empty and filled by buffer-to-texture copies (streaming): such a texture has no bytes in its storage when it is made, so astc_decision can only say "decoded". With a read-only
+// cache (the prebuilt pack) the decision is made at the texture's FIRST copy instead, before its Metal texture exists: when the copy is a whole level (the prebuilt planes are whole levels) and every plane of it is in
+// the cache, the texture is made ASTC and the copy that follows reads those entries; otherwise it is decoded as before, and the planes are queued for the background encoder (which a copy never did before)
+static void astc_first_copy(const p_copy_b2t *c, uint32_t size) {
+    const tex_t *t = c->tex; uint32_t pf;
+    if (!t || !t->serial || !astc_block() || astc_sync() || !nvn_fmt_bc(t->d.format) || !astc_eligible(t, &pf) || !nvn_bc_astc_readonly_ready() || tex_get(t->serial)) return;
+    pthread_mutex_lock(&g_astc_mu); astc_dec *e = astc_slot(t->serial, 0); int known = e && (e->flags & 1); pthread_mutex_unlock(&g_astc_mu);
+    if (known || astc_content_present(t)) return;
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    if (!bpb || bw != 4 || bh != 4 || !c->r.width || !c->r.height) return;
+    unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0;
+    { unsigned sk = bc_skip(t); if (level < sk) return; }
+    uint32_t lw = MAX(t->d.width >> level, 1u), lh = MAX(t->d.height >> level, 1u);
+    atomic_fetch_add(&g_astc_copy_first, 1);
+    if (c->r.xoffset || c->r.yoffset || (uint32_t)c->r.width != lw || (uint32_t)c->r.height != lh) { atomic_fetch_add(&g_astc_copy_partial, 1); return; }   // a piece of a level has no entry of its own: decoded
+    const p_copy_strides *cs = copy_strides(c, size); int64_t rs = cs ? cs->row : S.copy_stride, is = cs ? cs->image : S.copy_img_stride;
+    size_t tight = (size_t)((c->r.width + 3) / 4) * bpb, row = rs ? (size_t)rs : tight, rows = (c->r.height + 3) / 4, img = is ? (size_t)is : row * rows;
+    int nz = c->r.depth ? c->r.depth : 1;
+    void *smb; uint64_t smo;
+    if (row < tight || !mtl_addr(c->src, img * nz, &smb, &smo)) return;
+    const uint8_t *src = (const uint8_t *)[(__bridge id<MTLBuffer>)smb contents];
+    if (!src) return;
+    uint8_t *packed = row == tight ? NULL : malloc(tight * rows);
+    int all = 1; uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    for (int z = 0; z < nz; z++) {
+        const uint8_t *plane = src + smo + z * img;
+        if (packed) { for (size_t r = 0; r < rows; r++) memcpy(packed + r * tight, plane + r * row, tight); plane = packed; }
+        if (nvn_bc_astc_learn(t->d.format, plane, tight * rows, (uint32_t)c->r.width, (uint32_t)c->r.height, astc_block(), NULL) != 1) all = 0;   // a miss is queued for the background encoder
+    }
+    free(packed);
+    atomic_fetch_add(&g_astc_copy_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); atomic_fetch_add(&g_astc_copy_bytes, tight * rows * nz);
+    pthread_mutex_lock(&g_astc_mu); e = astc_slot(t->serial, 1);
+    if (!(e->flags & 1)) { e->flags = 1 | (all ? 2 : 0) | 4; atomic_fetch_add(all ? &g_astc_n_astc : &g_astc_n_decoded, 1); if (all) atomic_fetch_add(&g_astc_copy_astc, 1); }
+    pthread_mutex_unlock(&g_astc_mu);
+}
 static void copy_b2t(const p_copy_b2t *c, uint32_t size) {
     if (c->tex) zskip_del(c->tex->serial);
+    astc_first_copy(c, size);   // DM_NVN_BC_ASTC: before the texture is made
     id<MTLTexture> t = tex_mtl(c->tex); sparse_gpu_wrote(c->tex);
     if (!t) { PD("C ser=%llu (no host texture)", c->tex->serial); return; }
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);

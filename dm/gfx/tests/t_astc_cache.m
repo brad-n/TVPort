@@ -115,7 +115,6 @@ static void pack_contract(NSString *root) {
         NSString *p = [root stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.pack", names[d]]]; write_pack(p, e, 4, d);
         KEYOF(k0); CHECK(!nvn_bc_astc_pack_info(p.fileSystemRepresentation, NULL, NULL, NULL)); 
         CHECK(!nvn_bc_astc_cache_read(&key, got, sizeof pa, NULL, p.fileSystemRepresentation));
-        if (!(d == 1 || d == 2 || d == 3 || d == 5 || d == 7 || d == 4 || d == 6)) CHECK(0);
     }
     { NSString *p = [root stringByAppendingPathComponent:@"empty.pack"]; [@"" writeToFile:p atomically:NO encoding:NSUTF8StringEncoding error:NULL];
       KEYOF(k0); CHECK(!nvn_bc_astc_cache_read(&key, got, sizeof pa, NULL, p.fileSystemRepresentation)); }

@@ -531,6 +531,17 @@ struct SettingsForm: View {
                             Text("Off").tag("off")
                         }
                         note("Keeps the game's own memory in files on the Apple TV's storage so it doesn't count against tvOS's ~2.1 GB app limit. Automatic is right for almost every game.")
+                        Picker("Compressed textures (ASTC)", selection: compressedTexturesBinding) {
+                            Text("Automatic").tag("")
+                            Text("On").tag("on")
+                            Text("Off").tag("off")
+                        }
+                        Picker("Block size", selection: compressedBlockBinding) {
+                            Text("4×4").tag(4)
+                            Text("6×6").tag(6)
+                        }
+                        .pickerStyle(.segmented).disabled(library.games.first { $0.id == library.selection }?.compressedTextures == "off")
+                        note("The Apple TV's GPU has no BC texture formats, so the game's BC1/2/3/7 textures would be stored as RGBA8, 4 to 8 times their size. On, and Automatic, which is on for the Apple TV, prepares them as ASTC on this Mac while building and sends them with the game files (it can add several GB), and the game stores them that way. 4×4 is sharper; 6×6 is about 2.3 times smaller and a little softer. Off keeps them as RGBA8.")
                         Toggle("Metal 4 pipelines", isOn: flagBinding(\.metal4Pipelines))
                         note("Turns on DM_PSO_MTL4 and keeps the pulling shader libraries in the build. Experimental.")
                         TextField("Pipeline archive GPU", text: textBinding(\.pipelineGPU), prompt: Text("Empty for none, or g18p"))
@@ -571,6 +582,22 @@ struct SettingsForm: View {
         return Binding(get: { library.games.first { $0.id == gameID }?.gameMemoryPaging ?? "" }, set: { value in
             guard library.selection == gameID else { return }
             library.update { $0.gameMemoryPaging = value.isEmpty ? nil : value }
+        })
+    }
+
+    private var compressedTexturesBinding: Binding<String> {
+        let gameID = library.selection
+        return Binding(get: { library.games.first { $0.id == gameID }?.compressedTextures ?? "" }, set: { value in
+            guard library.selection == gameID else { return }
+            library.update { $0.compressedTextures = value.isEmpty ? nil : value }
+        })
+    }
+
+    private var compressedBlockBinding: Binding<Int> {
+        let gameID = library.selection
+        return Binding(get: { library.games.first { $0.id == gameID }?.compressedTextureBlock ?? 4 }, set: { value in
+            guard library.selection == gameID else { return }
+            library.update { $0.compressedTextureBlock = value == 6 ? 6 : nil }
         })
     }
 

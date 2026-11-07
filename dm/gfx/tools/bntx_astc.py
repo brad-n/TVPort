@@ -10,7 +10,7 @@ nvn_astc_cache.m, nvn_astc.mm, the astc-encoder objects built with the host Make
 Nothing in Python hashes or encodes a texel. The Python side only finds textures and tells the library what the game would tell NVN: target, format, size, levels, packaged layout byte.
 
 Texture sources (any RomFS image, `RomFS.img`, or an extracted folder): BNTX files and BNTX embedded in other files (BFRES), also inside zstd, Yaz0 and SARC containers, nested.
-Super Smash Bros. Ultimate keeps its textures as NUTEXB inside data.arc (dm/gfx/tools/smash_arc.py): see --nutexb.
+Super Smash Bros. Ultimate keeps its textures as NUTEXB in data.arc (dm/gfx/tools/smash_arc.py): its current files are read from the archive, NUTEXB ones as textures.
 
 Usage: bntx_astc.py <RomFS.img | RomFS folder | build folder> --out DIR [--block 4|6] [--workers N] [--scan-only] [--force]
 Output DIR: cache/<key>.astc (the entries), astc-ro.pack (the pack, with the input fingerprint in its header), report.json.
@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -179,6 +180,8 @@ def sarc_members(d):
         yield nm, d[doff + s:doff + e]
 
 
+KNOWN_MAGIC = (b'\x28\xb5\x2f\xfd', b'Yaz0', b'SARC', b'BNTX', b'FRES', b'EFFN')
+HINTS = ('.bfres', '.bntx', '.bkres', '.nutexb')
 MAX_BLOB = 3 << 30   # no container expands past this
 MAX_DEPTH = 8
 
@@ -224,6 +227,21 @@ def target_of(t):
     return tgt, max(depth, 1)
 
 
+# NUTEXB (Super Smash Bros. Ultimate): the image, then a footer of 0x6c bytes: name[64], width, height, depth, format byte + 3, 4, mips, 0x1000, layers, image size, ' XET', version 0x00020001.
+# Its block height is the driver's own (no packaged layout): the engine's automatic layout gives the recorded image size for every BC texture checked.
+NUTEXB_FORMATS = {0x80: 0x1a01, 0x85: 0x1a06, 0x90: 0x1b01, 0x95: 0x1b06, 0xa0: 0x1c01, 0xa5: 0x1c06, 0xb0: 0x1d01, 0xb5: 0x1d02, 0xc0: 0x1e01, 0xc5: 0x1e02, 0xd7: 0x1f0a, 0xe0: 0x2001, 0xe5: 0x2006}
+
+
+def nutexb_texture(d):
+    """The texture a NUTEXB holds, as bntx_textures describes one; None for bytes that are no NUTEXB"""
+    if len(d) < 0x6c + 0x200 or d[-8:-4] != b' XET': return None
+    w, h, dep, fm, _, mips, _, layers, size = struct.unpack_from('<9I', d, len(d) - 0x6c + 0x40)
+    if size > len(d) - 0x6c or not 0 < mips <= 20 or not 0 < layers <= 2048: return {'bad': 'nutexb footer'}
+    dim = 2 if dep > 1 else 3 if layers == 6 else 5 if layers > 1 else 1
+    return {'fmt': NUTEXB_FORMATS.get(fm & 0xff, 0x10000 | fm & 0xff), 'w': w, 'h': h, 'depth': dep, 'array': layers, 'mips': mips, 'samples': 1, 'dimension': dim, 'layout': 0, 'size': size,
+            'offs': (), 'start': 0, 'end': len(d), 'auto': True}
+
+
 class Job:
     """One worker's state: counters and the planes it keyed"""
     def __init__(self, lib, block, cache, encode, dicts):
@@ -240,16 +258,19 @@ class Job:
         tg = target_of(t)
         if tg is None or t['samples'] > 1 or t['dimension'] == 2: c['ineligible_shape'] += 1; return
         target, depth = tg
-        if t['w'] == 0 or t['h'] == 0 or not t['offs'] or t['w'] > 16384 or t['h'] > 16384: c['unparsed'] += 1; return
+        if t['w'] == 0 or t['h'] == 0 or (not t['offs'] and not t.get('auto')) or t['w'] > 16384 or t['h'] > 16384: c['unparsed'] += 1; return
         c['eligible'] += 1
         nvn, alt = eligible
-        pkg = (t['layout'] & 0xff) + 1
+        pkg = 0 if t.get('auto') or os.environ.get('BNTX_ASTC_AUTO_LAYOUT') else (t['layout'] & 0xff) + 1   # SetPackagedTextureLayout's byte 0 (a NUTEXB has none: the automatic block height); --auto-layout is a diagnostic
         start, size = t['start'], t['size']
         if start + size > t['end']: c['short'] += 1; return
         # the texture must lie in the BNTX as the engine lays it out: the first mip offsets
-        rel = [o - t['offs'][0] for o in t['offs']]
-        want = [self.L.dm_level_offset(target, nvn, t['w'], t['h'], depth, t['mips'], pkg, i) for i in range(len(rel))]
-        if rel != want: c['layout_differs'] += 1
+        if t['offs']:
+            rel = [o - t['offs'][0] for o in t['offs']]
+            want = [self.L.dm_level_offset(target, nvn, t['w'], t['h'], depth, t['mips'], pkg, i) for i in range(len(rel))]
+            if rel != want: c['layout_differs'] += 1
+        elif self.L.dm_texture_size(target, nvn, t['w'], t['h'], depth, t['mips'], pkg) != size:   # a NUTEXB records the size the driver gave the texture
+            c['layout_differs'] += 1
         ident = hashlib.sha1(struct.pack('<7I', t['fmt'], t['w'], t['h'], depth, t['mips'], target, pkg) + d[start:start + size]).digest()
         if ident in self.seen: c['repeat'] += 1; return
         self.seen.add(ident)
@@ -278,7 +299,12 @@ class Job:
                 c['sarc'] += 1
                 for nm, member in sarc_members(d): self.blob(member, name + '/' + nm, depth + 1, nm)
                 return
-            if m == b'BNTX' or m == b'FRES' or hint.endswith(('.bfres', '.bntx', '.bkres')) or name.endswith(('.bfres', '.bntx', '.bkres')):
+            if name.endswith('.nutexb'):
+                c['nutexb'] += 1
+                t = nutexb_texture(d)
+                if t: self.texture(d, t, name)
+                return
+            if m in (b'BNTX', b'FRES', b'EFFN') or hint.endswith(('.bfres', '.bntx', '.bkres')) or name.endswith(('.bfres', '.bntx', '.bkres')):
                 for mt in re.finditer(b'BNTX\0\0\0\0', d):
                     if bntx_ok(d, mt.start()):
                         c['bntx'] += 1
@@ -322,6 +348,22 @@ def image_files(path):
     return out
 
 
+def smash_arc_files(romfs, files):
+    """data.arc (Super Smash Bros. Ultimate) replaces itself with its current files: [(name, offset in the input, stored size)], the NUTEXB ones named so"""
+    arc = next(((n, o, sz) for n, o, sz in files if n == '/data.arc'), None)
+    if arc is None: return files
+    sys.path.insert(0, HERE)
+    import smash_arc
+    path = romfs + '/data.arc' if os.path.isfile(romfs) else os.path.join(romfs, 'data.arc')
+    ents = smash_arc.files(path)
+    if ents is None: return files
+    nutexb = smash_arc.hash40('nutexb')
+    base = arc[1] if os.path.isfile(romfs) else 0
+    out = [f for f in files if f[0] != '/data.arc']
+    out += [('/data.arc#%x%s' % (e[0], '.nutexb' if e[4] == nutexb else ''), base + e[1], e[2]) for e in ents]
+    return out
+
+
 def folder_files(path):
     out = []
     for r, ds, fs in os.walk(path):
@@ -334,6 +376,7 @@ def folder_files(path):
 
 def fingerprint(romfs, block):
     h = hashlib.sha256(); h.update(sources_hash().encode()); h.update(b'block %d\0' % block)
+    with open(os.path.abspath(__file__), 'rb') as f: h.update(f.read())   # the tool's own logic (what it finds and how it names it) is part of what the pack holds
     if os.path.isfile(romfs):
         st = os.stat(romfs); h.update(b'img %d %d\0' % (st.st_size, st.st_mtime_ns)); h.update(os.path.basename(romfs).encode())
         with open(romfs, 'rb') as f: h.update(f.read(32))
@@ -354,9 +397,15 @@ def work(batch):
     s = _STATE
     job = Job(s['lib'], s['block'], s['cache'], s['encode'], s['dicts'])
     for name, off, size in batch:
+        if s['fd'] is not None: head = os.pread(s['fd'], 4, off)
+        else:
+            with open(s['romfs'] + name.split('#')[0], 'rb') as f: head = f.read(4)
+        if head not in KNOWN_MAGIC and not (len(head) == 4 and head[1:4] == b'*M\x18' and 0x50 <= head[0] <= 0x5f) and not name.endswith(HINTS):   # unknown bytes are not read: a RomFS holds multi-GB data files
+            job.c['other_files'] += 1; job.c['other_bytes'] += size
+            continue
         if s['fd'] is not None: d = os.pread(s['fd'], size, off)
         else:
-            with open(s['romfs'] + name, 'rb') as f: d = f.read()
+            with open(s['romfs'] + name.split('#')[0], 'rb') as f: f.seek(off); d = f.read(size)
         job.blob(d, name)
     return dict(c=dict(job.c), planes=job.planes, formats=dict(job.formats), errors=job.errors[:50], n_errors=len(job.errors))
 
@@ -426,7 +475,7 @@ def batches(files, n):
     if batch: yield batch
 
 
-def prebuild(inp, out, block=4, workers=None, scan_only=False, force=False, log=print):
+def prebuild(inp, out, block=4, workers=None, scan_only=False, force=False, log=print, drop_cache=False, verbose=False):
     t0 = time.monotonic()
     block = int(block)
     if block not in (4, 6): raise SystemExit('--block must be 4 or 6')
@@ -439,13 +488,15 @@ def prebuild(inp, out, block=4, workers=None, scan_only=False, force=False, log=
         rep = {}
         if os.path.exists(os.path.join(out, 'report.json')):
             with open(os.path.join(out, 'report.json')) as f: rep = json.load(f)
-        log(f'astc-ro.pack is up to date for these inputs ({have["entries"]} entries, {have["bytes"]} bytes)')
+        log(f'astc-ro.pack is up to date for these inputs ({have["entries"]} entries, {have["bytes"] / 2**30:.2f} GB)')
+        if drop_cache: shutil.rmtree(cache, ignore_errors=True)
         return dict(rep, up_to_date=True, pack=pack, entries=have['entries'], pack_bytes=have['bytes'])
     lib = build_library(os.path.join(out, 'lib'))
     os.makedirs(cache, exist_ok=True)
     files = image_files(romfs) if os.path.isfile(romfs) else folder_files(romfs)
+    files = smash_arc_files(romfs, files)
     dicts = zs_dicts(romfs, files, lib)
-    log(f'{romfs}: {len(files)} files, {sum(f[2] for f in files) / 2**30:.1f} GiB; library {os.path.basename(lib)}; ASTC {block}x{block}')
+    log(f'astc: {romfs}: {len(files)} files, {sum(f[2] for f in files) / 2**30:.1f} GiB; ASTC {block}x{block}; library {os.path.basename(lib)}')
     workers = workers or os.cpu_count() or 4
     total = collections.Counter(); formats = collections.Counter(); keys = {}; errors = []; plane_count = 0; hits = 0
     unique = {}
@@ -461,22 +512,25 @@ def prebuild(inp, out, block=4, workers=None, scan_only=False, force=False, log=
                     keys[key] = key
                 if key2 and key2 not in keys: keys[key2] = key
             scanned += 1
-            if scanned % 20 == 0: log(f'  {scanned}/{len(chunks)} batches, {len(unique)} unique planes, {time.monotonic() - t1:.0f} s')
+            if scanned % 20 == 0: log(f'astc: {scanned}/{len(chunks)} batches, {len(unique)} unique planes, {time.monotonic() - t1:.0f} s')
     t_scan = time.monotonic() - t1
     rgba = sum(w * h * 4 for w, h, _ in unique.values())
+    digest = hashlib.sha256(b''.join(bytes.fromhex(k) for k in sorted(unique))).hexdigest()
     rep = dict(input=romfs, block=block, files=len(files), textures_found=total['textures'], bntx_files=total['bntx'], eligible_textures=total['eligible'], converted_textures=total['converted'],
-               repeated_textures=total['repeat'], layout_differs=total['layout_differs'], layout_failed=total['layout_failed'], unparsed=total['unparsed'], short=total['short'],
-               ineligible_shape=total['ineligible_shape'], container_errors=total['container_errors'], plane_errors=total['plane_errors'], planes=plane_count, unique_planes=len(unique),
+               repeated_textures=total['repeat'], nutexb_files=total['nutexb'], layout_differs=total['layout_differs'], layout_failed=total['layout_failed'], unparsed=total['unparsed'], short=total['short'],
+               ineligible_shape=total['ineligible_shape'], container_errors=total['container_errors'], plane_errors=total['plane_errors'], planes=plane_count, unique_planes=len(unique), keys_sha256=digest,
                decoded_rgba_bytes_covered=rgba, astc_bytes=sum(a for _, _, a in unique.values()), formats=dict(formats.most_common()), encoded_now=len(unique) - hits, cached_before=hits,
                scan_seconds=round(t_scan, 1), error_samples=errors[:20])
     if scan_only:
-        log(json.dumps(rep, indent=1)); return rep
+        log('astc: ' + json.dumps({k: v for k, v in rep.items() if k not in ('formats', 'error_samples')}) if not verbose else json.dumps(rep, indent=1)); return rep
     if total['plane_errors']: raise SystemExit(f'{total["plane_errors"]} planes failed to encode: {errors[:5]}')
     t2 = time.monotonic()
     entries, payloads, size = write_pack(pack, cache, keys, fp)
     rep.update(pack=pack, entries=entries, payloads=payloads, pack_bytes=size, pack_seconds=round(time.monotonic() - t2, 1), total_seconds=round(time.monotonic() - t0, 1), up_to_date=False)
     with open(os.path.join(out, 'report.json'), 'w') as f: json.dump(rep, f, indent=1)
-    log(json.dumps({k: v for k, v in rep.items() if k not in ('formats', 'error_samples')}, indent=1))
+    if drop_cache: shutil.rmtree(cache, ignore_errors=True)   # the pack holds every entry; the folder is only needed to encode again without it
+    log(f'astc-ro.pack: {entries} entries ({payloads} blocks of ASTC), {size / 2**30:.2f} GB; {rep["converted_textures"]} textures, {len(unique)} planes covering {rgba / 2**30:.1f} GB of decoded RGBA8; {rep["total_seconds"]:.0f} s')
+    if verbose: log(json.dumps(rep, indent=1))
     return rep
 
 
@@ -488,8 +542,14 @@ def main():
     ap.add_argument('--workers', type=int, default=0, help='processes (default: every core)')
     ap.add_argument('--scan-only', action='store_true', help='find and key the planes; encode and write nothing')
     ap.add_argument('--force', action='store_true', help='rebuild even if the pack is up to date')
+    ap.add_argument('--drop-cache', action='store_true', help='delete the cache/ folder once the pack is written (it holds the same entries again)')
+    ap.add_argument('--json', action='store_true', help='print the whole report')
+    ap.add_argument('--auto-layout', action='store_true', help='diagnostic with --scan-only: ignore the BNTX block height and count the textures whose mip offsets the engine\'s automatic layout does not reproduce')
     a = ap.parse_args()
-    prebuild(a.input, a.out, a.block, a.workers or None, a.scan_only, a.force)
+    if a.auto_layout:
+        if not a.scan_only: ap.error('--auto-layout is a diagnostic: use it with --scan-only')
+        os.environ['BNTX_ASTC_AUTO_LAYOUT'] = '1'
+    prebuild(a.input, a.out, a.block, a.workers or None, a.scan_only, a.force, drop_cache=a.drop_cache, verbose=a.json)
 
 
 if __name__ == '__main__':

@@ -810,3 +810,10 @@ int nvn_bc_astc_fetch(uint32_t format, const void *source, size_t source_size, u
     bg_enqueue(format, source, source_size, width, height, block, key);
     return 0;
 }
+int nvn_bc_astc_readonly_ready(void) {
+    pthread_mutex_lock(&g_bg.mu); bg_env_config_locked(); NSString *ro = g_bg.readonly ? @(g_bg.readonly) : nil; pthread_mutex_unlock(&g_bg.mu);
+    if (!ro) return 0;
+    if (pack_for(ro.UTF8String)) return 1;
+    BOOL isdir = NO;
+    return [NSFileManager.defaultManager fileExistsAtPath:ro isDirectory:&isdir] && isdir;
+}

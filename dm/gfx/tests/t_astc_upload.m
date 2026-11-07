@@ -251,6 +251,49 @@ static void run_background(const char *dir, int six) {
         defer_obj_release(mt4); release_fixture(m4);
         CHECK(nvn_bc_astc_bg_wait(120), "its planes drain into the writable directory");
     }
+    // 5c. a texture created empty and filled by a copy: with a read-only cache the format is decided at its first copy. A whole-level copy whose plane is in the pack makes it ASTC; one that is not, or a piece of a level, leaves it decoded
+    {
+        enum { N = 16 };
+        nvn_texdesc cd = {.target = NVN_TEXTURE_TARGET_2D, .format = 0x44, .width = N, .height = N, .depth = 1, .levels = 1, .samples = 1};
+        void *smem; if (posix_memalign(&smem, getpagesize(), 16384)) abort(); mtl_pool_add(smem, 16384);
+        size_t row = N / 4 * 16, rows = N / 4; fill_blocks(smem, row * rows, 0x44, 321);
+        char c1[512]; subdir(c1, sizeof c1, dir, "copy-warm");
+        configure(c1, 64u << 20, 1ull << 30, 0, 1);
+        nvn_astc_cache_key kk; CHECK(nvn_bc_astc_learn(0x44, smem, row * rows, N, N, blk, &kk) == 0, "the copy's plane is queued"); CHECK(nvn_bc_astc_bg_wait(120), "and encoded");
+        char pk[600]; snprintf(pk, sizeof pk, "%s/copy.pack", dir); pack_dir(c1, pk);
+        char c2[512]; subdir(c2, sizeof c2, dir, "copy-new");
+        nvn_astc_bg_config rc = {.cache = c2, .readonly = pk, .queue_cap = 64u << 20, .cache_max = 1ull << 30, .min_free = 0, .threads = 1};
+        nvn_bc_astc_bg_configure(&rc);
+        uint8_t *expected = malloc((size_t)N * N * 4); CHECK(!nvn_bc_decode(0x44, smem, row, N, N, expected, (size_t)N * 4), "CPU decode of the copy source");
+        uint64_t first0 = atomic_load(&g_astc_copy_first), astc0 = atomic_load(&g_astc_copy_astc), part0 = atomic_load(&g_astc_copy_partial);
+        void *keep[6] = {0};   // storage stays allocated until the end: a new texture at the address of an earlier one would be aliased to its Metal texture
+        for (int variant = 0; variant < 3; variant++) {   // 0: the whole level, cached; 1: the whole level, not cached; 2: a piece of a level
+            tex_t t = {.magic = MAGIC('T','E','X',0), .serial = nvn_new_serial(), .d = cd}; nvn_tex_layout(&cd, &t.L);
+            void *tmem; if (posix_memalign(&tmem, getpagesize(), (t.L.size + 16383) & ~(size_t)16383)) abort();
+            memset(tmem, 0, t.L.size); t.mem = tmem; t.off = 0x10000u * (variant + 1); mtl_pool_add(tmem, (t.L.size + 16383) & ~(size_t)16383);   // another offset: textures of one description and offset share a Metal texture
+            mtl_tex_init(&t);
+            void *other = NULL; uint64_t src = (uint64_t)(uintptr_t)smem;
+            if (variant == 1) { if (posix_memalign(&other, getpagesize(), 16384)) abort(); mtl_pool_add(other, 16384); fill_blocks(other, row * rows, 0x44, 999); src = (uint64_t)(uintptr_t)other; }
+            p_copy_b2t cp = {.src = src, .tex = &t, .r = {0, 0, 0, variant == 2 ? 8 : N, variant == 2 ? 8 : N, 1}};
+            mtl_sub_begin(); copy_b2t(&cp, sizeof cp); CHECK(mtl_wait(mtl_sub_commit(), 20000000000ull), "the copy completes");
+            id<MTLTexture> mt = tex_mtl(&t);
+            CHECK(mt && mt.pixelFormat == (variant == 0 ? astc_pf : MTLPixelFormatRGBA8Unorm), variant == 0 ? "an empty texture whose first copy is a cached whole level is made ASTC" : "an uncached or partial first copy leaves it decoded");
+            if (variant == 0 && mt) {
+                id<MTLBuffer> out = [g_dev newBufferWithLength:(size_t)N * N * 16 options:MTLResourceStorageModeShared]; uint32_t sel[2] = {0, 0};
+                id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTL4ComputeCommandEncoder> unused = nil; (void)unused;
+                id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                [e setComputePipelineState:sampler_pipeline(0)]; [e setTexture:mt atIndex:0]; [e setBuffer:out offset:0 atIndex:0]; [e setBytes:sel length:sizeof sel atIndex:1];
+                [e dispatchThreads:MTLSizeMake(N, N, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                const float *got = out.contents; double err = 0; for (unsigned i = 0; i < N * N * 4; i++) err += fabs(got[i] - expected[i] / 255.0); err /= N * N * 4;
+                CHECK(err < 0.04 * (six ? 6.0 : 1.0), "the copy into the ASTC texture is the BC decode");
+            }
+            defer_obj_release(mt); keep[variant] = tmem; keep[3 + variant] = other;
+        }
+        for (int i = 0; i < 6; i++) if (keep[i]) release_fixture(keep[i]);
+        CHECK(atomic_load(&g_astc_copy_first) - first0 == 3 && atomic_load(&g_astc_copy_astc) - astc0 == 1 && atomic_load(&g_astc_copy_partial) - part0 == 1, "three first copies seen: one ASTC via the pack, one piece of a level");
+        CHECK(nvn_bc_astc_bg_wait(120), "the uncached plane drains into the writable directory"); CHECK(cache_files(c2) >= 1, "and is encoded for the next run");
+        free(expected); release_fixture(smem);
+    }
     // 6. cache size cap: room for two entries, four planes encoded, two written
     {
         char c[512]; subdir(c, sizeof c, dir, "capped");

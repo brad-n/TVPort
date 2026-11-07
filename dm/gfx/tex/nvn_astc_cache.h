@@ -29,6 +29,8 @@ typedef struct {
 const char *nvn_bc_astc_cache_status_name(nvn_astc_cache_status status);
 // A read-only cache (DM_NVN_ASTC_CACHE_RO, `readonly_cache` below) is a directory of <key>.astc files or ONE pack file (astc-ro.pack, see nvn_astc_cache.m). 1 when `path` is a pack that
 // holds together (header, size and index): its entry count, size and the input fingerprint the writer recorded; 0 for a directory, a missing path or a corrupt or short pack (ignored)
+// 1 when a read-only cache is configured and usable (a valid pack, or a directory), so a plane can be looked up before a texture is made
+int nvn_bc_astc_readonly_ready(void);
 // The content address of a plane (the name of its cache entry): SHA-256 over the version tag, format, size, block and the tightly packed BC bytes. For tools that key planes without encoding them
 void nvn_bc_astc_plane_key(uint32_t format, uint32_t width, uint32_t height, unsigned block, const void *source, size_t source_size, nvn_astc_cache_key *key);
 int nvn_bc_astc_pack_info(const char *path, uint64_t *entries, uint64_t *bytes, uint8_t fingerprint[32]);
