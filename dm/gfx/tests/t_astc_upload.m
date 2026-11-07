@@ -556,6 +556,7 @@ static void mixed_copy_case(uint32_t fmt, unsigned SW, unsigned OX, unsigned OY,
     void *tmem; nvn_texdesc d = {.target = NVN_TEXTURE_TARGET_2D, .format = fmt, .width = SW, .height = SW, .depth = 1, .levels = 1, .samples = 1};
     tex_t t = {.magic = MAGIC('T','E','X',0), .serial = nvn_new_serial(), .d = d}; nvn_tex_layout(&d, &t.L);
     if (posix_memalign(&tmem, getpagesize(), (t.L.size + 16383) & ~(size_t)16383)) abort();
+    static unsigned seq; t.off = 0x10000u * (100 + ++seq);   // a guest address of its own
     memset(tmem, 0, t.L.size); t.mem = tmem; mtl_pool_add(tmem, (t.L.size + 16383) & ~(size_t)16383);
     void *smem; if (posix_memalign(&smem, getpagesize(), 16384)) abort(); mtl_pool_add(smem, 16384);
     size_t row = RW / 4 * bb, rows = RH / 4; fill_blocks(smem, row * rows, fmt, 99);
