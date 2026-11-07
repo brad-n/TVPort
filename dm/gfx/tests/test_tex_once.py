@@ -319,7 +319,8 @@ class StripTests(unittest.TestCase):
         (d / 'plain.bntx').write_bytes(T.bntx(lib, [ts[0], ts[6]]))
         blob = b'FRES    ' + bytes(0x40) + T.bntx(lib, [ts[1], ts[2]]) + bytes(100)
         inner = T.sarc([('a.bfres', blob), ('notes.txt', b'hello')])
-        yz = T.yaz0_encode(T.sarc([('kart.bfres', blob), ('inner.sarc', inner)]))
+        raw_szs = T.sarc([('kart.bfres', blob), ('inner.sarc', inner)])
+        yz = tool.yaz0_pack(tool.native_open(tool.build_native(str(self.root / 'nlib'))), raw_szs, 2 * len(raw_szs) + 64)   # the native encoder: the test helper's pure-Python one takes minutes on this size
         (d / 'Model' / 'kart.szs').write_bytes(yz + bytes(64))
         z = B.zstd_module()
         (d / 'tex.bntx.zs').write_bytes(z.compress(T.bntx(lib, ts[3:5]), level=19) + skippable(100))     # an input that already carries a padding frame
