@@ -202,6 +202,194 @@ class CompressedTextures(unittest.TestCase):
         self.assertEqual(backend.pack_fingerprint(other), '')
 
 
+class StoreTexturesOnce(unittest.TestCase):
+    """docs/texture_once.md section 5: the per-game choice, the tool run in the build, the fallback, and the sparse image's trip to the Apple TV"""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / 'extract').mkdir(); (self.root / 'build').mkdir()
+        (self.root / 'extract/RomFS.img').write_bytes(b'r' * 500)
+        (self.root / 'extract/control.nacp').write_bytes(b'n')
+        (self.root / 'App.app').mkdir(); (self.root / 'App.app/embedded.mobileprovision').write_text('x')
+        self.pack = self.root / 'astc-ro.pack'; self.pack.write_bytes(b'p' * 90)
+        self.game = SimpleNamespace(build=self.root / 'build', romfs=self.root / 'extract/RomFS.img', app=self.root / 'App.app')
+        self.once = self.root / 'build/tvport-once/romfs.img'
+        patcher = patch('time.sleep'); patcher.start(); self.addCleanup(patcher.stop)
+
+    def make_image(self, size=100):
+        self.once.parent.mkdir(exist_ok=True)
+        self.once.write_bytes(b's' * size)
+
+    def run_tool(self, tool_exists=True, fail=None, make=True):
+        """store_textures_once with a fake tex_once.py: returns (result, argv of the tool run or None, log text)"""
+        fake_repo = self.root / 'repo'
+        tool = fake_repo / 'dm/gfx/tools/tex_once.py'
+        if tool_exists:
+            tool.parent.mkdir(parents=True, exist_ok=True); tool.write_text('')
+
+        def fake(argv, **kwargs):
+            if fail:
+                raise backend.Failure(fail)
+            if make:
+                self.make_image()
+        out = io.StringIO()
+        with patch.object(backend, 'REPO', fake_repo), patch.object(backend, 'stream', side_effect=fake) as stream, redirect_stdout(out):
+            result = backend.store_textures_once(self.game, self.pack, 6, 'python3', 512)
+        return result, ([str(a) for a in stream.call_args.args[0]] if stream.called else None), out.getvalue()
+
+    def test_automatic_follows_compressed_textures(self):
+        enabled = backend.texture_once_enabled
+        for choice, block, expected in (('auto', 4, True), (None, 4, True), ('on', 6, True), ('off', 4, False), ('off', 6, False),
+                                         ('auto', 0, False), ('on', 0, False), (None, 0, False)):   # block 0 = Compressed textures Off
+            self.assertEqual(enabled(SimpleNamespace(texture_once=choice), block), expected, (choice, block))
+        self.assertTrue(enabled(SimpleNamespace(), 4))   # an older caller that does not know the option
+
+    def test_the_build_command_takes_the_choice(self):
+        for argv, expected in ((['--texture-once', 'off'], 'off'), (['--texture-once', 'on'], 'on'), ([], 'auto')):
+            with patch.object(sys, 'argv', ['backend.py', 'build', '/x'] + argv), patch.object(backend, 'cmd_build') as build, patch.object(backend, 'BUNDLED', False):
+                backend.main()
+            self.assertEqual(build.call_args.args[0].texture_once, expected)
+
+    def test_the_tool_runs_with_the_pack_cap_and_block_and_its_image_is_returned(self):
+        result, argv, _ = self.run_tool()
+        self.assertEqual(result, self.once)
+        self.assertEqual(argv[:2], ['python3', '-I'])
+        self.assertTrue(argv[2].endswith('dm/gfx/tools/tex_once.py'))
+        self.assertEqual(argv[3], str(self.game.romfs))
+        self.assertEqual(argv[argv.index('--pack') + 1], str(self.pack))
+        self.assertEqual(argv[argv.index('--out') + 1], str(self.root / 'build/tvport-once'))
+        self.assertEqual(argv[argv.index('--max-dim') + 1], '512')
+        self.assertEqual(argv[argv.index('--block') + 1], '6')
+        self.assertTrue((self.once.parent / 'control.nacp').is_symlink())   # build_ipa.sh looks beside the image for it
+        self.assertFalse((self.once.parent / 'icon.jpg').exists())
+
+    def test_a_missing_tool_falls_back_with_one_warning(self):
+        result, argv, text = self.run_tool(tool_exists=False)
+        self.assertIsNone(result)
+        self.assertIsNone(argv)
+        self.assertEqual(text.count('stored twice'), 1)
+        self.assertEqual(len([line for line in text.splitlines() if '"log"' in line]), 1)
+
+    def test_a_failed_tool_falls_back_with_one_warning(self):
+        result, _, text = self.run_tool(fail='self-check failed: plane 3')
+        self.assertIsNone(result)
+        self.assertEqual(len([line for line in text.splitlines() if '"log"' in line]), 1)
+        self.assertIn('self-check failed', text)
+
+    def test_a_tool_that_leaves_no_image_falls_back(self):
+        self.assertIsNone(self.run_tool(make=False)[0])
+
+    def test_no_pack_means_no_run(self):
+        out = io.StringIO()
+        with patch.object(backend, 'stream') as stream, redirect_stdout(out):
+            self.assertIsNone(backend.store_textures_once(self.game, None, 4, 'python3', 0))
+        stream.assert_not_called()
+
+    def test_the_project_is_built_against_the_stripped_image(self):
+        args = SimpleNamespace(fps=False, mode='handheld', texture_cap=512, players='', render_scale=1, no_thermal_cap=False, fps_target=0, swap_ab_xy=False, swap_ab=None, swap_xy=None,
+                               art=None, art_scale=0, art_x=0, art_y=0, shelf_art=None, shelf_scale=0, shelf_x=0, shelf_y=0, pso_mtl4=False, extra_env=[])
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / '0100000000010000_build').mkdir()
+            game = backend.Game(Path(folder))
+            seen = []
+            for romfs in (None, self.once):
+                with patch.object(backend, 'restore_tables'), patch.object(backend, 'stream') as stream, patch.object(backend.Game, 'romfs', Path('/plain/RomFS.img')):
+                    backend.generate_project(game, args, 'TEAM', 'test.game', sys.executable, romfs)
+                seen.append(stream.call_args.kwargs['env']['ROMFS'])
+        self.assertEqual(seen, ['/plain/RomFS.img', str(self.once)])
+
+    def build(self, **options):
+        """cmd_build up to the install with everything heavy replaced: returns (generate_project call, install call, store call)"""
+        args = SimpleNamespace(folder=str(self.root), team='T', keys=None, device='dev', texture_cap=512, astc=options.get('astc', 'auto'), astc_block=4, texture_once=options.get('once', 'auto'), icloud=False, art=None, mode='handheld', render_scale=1)
+        game = SimpleNamespace(build=self.root / 'build', romfs=self.game.romfs, app=self.game.app, prepared=True, addons=[], input_signature=lambda: 's', state=lambda: {'source_signature': 's'},
+                               bundle_id=lambda team: 'b', save_state=lambda **kw: None)
+        out = io.StringIO()
+        with patch.object(backend, 'Game', return_value=game), patch.object(backend, 'known_team', return_value='T'), patch.object(backend, 'relocate_build', return_value=game), \
+             patch.object(backend, 'BUNDLED', False), patch.object(backend, 'engine_python', return_value='python3'), patch.object(backend, 'one_build_at_a_time'), \
+             patch.object(backend, 'prebuild_astc', return_value=options.get('pack', self.pack)), patch.object(backend, 'remember_shaders'), \
+             patch.object(backend, 'backup_saves', return_value={'state': 'none', 'files': 0}), patch.object(backend, 'generate_project') as generate, patch.object(backend, 'bundle_shaders'), \
+             patch.object(backend, 'compile_app'), patch.object(backend, 'install') as install, patch.object(backend, 'restore_saves', return_value=0), patch.object(backend, 'provisioning', return_value={}), \
+             patch.object(backend, 'store_textures_once', return_value=options.get('image')) as store, redirect_stdout(out):
+            backend.cmd_build(args)
+        return generate, install, store
+
+    def test_the_build_uses_the_stripped_image_for_the_app_and_the_install(self):
+        generate, install, store = self.build(image=self.once)
+        self.assertEqual(store.call_args.args[1:], (self.pack, 4, 'python3', 512))
+        self.assertEqual(generate.call_args.args[5], self.once)
+        self.assertEqual(install.call_args.args[3:], (self.pack, self.once))
+
+    def test_the_build_skips_the_tool_when_off_or_without_compressed_textures(self):
+        for options in ({'once': 'off'}, {'astc': 'off'}, {'pack': None}):
+            generate, install, store = self.build(image=self.once, **options)
+            store.assert_not_called()
+            self.assertIsNone(generate.call_args.args[5], options)
+            self.assertIsNone(install.call_args.args[4], options)
+
+    def test_a_failed_tool_builds_and_installs_as_before(self):
+        generate, install, _ = self.build(image=None)
+        self.assertIsNone(generate.call_args.args[5])
+        self.assertEqual(install.call_args.args[3:], (self.pack, None))
+
+    def install_once(self, listings, copy=None):
+        out = io.StringIO()
+        with patch.object(backend, 'run', return_value=done(0)), patch.object(backend, 'stream', side_effect=copy) as stream, patch.object(backend, 'installed_files', side_effect=listings), redirect_stdout(out):
+            backend.install(self.game, 'd', 'b', self.pack, self.once)
+        return [[str(a) for a in c.args[0]] for c in stream.call_args_list], out.getvalue()
+
+    def test_the_sparse_image_is_sent_as_romfs_img_with_no_pack_and_the_stale_pack_is_emptied(self):
+        self.make_image(100)
+        sent, text = self.install_once([{'astc-ro.pack': 90}, {'romfs.img': 100, 'astc-ro.pack': 90}, {'romfs.img': 100, 'astc-ro.pack': 0}])
+        self.assertEqual(len(sent), 2)
+        first, second = sent
+        self.assertEqual(first[first.index('--source') + 1], str(self.once))   # its own size is what is verified: 100, not the 500 of RomFS.img
+        self.assertEqual(first[first.index('--destination') + 1], 'Library/Caches/romfs.img')
+        self.assertEqual(second[second.index('--destination') + 1], 'Library/Caches/astc-ro.pack')
+        self.assertEqual((self.root / 'build/tvport-once/astc-ro.pack.empty').stat().st_size, 0)   # the pack itself is never the source
+        self.assertEqual(second[second.index('--source') + 1], str(self.root / 'build/tvport-once/astc-ro.pack.empty'))
+        self.assertNotIn(str(self.pack), first + second)
+        self.assertIn('gone from the Apple TV', text)
+
+    def test_nothing_is_emptied_when_there_is_no_old_pack(self):
+        self.make_image(100)
+        sent, _ = self.install_once([{}, {'romfs.img': 100}])
+        self.assertEqual(len(sent), 1)
+
+    def test_the_stripped_image_already_there_is_not_sent_again_but_another_of_the_same_size_is(self):
+        self.make_image(100)
+        self.install_once([{}, {'romfs.img': 100}])
+        sent, text = self.install_once([{'romfs.img': 100, 'astc-ro.pack': 0}])
+        self.assertEqual(sent, [])
+        self.assertIn('already on the Apple TV', text)
+        self.once.write_bytes(b't' * 100)   # same size, new content (another cap)
+        sent, _ = self.install_once([{'romfs.img': 100}, {'romfs.img': 100}])
+        self.assertEqual(len(sent), 1)
+
+    def test_a_short_arrival_of_the_stripped_image_fails(self):
+        self.make_image(100)
+        with self.assertRaises(backend.Failure) as error:
+            self.install_once([{}, {'romfs.img': 40}])
+        self.assertIn('40 bytes', str(error.exception))
+        self.assertFalse(self.once.with_name('romfs.img.sent').exists())
+
+    def test_a_pack_that_cannot_be_emptied_does_not_fail_the_install(self):
+        self.make_image(100)
+
+        def copy(argv, **kwargs):
+            if 'astc-ro.pack' in str(argv[-1]):
+                raise backend.Failure('devicectl: no')
+        sent, text = self.install_once([{'astc-ro.pack': 90}, {'romfs.img': 100}], copy)
+        self.assertIn('could not be emptied', text)
+
+    def test_the_game_without_the_option_installs_as_before(self):
+        out = io.StringIO()
+        with patch.object(backend, 'run', return_value=done(0)), patch.object(backend, 'stream') as stream, patch.object(backend, 'installed_files', side_effect=[{'romfs.img': 500}, {'astc-ro.pack': 90}]), redirect_stdout(out):
+            backend.install(self.game, 'd', 'b', self.pack)
+        argv = [str(a) for a in stream.call_args.args[0]]
+        self.assertEqual(argv[argv.index('--destination') + 1], 'Library/Caches/astc-ro.pack')
+        self.assertFalse(self.root.joinpath('build/tvport-once').exists())
+
+
 class Advanced(unittest.TestCase):
     def make_game(self, folder):
         (Path(folder) / '0100000000010000_build').mkdir()

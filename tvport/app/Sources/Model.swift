@@ -56,6 +56,7 @@ struct Game: Codable, Identifiable, Hashable {
     var gameMemoryPaging: String?     // "on" / "off"; nil = Automatic (the engine's default for the target). A tri-state, not a tvOS flag, so other targets can share it
     var compressedTextures: String?   // "on" / "off"; nil = Automatic (on for Apple TV builds). A tri-state and a block size, not tvOS flags, so other targets can share them
     var compressedTextureBlock: Int?  // ASTC block of the compressed textures: 4 (4x4, the default) or 6 (6x6, about 2.3 times smaller, softer)
+    var textureOnce: String?          // "on" / "off"; nil = Automatic (on whenever Compressed textures is on). Store textures once: the textures live in the game files only, not also in a second ASTC copy
     var pipelineGPU: String?          // GPU architectures for the pipeline archive (build script --gpu); empty = none
     var extraEnvironment: String?     // KEY=VALUE lines for the app's env file
     var addons: [GameAddon]?
@@ -70,6 +71,7 @@ struct Game: Codable, Identifiable, Hashable {
         if let paging = gameMemoryPaging, paging == "on" || paging == "off" { arguments += ["--guest-file", paging] }
         if let choice = compressedTextures, choice == "on" || choice == "off" { arguments += ["--astc", choice] }
         if compressedTextureBlock == 6 { arguments += ["--astc-block", "6"] }
+        if let choice = textureOnce, choice == "on" || choice == "off" { arguments += ["--texture-once", choice] }
         let gpu = (pipelineGPU ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if !gpu.isEmpty { arguments += ["--gpu", gpu] }
         for line in (extraEnvironment ?? "").split(whereSeparator: \.isNewline) {
