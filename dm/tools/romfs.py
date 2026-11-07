@@ -21,19 +21,32 @@ from typing import TYPE_CHECKING
 HEAD = struct.Struct('<8sQQQ')
 ENT = struct.Struct('<QQIHBB')
 MAGIC = b'DMROMFS1'
+SPARSE_MAGIC = b'DMSPARS1'   # dm/gfx/tools/sparse_image.py: the same image with its zero runs left out (and the ASTC pack embedded); read through its logical view
+
+
+def _sparse_image(path):
+    sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'gfx', 'tools'))
+    import sparse_image
+    return sparse_image.SparseImage(path)
 
 
 class Image:
     def __init__(self, path):
         self.path = _os.path.abspath(path)
         self.stat = _os.stat(self.path)
-        with builtins.open(self.path, 'rb') as f:
-            head = f.read(HEAD.size)
-            if len(head) < HEAD.size: raise ValueError(f'invalid RomFS image header: {path}')
-            magic, off, size, count = HEAD.unpack(head)
-            if magic != MAGIC or not 0 < count <= 0xffffffff or off < HEAD.size or off > self.stat.st_size or size != self.stat.st_size - off or count > size // ENT.size:
-                raise ValueError(f'invalid RomFS image header: {path}')
-            f.seek(off); self.index = f.read(size)
+        with builtins.open(self.path, 'rb') as f: magic = f.read(8)
+        self.sparse = _sparse_image(self.path) if magic == SPARSE_MAGIC else None   # a DMSPARS1 file: every offset below is LOGICAL
+        total = self.sparse.logical_size if self.sparse else self.stat.st_size
+        if self.sparse: head = self.sparse.read(0, HEAD.size)
+        else:
+            with builtins.open(self.path, 'rb') as f: head = f.read(HEAD.size)
+        if len(head) < HEAD.size: raise ValueError(f'invalid RomFS image header: {path}')
+        magic, off, size, count = HEAD.unpack(head)
+        if magic != MAGIC or not 0 < count <= 0xffffffff or off < HEAD.size or off > total or size != total - off or count > size // ENT.size:
+            raise ValueError(f'invalid RomFS image header: {path}')
+        if self.sparse: self.index = self.sparse.read(off, size)
+        else:
+            with builtins.open(self.path, 'rb') as f: f.seek(off); self.index = f.read(size)
         if len(self.index) != size: raise ValueError(f'incomplete RomFS image: {path}')
         self.count, self.pool = count, count * ENT.size
         next_child = 1
@@ -87,7 +100,7 @@ def _image(path, identity): return Image(path) if is_image(path) else None
 
 def is_image(path):
     try:
-        with builtins.open(path, 'rb') as f: return f.read(8) == MAGIC
+        with builtins.open(path, 'rb') as f: return f.read(8) in (MAGIC, SPARSE_MAGIC)
     except (OSError, TypeError): return False
 
 
@@ -111,6 +124,7 @@ def source(extraction):
 
 
 _fd_ranges = {}
+_fd_sparse = {}   # fd of a DMSPARS1 file's File -> its SparseImage (the file's offsets are logical: no mapping of the fd)
 
 
 class _File(io.RawIOBase):
@@ -118,7 +132,9 @@ class _File(io.RawIOBase):
         self.fd = _os.open(image.path, _os.O_RDONLY)
         self.start, self.length = image.entry(k)[:2]
         self.pos = 0
+        self.sparse = image.sparse
         _fd_ranges[self.fd] = (self.start, self.length)
+        if self.sparse: _fd_sparse[self.fd] = self.sparse
     def readable(self): return True
     def seekable(self): return True
     def fileno(self): return self.fd
@@ -129,12 +145,12 @@ class _File(io.RawIOBase):
         self.pos = pos; return pos
     def readinto(self, buffer):
         size = min(len(buffer), max(0, self.length - self.pos))
-        data = _os.pread(self.fd, size, self.start + self.pos)
+        data = self.sparse.read(self.start + self.pos, size) if self.sparse else _os.pread(self.fd, size, self.start + self.pos)
         buffer[:len(data)] = data; self.pos += len(data)
         return len(data)
     def close(self):
         if not self.closed:
-            _fd_ranges.pop(self.fd, None); _os.close(self.fd)
+            _fd_ranges.pop(self.fd, None); _fd_sparse.pop(self.fd, None); _os.close(self.fd)
         super().close()
 
 
@@ -298,10 +314,73 @@ class _Map:
     def __exit__(self, *args): self.close()
 
 
+class _SparseMap:
+    """mmap-compatible bounded view of a file inside a DMSPARS1 image: reads through the logical view. Searches and slices read what they need; the buffer protocol (a zero-copy parse)
+    reads the whole range once, up to 1 GB."""
+    def __init__(self, sparse, start, length):
+        self.sparse, self.start, self.length, self.pos, self.whole = sparse, start, length, 0, None
+    def __buffer__(self, flags):
+        if self.whole is None:
+            if self.length > 1 << 30: raise BufferError('a DMSPARS1 file range over 1 GB has no buffer view')
+            self.whole = memoryview(self.sparse.read(self.start, self.length))
+        return self.whole
+    def __len__(self): return self.length
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            a, b, step = key.indices(self.length)
+            data = self.sparse.read(self.start + a, max(b - a, 0))
+            return data if step == 1 else data[::step]
+        if key < 0: key += self.length
+        if not 0 <= key < self.length: raise IndexError('mmap index out of range')
+        return self.sparse.read(self.start + key, 1)[0]
+    def __contains__(self, value): return self.find(value) >= 0
+    def find(self, value, start=0, end=None):
+        a, b, _ = slice(start, end).indices(self.length)
+        step = 8 << 20; at = a
+        while at < b:
+            chunk = self.sparse.read(self.start + at, min(step + len(value) - 1, b - at))
+            found = chunk.find(value)
+            if found >= 0: return at + found
+            if at + step >= b: break
+            at += step
+        return -1
+    def rfind(self, value, start=0, end=None):
+        a, b, _ = slice(start, end).indices(self.length)
+        best = -1; at = a; step = 8 << 20
+        while at < b:
+            chunk = self.sparse.read(self.start + at, min(step + len(value) - 1, b - at))
+            found = chunk.rfind(value)
+            if found >= 0: best = at + found
+            if at + step >= b: break
+            at += step
+        return best
+    def index(self, value, start=0, end=None):
+        found = self.find(value, start, end)
+        if found < 0: raise ValueError('subsection not found')
+        return found
+    def size(self): return self.length
+    def tell(self): return self.pos
+    def seek(self, offset, whence=0):
+        pos = offset + (self.pos if whence == 1 else self.length if whence == 2 else 0)
+        if whence not in (0, 1, 2) or not 0 <= pos <= self.length: raise ValueError('invalid mmap seek')
+        self.pos = pos
+    def read(self, size=-1):
+        end = self.length if size < 0 else min(self.length, self.pos + size)
+        data = self[self.pos:end]; self.pos = end; return data
+    def close(self): self.whole = None
+    def __enter__(self): return self
+    def __exit__(self, *args): self.close()
+
+
 class _Mmap:
     @staticmethod
     def mmap(fd, length, *args, **kwargs):
         if fd not in _fd_ranges: return _mmap.mmap(fd, length, *args, **kwargs)
+        if fd in _fd_sparse:
+            if args or kwargs.get('access', _mmap.ACCESS_READ) != _mmap.ACCESS_READ: raise ValueError('RomFS mappings are read-only')
+            start, size = _fd_ranges[fd]; offset = kwargs.get('offset', 0)
+            if offset < 0 or offset > size or (length and length > size - offset): raise ValueError('mapping exceeds RomFS file')
+            return _SparseMap(_fd_sparse[fd], start + offset, length or size - offset)
         if sys.version_info < (3, 12): raise RuntimeError('RomFS image archive scans require Python 3.12 or newer')
         if args or kwargs.get('access', _mmap.ACCESS_READ) != _mmap.ACCESS_READ: raise ValueError('RomFS mappings are read-only')
         start, size = _fd_ranges[fd]; offset = kwargs.get('offset', 0)
