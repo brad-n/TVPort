@@ -108,6 +108,22 @@ class CatalogTests(Fixture):
         self.assertEqual(self.fetches, [sc.TITLEDB_URL])
 
 
+class ProjectSpecTests(unittest.TestCase):
+    SPEC = (Path(backend.REPO) / 'tvport/switchtv/project.yml').read_text()
+
+    def test_team_values_fill_both_targets(self):
+        spec = sc.render_spec(self.SPEC, 'L9492K5865', '77', ['switchtv-0100000000000001', 'switchtv-0100000000000002'])
+        self.assertNotRegex(spec, r'\$\{SWITCHTV_\w+\}')
+        self.assertEqual(spec.count('L9492K5865.dev.tvport.switchtv'), 4)   # two entitlements and two Info.plists
+        self.assertIn('PRODUCT_BUNDLE_IDENTIFIER: dev.tvport.l9492k5865.switchtv.topshelf', spec)   # the extension's ID is the app's plus a suffix
+        self.assertIn('LSApplicationQueriesSchemes: [switchtv-0100000000000001, switchtv-0100000000000002]', spec)
+
+    def test_group_name_is_the_one_game_builds_derive(self):
+        self.assertEqual(sc.group_id('L9492K5865'), 'L9492K5865.dev.tvport.switchtv')
+        script = (Path(backend.REPO) / 'dm/ios/tools/build_ipa.sh').read_text()
+        self.assertIn('$DM_TEAM_ID.dev.tvport.switchtv', script)
+
+
 class FingerprintTests(Fixture):
     def test_same_library_same_fingerprint_whenever_it_is_made(self):
         self.make()

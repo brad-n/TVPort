@@ -1,5 +1,6 @@
 # SwitchTV: the launcher app that lists the games TVPort built and opens them (tvport/backend.py `switchtv build` makes a copy of this folder,
 # adds Catalog/ + Generated/ and replaces the ${SWITCHTV_*} values and the empty LSApplicationQueriesSchemes list, then runs xcodegen on it).
+# Two targets: the app, and its Top Shelf extension (TopShelf/). Both carry the catalogue and the keychain access group (recently played is shared through it).
 name: SwitchTV
 options:
   bundleIdPrefix: dev.tvport
@@ -11,18 +12,31 @@ targets:
     platform: tvOS
     sources:
       - Sources
+      - Shared
       - path: Catalog       # a folder reference: catalog.json and images/. Not named Resources: codesign takes a Resources folder at the root of a tvOS app for a macOS-style bundle layout and refuses to sign it
         type: folder
         buildPhase: resources
         optional: true
       - Generated/Assets.xcassets
+    dependencies:
+      - target: TopShelf
+        embed: true
+      - sdk: TVServices.framework
+    entitlements:
+      path: Generated/SwitchTV.entitlements
+      properties:
+        keychain-access-groups: [${SWITCHTV_GROUP}]
     info:
       path: Generated/Info.plist
       properties:
         CFBundleDisplayName: SwitchTV
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: ${SWITCHTV_BUILD}
+        CFBundleVersion: "${SWITCHTV_BUILD}"
+        SwitchTVGroup: ${SWITCHTV_GROUP}      # the keychain access group (Shared/SharedStore.swift)
         UILaunchScreen: {}
+        CFBundleURLTypes:                     # switchtv://game/<title ID>: the Top Shelf opens the details of a game that cannot be opened directly
+          - CFBundleURLName: ${SWITCHTV_BUNDLE_ID}
+            CFBundleURLSchemes: [switchtv]
         LSApplicationQueriesSchemes: []   # one switchtv-<title ID> per game in the catalogue; canOpenURL answers false for any scheme not listed here
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: ${SWITCHTV_BUNDLE_ID}
@@ -30,6 +44,40 @@ targets:
       CODE_SIGN_STYLE: Automatic
       SWIFT_VERSION: "5.0"
       ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      TARGETED_DEVICE_FAMILY: "3"
+  TopShelf:
+    type: tv-app-extension
+    platform: tvOS
+    sources:
+      - TopShelf
+      - path: Shared/Catalog.swift
+      - path: Shared/SharedStore.swift
+      - path: Shared/Shelf.swift
+      - path: Catalog
+        type: folder
+        buildPhase: resources
+        optional: true
+    dependencies:
+      - sdk: TVServices.framework
+    entitlements:
+      path: Generated/TopShelf.entitlements
+      properties:
+        keychain-access-groups: [${SWITCHTV_GROUP}]
+    info:
+      path: Generated/TopShelf-Info.plist
+      properties:
+        CFBundleDisplayName: SwitchTV Top Shelf
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "${SWITCHTV_BUILD}"
+        SwitchTVGroup: ${SWITCHTV_GROUP}
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.tv-top-shelf
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ContentProvider
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: ${SWITCHTV_BUNDLE_ID}.topshelf
+      DEVELOPMENT_TEAM: ${SWITCHTV_TEAM}
+      CODE_SIGN_STYLE: Automatic
+      SWIFT_VERSION: "5.0"
       TARGETED_DEVICE_FAMILY: "3"
 schemes:
   SwitchTV:
