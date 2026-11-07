@@ -91,7 +91,7 @@ The one file to swap is `tvport/switchtv/Branding/switchtv-icon-source.png`: a s
 
 ## Starting a build from a URL
 
-`tvport://build?title=<16 hex digits>[&install=1|0]` queues a build for the library game with that title ID, exactly as Build & Install (`install=1`, the default) or a build without install (`install=0`) would, using the game's saved settings and the selected Apple TV. It is refused with one line in the log, and no dialog, when the title is malformed or not in the library, no Apple TV is selected (install only), the game is already building or queued, or keys are missing. Any other host or path is logged as unsupported and ignored. Nothing else is reachable by URL. Check the URL parser with `swiftc -parse-as-library -o /tmp/url_command_check app/Sources/TVPortURLCommand.swift app/Tests/url_command_check.swift && /tmp/url_command_check`.
+`tvport://build?title=<16 hex digits>[&install=1|0]` queues a build for the library game with that title ID, exactly as Build & Install (`install=1`, the default) or a build without install (`install=0`) would, using the game's saved settings and the selected Apple TV. It is refused with one line in the log, and no dialog, when the title is malformed or not in the library, no Apple TV is selected (install only), the game is already building or queued, or keys are missing. Any other host or path is logged as unsupported and ignored. Nothing else is reachable by URL. A URL never opens a window: the app delegate handles it and the main window scene ignores external events. Check the URL parser with `swiftc -parse-as-library -o /tmp/url_command_check app/Sources/TVPortURLCommand.swift app/Tests/url_command_check.swift && /tmp/url_command_check`.
 
 ## The packed app
 
