@@ -33,10 +33,11 @@ static int nvn_bc_format(uint32_t format, nvn_bc_format_info *info) {
 }
 int nvn_bc_astc_format(uint32_t format, unsigned block, uint32_t *pixel_format) {
     nvn_bc_format_info info;
-    if ((block != 4 && block != 6) || !nvn_bc_format(format, &info) || (info.pixel_format != MTLPixelFormatRGBA8Unorm && info.pixel_format != MTLPixelFormatRGBA8Unorm_sRGB)) return 0;   // RGBA8 only: not BC4/5 nor BC6H (RG11B10Float is 4 bytes too)
+    if (block < 4 || block > 6 || !nvn_bc_format(format, &info) || (info.pixel_format != MTLPixelFormatRGBA8Unorm && info.pixel_format != MTLPixelFormatRGBA8Unorm_sRGB)) return 0;   // RGBA8 only: not BC4/5 nor BC6H (RG11B10Float is 4 bytes too)
     int srgb = info.pixel_format == MTLPixelFormatRGBA8Unorm_sRGB;
     if (pixel_format) *pixel_format = block == 4 ? (srgb ? MTLPixelFormatASTC_4x4_sRGB : MTLPixelFormatASTC_4x4_LDR)
-                                                : (srgb ? MTLPixelFormatASTC_6x6_sRGB : MTLPixelFormatASTC_6x6_LDR);
+                                    : block == 5 ? (srgb ? MTLPixelFormatASTC_5x5_sRGB : MTLPixelFormatASTC_5x5_LDR)
+                                                 : (srgb ? MTLPixelFormatASTC_6x6_sRGB : MTLPixelFormatASTC_6x6_LDR);
     return 1;
 }
 
@@ -534,7 +535,7 @@ static int encode_plane(unsigned slot, uint32_t format, const void *source, uint
     size_t astc_pitch = ((size_t)width + block - 1) / block * 16;
     // Every stripe begins on both a BC and an ASTC block boundary. This bounds
     // decoded scratch without adding seams or retaining a second full texture.
-    size_t row = (size_t)width * 4, alignment = block == 6 ? 12 : 4;
+    size_t row = (size_t)width * 4, alignment = block == 6 ? 12 : block == 5 ? 20 : 4;   // lcm(4, block)
     size_t rows = ((4u << 20) / row / alignment) * alignment;
     if (!rows) rows = alignment;
     if (rows > height) rows = height;

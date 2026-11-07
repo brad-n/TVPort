@@ -27,7 +27,8 @@
 #include "../tex/nvn_bcdec.h"
 #include "../tex/nvn_astc_cache.h"
 #include "../tex/nvn_astc_planes.h"
-static unsigned astc_block(void);   // DM_NVN_BC_ASTC (below, with bc_unpack)
+static unsigned astc_block(void);   // the block of every BC format but BC1; astc_block_for(fmt) is the one to use
+static unsigned astc_block_for(uint32_t nvn_format);   // DM_NVN_BC_ASTC (below, with bc_unpack)
 static int g_embedded; static void embedded_pack_register(void);   // a stripped RomFS image embedding a pack (below, before astc_block)
 static int astc_sync(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_ASTC_MISS"); v = e && !strcmp(e, "sync"); } return v; }   // DM_NVN_ASTC_MISS=sync: phase A, a miss encodes on the calling thread
 #include "nvn_builtin.h"
@@ -2534,12 +2535,17 @@ static void embedded_pack_register(void) {
 // DM_NVN_BC_ASTC=4|6 (off by default; only on a GPU stored without BC, see no_bc): BC1/2/3/7 2D and 2D-array textures are stored as ASTC 4x4 / 6x6 LDR instead of RGBA8 (BC1 is 8x smaller, BC2/3/7 4x).
 // The BC bytes are decoded and encoded on the CPU (nvn_astc_cache.m: decode, ASTC FASTEST encode, content-addressed cache in DM_NVN_ASTC_CACHE, read-only prebuilt one in DM_NVN_ASTC_CACHE_RO).
 // BC4/5/6H and 3D textures keep the decoded path. Unset or 0 leaves every code path as it was
+static unsigned g_astc_v1;   // DM_NVN_BC1_ASTC (4|5|6; default DM_NVN_BC_ASTC), 0 = off. Set once by astc_block
 static unsigned astc_block(void) {
-    static unsigned v; static dispatch_once_t once;
+    static unsigned v;
+    static dispatch_once_t once;
     dispatch_once(&once, ^{
         embedded_pack_register();   // before anything reads DM_NVN_ASTC_CACHE_RO
         const char *e = getenv("DM_NVN_BC_ASTC"); unsigned b = e ? (unsigned)atoi(e) : 0;
         v = (b == 4 || b == 6) && no_bc() ? b : 0;
+        g_astc_v1 = v;
+        { const char *e1 = getenv("DM_NVN_BC1_ASTC"); unsigned b1 = e1 ? (unsigned)atoi(e1) : 0;
+          if (v && e1 && *e1) { if (b1 >= 4 && b1 <= 6) g_astc_v1 = b1; else MLOG("DM_NVN_BC1_ASTC=%s ignored: only 4, 5 and 6 are supported (BC1 uses DM_NVN_BC_ASTC=%u)", e1, v); } }
         { const char *why = stripped_refusal(g_embedded, no_bc(), v); if (why) MDIE("[RED] stripped RomFS image refused: %s", why); }
 #if TARGET_OS_TV
         if (v) {   // the app's data directory (Library/Caches, main.m DM_DATA_DIRECTORY): the writable cache lives there, a prebuilt one is installed beside it
@@ -2557,14 +2563,19 @@ static unsigned astc_block(void) {
             }
         }
 #endif
-        if (v) { MLOG("BC1/2/3/7 2D textures stored as ASTC %ux%u (content-addressed cache: %s, read-only cache: %s); a cache miss %s", v, v, getenv("DM_NVN_ASTC_CACHE") ?: "none", getenv("DM_NVN_ASTC_CACHE_RO") ?: "none",
+        if (v) { MLOG("BC2/3/7 2D textures stored as ASTC %ux%u, BC1 as %ux%u (content-addressed cache: %s, read-only cache: %s); a cache miss %s", v, v, g_astc_v1, g_astc_v1, getenv("DM_NVN_ASTC_CACHE") ?: "none", getenv("DM_NVN_ASTC_CACHE_RO") ?: "none",
                       astc_sync() ? "encodes on the calling thread (DM_NVN_ASTC_MISS=sync, testing only)" : "uploads the texture decoded and encodes in the background for the next run"); nvn_bc_astc_bg_start(); }
         else if (b) MLOG("DM_NVN_BC_ASTC=%u ignored: %s", b, b == 4 || b == 6 ? "this GPU has native BC (set DM_TEST_NO_BC=1 to test)" : "only 4 and 6 are supported");
     });
     return v;
 }
-static int astc_eligible(const tex_t *t, uint32_t *pf) {
+// The ASTC block of an NVN BC format: BC1 (incl. sRGB: 0x41 0x42 0x45 0x46) has DM_NVN_BC1_ASTC, every other BC format DM_NVN_BC_ASTC. 0 when DM_NVN_BC_ASTC is off
+static unsigned astc_block_for(uint32_t f) {
     unsigned b = astc_block();
+    return b && (f == 0x41 || f == 0x42 || f == 0x45 || f == 0x46) ? g_astc_v1 : b;
+}
+static int astc_eligible(const tex_t *t, uint32_t *pf) {
+    unsigned b = astc_block_for(t->d.format);
     return b && t->d.target != 2 && t->d.target != 5 && t->d.target != 6 && nvn_bc_astc_format(t->d.format, b, pf);
 }
 static int astc_decision(const tex_t *t);
@@ -2640,7 +2651,7 @@ static int astc_probe_plane(void *ctx, unsigned level, unsigned layer, uint32_t 
     return 0;
 }
 static int astc_probe(const tex_t *t) {
-    astc_probe_ctx c = {t, t->d.format, astc_block(), 1, 0};
+    astc_probe_ctx c = {t, t->d.format, astc_block_for(t->d.format), 1, 0};
     return nvn_astc_walk_planes_raw(&t->d, t->mem, bc_skip(t), astc_probe_raw, astc_probe_plane, &c) == 0 && c.all;
 }
 // A texture decoded on the CPU / GPU from storage that may hold tags (only with a stripped image): every plane that looks tagged is counted and named once
@@ -3211,7 +3222,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     d.usage |= keep & (MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView);
     int rb_shift = rb_packed_shift(t->d.format);   // the RGB565 family is repacked into Metal's order on the CPU (rb_packed_shift)
     uint32_t upf; int ubpp = 0, unp = bc_unpack(t->d.format, &upf, &ubpp);   // No BC: stored decompressed (see up_dec)
-    uint32_t apf; int astc = bc_astc(t, &apf), ablock = (int)astc_block(); if (astc) unp = 0;   // DM_NVN_BC_ASTC: stored as ASTC (the CPU path below)
+    uint32_t apf; int astc = bc_astc(t, &apf), ablock = (int)astc_block_for(t->d.format); if (astc) unp = 0;   // DM_NVN_BC_ASTC: stored as ASTC (the CPU path below)
     if (!astc) astc_learn_late(t);   // DM_NVN_ASTC_MISS=background: a decoded BC texture's planes go to the background encoder, once
     unsigned sk = bc_skip(t);   // NVN level of Metal level 0 (DM_BC_MAX_DIM)
     int linear = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0;   // linear storage no view could take (linear_fit): its rows are copied on the CPU
@@ -3730,7 +3741,7 @@ static uint64_t g_tex_zeroed;
 // the BC format's zero block decodes to (the same everywhere: BC1/BC7 opaque black, BC2/BC3 transparent black)
 static void astc_zero_fill(const tex_t *t, id<MTLTexture> mt) {
     if (!atomic_load(&g_sub_thread_set) || !on_sub_thread()) return;   // the upload batch belongs to the submit thread only
-    unsigned block = astc_block();
+    unsigned block = astc_block_for(t->d.format);
     if (!block) return;
     uint8_t void_block[16]; astc_void_block(t->d.format, void_block);
     size_t pitch0 = (size_t)((mt.width + block - 1) / block) * 16, rows0 = (mt.height + block - 1) / block;
@@ -6460,7 +6471,7 @@ static id<MTLTexture> tex_by_id(int tid) {   // Caller holds g_rmu
         if (!r.has_v) memset(&r.v, 0, sizeof r.v);
         uint32_t pf = view_pf ? view_pf : (uint32_t)base.pixelFormat;
         { uint32_t upf; int ubpp, astc_base = nvn_fmt_bc(rp->t.d.format) && mt_is_astc(base);   // DM_NVN_BC_ASTC: the base is ASTC, its views are the ASTC format of the view's BC format
-          if (r.v.set_format && astc_base && nvn_bc_astc_format(r.v.format, astc_block(), &upf)) pf = upf;
+          if (r.v.set_format && astc_base && nvn_bc_astc_format(r.v.format, astc_block_for(rp->t.d.format), &upf)) pf = upf;
           else if (r.v.set_format && bc_unpack(r.v.format, &upf, &ubpp)) pf = upf; }   // No BC: a BC view is switched to the decompressed format just like the base texture
         if (stv) pf = MTLPixelFormatX32_Stencil8;
         if (r.v.set_format && nvn_fmt_bc(rp->t.d.format) && !nvn_fmt_bc(r.v.format)) {   // the raw blocks of a BC texture through an uncompressed view (see rt_view_fmt): Metal has no such view
@@ -13390,13 +13401,13 @@ static void astc_first_copy(const p_copy_b2t *c, uint32_t size) {
     for (int z = 0; z < nz; z++) {
         const uint8_t *plane = src + smo + z * img;
         if (packed) { for (size_t r = 0; r < rows; r++) memcpy(packed + r * tight, plane + r * row, tight); plane = packed; }
-        nvn_astc_tag_result tr = nvn_bc_astc_tag_fetch(plane, tight * rows, astc_plane_bytes((uint32_t)c->r.width, (uint32_t)c->r.height, astc_block()), NULL);   // a stripped plane: its entry by the tag
+        nvn_astc_tag_result tr = nvn_bc_astc_tag_fetch(plane, tight * rows, astc_plane_bytes((uint32_t)c->r.width, (uint32_t)c->r.height, astc_block_for(t->d.format)), NULL);   // a stripped plane: its entry by the tag
         if (tr == NVN_TAG_HIT) continue;
         if (tr == NVN_TAG_MISS) {   // a tag nothing resolves: the hash is the last chance, and nothing is queued (zeros)
-            if (nvn_bc_astc_has_plane(t->d.format, plane, tight * rows, (uint32_t)c->r.width, (uint32_t)c->r.height, astc_block()) != 1) { all = 0; astc_tag_event(t, NVN_TAG_NOTE_UNRESOLVED, level, (uint32_t)c->r.width, (uint32_t)c->r.height); }
+            if (nvn_bc_astc_has_plane(t->d.format, plane, tight * rows, (uint32_t)c->r.width, (uint32_t)c->r.height, astc_block_for(t->d.format)) != 1) { all = 0; astc_tag_event(t, NVN_TAG_NOTE_UNRESOLVED, level, (uint32_t)c->r.width, (uint32_t)c->r.height); }
             continue;
         }
-        if (nvn_bc_astc_learn(t->d.format, plane, tight * rows, (uint32_t)c->r.width, (uint32_t)c->r.height, astc_block(), NULL) != 1) all = 0;   // a miss is queued for the background encoder
+        if (nvn_bc_astc_learn(t->d.format, plane, tight * rows, (uint32_t)c->r.width, (uint32_t)c->r.height, astc_block_for(t->d.format), NULL) != 1) all = 0;   // a miss is queued for the background encoder
     }
     free(packed);
     atomic_fetch_add(&g_astc_copy_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0); atomic_fetch_add(&g_astc_copy_bytes, tight * rows * nz);
@@ -13419,11 +13430,11 @@ static void copy_b2t(const p_copy_b2t *c, uint32_t size) {
     int is3d = c->tex->d.target == 2, nz = c->r.depth ? c->r.depth : 1;
     uint32_t astc_pf;
     if (nvn_fmt_bc(c->tex->d.format) && astc_eligible(c->tex, &astc_pf) && mt_is_astc(t)) {   // the texture's own format says whether it is ASTC (decided when it was made, kept)   // DM_NVN_BC_ASTC: the BC blocks in the source become ASTC blocks on the CPU (cache or decode + encode), then are copied block-wise
-        unsigned blk = astc_block();
+        unsigned blk = astc_block_for(c->tex->d.format);
         uint32_t lw = MAX(t.width >> level, 1u), lh = MAX(t.height >> level, 1u);
         // ASTC 4x4 blocks are the BC blocks' texels; 6x6 ones only line up with a region that starts on the grid and ends on it or at the level's edge
         if (c->r.xoffset % blk || c->r.yoffset % blk || ((c->r.width % blk) && c->r.xoffset + c->r.width != (int)lw) || ((c->r.height % blk) && c->r.yoffset + c->r.height != (int)lh)) {
-            RED_ONCE(158, "ASTC %ux%u: buffer-to-texture copy of %dx%d at %d,%d does not line up with the ASTC blocks, skipped (DM_NVN_BC_ASTC=4 has no such case)", blk, blk, c->r.width, c->r.height, c->r.xoffset, c->r.yoffset);
+            RED_ONCE(158, "ASTC %ux%u: buffer-to-texture copy of %dx%d at %d,%d does not line up with the ASTC blocks, skipped (a 4x4 block has no such case)", blk, blk, c->r.width, c->r.height, c->r.xoffset, c->r.yoffset);
             return;
         }
         void *smb; uint64_t smo;
