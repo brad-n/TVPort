@@ -28,6 +28,22 @@ def scheme(title_id: str) -> str:
     return SCHEME_PREFIX + title_id.lower()
 
 
+BUNDLE_ID = 'dev.tvport.{team}.switchtv'
+GROUP_ID = '{team}.dev.tvport.switchtv'   # the keychain access group SwitchTV, its Top Shelf extension and the game apps share (dm/ios/tools/build_ipa.sh derives the same name)
+
+
+def group_id(team: str) -> str:
+    return GROUP_ID.format(team=team)
+
+
+def render_spec(spec: str, team: str, build: str, schemes: list) -> str:
+    """project.yml of the SwitchTV app with the team's values in: its bundle ID and keychain access group, the build number, and the URL schemes of the catalogue's games."""
+    spec = spec.replace('LSApplicationQueriesSchemes: []', f'LSApplicationQueriesSchemes: [{", ".join(schemes)}]')
+    for key, value in (('SWITCHTV_BUNDLE_ID', BUNDLE_ID.format(team=team.lower())), ('SWITCHTV_GROUP', group_id(team)), ('SWITCHTV_TEAM', team), ('SWITCHTV_BUILD', build)):
+        spec = spec.replace('${' + key + '}', value)
+    return spec
+
+
 def library_games(library: list) -> list:
     """The library entries SwitchTV lists: games with a valid title ID that TVPort built."""
     return [item for item in library if isinstance(item, dict) and item.get('built') and TITLE_ID.match(item.get('titleID') or '')]

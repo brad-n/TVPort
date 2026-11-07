@@ -1,6 +1,6 @@
-// The games SwitchTV lists: Catalog/catalog.json and its images, written by `backend.py switchtv build`. Nothing is fetched at run time except screenshots.
+// The games SwitchTV lists: Catalog/catalog.json and its images, written by `backend.py switchtv build` into the app and into its Top Shelf extension. Nothing is fetched at run time except screenshots.
+// Foundation only: SwitchTV, the Top Shelf extension and the command-line checks (tvport/tests/test_switchtv_app.py) all compile this file.
 import Foundation
-import UIKit
 
 struct CatalogGame: Codable, Identifiable, Hashable {
     let titleID: String
@@ -24,6 +24,11 @@ struct CatalogGame: Codable, Identifiable, Hashable {
         case titleID, name, publisher, releaseDate, numberOfPlayers, genres, summary = "description", intro, bundleID, scheme, card, banner, screenshots
     }
 
+    var releaseYear: String? {
+        guard let releaseDate, releaseDate.count >= 4, releaseDate.prefix(4).allSatisfy(\.isNumber) else { return nil }
+        return String(releaseDate.prefix(4))
+    }
+
     var releaseText: String? {
         guard let releaseDate else { return nil }
         let parse = DateFormatter(); parse.dateFormat = "yyyy-MM-dd"; parse.locale = Locale(identifier: "en_US_POSIX")
@@ -35,35 +40,33 @@ struct CatalogGame: Codable, Identifiable, Hashable {
         guard let n = numberOfPlayers, n > 0 else { return nil }
         return n == 1 ? "1 player" : "1-\(n) players"
     }
+
+    /// The text under the title: publisher, year, players.
+    var metaText: String { [publisher, releaseYear, playersText].compactMap { $0 }.joined(separator: "  \u{2022}  ") }
+
+    /// The description, as long as the shop gave it.
+    var blurb: String? { summary ?? intro }
 }
 
 struct Catalog: Codable {
     let generated: String
     let games: [CatalogGame]
 
-    static let folder = Bundle.main.resourceURL!.appendingPathComponent("Catalog", isDirectory: true)
+    static var folder: URL { Bundle.main.resourceURL!.appendingPathComponent("Catalog", isDirectory: true) }
 
-    static func load() -> Catalog {
+    /// A-Z by name.
+    static func load(from folder: URL = Catalog.folder) -> Catalog {
         guard let data = try? Data(contentsOf: folder.appendingPathComponent("catalog.json")),
               let catalog = try? JSONDecoder().decode(Catalog.self, from: data) else { return Catalog(generated: "", games: []) }
         return Catalog(generated: catalog.generated, games: catalog.games.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
     }
+
+    func game(_ titleID: String) -> CatalogGame? { games.first { $0.titleID.caseInsensitiveCompare(titleID) == .orderedSame } }
 
     /// Genres that have at least two games, most games first.
     var genreRows: [(genre: String, games: [CatalogGame])] {
         var byGenre: [String: [CatalogGame]] = [:]
         for game in games { for genre in game.genres { byGenre[genre, default: []].append(game) } }
         return byGenre.filter { $0.value.count >= 2 }.sorted { ($0.value.count, $1.key) > ($1.value.count, $0.key) }.map { ($0.key, $0.value) }
-    }
-}
-
-/// Bundled images, decoded once.
-enum Art {
-    private static let cache = NSCache<NSString, UIImage>()
-    static func image(_ path: String) -> UIImage? {
-        if let hit = cache.object(forKey: path as NSString) { return hit }
-        guard let image = UIImage(contentsOfFile: Catalog.folder.appendingPathComponent(path).path) else { return nil }
-        cache.setObject(image, forKey: path as NSString)
-        return image
     }
 }

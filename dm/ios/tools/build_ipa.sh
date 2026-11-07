@@ -44,6 +44,8 @@ VNACP=$(dirname "$ROMFS")/control.nacp; [ -f "$VNACP" ] || VNACP=$W/data/v0/cont
 VNACP=${CONTROL:-$VNACP}   # from here on, the file that lists the game's languages for the launcher's settings
 export LC_ALL=C DM_BUNDLE_ID=${DM_BUNDLE_ID:-org.nxnative.$(echo "$GAME" | tr 'A-Z' 'a-z')} DM_DISPLAY_NAME DM_APP_VERSION DM_APP_CATEGORY=$(gp app_category) DM_TEAM_ID=${DM_TEAM_ID:-0000000000}   # placeholder identity: unsigned, the install tool replaces it
 export DM_URL_SCHEME=switchtv-$(echo "$GAME" | tr A-Z a-z)   # the Apple TV app answers this URL scheme, so the SwitchTV launcher can open the game (project_tv.yml)
+# The keychain access group the game shares with SwitchTV for its "recently played" (Apple TV, a real team only: the unsigned IPA keeps the placeholder and gets none; SourcesTV/TVLastPlayed.m)
+if [ "${DM_TVOS:-0}" = 1 ] && [ "$DM_TEAM_ID" != 0000000000 ] && [ -n "$DM_TEAM_ID" ]; then export DM_SWITCHTV_GROUP=$DM_TEAM_ID.dev.tvport.switchtv; else export DM_SWITCHTV_GROUP=; fi
 if [ "${DM_SHOW_FPS:-0}" = 1 ]; then export DM_SHOW_FPS=YES; else export DM_SHOW_FPS=NO; fi
 export DM_LANG=${DM_LANG:-en-US}
 if [ "$PREPARE_XCODE" = YES ]; then
@@ -186,8 +188,9 @@ else t "no app icon ($ICON not found): the home-screen icon stays blank"; fi
 # The unsigned IPA carries the same request in its executable's ad-hoc signature below; the install tool replaces that signature.
 if [ "$PREPARE_XCODE" = YES ] && [ -n "${DM_ENTITLEMENTS-default}" ]; then
   if [ -n "${DM_ENTITLEMENTS:-}" ]; then cp "$DM_ENTITLEMENTS" Gen/DmIOS.entitlements || die "copy DM_ENTITLEMENTS"
-  else printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
-    '<plist version="1.0"><dict><key>com.apple.developer.kernel.increased-memory-limit</key><true/></dict></plist>' > Gen/DmIOS.entitlements || die "entitlements"; fi
+  else GROUP_ENT=; [ -z "$DM_SWITCHTV_GROUP" ] || GROUP_ENT="<key>keychain-access-groups</key><array><string>$DM_SWITCHTV_GROUP</string></array>"
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+    "<plist version=\"1.0\"><dict><key>com.apple.developer.kernel.increased-memory-limit</key><true/>$GROUP_ENT</dict></plist>" > Gen/DmIOS.entitlements || die "entitlements"; fi
   echo "CODE_SIGN_ENTITLEMENTS = Gen/DmIOS.entitlements" >> Gen/dm.xcconfig
   t "entitlements: $(plutil -convert json -o - Gen/DmIOS.entitlements)"
 fi

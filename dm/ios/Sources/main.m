@@ -24,6 +24,9 @@
 #endif
 
 extern char **environ;
+#if TARGET_OS_TV
+void tv_record_last_played(void);   // SourcesTV/TVLastPlayed.m: tells SwitchTV (through its App Group) that this game was played just now
+#endif
 
 int dm_main(int argc, char **argv);   // dm/host/main.c compiled in with -Dmain=dm_main
 UIViewController *front_ios_root(void);
@@ -282,7 +285,12 @@ int front_ios_boot_ok(void) { return g_boot_ok; }
 - (void)sceneWillResignActive:(UIScene *)s { front_ios_focus_event(0); }
 - (void)sceneDidEnterBackground:(UIScene *)s { front_ios_focus_event(1); }
 - (void)sceneWillEnterForeground:(UIScene *)s { front_ios_focus_event(2); }
-- (void)sceneDidBecomeActive:(UIScene *)s { front_ios_focus_event(3); }
+- (void)sceneDidBecomeActive:(UIScene *)s {
+    front_ios_focus_event(3);
+#if TARGET_OS_TV
+    tv_record_last_played();
+#endif
+}
 @end
 
 int main(int argc, char **argv) {

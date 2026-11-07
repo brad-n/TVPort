@@ -24,6 +24,8 @@ enum Theme {
     static let cardRadius: CGFloat = 14
     static let pagePadding: CGFloat = 80
     static let rowSpacing: CGFloat = 40
+    /// The hero at the top of the home screen; the poster rows get the rest of the 1080-point screen.
+    static let heroHeight: CGFloat = 470
 }
 
 extension Color {

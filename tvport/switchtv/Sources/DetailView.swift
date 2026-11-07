@@ -20,7 +20,7 @@ struct DetailView: View {
                     if !game.genres.isEmpty {
                         HStack(spacing: 12) { ForEach(game.genres, id: \.self) { Text($0).font(.callout.weight(.semibold)).padding(.horizontal, 16).padding(.vertical, 6).background(Theme.accent.opacity(0.85), in: Capsule()) } }
                     }
-                    if let text = game.summary ?? game.intro {
+                    if let text = game.blurb {
                         Text(text).font(.body).foregroundStyle(Theme.textSecondary).frame(maxWidth: 1000, alignment: .leading).lineLimit(8)
                     }
                     playArea
@@ -29,7 +29,7 @@ struct DetailView: View {
                 .padding(.horizontal, Theme.pagePadding).padding(.bottom, 60)
             }
         }
-        .onAppear { library.refreshInstalled() }
+        .onAppear { library.refresh() }
     }
 
     private var metaLine: some View {
@@ -37,13 +37,13 @@ struct DetailView: View {
         return Text(parts.joined(separator: "  \u{2022}  ")).font(.title3).foregroundStyle(Theme.textSecondary)
     }
 
-    @ViewBuilder private var playArea: some View {
-        if library.canPlay(game) { PlayButton(game: game) }
-        else {
-            Text("Rebuild this game in TVPort to play it from SwitchTV")
-                .font(.headline).foregroundStyle(Theme.textPrimary).padding(.horizontal, 28).padding(.vertical, 16)
-                .background(Theme.surface, in: RoundedRectangle(cornerRadius: 12)).overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.accent, lineWidth: 2))
-                .focusable()
+    /// Play is always there: Select opens the game, or says to rebuild it (an alert, and the line under the button).
+    private var playArea: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Button { library.select(game) } label: { Label("Play", systemImage: "play.fill").font(.headline).padding(.horizontal, 28) }.tint(Theme.accent)
+            if !library.canPlay(game) {
+                Text(Library.rebuildMessage(game)).font(.callout).foregroundStyle(Theme.textSecondary)
+            }
         }
     }
 }

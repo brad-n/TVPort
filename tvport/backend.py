@@ -1317,8 +1317,6 @@ def cmd_save_import(args) -> None:
 
 # ---- SwitchTV: the launcher app on the Apple TV (tvport/switchtv, tvport/switchtv_catalog.py) ----
 
-SWITCHTV_BUNDLE = 'dev.tvport.{team}.switchtv'
-
 
 def switchtv_cache() -> Path:
     """Where the title database, banners and the build of SwitchTV live: TVPORT_SWITCHTV_CACHE, else inside TVPort's own data folder."""
@@ -1389,11 +1387,7 @@ def prepare_switchtv(team: str) -> tuple:
     shutil.copytree(source, work, ignore=shutil.ignore_patterns('Branding', '.DS_Store', 'Generated', 'Catalog'))
     shutil.copytree(catalog_out, work / 'Catalog')
     switchtv_icons(source / 'Branding/switchtv-icon-source.png', work)
-    spec = (work / 'project.yml').read_text()
-    schemes = ', '.join(g['scheme'] for g in catalog['games'])
-    spec = spec.replace('LSApplicationQueriesSchemes: []', f'LSApplicationQueriesSchemes: [{schemes}]')
-    for key, value in (('SWITCHTV_BUNDLE_ID', SWITCHTV_BUNDLE.format(team=team.lower())), ('SWITCHTV_TEAM', team), ('SWITCHTV_BUILD', str(int(time.time())))):
-        spec = spec.replace('${' + key + '}', value)
+    spec = sc.render_spec((work / 'project.yml').read_text(), team, str(int(time.time())), [g['scheme'] for g in catalog['games']])
     (work / 'project.yml').write_text(spec)
     return work, catalog, print_fingerprint
 
