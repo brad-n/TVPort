@@ -421,6 +421,42 @@ static void tag_contract(NSString *root) {
     { uint8_t *back = malloc(sizeof logical); CHECK(romfs_src_read(&s, back, sizeof logical, 0) && !memcmp(back, logical, sizeof logical)); free(back); }
     romfs_src_free(&s); free(wrapped);
 }
+// Block 5 (BC1 at 5x5 beside 4x4 / 6x6 for the rest): the format mapping, the keys, and a plane whose stripes (16384 texels wide: 60 rows at a time) must start on a BC and an ASTC row
+static void block5_contract(NSString *root) {
+    uint32_t pf;
+    CHECK(nvn_bc_astc_format(0x42, 5, &pf) == 1 && pf == MTLPixelFormatASTC_5x5_LDR);
+    CHECK(nvn_bc_astc_format(0x41, 5, &pf) == 1 && pf == MTLPixelFormatASTC_5x5_LDR);
+    CHECK(nvn_bc_astc_format(0x46, 5, &pf) == 1 && pf == MTLPixelFormatASTC_5x5_sRGB);
+    CHECK(nvn_bc_astc_format(0x4e, 5, &pf) == 1 && pf == MTLPixelFormatASTC_5x5_sRGB);
+    CHECK(nvn_bc_astc_format(0x44, 5, &pf) == 1 && pf == MTLPixelFormatASTC_5x5_LDR);
+    CHECK(nvn_bc_astc_format(0x42, 4, &pf) == 1 && pf == MTLPixelFormatASTC_4x4_LDR && nvn_bc_astc_format(0x46, 6, &pf) == 1 && pf == MTLPixelFormatASTC_6x6_sRGB);
+    CHECK(nvn_bc_astc_format(0x42, 3, NULL) == 0 && nvn_bc_astc_format(0x42, 7, NULL) == 0 && nvn_bc_astc_format(0x49, 5, NULL) == 0);
+    // one plane keys differently per block
+    enum { W = 40, H = 25 }; size_t bc = (size_t)(W / 4) * ((H + 3) / 4) * 8; uint8_t *plane = malloc(bc);
+    for (size_t i = 0; i < bc; i++) plane[i] = (uint8_t)(i * 37 + 11);
+    nvn_astc_cache_key k4, k5, k6; nvn_bc_astc_plane_key(0x42, W, H, 4, plane, bc, &k4); nvn_bc_astc_plane_key(0x42, W, H, 5, plane, bc, &k5); nvn_bc_astc_plane_key(0x42, W, H, 6, plane, bc, &k6);
+    CHECK(strcmp(k4.hex, k5.hex) && strcmp(k5.hex, k6.hex) && strcmp(k4.hex, k6.hex));
+    for (unsigned blk = 4; blk <= 6; blk++) {
+        size_t astc = (size_t)((W + blk - 1) / blk) * ((H + blk - 1) / blk) * 16; uint8_t *a = malloc(astc), *b = malloc(astc); int hit;
+        NSString *dir = [root stringByAppendingPathComponent:[NSString stringWithFormat:@"b5-%u", blk]];
+        CHECK(!nvn_bc_astc_encode(0x42, plane, bc, W, H, blk, a, astc, dir.fileSystemRepresentation, NULL, &hit) && !hit);
+        CHECK(!nvn_bc_astc_encode(0x42, plane, bc, W, H, blk, b, astc, dir.fileSystemRepresentation, NULL, &hit) && hit && !memcmp(a, b, astc));
+        CHECK(nvn_bc_astc_encode(0x42, plane, bc, W, H, blk, b, astc + 16, NULL, NULL, &hit) == -1);   // a wrong output size is refused
+        free(a); free(b);
+    }
+    free(plane);
+    // striped: 16384 x 130 BC1 (height not a multiple of 20 or 12)
+    {
+        const unsigned SW = 16384, SH = 130; size_t sbc = (size_t)(SW / 4) * ((SH + 3) / 4) * 8; uint8_t *sp = malloc(sbc);
+        for (size_t i = 0; i < sbc; i++) sp[i] = (uint8_t)((i * 2654435761u) >> 13);
+        for (unsigned blk = 4; blk <= 6; blk++) {
+            size_t astc = (size_t)((SW + blk - 1) / blk) * ((SH + blk - 1) / blk) * 16; uint8_t *o = malloc(astc); int hit;
+            CHECK(!nvn_bc_astc_encode(0x42, sp, sbc, SW, SH, blk, o, astc, NULL, NULL, &hit));
+            free(o);
+        }
+        free(sp);
+    }
+}
 int main(int argc, char **argv) { @autoreleasepool {
     size_t budget = argc > 1 && !strcmp(argv[1], "budget") ? 128 : 1u << 20;
     int mapped_mode = argc > 1 && (!strcmp(argv[1], "mapped") || !strcmp(argv[1], "mapped-memcpy"));
@@ -432,6 +468,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     NSString *root = @(directory);
     diagnostic_contract(root);
     restore_contract(root);
+    block5_contract(root);
     NSString *small = fixture(root, 1, 16);
     fixture(root, 2, 32); fixture(root, 3, 48);
     fixture(root, 4, 64); fixture(root, 5, 65536);

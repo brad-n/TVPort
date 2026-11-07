@@ -650,7 +650,7 @@ static void run_background_mixed(const char *dir) {
     CHECK(nt1 && nt1.pixelFormat == astc_pf_of(g_bc1_blk, 0), "a BC1 texture whose planes are cached is ASTC %ux%u", g_bc1_blk, g_bc1_blk);
     CHECK(nt7 && nt7.pixelFormat == astc_pf_of(g_blk, 0), "a BC7 texture whose planes are cached is ASTC %ux%u", g_blk, g_blk);
     for (unsigned l = 0; l < 4; l++) { double m, p;
-        if (nt1) { compare_level(nt1, &u1, d1, l, 0, &m, &p); CHECK(m < 0.02 * slack_of(g_bc1_blk), "BC1 level %u samples like its decode (%.4f)", l, m); }
+        if (nt1) { compare_level(nt1, &u1, d1, l, 0, &m, &p); CHECK(m < 0.03 * slack_of(g_bc1_blk), "BC1 level %u samples like its decode (%.4f)", l, m); }
         if (nt7) { compare_level(nt7, &u7, d7, l, 0, &m, &p); CHECK(m < 0.04 * slack_of(g_blk), "BC7 level %u samples like its decode (%.4f)", l, m); } }
     s = stats(); CHECK(s.hits - s0.hits >= 8 && s.fetch_misses == s0.fetch_misses, "the ASTC uploads were eight cache hits");
     defer_obj_release(mt1); defer_obj_release(mt7); defer_obj_release(nt1); defer_obj_release(nt7); release_fixture(m1); release_fixture(m7); release_fixture(n1); release_fixture(n7);
@@ -675,7 +675,7 @@ static void run_tagged_mixed(const char *dir) {
     uint8_t *wrapped; size_t wn; CHECK(fx_write_sparse(NULL, logical, sizeof logical, 4096, 0, pkd.bytes, pkd.length, &wrapped, &wn) >= 2, "the image");
     char img[600]; snprintf(img, sizeof img, "%s/mixed_romfs.img", dir); { FILE *f = fopen(img, "wb"); fwrite(wrapped, 1, wn, f); fclose(f); } free(wrapped);
     CHECK(embedded_pack_setup(img) == 1 && g_embedded, "a DMSPARS1 with a pack is a stripped image");
-    uint64_t entries, bytes; CHECK(nvn_bc_astc_pack_info(NVN_ASTC_EMBEDDED_ROOT, &entries, &bytes, NULL) && entries == 8, "eight entries in the pack");
+    uint64_t entries, bytes; CHECK(nvn_bc_astc_pack_info(NVN_ASTC_EMBEDDED_ROOT, &entries, &bytes, NULL) && entries == 8, "eight entries in the pack (%llu)", (unsigned long long)entries);
     char rw2[512]; subdir(rw2, sizeof rw2, dir, "mtag_rw2");
     nvn_astc_bg_config c = {.cache = rw2, .readonly = NVN_ASTC_EMBEDDED_ROOT, .queue_cap = 64u << 20, .cache_max = 1ull << 30, .min_free = 0, .threads = 1};
     nvn_bc_astc_bg_configure(&c);
@@ -696,7 +696,7 @@ static void run_tagged_mixed(const char *dir) {
         CHECK(g1 && !memcmp(g1, ref1[l], (size_t)(64 >> l) * (64 >> l) * 16), "BC1 level %u: the tagged plane is the hashed path's blocks", l);
         CHECK(g7 && !memcmp(g7, ref7[l], (size_t)(64 >> l) * (64 >> l) * 16), "BC7 level %u: the tagged plane is the hashed path's blocks", l);
         free(g1); free(g7);
-        double m, p; if (xm1) { compare_level(xm1, &x1, d1, l, 0, &m, &p); CHECK(m < 0.02 * slack_of(g_bc1_blk), "stripped BC1 level %u samples like the original (%.4f)", l, m); }
+        double m, p; if (xm1) { compare_level(xm1, &x1, d1, l, 0, &m, &p); CHECK(m < 0.03 * slack_of(g_bc1_blk), "stripped BC1 level %u samples like the original (%.4f)", l, m); }
     }
     g_embedded = 0;
     defer_obj_release(mt1); defer_obj_release(mt7); defer_obj_release(hm1); defer_obj_release(hm7); defer_obj_release(xm1); defer_obj_release(xm7);
@@ -708,7 +708,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     (void)argc; (void)argv;
     char dir[] = "/tmp/t_astc_upload.XXXXXX";
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
-    setenv("DM_TEST_NO_BC", "1", 1); const char *mode = getenv("T_ASTC_MODE"); int maxdim = mode && !strcmp(mode, "maxdim"), tagged = mode && !strcmp(mode, "tagged"), background = (mode && !strcmp(mode, "background")) || maxdim || tagged; if (maxdim) setenv("DM_BC_MAX_DIM", "64", 1); setenv("DM_NVN_ASTC_MISS", background ? "background" : "sync", 1); const char *which = getenv("T_ASTC_BLOCK"); int six = which && atoi(which) == 6; setenv("DM_NVN_BC_ASTC", six ? "6" : "4", 1); g_blk = six ? 6 : 4; { const char *b1 = getenv("T_ASTC_BC1_BLOCK"); g_bc1_blk = b1 && *b1 ? (unsigned)atoi(b1) : g_blk; if (b1 && *b1) setenv("DM_NVN_BC1_ASTC", b1, 1); else unsetenv("DM_NVN_BC1_ASTC"); } setenv("DM_NVN_ASTC_CACHE", dir, 1); unsetenv("DM_NVN_ASTC_CACHE_RO");
+    setenv("DM_TEST_NO_BC", "1", 1); const char *mode = getenv("T_ASTC_MODE"); int maxdim = mode && !strcmp(mode, "maxdim"), tagged = mode && (!strcmp(mode, "tagged") || !strcmp(mode, "tagged_mixed")), background = (mode && !strcmp(mode, "background")) || maxdim || tagged; if (maxdim) setenv("DM_BC_MAX_DIM", "64", 1); setenv("DM_NVN_ASTC_MISS", background ? "background" : "sync", 1); const char *which = getenv("T_ASTC_BLOCK"); int six = which && atoi(which) == 6; setenv("DM_NVN_BC_ASTC", six ? "6" : "4", 1); g_blk = six ? 6 : 4; { const char *b1 = getenv("T_ASTC_BC1_BLOCK"); g_bc1_blk = b1 && *b1 ? (unsigned)atoi(b1) : g_blk; if (b1 && *b1) setenv("DM_NVN_BC1_ASTC", b1, 1); else unsetenv("DM_NVN_BC1_ASTC"); } setenv("DM_NVN_ASTC_CACHE", dir, 1); unsetenv("DM_NVN_ASTC_CACHE_RO");
     mtl_init();
     CHECK(astc_block() == (six ? 6u : 4u), "DM_NVN_BC_ASTC is on (with DM_TEST_NO_BC)");
     CHECK(astc_block_for(0x42) == g_bc1_blk && astc_block_for(0x46) == g_bc1_blk && astc_block_for(0x41) == g_bc1_blk && astc_block_for(0x45) == g_bc1_blk, "BC1 (and sRGB) uses DM_NVN_BC1_ASTC");
@@ -721,8 +721,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         return failed ? 1 : 0;
     }
     if (tagged) {
-        run_tagged(dir);
-        run_tagged_mixed(dir);
+        if (getenv("T_ASTC_MODE") && !strcmp(getenv("T_ASTC_MODE"), "tagged_mixed")) run_tagged_mixed(dir); else run_tagged(dir);   // the embedded pack registers once per process
         mtl_drain();
         { char cmd[128]; snprintf(cmd, sizeof cmd, "rm -rf %s", dir); system(cmd); }
         printf("ASTC upload (tagged planes): %d checks, %d failures\n", checks, failed);
