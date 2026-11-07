@@ -525,6 +525,12 @@ struct SettingsForm: View {
                         note("A damaged offline manual no longer stops the build. Damaged game data still does.")
                         TextField("Extra extractor arguments", text: textBinding(\.extractorArguments), prompt: Text("--option value, quotes keep spaces"))
                         note("Added to every extraction step of the game's files, not to the title and key checks. --allow-damaged also turns off reuse of earlier results, so the next build takes longer.")
+                        Picker("Game memory paging", selection: pagingBinding) {
+                            Text("Automatic").tag("")
+                            Text("On").tag("on")
+                            Text("Off").tag("off")
+                        }
+                        note("Keeps the game's own memory in files on the Apple TV's storage so it doesn't count against tvOS's ~2.1 GB app limit. Automatic is right for almost every game.")
                         Toggle("Metal 4 pipelines", isOn: flagBinding(\.metal4Pipelines))
                         note("Turns on DM_PSO_MTL4 and keeps the pulling shader libraries in the build. Experimental.")
                         TextField("Pipeline archive GPU", text: textBinding(\.pipelineGPU), prompt: Text("Empty for none, or g18p"))
@@ -558,6 +564,14 @@ struct SettingsForm: View {
 
     private func place(_ game: Game) -> String {
         (library.backups[game.folder]?.last_backup_place ?? library.info?.last_backup_place) == "icloud" ? "iCloud Drive" : "this Mac"
+    }
+
+    private var pagingBinding: Binding<String> {
+        let gameID = library.selection
+        return Binding(get: { library.games.first { $0.id == gameID }?.gameMemoryPaging ?? "" }, set: { value in
+            guard library.selection == gameID else { return }
+            library.update { $0.gameMemoryPaging = value.isEmpty ? nil : value }
+        })
     }
 
     private func note(_ text: String) -> some View {

@@ -743,7 +743,7 @@ def restore_saves(game: Game, device: str, bundle: str) -> int:
     return len(sources)
 
 
-def write_env(game: Game, mode: str, texture_cap: int, players: str = '', render_scale: float = 1.0, thermal_cap: bool = True, fps_target: int = 0, swap_ab_xy: bool = False, swap_ab: Optional[bool] = None, swap_xy: Optional[bool] = None, pso_mtl4: bool = False, extra_env: Optional[list] = None) -> Path:
+def write_env(game: Game, mode: str, texture_cap: int, players: str = '', render_scale: float = 1.0, thermal_cap: bool = True, fps_target: int = 0, swap_ab_xy: bool = False, swap_ab: Optional[bool] = None, swap_xy: Optional[bool] = None, pso_mtl4: bool = False, extra_env: Optional[list] = None, guest_file: Optional[str] = None) -> Path:
     """The switches the app reads at launch (main.m, dm/env.txt)."""
     path = game.build / 'tvport-env.txt'
     lines = ['# Written by TVPort', f'DM_OPMODE={0 if mode == "handheld" else 1}', f'DM_BC_MAX_DIM={texture_cap}']
@@ -764,6 +764,8 @@ def write_env(game: Game, mode: str, texture_cap: int, players: str = '', render
         lines.append('DM_TV_PLAYERS=' + ' '.join(players.split()))
     if pso_mtl4:   # the Metal 4 pipelines; the build keeps the pulling libraries they need (IOS_PULL, generate_project)
         lines.append('DM_PSO_MTL4=1')
+    if guest_file in ('on', 'off'):   # Game memory paging (hle_svc.c guest_file_wanted); unset leaves the engine's per-target default
+        lines.append(f'DM_GUEST_FILE={1 if guest_file == "on" else 0}')
     pairs = extra_env_pairs(extra_env or [])
     if pairs:   # the player's own switches: they win over a line above with the same key
         keys = {key for key, _ in pairs}
@@ -875,7 +877,7 @@ def generate_project(game: Game, args, team: str, bundle: str, python: str) -> P
     env = profile_env(game)
     aoc = game.build / 'aoc'
     env.update(GAME=game.title_id, W=str(game.build), PATCHED=str(game.build / f'patched_{game.package}'), ROMFS=str(game.romfs), MSL_IOS=str(game.shaders), AOC=str(aoc) if aoc.is_dir() and game.prepared_content().get('dlc', True) else '',
-               DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players, args.render_scale, not args.no_thermal_cap, args.fps_target, args.swap_ab_xy, args.swap_ab, args.swap_xy, pso_mtl4, getattr(args, 'extra_env', None))), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
+               DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players, args.render_scale, not args.no_thermal_cap, args.fps_target, args.swap_ab_xy, args.swap_ab, args.swap_xy, pso_mtl4, getattr(args, 'extra_env', None), getattr(args, 'guest_file', None))), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
                DM_XCODE_PROJECT_DIR=str(game.build / 'tvport-xcode'), DM_XCODE_DERIVED_DATA=str(game.build / 'tvport-derived'), FONT_PY=python)
     env.update(artwork_env(args))
     if pso_mtl4:
@@ -1324,6 +1326,7 @@ def main() -> int:
     build.add_argument('--allow-damaged-manual', action='store_true')
     build.add_argument('--nx-extract-arg', action='append', default=[])
     build.add_argument('--pso-mtl4', action='store_true')
+    build.add_argument('--guest-file', choices=('on', 'off'))   # unset: the engine's default for the target
     build.add_argument('--gpu', default='')
     build.add_argument('--extra-env', action='append', default=[])   # KEY=VALUE
     build.add_argument('--players', default='')

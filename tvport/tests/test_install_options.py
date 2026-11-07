@@ -111,6 +111,17 @@ class Advanced(unittest.TestCase):
         self.assertIn('DM_OPMODE=1', text)
         self.assertNotIn('note', text)
 
+    def test_game_memory_paging_is_a_three_way_choice(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game = self.make_game(folder)
+            self.assertNotIn('DM_GUEST_FILE', backend.write_env(game, 'handheld', 512).read_text())
+            self.assertNotIn('DM_GUEST_FILE', backend.write_env(game, 'handheld', 512, guest_file=None).read_text())
+            self.assertIn('DM_GUEST_FILE=1\n', backend.write_env(game, 'handheld', 512, guest_file='on').read_text())
+            self.assertIn('DM_GUEST_FILE=0\n', backend.write_env(game, 'handheld', 512, guest_file='off').read_text())
+        with patch.object(sys, 'argv', ['backend.py', 'build', '/x', '--guest-file', 'on']), patch.object(backend, 'cmd_build') as build, patch.object(backend, 'BUNDLED', False):
+            backend.main()
+        self.assertEqual(build.call_args.args[0].guest_file, 'on')
+
     def test_bad_switches_are_refused(self):
         for bad in ('dm_foo=1', 'FOO BAR=1', 'NOEQUALS', '=1', 'A-B=1'):
             with self.assertRaises(backend.Failure, msg=bad):
