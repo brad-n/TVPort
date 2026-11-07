@@ -6,11 +6,11 @@ containers are recompressed into their own slot (Yaz0: zero tail; zstd: the rest
 archive's table is updated and the table is rewritten into its own slot the same way). The result is written as a DMSPARS1 file (sparse_image.py): zero runs are not stored, and the
 pack is embedded unchanged. The runtime resolves a tagged plane straight to its pack entry; anything else behaves as before.
 
-A plane's "length" for the tag rule is its payload size in BC bytes (what the engine's plane walk hands out: dm_plane.bc_bytes): a plane under 16 bytes is never touched. What is
-overwritten is the plane's whole stored span (the bytes from its level offset to the next level's: the block-linear data and its GOB padding), so [8, span) reads as zeros.
+A plane's "length" for the tag rule is its stored length as the runtime computes it (nvn_astc_plane_storage: whole GOBs, ceil(row bytes / 64) wide x the block rows x block size) at its storage
+offset; exactly [offset, offset + length) is overwritten (a plane under 16 bytes is never touched), so [8, length) reads as zeros.
 The levels above the texture cap (the runtime never loads them) are zeroed whole and carry no tag.
 
-Usage: tex_once.py <RomFS.img | build folder> --pack astc-ro.pack --out DIR [--max-dim N] [--block 4|6] [--workers N] [--json]
+Usage: tex_once.py <RomFS.img | build folder> --pack astc-ro.pack --out DIR [--max-dim N] [--block 4|6] [--bc1-block 4|5|6] [--workers N] [--json]
 Output DIR: romfs.img (DMSPARS1, the pack embedded), report.json. Exit 0 only when the self-check passed (or the inputs are unchanged and nothing was rewritten).
 The self-check re-reads the written file: every byte outside the covered planes equals the original, every tagged plane reads tag + zeros and its tag resolves in the pack (exactly one
 entry of the plane's ASTC size), every container parses, the DMROMFS1 header and index are byte-identical and the embedded pack is the given pack.
@@ -40,7 +40,8 @@ ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
 SKIPPABLE_FIRST = 0x184d2a50
 YAZ0_CHAIN = 64
 ZSTD_LEVELS = (3, 10, 19)
-MIN_PLANE = 16            # planes with fewer payload bytes are never tagged (a tag is 8 bytes)
+MIN_PLANE = 16            # planes whose stored length (nvn_astc_plane_storage) is under this are never tagged (a tag is 8 bytes)
+BC1_FORMATS = (0x1a01, 0x1a06)
 NATIVE_SOURCE = os.path.join(HERE, 'tex_once_native.c')
 
 
@@ -89,15 +90,42 @@ def zstd_stream(data, slot, zd=None):
     return None
 
 
-def zstd_slot(data, slot, zd=None):
+def zstd_slot(data, slot, zd=None, min_tail=0):
     """`data` compressed into exactly `slot` bytes: the stream, then one skippable frame of zeros to the slot's end. None when it does not fit, or leaves a tail of 1..7 bytes (no room for the frame's header)"""
     z = B.zstd_module()
     for level in ZSTD_LEVELS[:2 if len(data) > (32 << 20) else 3]:
         comp = z.compress(data, level=level, zstd_dict=zd) if zd else z.compress(data, level=level)
         tail = slot - len(comp)
-        if tail == 0: return comp
-        if tail >= 8: return comp + skippable_frame(tail)
+        if tail == 0 and not min_tail: return comp
+        if tail >= max(8, min_tail): return comp + skippable_frame(tail)
     return None
+
+
+class NvnTexdesc(ctypes.Structure):   # nvn_texdesc, dm/gfx/nvn/nvn_tex.h
+    _fields_ = [('target', ctypes.c_int), ('format', ctypes.c_int), ('flags', ctypes.c_int), ('samples', ctypes.c_int), ('width', ctypes.c_uint32), ('height', ctypes.c_uint32),
+                ('depth', ctypes.c_uint32), ('levels', ctypes.c_uint32), ('stride', ctypes.c_uint32), ('pkg_block_h', ctypes.c_int)]
+
+
+def plane_storage(L, desc, level, layer):
+    """(offset in the texture's storage, length) of a plane's stored bytes: the runtime's own nvn_astc_plane_storage (dm/gfx/tex/nvn_astc_planes.c) when the library has it; until it is merged,
+    the same computation from the engine's geometry functions (whole GOBs: ceil(row bytes / 64) x ceil(rows / block height) blocks). None for a texture that cannot be deswizzled"""
+    off, ln = ctypes.c_uint64(), ctypes.c_uint64()
+    if hasattr(L, 'nvn_astc_plane_storage'):
+        f = L.nvn_astc_plane_storage
+        f.argtypes = [ctypes.POINTER(NvnTexdesc), ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64)]
+        f.restype = ctypes.c_int
+        return (off.value, ln.value) if f(ctypes.byref(desc), level, layer, ctypes.byref(off), ctypes.byref(ln)) == 0 else None
+    g, gobs = L.nvn_deswizzle_geom, L.nvn_tex_level_gobs
+    u32, u64, up = ctypes.c_uint32, ctypes.c_uint64, ctypes.c_uint
+    g.argtypes = [ctypes.POINTER(NvnTexdesc), up, up, ctypes.POINTER(u32), ctypes.POINTER(u32), ctypes.POINTER(u32), ctypes.POINTER(u64), ctypes.POINTER(up), ctypes.POINTER(up), ctypes.POINTER(u32)]
+    g.restype = ctypes.c_int
+    gobs.argtypes = [ctypes.POINTER(NvnTexdesc), up]; gobs.restype = u32
+    rb, rows, slices, base, th, td, bpb = u32(), u32(), u32(), u64(), up(), up(), u32()
+    if g(ctypes.byref(desc), level, layer, *(ctypes.byref(x) for x in (rb, rows, slices, base, th, td, bpb))): return None
+    lb = max(gobs(ctypes.byref(desc), level) * 64, rb.value)
+    gobs_x = (lb + 63) >> 6
+    blocks_y = (rows.value + 8 * (1 << th.value) - 1) >> (3 + th.value)
+    return base.value, gobs_x * blocks_y * 512 * (1 << th.value) * (1 << td.value)
 
 
 # ---- the pack ------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -136,16 +164,17 @@ def sarc_ranges(d):
 
 # ---- the walker: strip and check share the container dispatch and the texture plan -----------------------------------------------------------------------------------------------
 class Walker:
-    def __init__(self, lib, native, block, max_dim, pack, dicts):
+    def __init__(self, lib, native, block, max_dim, pack, dicts, bc1_block=None):
         self.L, self.N = B.lib_open(lib), native_open(native)
         self.block, self.max_dim, self.pack, self.dicts = block, max_dim, pack, dicts
+        self.bc1_block = bc1_block or block
         self.c = collections.Counter(); self.errors = []; self.new_csz = None
         self.zdicts = {}
 
     # -- textures
     def plan(self, d, t):
-        """What to do with one texture of d: None (not a format the pack covers), ('skip', reason, planes) or ('ok', mods, small) with mods = [(offset in d, span, tag or None, ASTC bytes)]:
-        tag + zeros over the span for a plane the pack holds, zeros alone for a level above the cap; `small` counts the planes under MIN_PLANE bytes left as they are"""
+        """What to do with one texture of d: None (not a format the pack covers), ('skip', reason, planes) or ('ok', mods, small) with mods = [(offset in d, length, tag or None, ASTC bytes)]:
+        tag + zeros over [plane storage offset, + its stored length) for a plane the pack holds, zeros alone over a whole level above the cap; `small` counts the planes under MIN_PLANE bytes left as they are"""
         L = self.L
         if 'bad' in t: return None
         eligible = B.BC_ELIGIBLE.get(t['fmt'])
@@ -168,9 +197,11 @@ class Walker:
         ls = total // layers
         cap = mips * (depth + 1) + 8
         out = (B.Plane * cap)()
-        n = L.dm_texture_planes(target, nvn, t['w'], t['h'], depth, mips, pkg, B.addr(d) + start, size, self.block, alt, None, 0, out, cap, self.max_dim)
+        blk = self.bc1_block if t['fmt'] in BC1_FORMATS else self.block        # BC1 has its own ASTC block (DM_NVN_BC1_ASTC), every other format the general one
+        n = L.dm_texture_planes(target, nvn, t['w'], t['h'], depth, mips, pkg, B.addr(d) + start, size, blk, alt, None, 0, out, cap, self.max_dim)
         if n < 0: return ('skip', 'layout_failed', 0)
         skip = L.dm_skip_levels(target, nvn, t['w'], t['h'], depth, mips, self.max_dim)
+        desc = NvnTexdesc(target, nvn, 0, 0, t['w'], t['h'], depth, mips, 0, pkg)
         mods, small = [], 0
         for i in range(n):
             p = out[i]
@@ -178,10 +209,11 @@ class Walker:
             if self.pack.keys.get(key) != p.astc_bytes: return ('skip', 'not_in_pack', n)
             tag = key[:8]
             if not any(tag) or not self.pack.resolves(tag, p.astc_bytes): return ('skip', 'tag_ambiguous', n)
-            if p.bc_bytes < MIN_PLANE: small += 1; continue
-            lo = offs[p.level]
-            hi = offs[p.level + 1] if p.level + 1 < mips else ls
-            mods.append((start + p.layer * ls + lo, hi - lo, tag, p.astc_bytes))
+            st = plane_storage(L, desc, p.level, p.layer)
+            if st is None: return ('skip', 'layout_failed', n)
+            if st[1] < MIN_PLANE: small += 1; continue
+            if st[0] + st[1] > size: return ('skip', 'short', n)
+            mods.append((start + st[0], st[1], tag, p.astc_bytes))
         for level in range(skip):
             lo = offs[level]; hi = offs[level + 1] if level + 1 < mips else ls
             for layer in range(layers): mods.append((start + layer * ls + lo, hi - lo, None, 0))
@@ -390,7 +422,7 @@ _W = {}
 
 def worker_init(cfg):
     pack = PackIndex(cfg['pack'])
-    _W.update(cfg=cfg, w=Walker(cfg['lib'], cfg['native'], cfg['block'], cfg['max_dim'], pack, cfg['dicts']), fd=os.open(cfg['romfs'], os.O_RDONLY))
+    _W.update(cfg=cfg, w=Walker(cfg['lib'], cfg['native'], cfg['block'], cfg['max_dim'], pack, cfg['dicts'], cfg.get('bc1_block')), fd=os.open(cfg['romfs'], os.O_RDONLY))
     if cfg.get('sparse'): _W['sparse'] = S.SparseImage(cfg['sparse'])
 
 
@@ -501,7 +533,8 @@ class Arc:
         self.table = False
         if want_table:
             fs = bytes(self.T['fs'])
-            self.table = zstd_slot(fs, self.T['stored']) is not None and self.table_off + self.table_size <= self.base + self.size
+            fits = zstd_slot(fs, self.T['stored'], min_tail=64) is not None   # with room to spare: the rewritten table compresses a little differently
+            self.table = fits and self.table_off + self.table_size <= self.base + self.size
 
     def usable(self, entries):
         """Table mode needs every entry before the table (the table is written once all their sizes are known)"""
@@ -563,16 +596,22 @@ def run(args):
     if not os.path.isfile(romfs): log(f'[RED] {romfs} is a folder: tex_once needs a RomFS image'); return 2
     if S.is_sparse(romfs): log(f'[RED] {romfs} is already a DMSPARS1 image'); return 2
     block, max_dim = int(args.block), max(int(args.max_dim or 0), 0)
+    bc1 = int(args.bc1_block or block)
     out = os.path.abspath(args.out); pack = os.path.abspath(args.pack)
     os.makedirs(out, exist_ok=True)
     have = B.read_pack_header(pack)
     if not have: log(f'[RED] {pack} is no complete ASTC pack'); return 2
-    if have['fingerprint'] != B.fingerprint(romfs, block, max_dim):
-        log(f'[RED] {pack} was not built from this RomFS, cap {max_dim}, block {block}x{block}: build it again with bntx_astc.py'); return 2
+    fp_args = {} if bc1 == block else {'bc1_block': bc1}      # a pack built without --bc1-block is the pack of today: same fingerprint
+    expect = None
+    if not args.no_pack_check:
+        try: expect = B.fingerprint(romfs, block, max_dim, **fp_args)
+        except TypeError: log('[RED] this bntx_astc.py has no --bc1-block'); return 2
+    if expect is not None and have['fingerprint'] != expect:
+        log(f'[RED] {pack} was not built from this RomFS, cap {max_dim}, block {block}x{block}' + (f', BC1 block {bc1}' if bc1 != block else '') + ': build it again with bntx_astc.py'); return 2
     import romfs as romfs_mod
     img = romfs_mod.Image(romfs)
     logical = os.path.getsize(romfs)
-    fp = hashlib.sha256(b'tex_once %d\0' % TOOL_VERSION + tool_hash() + b'size %d\0max_dim %d\0block %d\0arc %s\0' % (logical, max_dim, block, args.arc_mode.encode())
+    fp = hashlib.sha256(b'tex_once %d\0' % TOOL_VERSION + tool_hash() + b'size %d\0max_dim %d\0block %d\0bc1 %d\0arc %s\0' % (logical, max_dim, block, bc1, args.arc_mode.encode())
                         + hashlib.sha256(img.index).digest() + have['fingerprint'] + b'%d' % have['bytes']).hexdigest()
     target, rep_path = os.path.join(out, 'romfs.img'), os.path.join(out, 'report.json')
     old = read_report(rep_path)
@@ -608,7 +647,7 @@ def run(args):
     if arc and arc.table: marks.append((arc.table_off, arc.table_size, None, 'table'))
     marks.sort(key=lambda m: m[0])
     tasks = partition(logical, marks)
-    cfg = dict(lib=lib, native=native, block=block, max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs)
+    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs)
     writer = S.SparseWriter(target, logical)
     totals = collections.Counter(); errors = []; n_errors = 0
     updates, mods_by_task, table_new = {}, {}, None
@@ -686,7 +725,7 @@ def run(args):
         if writer_c[k] != vtotals.get(k, 0): problems.append(f'{k}: the strip counted {writer_c[k]}, the check found {vtotals.get(k, 0)}')
     if n_errors: log(f'{n_errors} containers could not be read and were left as they are, first: {errors[:3]}')
     passed = not problems
-    rep = dict(tool_version=TOOL_VERSION, input_fingerprint=fp, input=romfs, pack=pack, block=block, max_dim=max_dim, arc_mode='table' if arc and arc.table else 'pad' if arc else 'none',
+    rep = dict(tool_version=TOOL_VERSION, input_fingerprint=fp, input=romfs, pack=pack, block=block, bc1_block=bc1, max_dim=max_dim, arc_mode='table' if arc and arc.table else 'pad' if arc else 'none',
                bytes=dict(logical=logical, physical=stats['physical'], pack=stats['pack_size'], romfs_stored=stats['stored'], extents=stats['extents']),
                errors=dict(containers_unreadable=n_errors, samples=errors[:10]), **split_counters(totals),
                self_check=dict(passed=passed, problems=problems[:20], seconds=round(time.monotonic() - t2, 1)),
@@ -709,6 +748,8 @@ def main():
     ap.add_argument('--max-dim', type=int, default=0, help='the texture cap the pack was built with (0 = none)')
     ap.add_argument('--block', type=int, default=4, choices=(4, 6))
     ap.add_argument('--workers', type=int, default=0, help='processes (default: every core)')
+    ap.add_argument('--bc1-block', type=int, default=None, choices=(4, 5, 6), help='ASTC block of BC1 textures when it differs from --block (default: --block); the pack must have been built with it')
+    ap.add_argument('--no-pack-check', action='store_true', help=argparse.SUPPRESS)   # tests only: a pack made by hand
     ap.add_argument('--arc-mode', choices=('table', 'pad'), default='table', help="Smash's data.arc: update the table's stored sizes (default), or pad entries with skippable frames and leave the table")
     ap.add_argument('--force', action='store_true', help='rewrite even if the inputs are unchanged')
     ap.add_argument('--json', action='store_true', help='print the whole report')

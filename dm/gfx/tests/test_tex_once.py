@@ -28,10 +28,11 @@ def load(name):
     return mod
 
 
+import test_bntx_astc as T   # the synthetic BNTX / SARC / Yaz0 / zstd builders (first: it registers the one bntx_astc module the worker processes unpickle)
 S = load('sparse_image')
 tool = load('tex_once')
 B = tool.B
-import test_bntx_astc as T   # the synthetic BNTX / SARC / Yaz0 / zstd builders
+assert B is T.tool
 import romfs_image
 
 
@@ -290,6 +291,7 @@ def smash_arc_file(payloads):
         ents.append((len(body) // 4, len(data), usz)); body += data
     fs = smash_fs(ents)
     frame = zstd.compress(fs, level=19)
+    frame += tool.skippable_frame(200)          # slack in the table's slot, as the rewrite needs
     table_off = file_off + len(body) + (-len(body) % 16)
     head = struct.pack('<Q', 0xABCDEF9876543210) + struct.pack('<6Q', 0, file_off, 0, table_off, table_off + 16 + len(frame), 0)
     return bytes(head) + bytes(file_off - len(head)) + bytes(body) + bytes(table_off - file_off - len(body)) + struct.pack('<4I', 0x10, len(fs), len(frame), len(fs)) + frame + bytes(16), ents
@@ -300,7 +302,8 @@ class StripTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(); cls.root = Path(cls.tmp.name)
-        cls.libpath = B.build_library(str(cls.root / 'lib'))
+        cls.libdir = os.environ.get('TEX_ONCE_TEST_LIB')   # a folder holding libastc_prebuild-<tag>.dylib already (skips the compile)
+        cls.libpath = B.build_library(cls.libdir or str(cls.root / 'lib'))
         cls.lib = B.lib_open(cls.libpath)
 
     @classmethod
@@ -338,6 +341,9 @@ class StripTests(unittest.TestCase):
         work = self.root / (name + '_work'); work.mkdir()
         img = work / 'RomFS.img'
         romfs_image.pack(str(d), str(img))
+        if self.libdir:
+            (work / 'pack' / 'lib').mkdir(parents=True)
+            for f in Path(self.libdir).glob('*.dylib'): (work / 'pack' / 'lib' / f.name).write_bytes(f.read_bytes())
         rep = B.prebuild(str(img), str(work / 'pack'), 4, workers=2, log=lambda *_: None, max_dim=cap)
         return d, img, work / 'pack' / 'astc-ro.pack', work / 'out'
 
@@ -351,7 +357,7 @@ class StripTests(unittest.TestCase):
 
     def parse(self, argv):
         import argparse
-        ns = argparse.Namespace(input=argv[0], pack=None, out=None, max_dim=0, block=4, workers=2, arc_mode='table', force=False, json=False)
+        ns = argparse.Namespace(input=argv[0], pack=None, out=None, max_dim=0, block=4, bc1_block=None, workers=2, arc_mode='table', force=False, json=False, no_pack_check=False)
         i = 1
         while i < len(argv):
             k = argv[i]
@@ -361,6 +367,8 @@ class StripTests(unittest.TestCase):
             elif k == '--max-dim': ns.max_dim = int(argv[i + 1]); i += 2
             elif k == '--arc-mode': ns.arc_mode = argv[i + 1]; i += 2
             elif k == '--force': ns.force = True; i += 1
+            elif k == '--bc1-block': ns.bc1_block = int(argv[i + 1]); i += 2
+            elif k == '--no-pack-check': ns.no_pack_check = True; i += 1
             else: i += 1
         return ns
 
@@ -378,7 +386,7 @@ class StripTests(unittest.TestCase):
         c = rep['containers']
         self.assertGreaterEqual(c['yaz0'], 1); self.assertGreaterEqual(c['zstd'], 2); self.assertGreaterEqual(c['sarc'], 2)
         self.assertGreaterEqual(c['recompressed:yaz0'], 1); self.assertGreaterEqual(c['recompressed:zstd'], 2)
-        self.assertEqual(rep['planes']['untouched_under_16_bytes'], 1)             # the 4x4 BC1
+        self.assertEqual(rep['planes']['untouched_under_16_bytes'], 0)             # even the one-block 4x4 BC1 plane has a stored length of whole GOBs
         self.assertGreater(rep['planes']['tagged'], 20)
         self.assertEqual(rep['planes']['skipped'], {})
         # romfs.py reads the stripped image like a plain one: same listing, sizes, untouched files
@@ -409,19 +417,93 @@ class StripTests(unittest.TestCase):
         n = L.dm_texture_planes(1, t0.nvn, t0.w, t0.h, 1, t0.mips, t0.pkg + 1, B.addr(orig) + start, tex['size'], 4, 0, None, 0, planes, cap, 0)
         self.assertEqual(n, t0.mips)
         offs = [L.dm_level_offset(1, t0.nvn, t0.w, t0.h, 1, t0.mips, t0.pkg + 1, i) for i in range(t0.mips)]
-        total = L.dm_texture_size(1, t0.nvn, t0.w, t0.h, 1, t0.mips, t0.pkg + 1)
+        desc = tool.NvnTexdesc(1, t0.nvn, 0, 0, t0.w, t0.h, 1, t0.mips, 0, t0.pkg + 1)
         expect = bytearray(orig)
         for i in range(n):
             key = bytes.fromhex(planes[i].key.decode())
             self.assertIn(key, idx.keys)
-            lo = start + offs[planes[i].level]; hi = start + (offs[i + 1] if i + 1 < n else total)
+            so, sl = tool.plane_storage(L, desc, planes[i].level, planes[i].layer)    # the runtime's stored length of the plane: exactly this range is overwritten
+            lo = start + so; hi = lo + sl
             self.assertEqual(new[lo:lo + 8], key[:8])                      # the tag is the first 8 bytes of the pack key
             self.assertEqual(new[lo + 8:hi], bytes(hi - lo - 8))           # then zeros
             expect[lo:hi] = key[:8] + bytes(hi - lo - 8)
-        self.assertEqual(bytes(expect), new)                               # every other byte is the original's
-        # the plane under 16 bytes (second texture, one BC1 block) was not touched
         t6 = B.bntx_textures(orig, 0)[1]
-        self.assertEqual(new[t6['start']:t6['start'] + t6['size']], orig[t6['start']:t6['start'] + t6['size']])
+        other = slice(t6['start'], t6['start'] + t6['size'])               # the second texture is checked below
+        expect[other] = bytes(t6['size']); got = bytearray(new); got[other] = bytes(t6['size'])
+        self.assertEqual(bytes(expect), bytes(got))                        # every other byte is the original's
+        # the one-block BC1 texture (second): its single plane has whole GOBs of storage, so it is tagged too
+        self.assertEqual(new[t6['start'] + 8:t6['start'] + 512], bytes(504))
+
+
+    def test_zeroed_range_is_the_runtime_plane_storage(self):
+        """2D, array, cube and mipped textures: the bytes the strip rewrites are exactly each plane's [nvn_astc_plane_storage offset, + length)"""
+        lib = self.lib
+        cases = [T.Texture(0x1c01, 128, 64, mips=5, pkg=3), T.Texture(0x1a01, 64, 64, mips=3, layers=3, dim=5, pkg=1), T.Texture(0x2006, 64, 64, mips=3, layers=6, dim=3, pkg=1),
+                 T.Texture(0x1a06, 128, 64, mips=4, pkg=0), T.Texture(0x2001, 37, 21, mips=3, pkg=2)]
+        w = tool.Walker(self.libpath, tool.build_native(str(self.root / 'nlib')), 4, 0, None, {})
+        for tex in cases:
+            data = T.bntx(lib, [tex])
+            t = B.bntx_textures(data, 0)[0]
+            target, depth = B.target_of(t)
+            desc = tool.NvnTexdesc(target, tex.nvn, 0, 0, tex.w, tex.h, depth, tex.mips, 0, tex.pkg + 1)
+            walked = (B.Plane * 64)()
+            n = lib.dm_texture_planes(target, tex.nvn, tex.w, tex.h, depth, tex.mips, tex.pkg + 1, B.addr(data) + t['start'], t['size'], 4, 0, None, 0, walked, 64, 0)
+            self.assertGreater(n, 0)
+            pack = tool.PackIndex.__new__(tool.PackIndex)
+            pack.keys = {bytes.fromhex(walked[i].key.decode()): walked[i].astc_bytes for i in range(n)}
+            pack.prefix = __import__('collections').Counter((k[:8], a) for k, a in pack.keys.items())
+            w.pack = pack
+            kind, mods, small = w.plan(data, t)
+            self.assertEqual(kind, 'ok')
+            want = []
+            for i in range(n):
+                off, ln = tool.plane_storage(lib, desc, walked[i].level, walked[i].layer)
+                if hasattr(lib, 'nvn_astc_plane_storage'):   # the runtime's own function, once the library has it: the same range
+                    import ctypes
+                    o, l = ctypes.c_uint64(), ctypes.c_uint64()
+                    lib.nvn_astc_plane_storage.argtypes = [ctypes.POINTER(tool.NvnTexdesc), ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64)]
+                    self.assertEqual(lib.nvn_astc_plane_storage(ctypes.byref(desc), walked[i].level, walked[i].layer, ctypes.byref(o), ctypes.byref(l)), 0)
+                    self.assertEqual((o.value, l.value), (off, ln))
+                want.append((t['start'] + off, ln))
+            self.assertEqual(sorted((m[0], m[1]) for m in mods), sorted(want), tex.fmt)
+            self.assertEqual(small, 0)
+            new = w.leaf(data, [t])
+            exp = bytearray(data)
+            for o, ln in want: exp[o:o + ln] = bytes(ln)
+            for m in mods: exp[m[0]:m[0] + 8] = m[2]
+            self.assertEqual(new, bytes(exp))
+
+    def test_bc1_block_has_its_own_keys(self):
+        """--bc1-block 6 with --block 4: BC1 planes are keyed and sized at 6x6, BC7 at 4x4; a pack made without it is the same as today's for the default"""
+        import collections
+        lib = self.lib
+        bc1, bc7 = T.Texture(0x1a01, 64, 64, mips=3, pkg=1), T.Texture(0x2001, 64, 64, mips=3, pkg=2)
+        d = self.root / 'bc1tree'; d.mkdir()
+        (d / 'a.bntx').write_bytes(T.bntx(lib, [bc1])); (d / 'b.bntx').write_bytes(T.bntx(lib, [bc7]))
+        work = self.root / 'bc1work'; work.mkdir()
+        img = work / 'RomFS.img'; romfs_image.pack(str(d), str(img))
+        cache = work / 'cache'; cache.mkdir()
+        keys = {}
+        for name, blk in (('a.bntx', 6), ('b.bntx', 4)):
+            job = B.Job(self.libpath, blk, str(cache), True, {}, 0)
+            job.blob((d / name).read_bytes(), name)
+            for key, key2, w_, h_, astc, hit in job.planes:
+                keys[key] = key
+                if key2: keys[key2] = key
+        pack = work / 'astc-ro.pack'
+        B.write_pack(str(pack), str(cache), keys, bytes(32))
+        out = work / 'out'
+        self.assertEqual(self.run_tool(img, pack, out, 0, '--bc1-block', '6', '--no-pack-check'), 0)
+        rep = self.report(out)
+        self.assertEqual((rep['bc1_block'], rep['block'], rep['planes']['tagged'], rep['planes']['skipped']), (6, 4, 6, {}))
+        # the same pack read at 4x4 for BC1: its BC1 planes are not in the pack
+        out4 = work / 'out4'
+        self.assertEqual(self.run_tool(img, pack, out4, 0, '--no-pack-check'), 0)
+        rep4 = self.report(out4)
+        self.assertEqual((rep4['planes']['tagged'], rep4['planes']['skipped'].get('not_in_pack')), (3, 3))
+        self.assertNotEqual(rep['input_fingerprint'], rep4['input_fingerprint'])
+        # a real pack's check: a bc1 block that the pack was not built for is refused
+        self.assertEqual(self.run_tool(img, pack, work / 'out5', 0, '--bc1-block', '6'), 2)
 
     def test_texture_cap_zeroes_the_levels_the_runtime_never_loads(self):
         d, img, pack, out = self.make('t3', cap=64)
@@ -449,7 +531,7 @@ class StripTests(unittest.TestCase):
     def test_self_check_catches_a_damaged_strip(self):
         d, img, pack, out = self.make('t5')
         lib = self.lib
-        w = tool.Walker(self.libpath, tool.build_native(str(self.root / 'lib')), 4, 0, tool.PackIndex(str(pack)), {})
+        w = tool.Walker(self.libpath, tool.build_native(str(self.root / 'nlib')), 4, 0, tool.PackIndex(str(pack)), {})
         o = T.bntx(lib, [self.ts[0]])
         n = w.strip(o, 'x.bntx')
         self.assertIsNotNone(n)
@@ -466,7 +548,7 @@ class StripTests(unittest.TestCase):
 
     def test_unknown_or_unfitting_containers_are_left_alone_and_reported(self):
         d, img, pack, out = self.make('t6')
-        w = tool.Walker(self.libpath, tool.build_native(str(self.root / 'lib')), 4, 0, tool.PackIndex(str(pack)), {})
+        w = tool.Walker(self.libpath, tool.build_native(str(self.root / 'nlib')), 4, 0, tool.PackIndex(str(pack)), {})
         o = T.bntx(self.lib, [self.ts[0]])
         z = B.zstd_module()
         # a zstd slot with no room: the stored stream is the best that fits, the stripped data does not -> kept as is
@@ -475,7 +557,7 @@ class StripTests(unittest.TestCase):
         self.assertIsNotNone(r); self.assertEqual(len(r), len(tiny))
         # a Yaz0 slot far too small for what it expands to once tagged
         noise = os.urandom(20000)
-        ytiny = tool.yaz0_pack(w.N, noise, 21000)
+        ytiny = tool.yaz0_pack(w.N, noise, 25000)
         w.c.clear()
         self.assertIsNone(w.strip(ytiny[:len(ytiny)], 'n.szs'))                         # no texture: nothing to do
         self.assertEqual(w.c['other_files'], 1)
