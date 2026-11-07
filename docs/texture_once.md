@@ -73,8 +73,8 @@ Counters join the existing ASTC counters line after each `memory up to frame` li
 - Writes `<dir>/romfs.img` (DMSPARS1, pack embedded) and `<dir>/report.json`; exit 0 only when the self-check passed.
 - Skips (exit 0, nothing rewritten) when `<dir>/report.json` records the same input fingerprint (RomFS size+index hash, pack fingerprint, cap, block).
 - Container rules (spike section C): loose/uncompressed -> in place; Yaz0 -> recompress, zero tail in the slot (header keeps the decompressed size);
-  zstd -> recompress, pad the slot with one zstd skippable frame (a tail under 8 bytes stays zero-filled inside the frame's content is impossible:
-  keep the original stream then); Smash data.arc -> recompress entries, update each entry's stored size in the zstd-compressed table, rewrite the
+  zstd -> recompress, pad the rest of the slot with one zstd skippable frame (zero content); a tail under 8 bytes cannot hold the frame's header,
+  so that container keeps its original stream; Smash data.arc -> recompress entries, update each entry's stored size in the zstd-compressed table, rewrite the
   table into its own slot the same way. Anything else holding covered planes: leave untouched and report it.
 - Self-check before exit 0: re-walk the logical image with the prebuild's walker; every tagged plane reads tag+zeros and its tag resolves in the
   pack; every other decompressed byte equals the original; every container parses; the DMROMFS1 index is byte-identical.
