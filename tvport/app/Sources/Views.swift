@@ -13,6 +13,8 @@ struct TVPortApp: App {
                 .background(InitialWindowSize())
                 .onAppear { URLBuildRouter.shared.attach(library) }
         }
+        // URL events go to URLBuildDelegate; an empty match set stops this scene opening a window for each one.
+        .handlesExternalEvents(matching: [])
         .windowResizability(.contentSize)
         .defaultSize(width: 1000, height: 670)
         .windowToolbarStyle(.unified)
