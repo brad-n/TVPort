@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-ENGINE = ('dm', 'scripts', 'LICENSE')
+ENGINE = ('dm', 'scripts', 'LICENSE', 'tvport/switchtv')   # tvport/switchtv: the SwitchTV launcher app, which backend.py switchtv builds
 LEFT_OUT = ('dm/tools/fuzz/',)   # the fuzzers' inputs: made-up game files, which no build reads
 GAME_SUFFIXES = {'.nsp', '.xci', '.nsz', '.xcz', '.nca', '.ncz', '.tik', '.keys', '.nso', '.nro', '.img', '.ipa', '.ips'}
 GAME_NAMES = {'prod.keys', 'title.keys', 'dev.keys', 'control.nacp', 'main.npdm', 'c1_full.tsv', 'cb_extent.tsv', 'pso_user.tsv', 'tvport-shaders.tsv', 'tvport.json', 'tvport-env.txt'}
@@ -120,7 +120,7 @@ def main() -> int:
                 cwd=REPO, env=dict(os.environ, COPYFILE_DISABLE='1'))
         info = {'id': engine_id, 'commit': commit, 'dirty': dirty, 'chain': chain, 'files': len(files), 'uv': uv_version, 'made': datetime.now(timezone.utc).isoformat(timespec='seconds')}
         (resources / 'engine.json').write_text(json.dumps(info, indent=1) + '\n')
-        for name in ('backend.py', 'save_import.py', 'requirements.txt'):
+        for name in ('backend.py', 'save_import.py', 'switchtv_catalog.py', 'requirements.txt'):
             shutil.copy2(REPO / 'tvport' / name, resources / name)
         licenses = resources / 'Licenses'
         licenses.mkdir()
