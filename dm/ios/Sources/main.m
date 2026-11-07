@@ -277,6 +277,8 @@ int front_ios_boot_ok(void) { return g_boot_ok; }
     self.window.rootViewController = front_ios_root();
     [self.window makeKeyAndVisible];
 }
+// A switchtv-<title ID>://play link (the SwitchTV launcher, Apple TV): opening the app is all it asks for, so the link needs no handling and its query is ignored
+- (void)scene:(UIScene *)scene openURLContexts:(NSSet<UIOpenURLContext *> *)contexts {}
 - (void)sceneWillResignActive:(UIScene *)s { front_ios_focus_event(0); }
 - (void)sceneDidEnterBackground:(UIScene *)s { front_ios_focus_event(1); }
 - (void)sceneWillEnterForeground:(UIScene *)s { front_ios_focus_event(2); }
