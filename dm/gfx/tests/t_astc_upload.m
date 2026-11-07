@@ -5,6 +5,7 @@
 #include "../nvn/nvn_mtl.m"
 #include <math.h>
 #include <dirent.h>
+#include <sys/stat.h>
 void *front_metal_layer(void) { return NULL; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
 module_t *g_mod; int g_nmod;
@@ -13,6 +14,7 @@ uint64_t now_ns(void) { return bp_now(); }
 static int checks, failed;
 #define CHECK(c, label) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: %s (line %d)\n", label, __LINE__); } } while (0)
 
+static unsigned g_seed_base;   // added to every fixture seed: another set of bytes for the same texture
 static void fill_blocks(uint8_t *data, size_t size, uint32_t format, unsigned seed) {
     int bb = (format == 0x41 || format == 0x42 || format == 0x45 || format == 0x46 || format == 0x49 || format == 0x4a) ? 8 : 16;
     uint32_t state = seed + 1;
@@ -23,22 +25,26 @@ static void fill_blocks(uint8_t *data, size_t size, uint32_t format, unsigned se
         }
     }
 }
+static void fill_storage(tex_t *tp, nvn_texdesc desc) {
+    tex_t texture = *tp;
+    for (unsigned level = 0; level < desc.levels; level++) {
+        uint32_t row, rows, depth, bpb; uint64_t base; unsigned th, td;
+        if (nvn_deswizzle_geom(&desc, level, 0, &row, &rows, &depth, &base, &th, &td, &bpb)) abort();
+        size_t size = (size_t)row * rows * depth; uint8_t *linear = malloc(size);
+        for (unsigned layer = 0; layer < texture.L.layers; layer++) {
+            fill_blocks(linear, size, desc.format, level + layer * 17 + g_seed_base);
+            if (nvn_swizzle(&desc, level, layer, linear, row, texture.mem)) abort();
+        }
+        free(linear);
+    }
+}
 static tex_t fixture(nvn_texdesc desc, void **allocation) {
     tex_t texture = {0}; texture.d = desc; nvn_tex_layout(&desc, &texture.L);
     size_t page = getpagesize(), bytes = (texture.L.size + page - 1) & ~(page - 1);
     if (posix_memalign(allocation, page, bytes)) abort();
     memset(*allocation, 0, bytes); mtl_pool_add(*allocation, bytes);
     texture.mem = *allocation; texture.serial = nvn_new_serial(); texture.has_layout = 1; texture.magic = MAGIC('T', 'E', 'X', 0);
-    for (unsigned level = 0; level < desc.levels; level++) {
-        uint32_t row, rows, depth, bpb; uint64_t base; unsigned th, td;
-        if (nvn_deswizzle_geom(&desc, level, 0, &row, &rows, &depth, &base, &th, &td, &bpb)) abort();
-        size_t size = (size_t)row * rows * depth; uint8_t *linear = malloc(size);
-        for (unsigned layer = 0; layer < texture.L.layers; layer++) {
-            fill_blocks(linear, size, desc.format, level + layer * 17);
-            if (nvn_swizzle(&desc, level, layer, linear, row, texture.mem)) abort();
-        }
-        free(linear);
-    }
+    fill_storage(&texture, desc);
     return texture;
 }
 static void release_fixture(void *allocation) { mtl_pool_del(allocation); mtl_drain(); free(allocation); }
@@ -66,7 +72,7 @@ static void compare_level(id<MTLTexture> mt, tex_t *texture, nvn_texdesc d, unsi
     nvn_deswizzle_geom(&d, level, 0, &row, &rows, &depth, &base, &th, &td, &bpb);
     uint32_t w = MAX(d.width >> level, 1u), h = MAX(d.height >> level, 1u);
     uint8_t *linear = malloc((size_t)row * rows);
-    fill_blocks(linear, (size_t)row * rows, d.format, level + layer * 17);
+    fill_blocks(linear, (size_t)row * rows, d.format, level + layer * 17 + g_seed_base);
     uint32_t upf; int ubpp; nvn_bc_unpacked(d.format, &upf, &ubpp);
     uint8_t *expected = malloc((size_t)w * h * 4);
     CHECK(!nvn_bc_decode(d.format, linear, row, w, h, expected, (size_t)w * 4), "CPU decode of the fixture");
@@ -100,13 +106,169 @@ static id<MTLTexture> upload(tex_t *t) {
     return mt;
 }
 
+
+// ---- DM_NVN_ASTC_MISS=background (T_ASTC_MODE=background): a miss uploads decoded and is encoded off the calling thread; the next texture of the same bytes is ASTC ----
+static void configure(const char *rw, size_t queue_cap, uint64_t cache_max, uint64_t min_free, unsigned threads) {
+    nvn_astc_bg_config c = {.cache = rw, .readonly = NULL, .queue_cap = queue_cap, .cache_max = cache_max, .min_free = min_free, .threads = threads};
+    nvn_bc_astc_bg_configure(&c);
+}
+static nvn_astc_bg_stats stats(void) { nvn_astc_bg_stats s; nvn_bc_astc_bg_stats(&s); return s; }
+static void subdir(char *out, size_t n, const char *dir, const char *name) { snprintf(out, n, "%s/%s", dir, name); mkdir(out, 0755); }
+static void run_background(const char *dir, int six) {
+    unsigned blk = six ? 6 : 4;
+    MTLPixelFormat astc_pf = six ? MTLPixelFormatASTC_6x6_LDR : MTLPixelFormatASTC_4x4_LDR;
+    char rw[512]; subdir(rw, sizeof rw, dir, "rw");
+    configure(rw, 64u << 20, 1ull << 30, 0, 2);
+    CHECK(!astc_sync(), "background is the mode");
+    nvn_texdesc d = {.target = NVN_TEXTURE_TARGET_2D, .format = 0x4d, .width = 64, .height = 64, .depth = 1, .levels = 4, .samples = 1};
+    // 1. a miss: the texture is decoded (RGBA8, as without ASTC), exact, and its four planes are queued, encoded, written
+    void *m1, *m2; tex_t t1 = fixture(d, &m1);
+    id<MTLTexture> mt1 = upload(&t1);
+    CHECK(mt1 && mt1.pixelFormat == MTLPixelFormatRGBA8Unorm, "a cache miss uploads the decoded format");
+    for (unsigned l = 0; mt1 && l < 4; l++) { double mean, peak; compare_level(mt1, &t1, d, l, 0, &mean, &peak); CHECK(mean < 0.0005, "decoded upload is the BC decode"); }
+    CHECK(nvn_bc_astc_bg_wait(120), "the queue drains");
+    nvn_astc_bg_stats s = stats();
+    printf("after the miss: %llu misses, %llu queued, %llu encoded, %llu written\n", (unsigned long long)s.misses, (unsigned long long)s.queued, (unsigned long long)s.encoded, (unsigned long long)s.written);
+    CHECK(s.misses == 4 && s.queued == 4 && s.encoded == 4 && s.written == 4 && s.dropped == 0, "four planes missed, were queued, encoded and written");
+    CHECK(cache_files(rw) == 4, "four cache files");
+    // the decision is kept: the same texture uploaded again (now every plane is cached) stays decoded
+    id<MTLTexture> mt1b = pkg_upload(&t1, NULL, mt1, 0); mtl_drain();
+    CHECK(mt1b && mt1b.pixelFormat == MTLPixelFormatRGBA8Unorm, "a decoded texture stays decoded on re-upload, though its planes are cached now");
+    // 2. a new texture of the same bytes: every plane hits, ASTC
+    tex_t t2 = fixture(d, &m2);
+    id<MTLTexture> mt2 = upload(&t2);
+    CHECK(mt2 && mt2.pixelFormat == astc_pf, "a texture whose planes are all cached is ASTC");
+    for (unsigned l = 0; mt2 && l < 4; l++) { double mean, peak; compare_level(mt2, &t2, d, l, 0, &mean, &peak); CHECK(mean < 0.04 * (six ? 6.0 : 1.0), "ASTC samples close to the BC decode"); }
+    s = stats(); CHECK(s.hits >= 4 && s.fetch_misses == 0, "the ASTC upload was four cache hits");
+    // 3. an ASTC texture stays ASTC when its storage gets other bytes: the planes without an entry are void blocks, queued, never encoded on this thread
+    g_seed_base = 1000; fill_storage(&t2, d);
+    double before = s.encode_ns; (void)before;
+    id<MTLTexture> mt2b = pkg_upload(&t2, NULL, mt2, 0); mtl_drain();
+    CHECK(mt2b && mt2b.pixelFormat == astc_pf, "an ASTC texture stays ASTC when its content changes to uncached bytes");
+    s = stats(); CHECK(s.fetch_misses == 4 && s.queued == 8, "its four new planes were queued");
+    CHECK(nvn_bc_astc_bg_wait(120), "and drain");
+    id<MTLTexture> mt2c = pkg_upload(&t2, NULL, mt2b, 0); mtl_drain();
+    CHECK(mt2c && mt2c.pixelFormat == astc_pf, "still ASTC");
+    for (unsigned l = 0; mt2c && l < 4; l++) { double mean, peak; compare_level(mt2c, &t2, d, l, 0, &mean, &peak); CHECK(mean < 0.04 * (six ? 6.0 : 1.0), "after the background encode the next upload shows the new bytes"); }
+    g_seed_base = 0;
+    defer_obj_release(mt1); defer_obj_release(mt2); release_fixture(m1); release_fixture(m2);
+
+    // 4. buffer-to-texture copies follow the texture's own format. A texture made for copies has no bytes yet: decoded
+    if (!six) {
+        enum { SW = 32, RW = 16, RH = 12, OX = 8, OY = 4 };
+        nvn_texdesc cd = {.target = NVN_TEXTURE_TARGET_2D, .format = 0x44, .width = SW, .height = SW, .depth = 1, .levels = 1, .samples = 1};
+        void *smem; if (posix_memalign(&smem, getpagesize(), 16384)) abort(); mtl_pool_add(smem, 16384);
+        size_t row = RW / 4 * 16, rows = RH / 4; fill_blocks(smem, row * rows, 0x44, 99);
+        uint8_t *expected = malloc((size_t)RW * RH * 4); CHECK(!nvn_bc_decode(0x44, smem, row, RW, RH, expected, (size_t)RW * 4), "CPU decode of the copy source");
+        for (int into_astc = 0; into_astc < 2; into_astc++) {
+            void *tmem = NULL; tex_t t;
+            if (into_astc) {   // bytes in the storage, all planes cached (a first texture of them was uploaded decoded and encoded): ASTC at creation
+                tex_t seed = fixture(cd, &tmem); id<MTLTexture> sm = upload(&seed); defer_obj_release(sm); CHECK(nvn_bc_astc_bg_wait(120), "seed drains");
+                release_fixture(tmem); t = fixture(cd, &tmem);
+            } else {
+                t = (tex_t){.magic = MAGIC('T','E','X',0), .serial = nvn_new_serial(), .d = cd}; nvn_tex_layout(&cd, &t.L);
+                if (posix_memalign(&tmem, getpagesize(), (t.L.size + 16383) & ~(size_t)16383)) abort();
+                memset(tmem, 0, t.L.size); t.mem = tmem; mtl_pool_add(tmem, (t.L.size + 16383) & ~(size_t)16383);
+            }
+            mtl_tex_init(&t); mtl_sub_begin(); id<MTLTexture> mt = tex_mtl(&t);
+            CHECK(mtl_wait(mtl_sub_commit(), 20000000000ull), "the new texture completes");
+            CHECK(mt && mt.pixelFormat == (into_astc ? MTLPixelFormatASTC_4x4_LDR : MTLPixelFormatRGBA8Unorm), into_astc ? "a texture with cached bytes is ASTC" : "a texture with no bytes yet is decoded");
+            for (int pass = 0; pass < (into_astc ? 2 : 1); pass++) {   // into ASTC: the first copy's source is not in the cache (void blocks, queued), the second is
+                p_copy_b2t c = {.src = (uint64_t)(uintptr_t)smem, .tex = &t, .r = {OX, OY, 0, RW, RH, 1}};
+                mtl_sub_begin(); copy_b2t(&c, sizeof c); CHECK(mtl_wait(mtl_sub_commit(), 20000000000ull), "the copy completes");
+                id<MTLBuffer> out = [g_dev newBufferWithLength:(size_t)SW * SW * 16 options:MTLResourceStorageModeShared];
+                uint32_t sel[2] = {0, 0};
+                id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                [e setComputePipelineState:sampler_pipeline(0)]; [e setTexture:mt atIndex:0]; [e setBuffer:out offset:0 atIndex:0]; [e setBytes:sel length:sizeof sel atIndex:1];
+                [e dispatchThreads:MTLSizeMake(SW, SW, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                const float *got = out.contents; double inside = 0;
+                for (unsigned y = OY; y < OY + RH; y++) for (unsigned x = OX; x < OX + RW; x++) for (unsigned ch = 0; ch < 4; ch++)
+                    inside += fabs(got[((size_t)y * SW + x) * 4 + ch] - expected[((y - OY) * RW + (x - OX)) * 4 + ch] / 255.0);
+                inside /= RW * RH * 4;
+                printf("copy_b2t into %s, pass %d: mean error inside %.4f\n", into_astc ? "ASTC" : "decoded", pass, inside);
+                if (!into_astc) CHECK(inside < 0.001, "a copy into a decoded texture is the BC decode");
+                else if (pass == 0) { nvn_astc_bg_stats cs = stats(); CHECK(cs.fetch_misses >= 1, "the uncached copy source was queued, not encoded here"); CHECK(nvn_bc_astc_bg_wait(120), "and drains"); }
+                else CHECK(inside < 0.04, "once encoded, the copy into the ASTC texture is the BC decode");
+            }
+            CHECK(mt.pixelFormat == (into_astc ? MTLPixelFormatASTC_4x4_LDR : MTLPixelFormatRGBA8Unorm), "the copies did not change the texture's format");
+            defer_obj_release(mt); release_fixture(tmem);
+        }
+        free(expected); release_fixture(smem);
+    }
+
+    // 5. queue cap: 256x256 BC7 planes of 65,536 bytes, a cap of two and a half of them; the rest is dropped and counted
+    {
+        char q[512]; subdir(q, sizeof q, dir, "queue");
+        size_t bytes = 256 * 256;   // 64x64 blocks of 16 bytes
+        configure(q, 2 * bytes + bytes / 2, 1ull << 30, 0, 1);
+        uint8_t *buf = malloc(bytes);
+        for (unsigned i = 0; i < 8; i++) { fill_blocks(buf, bytes, 0x4d, 500 + i); CHECK(nvn_bc_astc_learn(0x4d, buf, bytes, 256, 256, blk, NULL) == 0, "a fresh plane misses"); }
+        s = stats();
+        printf("queue cap: %llu queued, %llu dropped (%.1f MB), %llu pending-duplicates\n", (unsigned long long)s.queued, (unsigned long long)s.dropped, s.dropped_bytes / 1048576.0, (unsigned long long)s.duplicates);
+        CHECK(s.queued + s.dropped + s.duplicates == 8 && s.dropped >= 1 && s.queued >= 2, "every miss is queued or counted as dropped");
+        CHECK(s.queued_bytes_now <= 2 * bytes + bytes / 2, "the queue never holds more than its cap");
+        CHECK(nvn_bc_astc_bg_wait(120), "drains"); s = stats(); CHECK(s.encoded == s.queued && s.written == s.queued, "everything queued was encoded and written");
+        // a dropped plane is not remembered: it can be queued again
+        fill_blocks(buf, bytes, 0x4d, 507); int again = nvn_bc_astc_learn(0x4d, buf, bytes, 256, 256, blk, NULL); CHECK(again == 0 || again == 1, "a later look-up of a dropped plane is valid");
+        CHECK(nvn_bc_astc_bg_wait(120), "drains again");
+        free(buf);
+    }
+    // 6. cache size cap: room for two entries, four planes encoded, two written
+    {
+        char c[512]; subdir(c, sizeof c, dir, "capped");
+        size_t bytes = 128 * 128;
+        size_t astc_bytes = (size_t)((128 + blk - 1) / blk) * ((128 + blk - 1) / blk) * 16;
+        configure(c, 64u << 20, 2 * (astc_bytes + 40) + 10, 0, 1);
+        uint8_t *buf = malloc(bytes);
+        for (unsigned i = 0; i < 4; i++) { fill_blocks(buf, bytes, 0x4d, 700 + i); nvn_bc_astc_learn(0x4d, buf, bytes, 128, 128, blk, NULL); }
+        CHECK(nvn_bc_astc_bg_wait(120), "drains"); s = stats();
+        printf("cache cap: %llu encoded, %llu written, %llu not written for the cap, %llu bytes\n", (unsigned long long)s.encoded, (unsigned long long)s.written, (unsigned long long)s.skipped_cap, (unsigned long long)s.cache_bytes);
+        CHECK(s.encoded == 4 && s.written == 2 && s.skipped_cap == 2 && cache_files(c) == 2 && s.cache_bytes <= 2 * (astc_bytes + 40) + 10, "the cache stops at its cap");
+        free(buf);
+    }
+    // 7. low free disk: nothing is written
+    {
+        char c[512]; subdir(c, sizeof c, dir, "lowdisk");
+        configure(c, 64u << 20, 1ull << 30, 1ull << 60, 1);
+        size_t bytes = 128 * 128; uint8_t *buf = malloc(bytes); fill_blocks(buf, bytes, 0x4d, 800); nvn_bc_astc_learn(0x4d, buf, bytes, 128, 128, blk, NULL);
+        CHECK(nvn_bc_astc_bg_wait(120), "drains"); s = stats(); CHECK(s.encoded == 1 && s.written == 0 && s.skipped_lowdisk == 1 && cache_files(c) == 0, "writes stop when the disk is low");
+        free(buf);
+    }
+    // 8. corrupt and short entries are ignored, and replaced by the background encode
+    {
+        char c[512]; subdir(c, sizeof c, dir, "corrupt");
+        configure(c, 64u << 20, 1ull << 30, 0, 1);
+        size_t bytes = 128 * 128; uint8_t *buf = malloc(bytes), *out = malloc(bytes);
+        size_t astc_bytes = (size_t)((128 + blk - 1) / blk) * ((128 + blk - 1) / blk) * 16;
+        fill_blocks(buf, bytes, 0x4d, 900); nvn_astc_cache_key key; CHECK(nvn_bc_astc_learn(0x4d, buf, bytes, 128, 128, blk, &key) == 0, "miss");
+        CHECK(nvn_bc_astc_bg_wait(120), "drains");
+        CHECK(nvn_bc_astc_fetch(0x4d, buf, bytes, 128, 128, blk, out, astc_bytes) == 1, "now a hit");
+        char path[1024]; snprintf(path, sizeof path, "%s/%s.astc", c, key.hex);
+        FILE *f = fopen(path, "r+b"); fseek(f, 100, SEEK_SET); int ch = fgetc(f); fseek(f, 100, SEEK_SET); fputc(ch ^ 0x55, f); fclose(f);
+        CHECK(nvn_bc_astc_fetch(0x4d, buf, bytes, 128, 128, blk, out, astc_bytes) == 0, "a flipped byte fails the payload hash: a miss");
+        CHECK(nvn_bc_astc_bg_wait(120), "the entry is rewritten");
+        CHECK(nvn_bc_astc_fetch(0x4d, buf, bytes, 128, 128, blk, out, astc_bytes) == 1, "and hits again");
+        truncate(path, 60);
+        CHECK(nvn_bc_astc_learn(0x4d, buf, bytes, 128, 128, blk, NULL) == 0, "a short file is a miss");
+        CHECK(nvn_bc_astc_bg_wait(120), "rewritten"); CHECK(nvn_bc_astc_fetch(0x4d, buf, bytes, 128, 128, blk, out, astc_bytes) == 1, "hits");
+        free(buf); free(out);
+    }
+}
+
 int main(int argc, char **argv) { @autoreleasepool {
     (void)argc; (void)argv;
     char dir[] = "/tmp/t_astc_upload.XXXXXX";
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
-    setenv("DM_TEST_NO_BC", "1", 1); const char *which = getenv("T_ASTC_BLOCK"); int six = which && atoi(which) == 6; setenv("DM_NVN_BC_ASTC", six ? "6" : "4", 1); setenv("DM_NVN_ASTC_CACHE", dir, 1); unsetenv("DM_NVN_ASTC_CACHE_RO");
+    setenv("DM_TEST_NO_BC", "1", 1); const char *mode = getenv("T_ASTC_MODE"); int background = mode && !strcmp(mode, "background"); setenv("DM_NVN_ASTC_MISS", background ? "background" : "sync", 1); const char *which = getenv("T_ASTC_BLOCK"); int six = which && atoi(which) == 6; setenv("DM_NVN_BC_ASTC", six ? "6" : "4", 1); setenv("DM_NVN_ASTC_CACHE", dir, 1); unsetenv("DM_NVN_ASTC_CACHE_RO");
     mtl_init();
     CHECK(astc_block() == (six ? 6u : 4u), "DM_NVN_BC_ASTC is on (with DM_TEST_NO_BC)");
+    if (background) {
+        run_background(dir, six);
+        mtl_drain();
+        { char cmd[128]; snprintf(cmd, sizeof cmd, "rm -rf %s", dir); system(cmd); }
+        printf("ASTC upload (background, %s): %d checks, %d failures\n", six ? "6x6" : "4x4", checks, failed);
+        return failed ? 1 : 0;
+    }
     double slack = six ? 6.0 : 1.0;   // 6x6 holds 3.56 bits a texel against 8 for 4x4, and the fixture is noise at every 4x4 block: the bounds only catch a wrong layout (a run with T_ASTC_BLOCK=6)
 
     struct { uint32_t format; MTLPixelFormat expect; double mean_max; const char *name; } cases[] = {
