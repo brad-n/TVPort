@@ -3,6 +3,7 @@
 // BC4/BC5 and 3D staying decoded, and ASTC off (unset) leaving every BC format as it was.
 // Fixture and swizzling follow nxnative-tvos' t_bc_upload.m (MIT, yuchanns).
 #include "../nvn/nvn_mtl.m"
+#include "../../host/tests/romfs_sparse_fixture.h"
 #include <math.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -12,7 +13,7 @@ module_t *g_mod; int g_nmod;
 void svc_thread_dump(void) {}
 uint64_t now_ns(void) { return bp_now(); }
 static int checks, failed;
-#define CHECK(c, label) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: %s (line %d)\n", label, __LINE__); } } while (0)
+#define CHECK(c, ...) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: "); fprintf(stderr, __VA_ARGS__); fprintf(stderr, " (line %d)\n", __LINE__); } } while (0)
 
 static unsigned g_seed_base;   // added to every fixture seed: another set of bytes for the same texture
 static void fill_blocks(uint8_t *data, size_t size, uint32_t format, unsigned seed) {
@@ -154,6 +155,182 @@ static void run_maxdim(const char *dir) {
     CHECK(mt2 && mt2.textureType == MTLTextureType2D, "and 2D");
     for (unsigned l = sk; mt2 && l < d.levels; l++) { double mean, peak; compare_level_sk(mt2, &t2, d, l, 0, &mean, &peak, sk); printf("maxdim ASTC NVN level %u: mean error %.4f\n", l, mean); CHECK(mean < 0.04, "ASTC level samples like the BC decode of the NVN level it came from"); }
     defer_obj_release(mt1); defer_obj_release(mt2); release_fixture(m1); release_fixture(m2);
+}
+// ---- Tagged planes (T_ASTC_MODE=tagged; docs/texture_once.md sections 2 and 3): a stripped plane is the first 8 bytes of its pack key and zeros. The pack is embedded in a DMSPARS1 image ----
+typedef struct { uint8_t key[8][32]; unsigned n; } tag_keys;
+static int tag_collect(void *ctx, unsigned level, unsigned layer, uint32_t w, uint32_t h, const void *bc, size_t size) {
+    (void)layer; tag_keys *k = ctx; nvn_astc_cache_key key; nvn_bc_astc_plane_key(0x4d, w, h, 4, bc, size, &key);
+    for (int i = 0; i < 32; i++) { unsigned v; sscanf(key.hex + 2 * i, "%2x", &v); k->key[level][i] = (uint8_t)v; }
+    k->n = level + 1; return 0;
+}
+static void strip_plane(tex_t *t, unsigned level, const uint8_t *prefix8) {   // docs/texture_once.md section 2: the plane's stored bytes become the prefix and zeros
+    uint64_t off, len; CHECK(!nvn_astc_plane_storage(&t->d, level, 0, &off, &len) && off + len <= t->L.size && len >= 16, "plane storage of level %u", level);
+    memset((uint8_t *)t->mem + off, 0, len); memcpy((uint8_t *)t->mem + off, prefix8, 8);
+}
+static float *read_level(id<MTLTexture> mt, unsigned level, uint32_t w, uint32_t h) {
+    id<MTLBuffer> out = [g_dev newBufferWithLength:(size_t)w * h * 16 options:MTLResourceStorageModeShared]; uint32_t sel[2] = {level, 0};
+    id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:sampler_pipeline(0)]; [e setTexture:mt atIndex:0]; [e setBuffer:out offset:0 atIndex:0]; [e setBytes:sel length:sizeof sel atIndex:1];
+    [e dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    float *r = malloc((size_t)w * h * 16); memcpy(r, out.contents, (size_t)w * h * 16); return r;
+}
+static double mean_err_vs_decode(id<MTLTexture> mt, unsigned level, uint32_t format, const uint8_t *tight, size_t pitch, uint32_t w, uint32_t h) {
+    uint8_t *want = malloc((size_t)w * h * 4); CHECK(!nvn_bc_decode(format, tight, pitch, w, h, want, (size_t)w * 4), "CPU decode");
+    float *got = read_level(mt, level, w, h); double sum = 0; for (size_t i = 0; i < (size_t)w * h * 4; i++) sum += fabs(got[i] - want[i] / 255.0);
+    free(got); free(want); return sum / ((double)w * h * 4);
+}
+static void tag_counts(uint64_t *hit, uint64_t *unres, uint64_t *dec) { nvn_bc_astc_tag_stats(hit, unres, dec); }
+static tex_t empty_texture(nvn_texdesc d, void **mem, unsigned serial_off) {
+    tex_t t = {.magic = MAGIC('T','E','X',0), .serial = nvn_new_serial(), .d = d}; nvn_tex_layout(&d, &t.L);
+    if (posix_memalign(mem, getpagesize(), (t.L.size + 16383) & ~(size_t)16383)) abort();
+    memset(*mem, 0, t.L.size); t.mem = *mem; t.off = 0x10000u * serial_off; mtl_pool_add(*mem, (t.L.size + 16383) & ~(size_t)16383);
+    return t;
+}
+// nvn_astc_plane_storage: the bytes a plane's data lands in lie inside [offset, offset + length), planes do not overlap, and the walker's raw hook handles / passes / stops as documented
+typedef struct { unsigned raw_calls, fn_calls, handle_every, stop_at; } walk_probe;
+static int walk_raw(void *ctx, unsigned level, unsigned layer, uint32_t w, uint32_t h, const void *st, size_t len) {
+    (void)level; (void)layer; (void)w; (void)h; (void)st; (void)len; walk_probe *p = ctx; unsigned n = p->raw_calls++;
+    if (p->stop_at && n + 1 == p->stop_at) return -7;
+    return p->handle_every && n % p->handle_every == 0;
+}
+static int walk_fn(void *ctx, unsigned level, unsigned layer, uint32_t w, uint32_t h, const void *bc, size_t size) { (void)level; (void)layer; (void)w; (void)h; (void)bc; (void)size; ((walk_probe *)ctx)->fn_calls++; return 0; }
+static void check_plane_storage(nvn_texdesc d, const char *name) {
+    nvn_texlayout L; nvn_tex_layout(&d, &L); uint8_t *mem = calloc(1, L.size + 64);
+    unsigned levels = d.levels ? d.levels : 1, layers = nvn_astc_layers(&d); uint64_t prev_end = 0; int ok = 1;
+    for (unsigned y = 0; y < layers; y++) for (unsigned l = 0; l < levels; l++) {
+        uint32_t row, rows, slices, bpb; uint64_t base; unsigned th, td; if (nvn_deswizzle_geom(&d, l, y, &row, &rows, &slices, &base, &th, &td, &bpb)) abort();
+        uint8_t *lin = malloc((size_t)row * rows); memset(lin, 0xFF, (size_t)row * rows); if (nvn_swizzle(&d, l, y, lin, row, mem)) abort(); free(lin);
+        uint64_t off, len; if (nvn_astc_plane_storage(&d, l, y, &off, &len)) abort();
+        uint64_t first = UINT64_MAX, last = 0, count = 0; for (uint64_t i = 0; i < L.size; i++) if (mem[i]) { if (first == UINT64_MAX) first = i; last = i; count++; mem[i] = 0; }
+        if (count != (uint64_t)row * rows || first < off || last >= off + len || off + len > L.size || off < prev_end * 0) ok = 0;
+        if (y == 0 && l && off < prev_end) ok = 0;   // within a layer, levels follow each other
+        if (y == 0) prev_end = off + len;
+    }
+    CHECK(ok, "plane storage of %s: written bytes inside [offset, offset + length), levels in order", name);
+    walk_probe p = {0, 0, 0, 0}; int r = nvn_astc_walk_planes_raw(&d, mem, 0, walk_raw, walk_fn, &p);
+    CHECK(r == 0 && p.raw_calls == levels * layers && p.fn_calls == levels * layers, "%s: raw returning 0 goes on to every plane", name);
+    p = (walk_probe){0, 0, 1, 0}; r = nvn_astc_walk_planes_raw(&d, mem, 0, walk_raw, walk_fn, &p);
+    CHECK(r == 0 && p.raw_calls == levels * layers && p.fn_calls == 0, "%s: raw returning 1 handles the plane", name);
+    p = (walk_probe){0, 0, 0, 2}; r = nvn_astc_walk_planes_raw(&d, mem, 0, walk_raw, walk_fn, &p);
+    CHECK(levels * layers < 2 || (r == -7 && p.raw_calls == 2 && p.fn_calls == 1), "%s: raw returning < 0 stops the walk with that value", name);
+    p = (walk_probe){0, 0, 0, 0}; r = nvn_astc_walk_planes(&d, mem, levels > 1 ? 1 : 0, walk_fn, &p); CHECK(r == 0 && p.fn_calls == (levels > 1 ? levels - 1 : levels) * layers, "%s: the plain walk is unchanged", name);
+    free(mem);
+}
+static void run_tagged(const char *dir) {
+    const unsigned blk = 4;
+    check_plane_storage((nvn_texdesc){.target = NVN_TEXTURE_TARGET_2D, .format = 0x4d, .width = 64, .height = 64, .depth = 1, .levels = 4, .samples = 1}, "BC7 64x64 x4");
+    check_plane_storage((nvn_texdesc){.target = NVN_TEXTURE_TARGET_2D, .format = 0x44, .width = 37, .height = 21, .depth = 1, .levels = 6, .samples = 1}, "BC3 37x21 x6");
+    check_plane_storage((nvn_texdesc){.target = NVN_TEXTURE_TARGET_2D, .format = 0x42, .width = 1024, .height = 512, .depth = 1, .levels = 11, .samples = 1}, "BC1 1024x512 x11");
+    check_plane_storage((nvn_texdesc){.target = NVN_TEXTURE_TARGET_2D_ARRAY, .format = 0x44, .width = 128, .height = 128, .depth = 3, .levels = 4, .samples = 1}, "BC3 array of 3");
+    check_plane_storage((nvn_texdesc){.target = NVN_TEXTURE_TARGET_2D, .format = 0x4d, .width = 4, .height = 4, .depth = 1, .levels = 1, .samples = 1}, "BC7 4x4");
+    // the refusal rule for a stripped image
+    CHECK(!stripped_refusal(0, 0, 0) && !stripped_refusal(0, 1, 4) && stripped_refusal(1, 0, 4) && strstr(stripped_refusal(1, 0, 4), "native BC") && stripped_refusal(1, 1, 0) && strstr(stripped_refusal(1, 1, 0), "DM_NVN_BC_ASTC") && !stripped_refusal(1, 1, 4), "stripped_refusal: native BC and ASTC off refuse, the ASTC path on a BC-less GPU accepts");
+    // 1. seed the writable directory with every plane the scenarios below need, by the hashed path, then pack it
+    char rw[512]; subdir(rw, sizeof rw, dir, "rw"); configure(rw, 64u << 20, 1ull << 30, 0, 2);
+    nvn_texdesc d = {.target = NVN_TEXTURE_TARGET_2D, .format = 0x4d, .width = 64, .height = 64, .depth = 1, .levels = 4, .samples = 1};
+    void *m1; tex_t t1 = fixture(d, &m1);
+    tag_keys keys = {{{0}}, 0}; CHECK(nvn_astc_walk_planes(&t1.d, t1.mem, 0, tag_collect, &keys) == 0 && keys.n == 4, "the four plane keys");
+    id<MTLTexture> mt1 = upload(&t1); CHECK(nvn_bc_astc_bg_wait(120), "seed drains"); CHECK(cache_files(rw) == 4, "four entries from the first texture");
+    // two 16x16 BC7 textures whose stored bytes look tagged (8 bytes, then zeros) but are genuine content: one with a prefix no entry has, one with the prefix of a bigger entry
+    nvn_texdesc d5 = {.target = NVN_TEXTURE_TARGET_2D, .format = 0x4d, .width = 16, .height = 16, .depth = 1, .levels = 1, .samples = 1};
+    void *m5[2]; tex_t t5[2]; uint8_t tight[2][256]; size_t pitch5 = 4 * 16;
+    for (int v = 0; v < 2; v++) {
+        t5[v] = empty_texture(d5, &m5[v], 0); uint8_t head[8]; for (int i = 0; i < 8; i++) head[i] = v ? keys.key[0][i] : (uint8_t)(0xe0 + i);
+        memcpy(t5[v].mem, head, 8);   // a BC7 block's first 8 bytes in an otherwise empty plane
+        CHECK(!nvn_deswizzle(&d5, 0, 0, t5[v].mem, tight[v], pitch5) && nvn_bc_astc_looks_tagged(t5[v].mem, 512), "the genuine plane looks tagged");
+        uint8_t out[256]; int hit; CHECK(!nvn_bc_astc_encode(0x4d, tight[v], 256, 16, 16, blk, out, 256, rw, NULL, &hit), "encode the genuine plane into the writable directory");
+    }
+    // a copy source: one BC3 plane, cached
+    enum { N = 16 }; size_t crow = N / 4 * 16, crows = N / 4;
+    void *smem; if (posix_memalign(&smem, getpagesize(), 16384)) abort(); mtl_pool_add(smem, 16384); fill_blocks(smem, crow * crows, 0x44, 321);
+    nvn_astc_cache_key ck; CHECK(nvn_bc_astc_learn(0x44, smem, crow * crows, N, N, blk, &ck) == 0, "the copy plane is queued"); CHECK(nvn_bc_astc_bg_wait(120), "and encoded");
+    uint8_t ckey[32]; for (int i = 0; i < 32; i++) { unsigned v; sscanf(ck.hex + 2 * i, "%2x", &v); ckey[i] = (uint8_t)v; }
+    char pk[600]; snprintf(pk, sizeof pk, "%s/seed.pack", dir); pack_dir(rw, pk);
+    // 2. the pack goes into a DMSPARS1 image (logical image: bytes with holes), which DM_ROMFS would name: the embedded pack becomes the read-only cache
+    NSData *pkd = [NSData dataWithContentsOfFile:@(pk)]; uint8_t logical[20000]; for (int i = 0; i < 20000; i++) logical[i] = (uint8_t)(i * 31 + 1);
+    memset(logical + 3000, 0, 9000);
+    uint8_t *wrapped; size_t wn; CHECK(fx_write_sparse(NULL, logical, sizeof logical, 4096, 0, pkd.bytes, pkd.length, &wrapped, &wn) >= 2, "the image");
+    char img[600]; snprintf(img, sizeof img, "%s/romfs.img", dir); { FILE *f = fopen(img, "wb"); fwrite(wrapped, 1, wn, f); fclose(f); } free(wrapped);
+    char plain[600]; snprintf(plain, sizeof plain, "%s/plain.img", dir); { FILE *f = fopen(plain, "wb"); fwrite(logical, 1, sizeof logical, f); fclose(f); }
+    CHECK(embedded_pack_setup(plain) == 0 && !g_embedded, "a plain file is not a stripped image");
+    setenv("DM_NVN_ASTC_CACHE_RO", "/nonexistent-ro", 1);
+    CHECK(embedded_pack_setup(img) == 1 && g_embedded, "a DMSPARS1 with a pack is a stripped image");
+    CHECK(!strcmp(getenv("DM_NVN_ASTC_CACHE_RO"), NVN_ASTC_EMBEDDED_ROOT), "its pack takes precedence over DM_NVN_ASTC_CACHE_RO");
+    uint64_t entries, bytes; CHECK(nvn_bc_astc_pack_info(NVN_ASTC_EMBEDDED_ROOT, &entries, &bytes, NULL) && entries == 7 && bytes == pkd.length, "seven entries (4 + 2 genuine + 1 copy)");
+    char rw2[512]; subdir(rw2, sizeof rw2, dir, "rw2");
+    nvn_astc_bg_config c = {.cache = rw2, .readonly = NVN_ASTC_EMBEDDED_ROOT, .queue_cap = 64u << 20, .cache_max = 1ull << 30, .min_free = 0, .threads = 1};
+    nvn_bc_astc_bg_configure(&c);
+    // 3. the hashed path from the embedded pack (a texture with the original bytes), and the tagged one: the same ASTC blocks
+    void *m3; tex_t t3 = fixture(d, &m3); id<MTLTexture> mt3 = upload(&t3);
+    CHECK(mt3 && mt3.pixelFormat == MTLPixelFormatASTC_4x4_LDR, "the hashed path resolves from the embedded pack");
+    float *ref[4]; for (unsigned l = 0; l < 4; l++) ref[l] = read_level(mt3, l, 64 >> l, 64 >> l);
+    nvn_astc_bg_stats before = stats(); uint64_t h0, u0, d0; tag_counts(&h0, &u0, &d0);
+    void *m2; tex_t t2 = fixture(d, &m2); for (unsigned l = 0; l < 4; l++) strip_plane(&t2, l, keys.key[l]);
+    CHECK(nvn_bc_astc_looks_tagged(t2.mem, 16) && !memcmp(t2.mem, keys.key[0], 8), "level 0 of the stripped texture is the tag");
+    id<MTLTexture> mt2 = upload(&t2);
+    CHECK(mt2 && mt2.pixelFormat == MTLPixelFormatASTC_4x4_LDR && mt2.mipmapLevelCount == 4, "a stripped texture is ASTC");
+    uint64_t h1, u1, d1; tag_counts(&h1, &u1, &d1); nvn_astc_bg_stats after = stats();
+    CHECK(h1 - h0 == 4 && u1 == u0 && d1 == d0, "four tagged hits, nothing unresolved or decoded (%llu / %llu / %llu)", (unsigned long long)(h1 - h0), (unsigned long long)(u1 - u0), (unsigned long long)(d1 - d0));
+    CHECK(after.hits == before.hits && after.misses == before.misses && after.fetch_misses == before.fetch_misses && after.queued == before.queued, "no hashed lookup was made for a tagged plane");
+    for (unsigned l = 0; l < 4; l++) { float *got = read_level(mt2, l, 64 >> l, 64 >> l); CHECK(!memcmp(got, ref[l], (size_t)(64 >> l) * (64 >> l) * 16), "level %u: the tagged plane is the same ASTC blocks as the hashed path's", l); free(got); }
+    for (unsigned l = 0; l < 4; l++) { double mean, peak; compare_level(mt2, &t2, d, l, 0, &mean, &peak); CHECK(mean < 0.04, "level %u of the stripped texture samples like the original BC decode (%.4f)", l, mean); }
+    // 4. planes that merely look tagged resolve by hash, with no red line or count
+    for (int v = 0; v < 2; v++) {
+        tag_counts(&h0, &u0, &d0); before = stats();
+        id<MTLTexture> mt = upload(&t5[v]);
+        CHECK(mt && mt.pixelFormat == MTLPixelFormatASTC_4x4_LDR, "a genuine plane that looks tagged (%s) is ASTC through the hash", v ? "its prefix names a bigger entry" : "unknown prefix");
+        tag_counts(&h1, &u1, &d1); after = stats();
+        CHECK(h1 == h0 && u1 == u0 && d1 == d0, "and counts nothing as tagged");
+        CHECK(after.hits >= before.hits + 1 && after.misses == before.misses, "it was found by the hash");
+        CHECK(mt && mean_err_vs_decode(mt, 0, 0x4d, tight[v], pitch5, 16, 16) < 0.04, "and samples like its BC decode");
+        defer_obj_release(mt);
+    }
+    // 5. a tag no entry has, and a hash no entry has: the texture is decoded, every plane unresolved (and, decoded from its zeros, counted as decoded), nothing queued, one red line each
+    {
+        tag_counts(&h0, &u0, &d0); before = stats();
+        void *m6; tex_t t6 = fixture(d, &m6); uint8_t junk[8] = {0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x60, 0x61};
+        for (unsigned l = 0; l < 4; l++) strip_plane(&t6, l, junk);
+        id<MTLTexture> mt = upload(&t6);
+        CHECK(mt && mt.pixelFormat == MTLPixelFormatRGBA8Unorm, "a stripped texture with no entries is decoded");
+        tag_counts(&h1, &u1, &d1); after = stats();
+        CHECK(u1 - u0 == 4 && h1 == h0, "four unresolved planes (%llu)", (unsigned long long)(u1 - u0));
+        CHECK(d1 - d0 == 4, "four decoded planes (%llu)", (unsigned long long)(d1 - d0));
+        CHECK(after.queued == before.queued && after.misses == before.misses, "nothing was queued for the encoder: the bytes are zeros");
+        pthread_mutex_lock(&g_astc_mu); astc_dec *e = astc_slot(t6.serial, 0); int flags = e ? e->flags : 0; pthread_mutex_unlock(&g_astc_mu);
+        CHECK((flags & 8) && (flags & 16), "each red line is logged once per texture (flags %#x)", flags);
+        defer_obj_release(mt); release_fixture(m6);
+    }
+    // 6. copies: a whole-level stripped source whose entry exists makes the texture ASTC at its first copy and is read by tag; an unknown tag, and a piece of a level, are decoded and counted
+    {
+        nvn_texdesc cd = {.target = NVN_TEXTURE_TARGET_2D, .format = 0x44, .width = N, .height = N, .depth = 1, .levels = 1, .samples = 1};
+        uint8_t *expected = malloc((size_t)N * N * 4); CHECK(!nvn_bc_decode(0x44, smem, crow, N, N, expected, (size_t)N * 4), "CPU decode of the copy source");
+        void *src[3], *tm[3]; uint8_t bad[8] = {0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78};
+        for (int v = 0; v < 3; v++) {   // 0: tag of the cached plane; 1: unknown tag; 2: tag of the cached plane, but a piece of the level is copied
+            if (posix_memalign(&src[v], getpagesize(), 16384)) abort(); mtl_pool_add(src[v], 16384); memset(src[v], 0, 16384); memcpy(src[v], v == 1 ? bad : ckey, 8);
+            tag_counts(&h0, &u0, &d0); uint64_t part0 = atomic_load(&g_astc_copy_partial);
+            void *tmem; tex_t t = empty_texture(cd, &tmem, v + 1); tm[v] = tmem; mtl_tex_init(&t);
+            p_copy_b2t cp = {.src = (uint64_t)(uintptr_t)src[v], .tex = &t, .r = {0, 0, 0, v == 2 ? 8 : N, v == 2 ? 8 : N, 1}};
+            mtl_sub_begin(); copy_b2t(&cp, sizeof cp); CHECK(mtl_wait(mtl_sub_commit(), 20000000000ull), "the copy completes");
+            id<MTLTexture> mt = tex_mtl(&t); tag_counts(&h1, &u1, &d1);
+            if (v == 0) {
+                CHECK(mt && mt.pixelFormat == MTLPixelFormatASTC_4x4_LDR, "a stripped whole-level copy source makes the texture ASTC");
+                CHECK(h1 - h0 == 1 && u1 == u0 && d1 == d0, "one tagged hit (%llu/%llu/%llu)", (unsigned long long)(h1 - h0), (unsigned long long)(u1 - u0), (unsigned long long)(d1 - d0));
+                CHECK(mt && mean_err_vs_decode(mt, 0, 0x44, smem, crow, N, N) < 0.04, "and samples like the original plane");
+            } else {
+                CHECK(mt && mt.pixelFormat == MTLPixelFormatRGBA8Unorm, "an unknown tag, or a piece of a level, leaves the texture decoded");
+                CHECK(d1 - d0 == 1, "the decode of the tag's bytes is counted (%llu)", (unsigned long long)(d1 - d0));
+                if (v == 1) CHECK(u1 - u0 == 1, "an unknown tag at a whole level is unresolved too"); else CHECK(atomic_load(&g_astc_copy_partial) - part0 == 1 && u1 == u0, "a piece of a level is not an unresolved lookup");
+            }
+            defer_obj_release(mt);
+        }
+        for (int v = 0; v < 3; v++) { release_fixture(src[v]); release_fixture(tm[v]); }
+        free(expected);
+    }
+    g_embedded = 0;
+    defer_obj_release(mt1); defer_obj_release(mt2); defer_obj_release(mt3);
+    release_fixture(m1); release_fixture(m2); release_fixture(m3); release_fixture(smem); for (int v = 0; v < 2; v++) release_fixture(m5[v]);
+    for (int i = 0; i < 4; i++) free(ref[i]);
+    CHECK(nvn_bc_astc_bg_wait(120), "drains");
 }
 static void run_background(const char *dir, int six) {
     unsigned blk = six ? 6 : 4;
@@ -365,7 +542,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     (void)argc; (void)argv;
     char dir[] = "/tmp/t_astc_upload.XXXXXX";
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
-    setenv("DM_TEST_NO_BC", "1", 1); const char *mode = getenv("T_ASTC_MODE"); int maxdim = mode && !strcmp(mode, "maxdim"), background = (mode && !strcmp(mode, "background")) || maxdim; if (maxdim) setenv("DM_BC_MAX_DIM", "64", 1); setenv("DM_NVN_ASTC_MISS", background ? "background" : "sync", 1); const char *which = getenv("T_ASTC_BLOCK"); int six = which && atoi(which) == 6; setenv("DM_NVN_BC_ASTC", six ? "6" : "4", 1); setenv("DM_NVN_ASTC_CACHE", dir, 1); unsetenv("DM_NVN_ASTC_CACHE_RO");
+    setenv("DM_TEST_NO_BC", "1", 1); const char *mode = getenv("T_ASTC_MODE"); int maxdim = mode && !strcmp(mode, "maxdim"), tagged = mode && !strcmp(mode, "tagged"), background = (mode && !strcmp(mode, "background")) || maxdim || tagged; if (maxdim) setenv("DM_BC_MAX_DIM", "64", 1); setenv("DM_NVN_ASTC_MISS", background ? "background" : "sync", 1); const char *which = getenv("T_ASTC_BLOCK"); int six = which && atoi(which) == 6; setenv("DM_NVN_BC_ASTC", six ? "6" : "4", 1); setenv("DM_NVN_ASTC_CACHE", dir, 1); unsetenv("DM_NVN_ASTC_CACHE_RO");
     mtl_init();
     CHECK(astc_block() == (six ? 6u : 4u), "DM_NVN_BC_ASTC is on (with DM_TEST_NO_BC)");
     if (maxdim) {
@@ -373,6 +550,13 @@ int main(int argc, char **argv) { @autoreleasepool {
         mtl_drain();
         { char cmd[128]; snprintf(cmd, sizeof cmd, "rm -rf %s", dir); system(cmd); }
         printf("ASTC upload (DM_BC_MAX_DIM=64): %d checks, %d failures\n", checks, failed);
+        return failed ? 1 : 0;
+    }
+    if (tagged) {
+        run_tagged(dir);
+        mtl_drain();
+        { char cmd[128]; snprintf(cmd, sizeof cmd, "rm -rf %s", dir); system(cmd); }
+        printf("ASTC upload (tagged planes): %d checks, %d failures\n", checks, failed);
         return failed ? 1 : 0;
     }
     if (background) {

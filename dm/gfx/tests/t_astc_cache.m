@@ -2,6 +2,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdatomic.h>
+#include <sys/wait.h>
+#include "../../host/romfs_sparse.h"   // before the pread fake below: the image reader is the real one
+#include "../../host/tests/romfs_sparse_fixture.h"
 static _Atomic int read_fault;
 static _Atomic unsigned read_calls;
 static _Atomic size_t largest_read;
@@ -339,6 +342,85 @@ static void restore_contract(NSString *root) {
     CHECK(!munmap(source, page));
 }
 
+// ---- Tagged planes and the pack embedded in a DMSPARS1 image (docs/texture_once.md sections 1 to 3) ----
+static void tag_contract(NSString *root) {
+    uint8_t pa[100], pb[256], pc[100], pd[100], got[256]; memset(pa, 0xA1, sizeof pa); for (int i = 0; i < 256; i++) pb[i] = (uint8_t)(i * 7); memset(pc, 0xC3, sizeof pc); memset(pd, 0xD4, sizeof pd);
+    pk_entry e[7]; memset(e, 0, sizeof e);
+    for (int i = 0; i < 7; i++) for (int j = 0; j < 32; j++) e[i].key[j] = (uint8_t)(i * 37 + j * 11 + 1);
+    // e4 and e5 share the 8-byte prefix of e0 and differ after it: e4 has e0's payload size (100), e5 another (256); e6 shares e1's prefix with the same size as e1 (ambiguous)
+    memcpy(e[4].key, e[0].key, 8); e[4].key[9] ^= 0x40; memcpy(e[5].key, e[0].key, 8); e[5].key[10] ^= 0x41; memcpy(e[6].key, e[1].key, 8); e[6].key[12] ^= 0x42;
+    e[0].payload = pa; e[0].size = 100; e[1].payload = pb; e[1].size = 256; e[2].payload = pc; e[2].size = 100; e[3].payload = pd; e[3].size = 100;
+    e[4].payload = pd; e[4].size = 100; e[5].payload = pb; e[5].size = 256; e[6].payload = pb; e[6].size = 256;
+    uint8_t k0[32], k1[32], k2[32], k3[32]; memcpy(k0, e[0].key, 32); memcpy(k1, e[1].key, 32); memcpy(k2, e[2].key, 32); memcpy(k3, e[3].key, 32);
+    NSString *pack = [root stringByAppendingPathComponent:@"tag.pack"]; write_pack(pack, e, 7, 0);
+    const char *ro = pack.fileSystemRepresentation;
+    uint8_t plane[64]; uint8_t out[256];
+    // e0's prefix is shared with e4 (same payload size, 100) and e5 (256): two entries of size 100 -> ambiguous; e2 and e3 have unique prefixes
+    memset(plane, 0, sizeof plane); memcpy(plane, k2, 8);
+    CHECK(nvn_bc_astc_tag_fetch_root(ro, plane, sizeof plane, 100, NULL) == NVN_TAG_HIT);                          // a unique prefix: found without reading anything
+    uint64_t h0, u0, d0; nvn_bc_astc_tag_stats(&h0, &u0, &d0);
+    memset(out, 0, sizeof out); CHECK(nvn_bc_astc_tag_fetch_root(ro, plane, sizeof plane, 100, out) == NVN_TAG_HIT && !memcmp(out, pc, 100));   // and read
+    uint64_t h1, u1, d1; nvn_bc_astc_tag_stats(&h1, &u1, &d1); CHECK(h1 == h0 + 1 && u1 == u0 && d1 == d0);        // only a read counts as a tagged hit
+    // the same plane through the hash path's key: the entry the tag names is the entry the key names
+    { nvn_astc_cache_key key; NSString *hx = hexkey(k2); strcpy(key.hex, hx.UTF8String); uint8_t viakey[256]; CHECK(nvn_bc_astc_cache_read(&key, viakey, 100, NULL, ro) && !memcmp(viakey, out, 100)); }
+    CHECK(nvn_bc_astc_tag_fetch_root(ro, plane, sizeof plane, 101, out) == NVN_TAG_MISS);                          // looks tagged, the size differs: no entry
+    memset(plane, 0, sizeof plane); memcpy(plane, k3, 8); CHECK(nvn_bc_astc_tag_fetch_root(ro, plane, sizeof plane, 100, out) == NVN_TAG_HIT && !memcmp(out, pd, 100));
+    // prefix shared by two entries: the one of the expected size is picked when only one has it, none when both do
+    memset(plane, 0, sizeof plane); memcpy(plane, k0, 8);
+    CHECK(nvn_bc_astc_tag_fetch_root(ro, plane, sizeof plane, 100, out) == NVN_TAG_MISS);                          // e0 and e4 both hold 100 bytes: ambiguous
+    memset(out, 0, sizeof out); CHECK(nvn_bc_astc_tag_fetch_root(ro, plane, sizeof plane, 256, out) == NVN_TAG_HIT && !memcmp(out, pb, 256));   // e5 is the only one of 256
+    memset(plane, 0, sizeof plane); memcpy(plane, k1, 8);   // e1 and e6: both 256
+    CHECK(nvn_bc_astc_tag_fetch_root(ro, plane, sizeof plane, 256, out) == NVN_TAG_MISS);                          // two entries of the size: ambiguous, so not resolved by the tag
+    memset(plane, 0, sizeof plane); memset(plane, 0x5a, 8);   // a prefix no entry has
+    CHECK(nvn_bc_astc_tag_fetch_root(ro, plane, sizeof plane, 100, out) == NVN_TAG_MISS);
+    // what does not look tagged is not looked up at all
+    memset(plane, 0, sizeof plane); CHECK(nvn_bc_astc_tag_fetch_root(ro, plane, sizeof plane, 100, out) == NVN_TAG_NONE && !nvn_bc_astc_looks_tagged(plane, sizeof plane));   // all zero
+    memcpy(plane, k2, 8); plane[63] = 1; CHECK(nvn_bc_astc_tag_fetch_root(ro, plane, sizeof plane, 100, out) == NVN_TAG_NONE);                // a tag-like prefix with data after it: an untagged plane
+    memset(plane, 0, sizeof plane); memcpy(plane, k2, 8); plane[8] = 1; CHECK(!nvn_bc_astc_looks_tagged(plane, sizeof plane));
+    memset(plane, 0, sizeof plane); memcpy(plane, k2, 8); CHECK(nvn_bc_astc_looks_tagged(plane, 16) && !nvn_bc_astc_looks_tagged(plane, 15) && nvn_bc_astc_looks_tagged(plane, 17) && !nvn_bc_astc_looks_tagged(NULL, 16));
+    { uint8_t z[64] = {0}; z[3] = 9; CHECK(nvn_bc_astc_looks_tagged(z, 64)); z[15] = 1; CHECK(!nvn_bc_astc_looks_tagged(z, 16)); }   // one nonzero byte in the head is enough
+    { uint8_t r[8 * 4 * 3] = {0}; memcpy(r, k2, 8); CHECK(nvn_bc_astc_looks_tagged_rows(r, 8, 24, 4) && nvn_bc_astc_looks_tagged_rows(r, 24, 24, 4) && !nvn_bc_astc_looks_tagged_rows(r, 8, 24, 0));
+      r[24 * 2 + 7] = 5; CHECK(!nvn_bc_astc_looks_tagged_rows(r, 8, 24, 4)); r[24 * 2 + 7] = 0; r[24 * 2 + 9] = 5; CHECK(nvn_bc_astc_looks_tagged_rows(r, 8, 24, 4));   // padding between rows is not looked at
+      CHECK(!nvn_bc_astc_looks_tagged_rows(r, 4, 24, 1)); }
+    // a corrupt payload is a miss, never a wrong plane, and never counted as a hit
+    NSString *flip = [root stringByAppendingPathComponent:@"tag-flip.pack"]; write_pack(flip, e, 7, 0);
+    { uint64_t off = 0; NSData *d = [NSData dataWithContentsOfFile:flip]; const uint8_t *b = d.bytes; uint64_t ioff; memcpy(&ioff, b + 24, 8);
+      for (int i = 0; i < 7; i++) if (!memcmp(b + ioff + 48 * i, k2, 32)) memcpy(&off, b + ioff + 48 * i + 32, 8);
+      FILE *f = fopen(flip.fileSystemRepresentation, "r+b"); fseek(f, (long)off + 40 + 5, SEEK_SET); fputc(0x77, f); fclose(f); }
+    memset(plane, 0, sizeof plane); memcpy(plane, k2, 8); nvn_bc_astc_tag_stats(&h0, &u0, &d0);
+    CHECK(nvn_bc_astc_tag_fetch_root(flip.fileSystemRepresentation, plane, sizeof plane, 100, out) == NVN_TAG_MISS); nvn_bc_astc_tag_stats(&h1, &u1, &d1); CHECK(h1 == h0);
+    // a directory as the read-only cache has no index to search: looks tagged, resolves to nothing
+    CHECK(nvn_bc_astc_tag_fetch_root(root.fileSystemRepresentation, plane, sizeof plane, 100, out) == NVN_TAG_MISS && nvn_bc_astc_tag_fetch_root(NULL, plane, sizeof plane, 100, out) == NVN_TAG_MISS);
+    nvn_bc_astc_tag_note(NVN_TAG_NOTE_UNRESOLVED); nvn_bc_astc_tag_note(NVN_TAG_NOTE_DECODED); nvn_bc_astc_tag_note(NVN_TAG_NOTE_DECODED);
+    uint64_t h2, u2, d2; nvn_bc_astc_tag_stats(&h2, &u2, &d2); CHECK(u2 == u1 + 1 && d2 == d1 + 2 && h2 == h1);
+
+    // the pack embedded in a DMSPARS1: offsets are relative to the pack; the same lookups work through the pseudo-root
+    NSData *pk = [NSData dataWithContentsOfFile:pack];
+    uint8_t *wrapped; size_t wn; uint8_t logical[3000]; for (int i = 0; i < 3000; i++) logical[i] = (uint8_t)(i % 251 + (i > 1000 && i < 2500 ? 0 : 1));
+    memset(logical + 1000, 0, 1500);
+    CHECK(fx_write_sparse(NULL, logical, sizeof logical, 64, 700, pk.bytes, pk.length, &wrapped, &wn) > 2);
+    NSString *img = [root stringByAppendingPathComponent:@"wrapped.img"]; [[NSData dataWithBytes:wrapped length:wn] writeToFile:img atomically:NO];
+    pid_t kid = fork();   // a damaged embedded pack is refused (it is remembered for the process, so a child shows it)
+    if (!kid) { int fd = open(img.fileSystemRepresentation, O_RDONLY); romfs_src s; if (!romfs_src_open(fd, &s)) _exit(2); _exit(nvn_bc_astc_use_embedded_pack(fd, s.pack_off + 8, s.pack_size) ? 1 : 0); }
+    int status = 0; waitpid(kid, &status, 0); CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    kid = fork();
+    if (!kid) { int fd = open(img.fileSystemRepresentation, O_RDONLY); romfs_src s; if (!romfs_src_open(fd, &s)) _exit(2); _exit(nvn_bc_astc_use_embedded_pack(fd, s.pack_off, s.pack_size - 16) ? 1 : 0); }   // a pack size that is not its header's
+    waitpid(kid, &status, 0); CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    int fd = open(img.fileSystemRepresentation, O_RDONLY); romfs_src s; CHECK(romfs_src_open(fd, &s) && s.sparse && s.pack_size == pk.length && s.pack_off % 16384 == 0);
+    CHECK(!nvn_bc_astc_pack_info(NVN_ASTC_EMBEDDED_ROOT, NULL, NULL, NULL));   // nothing registered yet
+    CHECK(nvn_bc_astc_use_embedded_pack(fd, s.pack_off, s.pack_size));
+    uint64_t entries, bytes; CHECK(nvn_bc_astc_pack_info(NVN_ASTC_EMBEDDED_ROOT, &entries, &bytes, NULL) && entries == 7 && bytes == pk.length);
+    nvn_astc_cache_key key; strcpy(key.hex, hexkey(k1).UTF8String);
+    CHECK(nvn_bc_astc_cache_read(&key, got, 256, NULL, NVN_ASTC_EMBEDDED_ROOT) && !memcmp(got, pb, 256));          // by key, through the embedded pack
+    memset(plane, 0, sizeof plane); memcpy(plane, k2, 8);
+    memset(out, 0, sizeof out); CHECK(nvn_bc_astc_tag_fetch_root(NVN_ASTC_EMBEDDED_ROOT, plane, sizeof plane, 100, out) == NVN_TAG_HIT && !memcmp(out, pc, 100));   // by tag
+    CHECK(nvn_bc_astc_use_embedded_pack(open(img.fileSystemRepresentation, O_RDONLY), s.pack_off, s.pack_size));   // a second registration changes nothing
+    // the pack's entries are read at pack offset + entry offset, not from the file's start: the file's first bytes are not a pack
+    { uint8_t head[8]; CHECK(pread(fd, head, 8, 0) == 8 && !memcmp(head, "DMSPARS1", 8)); }
+    // the writer's logical image reads back around the pack
+    { uint8_t *back = malloc(sizeof logical); CHECK(romfs_src_read(&s, back, sizeof logical, 0) && !memcmp(back, logical, sizeof logical)); free(back); }
+    romfs_src_free(&s); free(wrapped);
+}
 int main(int argc, char **argv) { @autoreleasepool {
     size_t budget = argc > 1 && !strcmp(argv[1], "budget") ? 128 : 1u << 20;
     int mapped_mode = argc > 1 && (!strcmp(argv[1], "mapped") || !strcmp(argv[1], "mapped-memcpy"));
@@ -506,6 +588,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     nvn_bc_astc_cache_prepare(NULL, NULL, 2u << 20, 0);
     CHECK(g_cache_small[small].length == 16);
     pack_contract(root);
+    tag_contract(root);
     background_contract(root);
     CHECK([NSFileManager.defaultManager removeItemAtPath:root error:NULL]);
     printf("ASTC cache: %u checks, %u failures, %zu retained bytes\n", checks, failures, used);

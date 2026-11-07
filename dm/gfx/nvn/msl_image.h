@@ -23,6 +23,7 @@ static const img_ent *msl_image_find(const romfs_img *m, const char *name) {
 typedef struct { const void *data; size_t size; void *base; size_t base_len; } msl_map;
 static int msl_image_map(const romfs_img *m, const img_ent *x, msl_map *out) {
     if (!x->b) { errno = EINVAL; return 0; }
+    if (m->src.sparse) { errno = ENOTSUP; return 0; }   // a DMSPARS1 has holes no mapping can read; the caller reads the file's bytes instead
     uint64_t delta = x->a % (uint64_t)getpagesize();
     void *p = mmap(NULL, (size_t)(x->b + delta), PROT_READ, MAP_SHARED, m->fd, (off_t)(x->a - delta));
     if (p == MAP_FAILED) return 0;

@@ -864,15 +864,15 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
 }
 HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", Result, h_fs_ReadFile, size_t *out, uint64_t h, int64_t off, void *buf, size_t sz) { dm_thread_service_request(); h = FH_IN(h);
     if (!h) { *out = 0; return RES_FAIL; }   // a file handle is an fd; 0 is stdin and never a file the game opened: the null handle the game keeps using after a failed open
-    size_t got = 0; int reprep = 0, fd = (int)h; int64_t base = 0;
-    if (IMG_H(h)) {   // an image entry: read the image's descriptor at the entry's offset, never past its end
+    size_t got = 0; int reprep = 0, fd = (int)h; int64_t base = 0; const romfs_src *isrc = NULL;
+    if (IMG_H(h)) {   // an image entry: read the image at the entry's offset, never past its end (isrc: a plain DMROMFS1 or a DMSPARS1, whose holes read as zero)
         const img_ent *x = &g_mnt[IMG_M(h)].img->e[IMG_K(h)];
-        fd = g_mnt[IMG_M(h)].img->fd; base = (int64_t)x->a;
+        isrc = &g_mnt[IMG_M(h)].img->src; base = (int64_t)x->a;
         sz = off < 0 || (uint64_t)off >= x->b ? 0 : (size_t)(x->b - off) < sz ? (size_t)(x->b - off) : sz;
     }
     dm_guest_write_prepare(buf, sz);   // The destination may be a texture pool page write-protected by the graphics layer: a kernel write to a read-only page returns EFAULT instead of page-faulting, so unprotect and mark dirty first
     while (got < sz) {
-        ssize_t r = pread(fd, (uint8_t *)buf + got, sz - got, base + off + got);
+        ssize_t r = isrc ? romfs_src_pread(isrc, (uint8_t *)buf + got, sz - got, (uint64_t)(base + off + got)) : pread(fd, (uint8_t *)buf + got, sz - got, base + off + got);
         if (r < 0) { if (errno == EINTR) continue;
             // The graphics layer write-protects tracked pages again after each upload (nvn_dirty.c), so a page made writable above can be read-only again by the time pread
             // writes it: a plain write would fault into the tracker's handler, a system call gets EFAULT. Prepare the rest again (unprotect, mark dirty) and read on. Monster Train 2

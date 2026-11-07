@@ -20,6 +20,7 @@ static int fake_clonefile(const char *src, const char *dst, uint32_t flags);
 #define pwrite fake_pwrite
 #define clonefile fake_clonefile
 #include "../hle_fs.c"
+#include "romfs_sparse_fixture.h"
 #undef pwrite
 #undef clonefile
 ssize_t pwrite(int, const void *, size_t, off_t);
@@ -172,6 +173,19 @@ int main(void) {
         }
         f = fopen(ip, "wb"); fwrite(img, 1, 39 + 50, f); fclose(f);   // cut off inside the index, as a copy stopped partway
         CHECK(!img_open(ip), "a cut-off image is refused");
+        {   // the same image wrapped in a DMSPARS1 (docs/texture_once.md): files with zero holes read through the mount like the plain image, ReadFile across extent boundaries and past the end of a file
+            uint8_t sp[sizeof img]; memcpy(sp, img, sizeof img); memcpy(sp + 32, "h\0\0\0oxy", 7);   // /data/a = "h", three zero bytes, "o"
+            uint8_t *w; size_t wn; CHECK(fx_write_sparse(NULL, sp, sizeof sp, 1, 2, NULL, 0, &w, &wn) > 3, "wrap the image in extents of two bytes with holes");
+            char wp[1100]; snprintf(wp, sizeof wp, "%s/sparse.img", root); f = fopen(wp, "wb"); fwrite(w, 1, wn, f); fclose(f); free(w);
+            setenv("DM_ROMFS", wp, 1); g_nmnt = 0; CHECK(h_fs_MountRom("rom", NULL, 0) == RES_OK && g_mnt[0].img && g_mnt[0].img->src.sparse, "a DMSPARS1 mounts as the RomFS");
+            uint64_t h; size_t n = 0; uint8_t b[16]; memset(b, 7, sizeof b);
+            CHECK(h_fs_OpenFile(&h, "rom:/data/a", MODE_READ) == RES_OK && h_fs_ReadFile(&n, h, 0, b, 16) == RES_OK && n == 5 && !memcmp(b, "h\0\0\0o", 5) && b[5] == 7, "a file with holes reads in full and stops at its end (got %zu)", n);
+            memset(b, 7, sizeof b); CHECK(h_fs_ReadFile(&n, h, 1, b, 3) == RES_OK && n == 3 && !b[0] && !b[1] && !b[2] && b[3] == 7, "a read inside the hole");
+            memset(b, 7, sizeof b); CHECK(h_fs_ReadFile(&n, h, 3, b, 2) == RES_OK && n == 2 && !b[0] && b[1] == 'o', "a read across a hole and an extent");
+            CHECK(h_fs_ReadFile(&n, h, 5, b, 4) == RES_OK && n == 0, "a read at the end of the file is empty"); h_fs_CloseFile(h);
+            CHECK(read_fs("rom:/data/c", got, sizeof got) && !strcmp(got, "xy"), "a file with no holes, behind an extent boundary");
+            g_nmnt = 0; setenv("DM_ROMFS", ip, 1);
+        }
     }
     snprintf(save, sizeof save, "%s/save", root); snprintf(work, sizeof work, "%s.work", save);
     mkdir(save, 0755); snprintf(p, sizeof p, "%s/a", save); put(p, "old");

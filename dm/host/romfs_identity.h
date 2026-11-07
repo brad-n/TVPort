@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "romfs_sparse.h"
 
 typedef struct { uint64_t size, index; char title[24], version[40], build[40]; } romfs_id;
 enum { ROMFS_ID_OK, ROMFS_ID_NONE /* no expected identity: not a slim build */, ROMFS_ID_BAD /* the expected identity cannot be read */,
@@ -26,30 +27,27 @@ static uint64_t romfs_id_mix(uint64_t h, const uint8_t *p, size_t n) {   // n mu
     }
     return h;
 }
-// Size and index hash of the image at path (title / version / build empty). 0 with errno set for a missing, cut off or invalid image.
+// Size and index hash of the image at path (title / version / build empty), over the LOGICAL image: a DMSPARS1 (romfs_sparse.h) has the identity of the plain DMROMFS1 it wraps, so stripping a RomFS
+// image keeps its identity. 0 with errno set for a missing, cut off or invalid image.
 static int romfs_id_of_image(const char *path, romfs_id *out) {
     memset(out, 0, sizeof *out);
     int fd = open(path, O_RDONLY); if (fd < 0) return 0;
-    struct stat st; uint8_t h[32]; uint64_t ioff, isz, hash = 0xcbf29ce484222325ull;
-    if (fstat(fd, &st) || pread(fd, h, sizeof h, 0) != (ssize_t)sizeof h) { int e = errno ? errno : EINVAL; close(fd); errno = e; return 0; }
+    uint8_t h[32]; uint64_t ioff, isz, hash = 0xcbf29ce484222325ull; romfs_src src;
+    if (!romfs_src_open(fd, &src)) { int e = errno ? errno : EINVAL; close(fd); errno = e; return 0; }
+    if (src.logical < sizeof h || !romfs_src_read(&src, h, sizeof h, 0)) { romfs_src_free(&src); close(fd); errno = EINVAL; return 0; }
     memcpy(&ioff, h + 8, 8); memcpy(&isz, h + 16, 8);
-    if (memcmp(h, "DMROMFS1", 8) || ioff < sizeof h || ioff > (uint64_t)st.st_size || isz != (uint64_t)st.st_size - ioff) { close(fd); errno = EINVAL; return 0; }
+    if (memcmp(h, "DMROMFS1", 8) || ioff < sizeof h || ioff > src.logical || isz != src.logical - ioff) { romfs_src_free(&src); close(fd); errno = EINVAL; return 0; }
     hash = romfs_id_mix(hash, h, sizeof h);
     enum { CHUNK = 1 << 20 };
-    uint8_t *buf = malloc(CHUNK + 8); if (!buf) { close(fd); errno = ENOMEM; return 0; }
+    uint8_t *buf = malloc(CHUNK + 8); if (!buf) { romfs_src_free(&src); close(fd); errno = ENOMEM; return 0; }
     for (uint64_t at = 0; at < isz;) {
-        size_t n = isz - at < CHUNK ? (size_t)(isz - at) : (size_t)CHUNK, got = 0;
-        while (got < n) {
-            ssize_t r = pread(fd, buf + got, n - got, (off_t)(ioff + at + got));
-            if (r < 0 && errno == EINTR) continue;
-            if (r <= 0) { free(buf); close(fd); errno = EINVAL; return 0; }
-            got += (size_t)r;
-        }
+        size_t n = isz - at < CHUNK ? (size_t)(isz - at) : (size_t)CHUNK;
+        if (!romfs_src_read(&src, buf, n, ioff + at)) { free(buf); romfs_src_free(&src); close(fd); errno = EINVAL; return 0; }
         size_t padded = (n + 7) & ~(size_t)7; memset(buf + n, 0, padded - n);
         hash = romfs_id_mix(hash, buf, padded); at += n;
     }
-    free(buf); close(fd);
-    out->size = (uint64_t)st.st_size; out->index = hash; return 1;
+    free(buf); romfs_src_free(&src); close(fd);
+    out->size = src.logical; out->index = hash; return 1;
 }
 static void romfs_id_field(char *dst, size_t cap, const char *v, size_t n) {
     if (n >= cap) n = cap - 1;

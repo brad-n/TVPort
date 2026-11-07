@@ -33,6 +33,23 @@ const char *nvn_bc_astc_cache_status_name(nvn_astc_cache_status status);
 int nvn_bc_astc_readonly_ready(void);
 // The content address of a plane (the name of its cache entry): SHA-256 over the version tag, format, size, block and the tightly packed BC bytes. For tools that key planes without encoding them
 void nvn_bc_astc_plane_key(uint32_t format, uint32_t width, uint32_t height, unsigned block, const void *source, size_t source_size, nvn_astc_cache_key *key);
+// The read-only cache root that names the pack a RomFS image embeds (DMSPARS1): register it first with nvn_bc_astc_use_embedded_pack
+#define NVN_ASTC_EMBEDDED_ROOT "dm:romfs-embedded-pack"
+// fd holds an NXASTCPK pack at [offset, offset + size) (offsets inside it relative to offset). fd stays open for the life of the process (closed here when the pack is not usable). 1 when the pack holds together
+int nvn_bc_astc_use_embedded_pack(int fd, uint64_t offset, uint64_t size);
+// ---- Tagged planes (docs/texture_once.md section 2): a stripped plane is the first 8 bytes of its pack key, then zeros ----
+typedef enum { NVN_TAG_NONE = 0 /* does not look tagged */, NVN_TAG_HIT /* exactly one entry of the expected size */, NVN_TAG_MISS /* looks tagged, no usable entry */ } nvn_astc_tag_result;
+enum { NVN_TAG_NOTE_UNRESOLVED = 1, NVN_TAG_NOTE_DECODED = 2 };
+// length >= 16, bytes [0,8) not all zero, bytes [8,length) all zero
+int nvn_bc_astc_looks_tagged(const void *plane, size_t length);
+// The same for a plane in rows of row_bytes bytes, stride apart (a copy source)
+int nvn_bc_astc_looks_tagged_rows(const void *plane, size_t row_bytes, size_t stride, size_t rows);
+// Look a tagged plane up in the read-only pack (by the 8-byte prefix) and, when output is not NULL, read its verified ASTC blocks (astc_size bytes) into it. NVN_TAG_HIT counts a tagged hit only when output is given
+nvn_astc_tag_result nvn_bc_astc_tag_fetch(const void *plane, size_t length, size_t astc_size, void *output);
+nvn_astc_tag_result nvn_bc_astc_tag_fetch_root(const char *readonly_cache, const void *plane, size_t length, size_t astc_size, void *output);
+// Counts a tagged plane that no path resolved (it would draw from zeros) or that was decoded as BC bytes
+void nvn_bc_astc_tag_note(int kind);
+void nvn_bc_astc_tag_stats(uint64_t *hits, uint64_t *unresolved, uint64_t *decoded);
 int nvn_bc_astc_pack_info(const char *path, uint64_t *entries, uint64_t *bytes, uint8_t fingerprint[32]);
 // Restore a previously encoded plane without touching its BC source. The caller
 // must first prove that the source and its layout have not changed. A miss or a
@@ -74,6 +91,9 @@ int nvn_bc_astc_bg_format_stats(char *buffer, size_t size);      // one log line
 int nvn_bc_astc_learn(uint32_t format, const void *source, size_t source_size, uint32_t width, uint32_t height, unsigned block, nvn_astc_cache_key *saved_key);
 // 1: the plane's ASTC blocks were read (verified) into output. 0: not there, queued as above; output untouched. -1: invalid.
 int nvn_bc_astc_fetch(uint32_t format, const void *source, size_t source_size, uint32_t width, uint32_t height, unsigned block, void *output, size_t output_size);
+// nvn_bc_astc_fetch without queueing a miss (a plane whose bytes are a tag and zeros has nothing to encode), and a lookup that reads nothing and queues nothing: 1 in a cache, 0 not, -1 invalid
+int nvn_bc_astc_fetch_noqueue(uint32_t format, const void *source, size_t source_size, uint32_t width, uint32_t height, unsigned block, void *output, size_t output_size);
+int nvn_bc_astc_has_plane(uint32_t format, const void *source, size_t source_size, uint32_t width, uint32_t height, unsigned block);
 #ifdef __cplusplus
 }
 #endif

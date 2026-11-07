@@ -7,38 +7,33 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "romfs_sparse.h"
 
 typedef struct { uint64_t a, b; uint32_t name; uint16_t nlen; uint8_t type, flags; } __attribute__((packed)) img_ent;   // directory: a = first child, b = children; file: a = offset, b = size
 _Static_assert(sizeof(img_ent) == 24, "RomFS image entry layout");
 #define IMG_ENT_DAMAGED 1    // in the image: this file failed the NCA's hash check and was written as read (nx_extract --allow-damaged)
 #define IMG_ENT_REPORTED 2   // in memory only: the host has named this damaged file in its log
-typedef struct { int fd; uint64_t n, damaged; img_ent *e; const char *names; } romfs_img;
+typedef struct { int fd; uint64_t n, damaged; img_ent *e; const char *names; romfs_src src; } romfs_img;   // src: the file as a plain DMROMFS1 or a DMSPARS1 (romfs_sparse.h); every read of its bytes goes through it
 
 static void romfs_image_close(romfs_img *m) {
-    if (m) { close(m->fd); free(m->e); free(m); }
+    if (m) { close(m->fd); romfs_src_free(&m->src); free(m->e); free(m); }
 }
-static int romfs_image_read(int fd, void *buf, size_t size, off_t off) {
-    size_t got = 0;
-    while (got < size) {
-        ssize_t n = pread(fd, (char *)buf + got, size - got, off + (off_t)got);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) { if (!n) errno = EINVAL; return 0; }
-        got += (size_t)n;
-    }
-    return 1;
-}
+// Reads [off, off + size) of the image's LOGICAL bytes (a DMSPARS1's holes read as zero); 0 with errno set when the range cannot be read in full
+static int romfs_image_read(const romfs_img *m, void *buf, size_t size, uint64_t off) { return romfs_src_read(&m->src, buf, size, off); }
 // NULL for an incomplete or invalid image (errno EINVAL), an I/O error, or allocation failure. The caller owns the descriptor and index on success.
 static romfs_img *romfs_image_open(const char *path) {
-    int fd = open(path, O_RDONLY); struct stat st; uint8_t h[32]; romfs_img *m = NULL; uint64_t ioff, isz, n;
+    int fd = open(path, O_RDONLY); uint8_t h[32]; romfs_img *m = NULL; uint64_t ioff, isz, n, size; romfs_src src;
     if (fd < 0) return NULL;
-    if (fstat(fd, &st) || !romfs_image_read(fd, h, sizeof h, 0)) goto bad;
+    if (!romfs_src_open(fd, &src)) goto bad;
+    size = src.logical;   // the DMROMFS1 image: the file itself, or what a DMSPARS1 wraps
+    if (!(m = calloc(1, sizeof *m))) { romfs_src_free(&src); goto bad; }
+    m->fd = fd; m->src = src;
+    if (size < sizeof h || !romfs_src_read(&m->src, h, sizeof h, 0)) goto bad;
     errno = EINVAL;
-    if (memcmp(h, "DMROMFS1", 8) || st.st_size < (off_t)sizeof h) goto bad;
+    if (memcmp(h, "DMROMFS1", 8)) goto bad;
     memcpy(&ioff, h + 8, 8); memcpy(&isz, h + 16, 8); memcpy(&n, h + 24, 8);
-    if (!n || n > UINT32_MAX || ioff < sizeof h || ioff > (uint64_t)st.st_size || isz != (uint64_t)st.st_size - ioff || isz > SIZE_MAX || n > isz / sizeof(img_ent)) goto bad;
-    if (!(m = calloc(1, sizeof *m))) goto bad;
-    m->fd = fd;
-    if (!(m->e = malloc((size_t)isz)) || !romfs_image_read(fd, m->e, (size_t)isz, (off_t)ioff)) goto bad;
+    if (!n || n > UINT32_MAX || ioff < sizeof h || ioff > size || isz != size - ioff || isz > SIZE_MAX || n > isz / sizeof(img_ent)) goto bad;
+    if (!(m->e = malloc((size_t)isz)) || !romfs_src_read(&m->src, m->e, (size_t)isz, ioff)) goto bad;
     m->n = n; m->names = (const char *)m->e + n * sizeof(img_ent);
     uint64_t pool = isz - n * sizeof(img_ent), next_child = 1;
     errno = EINVAL;
