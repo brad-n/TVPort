@@ -454,6 +454,7 @@ struct SettingsForm: View {
     @EnvironmentObject var library: Library
     @Environment(\.openWindow) private var openWindow
     @State private var choosingKeys = false
+    @State private var showAdvanced = false
 
     var body: some View {
         Form {
@@ -517,6 +518,27 @@ struct SettingsForm: View {
                     LabeledContent("Last backup", value: "\(time), \(place(game))")
                 }
             }
+            Section {
+                DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Toggle("Allow a damaged game manual", isOn: flagBinding(\.allowDamagedManual))
+                        note("A damaged offline manual no longer stops the build. Damaged game data still does.")
+                        TextField("Extra extractor arguments", text: textBinding(\.extractorArguments), prompt: Text("--option value, quotes keep spaces"))
+                        note("Added to every extraction step of the game's files, not to the title and key checks. --allow-damaged also turns off reuse of earlier results, so the next build takes longer.")
+                        Toggle("Metal 4 pipelines", isOn: flagBinding(\.metal4Pipelines))
+                        note("Turns on DM_PSO_MTL4 and keeps the pulling shader libraries in the build. Experimental.")
+                        TextField("Pipeline archive GPU", text: textBinding(\.pipelineGPU), prompt: Text("Empty for none, or g18p"))
+                        note("GPU architectures, separated by commas, to make a pipeline archive for on this Mac. Empty builds no archive, as before.")
+                        Text("Extra environment switches").font(.callout)
+                        TextEditor(text: textBinding(\.extraEnvironment))
+                            .font(.system(.caption, design: .monospaced)).frame(minHeight: 64)
+                            .overlay(RoundedRectangle(cornerRadius: 4).stroke(.quaternary))
+                        note("One KEY=VALUE per line, with capital letters, digits and underscores in the key. Blank lines and lines starting with # are skipped. These replace a generated switch with the same name.")
+                        note("Advanced options are saved for this game and take effect at the next Build & Install.")
+                    }
+                    .padding(.top, 6)
+                }
+            }
             Section("Game keys") {
                 LabeledContent("prod.keys") {
                     HStack {
@@ -536,6 +558,26 @@ struct SettingsForm: View {
 
     private func place(_ game: Game) -> String {
         (library.backups[game.folder]?.last_backup_place ?? library.info?.last_backup_place) == "icloud" ? "iCloud Drive" : "this Mac"
+    }
+
+    private func note(_ text: String) -> some View {
+        Text(text).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func textBinding(_ path: WritableKeyPath<Game, String?>) -> Binding<String> {
+        let gameID = library.selection
+        return Binding(get: { library.games.first { $0.id == gameID }?[keyPath: path] ?? "" }, set: { value in
+            guard library.selection == gameID else { return }
+            library.update { $0[keyPath: path] = value.isEmpty ? nil : value }
+        })
+    }
+
+    private func flagBinding(_ path: WritableKeyPath<Game, Bool?>) -> Binding<Bool> {
+        let gameID = library.selection
+        return Binding(get: { library.games.first { $0.id == gameID }?[keyPath: path] ?? false }, set: { value in
+            guard library.selection == gameID else { return }
+            library.update { $0[keyPath: path] = value ? true : nil }
+        })
     }
 
     private var playersBinding: Binding<String> {
