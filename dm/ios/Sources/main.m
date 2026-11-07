@@ -13,6 +13,7 @@
 #include "romfs_image.h"
 #include "romfs_identity.h"
 #include "player_env.h"
+#include "diag_path.h"
 #if TARGET_OS_TV
 #define DM_DATA_DIRECTORY NSCachesDirectory   // tvOS apps have no Documents to keep: Library/Caches holds the game files, the saves and the logs, and the system may purge it
 #else
@@ -183,6 +184,7 @@ static int boot_env(void) {
     }
     setenv("DM_ENV_FILE_KEYS", [from_file componentsJoinedByString:@" "].UTF8String, 1);   // the launcher keeps what an env file set (LauncherSettings.swift)
     setenv("DM_ENV_LAUNCH_KEYS", [from_launch componentsJoinedByString:@" "].UTF8String, 1);   // and what the launch environment set (docs/frontends.md, Saved choices)
+    dm_diag_start(doc.fileSystemRepresentation);   // DM_MEMSTAT / DM_THRCPU: only now are env.txt's values visible; a relative name goes into the data directory (Caches on tvOS)
     front_hud_env();   // an env file's DM_METAL_HUD; nothing in this process makes a Metal device before startGame (front_ios.m), which applies the launcher's
     // Game language (nn::oe::GetDesiredLanguage, hle_oe.c): the one the IPA was packed with (the NSP script's LANGUAGE / --language → DMLanguage in Info.plist), unless an env file sets DM_LANG
     // (or the launcher, which replaces this default before the game starts)

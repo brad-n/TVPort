@@ -15,7 +15,8 @@
 #include <fcntl.h>
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
-#include <os/proc.h>   // os_proc_available_memory: for the memory readout line
+#include <os/proc.h>   // os_proc_available_memory: for the memory readout line and the staging limits (mem_limits_init)
+#include "mem_limits.h"
 #endif
 #include "nvn_mtl.h"
 #include <mach/mach.h>
@@ -78,6 +79,10 @@ static uint64_t c2_handle(int stage, unsigned b);   // the handle c2 holds at by
 
 #define MLOG(...) do { flockfile(stderr); fprintf(stderr, "[dm] [nvn-mtl] " __VA_ARGS__); fputc('\n', stderr); funlockfile(stderr); } while (0)   // one line under one lock, as LOG (dm.h)
 #define MDIE(...) do { MLOG("FATAL " __VA_ARGS__); abort(); } while (0)
+// Memory-derived limits (mem_limits.h). The Mac keeps the fixed defaults; iOS/tvOS derive them once from os_proc_available_memory() at device setup (mem_limits_init).
+static size_t g_up_blk_max = 32u * 1024u * 1024u;       // UP_BLOCK_SIZE: the largest retained staging block (and overflow block) per upload slot
+static size_t g_up_batch_max = 128u * 1024u * 1024u;    // UP_BATCH_BYTES: the staging one upload batch may hold before it is split
+static uint64_t g_pool_budget_cap = UINT64_MAX;         // upper bound for pool_budget (texture creation budget)
 static void *realloc_or_die(void *p, size_t bytes, const char *what) {   // for a table the host cannot go on without: never NULL, so the caller cannot write through it or lose the old one
     void *grown = realloc(p, bytes); if (!grown) MDIE("no memory for %s", what);
     return grown;
@@ -531,6 +536,15 @@ void mtl_init(void) {
     g_res_check_on = getenv("DM_RES_CHECK") != NULL;
     g_dev = MTLCreateSystemDefaultDevice();
     if (!g_dev) MDIE("no Metal device");
+#if TARGET_OS_IPHONE
+    {   // size the upload staging and the texture creation budget from the memory this process can still use (mem_limits.h); the Mac keeps the fixed defaults
+        dm_mem_limits_t ml; dm_mem_limits(os_proc_available_memory(), g_dev.recommendedMaxWorkingSetSize, &ml);
+        g_up_blk_max = ml.up_block; g_up_batch_max = ml.up_batch; g_pool_budget_cap = ml.pool_budget;
+        MLOG("memory limits: os_proc_available_memory %llu MB, recommendedMaxWorkingSetSize %llu MB -> upload staging block %llu MB (retained at most %llu MB over 3 slots), upload batch budget %llu MB, texture creation budget %llu MB",
+             (unsigned long long)(os_proc_available_memory() >> 20), (unsigned long long)(g_dev.recommendedMaxWorkingSetSize >> 20), (unsigned long long)(ml.up_block >> 20),
+             (unsigned long long)((ml.up_block * 6) >> 20), (unsigned long long)(ml.up_batch >> 20), (unsigned long long)(MIN(ml.pool_budget, g_dev.recommendedMaxWorkingSetSize / 20) >> 20));
+    }
+#endif
     if (!g_dev.hasUnifiedMemory) MDIE("needs a unified-memory device (zero-copy memory pools)");
     g_q = [g_dev newCommandQueue];
     // A device without Metal 4 (the paravirtualized GPU of a virtual Mac, such as GitHub's macos-26 runner: no residency set, no MTL4CommandQueue) cannot run the NVN layer. The GL and
@@ -1091,6 +1105,7 @@ static uint64_t g_alloc_fence[ALLOC_MAX]; static uint64_t g_alloc_waits, g_alloc
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);
 static int mtl_wait_at(uint64_t fence, uint64_t timeout_ns, int site);
 static void up_flush(void);
+static void up_idle_release(void);
 // The upload batch belongs only to the submit thread (the thread that called mtl_sub_begin): the batch's encoder cannot be used across threads. Every entry point asserts current thread == submit thread,
 // and on mismatch prints the stack and aborts on the spot - so that 'another thread touched the batch' is exposed deterministically on Mac too, not by timing (real iOS device stuck at the main menu: the present thread flushed the submit thread's batch via q_cb).
 static pthread_t g_sub_thread; static _Atomic int g_sub_thread_set;
@@ -1133,6 +1148,7 @@ void mtl_sub_begin(void) {
     warm_claim();
     if (g_cb) MDIE("submit re-entered");
     g_sub_thread = pthread_self(); atomic_store(&g_sub_thread_set, 1);
+    up_idle_release();
     atomic_store(&g_last_commit_error, 0);
     g_sub_pool = objc_autoreleasePoolPush();
     g_cb = rec_cb_new();
@@ -2647,7 +2663,7 @@ static void up_wait_zero(_Atomic int *v, int site) {
     if (ws_on()) ws_put(site, w0, 1);
 }
 static unsigned g_up_seq;
-#define UP_BLOCK_SIZE (32u * 1024u * 1024u)
+#define UP_BLOCK_SIZE g_up_blk_max   // 32 MB on the Mac; smaller on iOS/tvOS when memory is tight (mem_limits.h). Always a power of two, at least UP_SLOT_BLOCK
 // Each upload slot keeps its staging resident until its next batch (up_begin waits for the previous batch). Grow the first block to the slot's previous batch demand, not just its first texture:
 // a small first texture followed by a large one otherwise allocates and retires a fresh 32 MB overflow every frame. Keep one overflow as well, at most 64 MB per slot / 192 MB across all three.
 // Bursts beyond that budget and individual uploads larger than UP_BLOCK_SIZE still use temporary blocks, retired only after their GPU work. DM_NVN_UPLOAD_REUSE=0 keeps the original one-block policy.
@@ -2656,6 +2672,47 @@ static __strong id<MTLBuffer> g_up_slot_blk[3], g_up_slot_over[3]; static unsign
 static size_t g_up_slot_want[3], g_up_batch_bytes; static int g_up_over_used;
 static int up_reuse(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_UPLOAD_REUSE"); on = !e || atoi(e); } return on; }
 static int up_retained(id<MTLBuffer> b, unsigned slot) { return b && (b == g_up_slot_blk[slot] || b == g_up_slot_over[slot]); }
+// A slot's retained blocks shrink back when they sit idle (DM_NVN_UPLOAD_IDLE_MS, default 2000 on iOS, 0 = never, the Mac's default): in steady play they held up to 192 MB of private GPU
+// memory (the iPad's OOM report: "private buffers 8, 224 MB"), sized by the largest batch since the start (a scene load). Checked at each submission's start on the submit thread, which owns
+// them; a slot whose batch is still running (g_up_alloc_busy) is left alone, and defer_obj_release holds a block until the GPU is done. Per slot:
+//   no batch for that long: both blocks go (the next batch makes them again: one 4-32 MB allocation each);
+//   its overflow block unused for that long: the overflow goes;
+//   every such window: a primary block larger than the window's largest batch needs (rounded up to a power of two, at least 4 MB) goes, and the slot's demand drops to that batch,
+//   so the next batch makes it at the smaller size
+static uint64_t g_up_slot_used_ns[3], g_up_over_ns[3], g_up_win_ns[3], g_up_idle_n, g_up_idle_bytes; static size_t g_up_win_max[3];
+static void up_idle_release(void) {
+    static int64_t idle_ns = -1;
+    if (idle_ns < 0) { const char *e = getenv("DM_NVN_UPLOAD_IDLE_MS");
+#if TARGET_OS_IPHONE
+        idle_ns = (e && *e ? atoll(e) : 2000) * 1000000ll;
+#else
+        idle_ns = (e && *e ? atoll(e) : 0) * 1000000ll;
+#endif
+        if (idle_ns < 0) idle_ns = 0; }
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    for (unsigned s = 0; idle_ns && !g_up_cb && s < 3; s++) {
+        if ((!g_up_slot_blk[s] && !g_up_slot_over[s]) || atomic_load(&g_up_alloc_busy[s])) continue;
+        uint64_t b = 0; const char *why = NULL;
+        if (now - g_up_slot_used_ns[s] >= (uint64_t)idle_ns) {
+            b = (g_up_slot_blk[s] ? g_up_slot_blk[s].length : 0) + (g_up_slot_over[s] ? g_up_slot_over[s].length : 0);
+            defer_obj_release(g_up_slot_blk[s]); defer_obj_release(g_up_slot_over[s]); g_up_slot_blk[s] = g_up_slot_over[s] = nil; why = "idle";
+        } else {
+            if (g_up_slot_over[s] && now - g_up_over_ns[s] >= (uint64_t)idle_ns) { b += g_up_slot_over[s].length; defer_obj_release(g_up_slot_over[s]); g_up_slot_over[s] = nil; why = "overflow unused"; }
+            if (now - g_up_win_ns[s] >= (uint64_t)idle_ns) {
+                size_t want = UP_SLOT_BLOCK; while (want < g_up_win_max[s]) want <<= 1;
+                if (g_up_slot_blk[s] && g_up_slot_blk[s].length > want) { b += g_up_slot_blk[s].length; defer_obj_release(g_up_slot_blk[s]); g_up_slot_blk[s] = nil; why = why ? "overflow unused, primary larger than recent batches" : "primary larger than recent batches"; }
+                g_up_slot_want[s] = g_up_win_max[s]; g_up_win_max[s] = 0; g_up_win_ns[s] = now;
+            }
+        }
+        if (!why) continue;
+        g_up_idle_n++; g_up_idle_bytes += b;
+        if (g_up_idle_n <= 8) MLOG("upload staging: slot %u (%s): %llu MB released; %llu releases, %llu MB in total", s, why, (unsigned long long)(b >> 20), (unsigned long long)g_up_idle_n, (unsigned long long)(g_up_idle_bytes >> 20));
+    }
+    static uint64_t said_ns;   // every 30 s: what the slots hold now
+    if (now - said_ns >= 30000000000ull) { said_ns = now; uint64_t held = 0;
+        for (unsigned s = 0; s < 3; s++) held += (g_up_slot_blk[s] ? g_up_slot_blk[s].length : 0) + (g_up_slot_over[s] ? g_up_slot_over[s].length : 0);
+        MLOG("upload staging: the slots hold %llu MB now; %llu releases, %llu MB in total", (unsigned long long)(held >> 20), (unsigned long long)g_up_idle_n, (unsigned long long)(g_up_idle_bytes >> 20)); }
+}
 typedef struct {
     __unsafe_unretained id<MTLBuffer> src;
     size_t off, row, image;
@@ -2713,7 +2770,7 @@ static NSMutableArray *g_up_keep;
 // batches; up_begin publishes queued commits before waiting for a slot. A single
 // texture larger than the budget gets its own block (uploads are not tiled here).
 static size_t g_up_staging_bytes;
-#define UP_BATCH_BYTES (128u * 1024u * 1024u)
+#define UP_BATCH_BYTES g_up_batch_max   // 128 MB on the Mac; at least two blocks and at most 128 MB on iOS/tvOS (mem_limits.h)
 
 
 // The upload command buffer was discarded by the system (dropped along during GPU error recovery; the first frame on entering Travincal drops one every run): the objects of this batch of textures are built and the timestamps updated, but the content was never written in,
@@ -2783,6 +2840,7 @@ static void up_flush(void) {
     // (nvnQueueFinish on any thread, up_begin on another) waited for that submission: hand it over now (from PR #141, which found the nvnQueueFinish half)
     if (!g_cb) rec_publish();
     if (up_reuse()) g_up_slot_want[slot] = MAX(g_up_slot_want[slot], g_up_batch_bytes);
+    g_up_win_max[slot] = MAX(g_up_win_max[slot], g_up_batch_bytes);
     g_up_cb = nil;
     up_diag();
     g_nup_blits = 0; g_nup_decs = 0;
@@ -2798,7 +2856,7 @@ static void up_begin(void) {
     // block, and its RHI thread waited for good inside nvnQueueSubmitCommands (q_cb drains before it waits for the same reason)
     if (atomic_load(&g_up_alloc_busy[slot])) rec_publish();
     up_wait_zero(&g_up_alloc_busy[slot], WS_UPALLOC);
-    atomic_store(&g_up_alloc_busy[slot], 1); g_up_cur_slot = slot;
+    atomic_store(&g_up_alloc_busy[slot], 1); g_up_cur_slot = slot; g_up_slot_used_ns[slot] = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     g_up_batch_bytes = 0; g_up_over_used = 0;
     [g_up_alloc4[slot] reset];
     g_up_cb = [g_dev newCommandBuffer];
@@ -2855,7 +2913,7 @@ static id<MTLBuffer> up_alloc(size_t n, size_t *off) {
         if (up_reuse() && need <= UP_BLOCK_SIZE && !g_up_over_used) {
             __strong id<MTLBuffer> *sb = &g_up_slot_over[g_up_cur_slot];
             if (!*sb) { *sb = [g_dev newBufferWithLength:UP_BLOCK_SIZE options:MTLResourceStorageModePrivate]; if (!*sb) MDIE("failed to create the overflow staging block"); res_add(*sb); g_up_blocks_new++; }
-            g_up_block = *sb; g_up_block_size = (*sb).length; g_up_over_used = 1;
+            g_up_block = *sb; g_up_block_size = (*sb).length; g_up_over_used = 1; g_up_over_ns[g_up_cur_slot] = clock_gettime_nsec_np(CLOCK_MONOTONIC);
         } else {
             g_up_block_size = n > UP_BLOCK_SIZE ? need : UP_BLOCK_SIZE;
             g_up_block = [g_dev newBufferWithLength:g_up_block_size options:MTLResourceStorageModePrivate];
@@ -8912,7 +8970,7 @@ enum { POOL_FRAME_BYTES = 32u << 20, POOL_REQ_BYTES = 128u << 20, POOL_SUB_MS = 
 static uint64_t g_walk_frame = ~0ull, g_walk_spent, g_walk_sub = ~0ull; static double g_walk_ms; static int g_walk_over;
 static uint64_t pool_tex_size(const tex_t *t) { return t->L.size ? t->L.size : 1; }
 static int pool_size_cmp(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
-static uint64_t pool_budget(void) { return g_dev.recommendedMaxWorkingSetSize / 20; }
+static uint64_t pool_budget(void) { return MIN((uint64_t)g_dev.recommendedMaxWorkingSetSize / 20, g_pool_budget_cap); }
 static uint64_t g_walk_req;
 // A render target no pass has written holds nothing to read, and a pass makes its texture when it renders. Made for a read, one that only registers next frame's target took three times the
 // textures and 17 GB allocated on Ocarina of Time: the game re-registers its IDs with transient targets, whose IDs a shader read as the previous texture

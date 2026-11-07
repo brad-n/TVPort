@@ -93,6 +93,11 @@ t_thermal_tsan: t_thermal.c $(MTL_T_DEP)
 check_t_thermal: t_thermal
 	./t_thermal
 	DM_THERMAL_CAP=0 ./t_thermal
+t_mem_limits: t_mem_limits.c ../nvn/mem_limits.h
+	clang -O1 -g -Wall -Werror -o $@ t_mem_limits.c
+.PHONY: check_t_mem_limits
+check_t_mem_limits: t_mem_limits
+	./t_mem_limits
 thermal-tsan: t_thermal_tsan
 	./t_thermal_tsan
 	DM_THERMAL_CAP=0 ./t_thermal_tsan
@@ -258,6 +263,9 @@ check_t_cpu_storage: RUN_ENV = MTL_DEBUG_LAYER=1
 t_initial_uncached: t_initial_uncached.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_initial_uncached.m $(MTL_T_SRC) $(FW)
 check_t_initial_uncached: RUN_ENV = MTL_DEBUG_LAYER=1
+t_upload_idle: t_upload_idle.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_upload_idle.m $(MTL_T_SRC) $(FW)
+check_t_upload_idle: RUN_ENV = MTL_DEBUG_LAYER=1
 t_upload_slots: t_upload_slots.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upload_slots.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_upload_slots
