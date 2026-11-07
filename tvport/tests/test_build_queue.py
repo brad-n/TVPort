@@ -83,6 +83,7 @@ import AppKit
     }
     @MainActor static func main() async {
         let library = Library()
+        library.keepSwitchTVCurrent = false   // SwitchTV refreshes after an install (SwitchTVSync, test_switchtv_sync.py); this test counts only game builds
         var a = Game(folder: "/sample/A", name: "A"); a.swapAB = true
         var b = Game(folder: "/sample/B", name: "B"); b.swapXY = true
         let c = Game(folder: "/sample/C", name: "C")
@@ -267,7 +268,7 @@ import AppKit
 ''')
             executable = root / 'checks'
             subprocess.run(['swiftc', '-parse-as-library',
-                            str(SOURCES / 'Model.swift'), str(SOURCES / 'BuildQueue.swift'),
+                            str(SOURCES / 'Model.swift'), str(SOURCES / 'BuildQueue.swift'), str(SOURCES / 'SwitchTVSync.swift'),
                             str(SOURCES / 'ArtworkCrop.swift'), str(stub), str(checks),
                             '-o', str(executable)], check=True)
             subprocess.run([str(executable), str(root / 'data')], check=True)

@@ -39,6 +39,10 @@ targets:
         DMShowFPS: ${DM_SHOW_FPS}           # YES = the frame-rate counter is on (front_ios.m; set by build_ipa.sh)
         DMLanguage: ${DM_LANG}              # the game language code (main.m sets DM_LANG from it; set by build_ipa.sh)
         DMForkPatches: ${DM_FORK_PATCHES}   # the fork's patches this build carries (dm/fork_patches.txt; set by build_ipa.sh)
+        CFBundleURLTypes:                   # SwitchTV (the launcher app) opens this game with switchtv-<title ID>://play; the host just comes to the front (SceneDelegate in Sources/main.m)
+          - CFBundleURLName: ${DM_BUNDLE_ID}
+            CFBundleURLSchemes:
+              - ${DM_URL_SCHEME}            # switchtv-<title ID in lowercase>, set by build_ipa.sh
         GCSupportsControllerUserInteraction: true   # Physical controllers (GameController)
         GCSupportedGameControllers:
           - ProfileName: ExtendedGamepad

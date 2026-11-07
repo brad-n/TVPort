@@ -67,6 +67,20 @@ Add a folder holding your game's `.nsp` or `.xci` files, pick your Apple TV, and
 
 Drop NSP, XCI, NSZ or XCZ updates/DLC onto a game in the sidebar or its game page, or use **Updates & DLC → Add Files**. TVPort reads package metadata with your keys and rejects packages for another game or region. Original files stay where they are; reconnect external drives before building. Removing an attachment keeps the original file. Build & Install applies attached content and removes detached content from the next app build. The engine selects the newest available update/DLC version. Content already in the original game folder is still discovered there.
 
+## SwitchTV, the launcher
+
+SwitchTV is a small Apple TV app that lists the games TVPort built (a hero banner, "Continue Playing", "All Games" and genre rows, and a details page with description, publisher, release date, players, genres and screenshots) and opens one with a press of Play. It lives in `tvport/switchtv/` (SwiftUI, tvOS 17+, bundle ID `dev.tvport.<team>.switchtv`); every colour is in `Sources/Theme.swift`.
+
+How it opens a game: each game app TVPort builds answers the URL scheme `switchtv-<title ID in lowercase>` (`dm/ios/project_tv.yml`, `CFBundleURLTypes`; the host just comes to the front). SwitchTV lists every game's scheme in `LSApplicationQueriesSchemes`, asks `canOpenURL`, and opens `switchtv-<id>://play`. A game built before this change has no scheme: SwitchTV then shows "Rebuild this game in TVPort to play it from SwitchTV" instead of Play. Games started from SwitchTV are remembered in the app's own preferences for the "Continue Playing" row.
+
+Putting it on the Apple TV: **Install SwitchTV** (toolbar, and in the Apple TV section of the settings), or `backend.py switchtv install --device <id>`. `switchtv catalog` only writes the catalogue, `build` builds without installing, and `sync` installs only when the catalogue changed (a fingerprint of the catalogue, its images and the app's own files, kept per Apple TV). The catalogue is made from the library, the artwork cache and blawar/titledb's US list (fetched once, about 90 MB, into `switchtv-cache/` in TVPort's folder; `TVPORT_SWITCHTV_CACHE` moves it). Fields the list lacks are simply left out. Under Settings, **Keep SwitchTV up to date** (on by default) refreshes SwitchTV after every Build & Install and after a game is removed; a failure there is a warning in the log and never fails a game build.
+
+tvOS has no way for an app to put other apps in a home-screen folder: new apps appear at the end of the home screen. Make a "Games" folder there once by hand (hold the clickpad on an app, choose New Folder) to keep the top row clean.
+
+### Changing the icon
+
+The one file to swap is `tvport/switchtv/Branding/switchtv-icon-source.png`: a square PNG (the owner's is 1254 x 1254) with the mark above a wordmark on a white background. `Branding/make_branding.swift` cuts the mark (the App Icon, centred on the logo's own white) and centres the whole logo (the Top Shelf images), and `dm/ios/tools/tv_icon.swift` (with `DM_ICON_BACKDROP`) lays them out as the layered tvOS assets, on every install. If the new logo has its mark somewhere else, change `markRect` in `make_branding.swift`; if its red differs, set `accent` and `ink` in `Sources/Theme.swift` (`make_branding.swift` writes the sampled colours to `colors.txt`).
+
 ## The packed app
 
 `python3 scripts/package_tvport.py` makes `tvport/dist/TVPort.app` and `TVPort-<version>.zip` (about 50 MB), an app that runs on any Mac without this checkout. It carries:

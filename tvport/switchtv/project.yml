@@ -1,0 +1,40 @@
+# SwitchTV: the launcher app that lists the games TVPort built and opens them (tvport/backend.py `switchtv build` makes a copy of this folder,
+# adds Catalog/ + Generated/ and replaces the ${SWITCHTV_*} values and the empty LSApplicationQueriesSchemes list, then runs xcodegen on it).
+name: SwitchTV
+options:
+  bundleIdPrefix: dev.tvport
+  deploymentTarget:
+    tvOS: "17.0"
+targets:
+  SwitchTV:
+    type: application
+    platform: tvOS
+    sources:
+      - Sources
+      - path: Catalog       # a folder reference: catalog.json and images/. Not named Resources: codesign takes a Resources folder at the root of a tvOS app for a macOS-style bundle layout and refuses to sign it
+        type: folder
+        buildPhase: resources
+        optional: true
+      - Generated/Assets.xcassets
+    info:
+      path: Generated/Info.plist
+      properties:
+        CFBundleDisplayName: SwitchTV
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: ${SWITCHTV_BUILD}
+        UILaunchScreen: {}
+        LSApplicationQueriesSchemes: []   # one switchtv-<title ID> per game in the catalogue; canOpenURL answers false for any scheme not listed here
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: ${SWITCHTV_BUNDLE_ID}
+      DEVELOPMENT_TEAM: ${SWITCHTV_TEAM}
+      CODE_SIGN_STYLE: Automatic
+      SWIFT_VERSION: "5.0"
+      ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      TARGETED_DEVICE_FAMILY: "3"
+schemes:
+  SwitchTV:
+    build:
+      targets:
+        SwitchTV: all
+    run:
+      config: Release

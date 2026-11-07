@@ -254,6 +254,8 @@ struct GameView: View {
             ToolbarActionButton(title: "Last Run Stats", enabled: canUseInstalledGame && !library.readingDiagnosis,
                                 help: "Read memory and frame times from the Apple TV") { library.diagnose() }
             ToolbarActionButton(title: "Open on TV", enabled: canUseInstalledGame) { library.launch() }
+            ToolbarActionButton(title: "Install SwitchTV", enabled: library.device != nil && !library.isBusy,
+                                help: "Install or update the SwitchTV launcher on the selected Apple TV") { library.installSwitchTV() }
             if library.buildQueue.active?.gameID == library.selection && library.buildQueue.active != nil {
                 ToolbarActionButton(title: "Stop", enabled: !library.buildQueue.paused) { library.cancel() }
             } else if let gameID = library.selection, library.buildQueue.position(gameID) != nil {
@@ -471,6 +473,10 @@ struct SettingsForm: View {
                 }
                 TextField("Signing team", text: $library.team, prompt: Text("10-character team ID"))
                 Button("Look Again") { Task { await library.refreshDevices() } }
+                Button("Install SwitchTV on Apple TV") { library.installSwitchTV() }
+                    .disabled(library.device == nil || library.isBusy)
+                    .help("Puts the SwitchTV launcher, with every game you have built, on the selected Apple TV")
+                if let status = library.switchTVStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
             }
             Section("Performance") {
                 Picker("Render mode", selection: binding(\.mode, default: .handheld)) { ForEach(RenderMode.allCases) { Text($0.label).tag($0) } }

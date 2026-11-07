@@ -66,12 +66,20 @@ func blurred(_ art: CGImage, _ w: Int, _ h: Int) -> CGImage {
     return CIContext().createCGImage(blur.outputImage!.cropped(to: extent), from: extent)!
 }
 
+// DM_ICON_BACKDROP=RRGGBB: a flat backdrop instead of the blurred copy of the art, for a logo that already sits on its own paper colour (tvport/switchtv/Branding).
+// The back layer is that colour, the front layer the art filling the icon; the Top Shelf's sides are that colour too.
+let backdrop: CGColor? = {
+    guard let hex = ProcessInfo.processInfo.environment["DM_ICON_BACKDROP"], hex.count == 6, let v = UInt32(hex, radix: 16) else { return nil }
+    return CGColor(srgbRed: Double(v >> 16 & 255) / 255, green: Double(v >> 8 & 255) / 255, blue: Double(v & 255) / 255, alpha: 1)
+}()
+
 func wide(_ art: CGImage) -> Bool { Double(art.width) / Double(art.height) >= wideEnough }
 
 func backLayer(_ art: CGImage, _ w: Int, _ h: Int) -> CGImage {   // opaque: tvOS refuses an icon whose back layer has transparency
     let c = bitmap(w, h)
-    c.setFillColor(CGColor(srgbRed: 0.05, green: 0.05, blue: 0.07, alpha: 1))
+    c.setFillColor(backdrop ?? CGColor(srgbRed: 0.05, green: 0.05, blue: 0.07, alpha: 1))
     c.fill(CGRect(x: 0, y: 0, width: w, height: h))
+    if backdrop != nil { return c.makeImage()! }
     if wide(art) { c.draw(art, in: fillRect(art, w, h)) } else {
         c.draw(blurred(art, w, h), in: CGRect(x: 0, y: 0, width: w, height: h))
         c.setFillColor(CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.35))
@@ -82,7 +90,7 @@ func backLayer(_ art: CGImage, _ w: Int, _ h: Int) -> CGImage {   // opaque: tvO
 
 func frontLayer(_ art: CGImage, _ w: Int, _ h: Int) -> CGImage {   // transparent around the art
     let c = bitmap(w, h)
-    if wide(art) {   // The middle of the art lifted off the back, so the parallax has something to move; its edges fade into the same picture below
+    if backdrop != nil { c.draw(art, in: fillRect(art, w, h)) } else if wide(art) {   // The middle of the art lifted off the back, so the parallax has something to move; its edges fade into the same picture below
         let colors = [CGColor(gray: 1, alpha: 1), CGColor(gray: 1, alpha: 1), CGColor(gray: 1, alpha: 0)] as CFArray
         let fade = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.genericGrayGamma2_2), colors: colors, locations: [0, 0.55, 1])!
         c.saveGState()
@@ -108,9 +116,9 @@ func frontLayer(_ art: CGImage, _ w: Int, _ h: Int) -> CGImage {   // transparen
 func shelfContent(_ art: CGImage, _ w: Int, _ h: Int) -> CGImage {
     let c = bitmap(w, h)
     let area = CGRect(x: 0, y: 0, width: w, height: h)
-    c.setFillColor(CGColor(srgbRed: 0.05, green: 0.05, blue: 0.07, alpha: 1))
+    c.setFillColor(backdrop ?? CGColor(srgbRed: 0.05, green: 0.05, blue: 0.07, alpha: 1))
     c.fill(area)
-    c.draw(blurred(art, w, h), in: area)
+    if backdrop == nil { c.draw(blurred(art, w, h), in: area) }
     // Automatic preserves the whole source. An explicit crop already has the
     // 8:3 visible aspect ratio, so fitting it fills the composition exactly.
     c.draw(art, in: fitRect(art, w, h, inset: 1))
@@ -123,9 +131,9 @@ func shelf(_ art: CGImage, _ w: Int, _ h: Int) -> CGImage {
     if visibleWidth == w { return content }
     let c = bitmap(w, h)
     let area = CGRect(x: 0, y: 0, width: w, height: h)
-    c.setFillColor(CGColor(srgbRed: 0.05, green: 0.05, blue: 0.07, alpha: 1))
+    c.setFillColor(backdrop ?? CGColor(srgbRed: 0.05, green: 0.05, blue: 0.07, alpha: 1))
     c.fill(area)
-    c.draw(blurred(art, w, h), in: area)
+    if backdrop == nil { c.draw(blurred(art, w, h), in: area) }
     c.draw(content, in: CGRect(x: (w - visibleWidth) / 2, y: 0, width: visibleWidth, height: h))
     return c.makeImage()!
 }
