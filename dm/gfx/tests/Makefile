@@ -93,6 +93,11 @@ t_thermal_tsan: t_thermal.c $(MTL_T_DEP)
 check_t_thermal: t_thermal
 	./t_thermal
 	DM_THERMAL_CAP=0 ./t_thermal
+t_mem_limits: t_mem_limits.c ../nvn/mem_limits.h
+	clang -O1 -g -Wall -Werror -o $@ t_mem_limits.c
+.PHONY: check_t_mem_limits
+check_t_mem_limits: t_mem_limits
+	./t_mem_limits
 thermal-tsan: t_thermal_tsan
 	./t_thermal_tsan
 	DM_THERMAL_CAP=0 ./t_thermal_tsan

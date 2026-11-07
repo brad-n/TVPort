@@ -15,7 +15,8 @@
 #include <fcntl.h>
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
-#include <os/proc.h>   // os_proc_available_memory: for the memory readout line
+#include <os/proc.h>   // os_proc_available_memory: for the memory readout line and the staging limits (mem_limits_init)
+#include "mem_limits.h"
 #endif
 #include "nvn_mtl.h"
 #include <mach/mach.h>
@@ -78,6 +79,10 @@ static uint64_t c2_handle(int stage, unsigned b);   // the handle c2 holds at by
 
 #define MLOG(...) do { flockfile(stderr); fprintf(stderr, "[dm] [nvn-mtl] " __VA_ARGS__); fputc('\n', stderr); funlockfile(stderr); } while (0)   // one line under one lock, as LOG (dm.h)
 #define MDIE(...) do { MLOG("FATAL " __VA_ARGS__); abort(); } while (0)
+// Memory-derived limits (mem_limits.h). The Mac keeps the fixed defaults; iOS/tvOS derive them once from os_proc_available_memory() at device setup (mem_limits_init).
+static size_t g_up_blk_max = 32u * 1024u * 1024u;       // UP_BLOCK_SIZE: the largest retained staging block (and overflow block) per upload slot
+static size_t g_up_batch_max = 128u * 1024u * 1024u;    // UP_BATCH_BYTES: the staging one upload batch may hold before it is split
+static uint64_t g_pool_budget_cap = UINT64_MAX;         // upper bound for pool_budget (texture creation budget)
 static void *realloc_or_die(void *p, size_t bytes, const char *what) {   // for a table the host cannot go on without: never NULL, so the caller cannot write through it or lose the old one
     void *grown = realloc(p, bytes); if (!grown) MDIE("no memory for %s", what);
     return grown;
@@ -531,6 +536,15 @@ void mtl_init(void) {
     g_res_check_on = getenv("DM_RES_CHECK") != NULL;
     g_dev = MTLCreateSystemDefaultDevice();
     if (!g_dev) MDIE("no Metal device");
+#if TARGET_OS_IPHONE
+    {   // size the upload staging and the texture creation budget from the memory this process can still use (mem_limits.h); the Mac keeps the fixed defaults
+        dm_mem_limits_t ml; dm_mem_limits(os_proc_available_memory(), g_dev.recommendedMaxWorkingSetSize, &ml);
+        g_up_blk_max = ml.up_block; g_up_batch_max = ml.up_batch; g_pool_budget_cap = ml.pool_budget;
+        MLOG("memory limits: os_proc_available_memory %llu MB, recommendedMaxWorkingSetSize %llu MB -> upload staging block %llu MB (retained at most %llu MB over 3 slots), upload batch budget %llu MB, texture creation budget %llu MB",
+             (unsigned long long)(os_proc_available_memory() >> 20), (unsigned long long)(g_dev.recommendedMaxWorkingSetSize >> 20), (unsigned long long)(ml.up_block >> 20),
+             (unsigned long long)((ml.up_block * 6) >> 20), (unsigned long long)(ml.up_batch >> 20), (unsigned long long)(MIN(ml.pool_budget, g_dev.recommendedMaxWorkingSetSize / 20) >> 20));
+    }
+#endif
     if (!g_dev.hasUnifiedMemory) MDIE("needs a unified-memory device (zero-copy memory pools)");
     g_q = [g_dev newCommandQueue];
     // A device without Metal 4 (the paravirtualized GPU of a virtual Mac, such as GitHub's macos-26 runner: no residency set, no MTL4CommandQueue) cannot run the NVN layer. The GL and
@@ -2649,7 +2663,7 @@ static void up_wait_zero(_Atomic int *v, int site) {
     if (ws_on()) ws_put(site, w0, 1);
 }
 static unsigned g_up_seq;
-#define UP_BLOCK_SIZE (32u * 1024u * 1024u)
+#define UP_BLOCK_SIZE g_up_blk_max   // 32 MB on the Mac; smaller on iOS/tvOS when memory is tight (mem_limits.h). Always a power of two, at least UP_SLOT_BLOCK
 // Each upload slot keeps its staging resident until its next batch (up_begin waits for the previous batch). Grow the first block to the slot's previous batch demand, not just its first texture:
 // a small first texture followed by a large one otherwise allocates and retires a fresh 32 MB overflow every frame. Keep one overflow as well, at most 64 MB per slot / 192 MB across all three.
 // Bursts beyond that budget and individual uploads larger than UP_BLOCK_SIZE still use temporary blocks, retired only after their GPU work. DM_NVN_UPLOAD_REUSE=0 keeps the original one-block policy.
@@ -2756,7 +2770,7 @@ static NSMutableArray *g_up_keep;
 // batches; up_begin publishes queued commits before waiting for a slot. A single
 // texture larger than the budget gets its own block (uploads are not tiled here).
 static size_t g_up_staging_bytes;
-#define UP_BATCH_BYTES (128u * 1024u * 1024u)
+#define UP_BATCH_BYTES g_up_batch_max   // 128 MB on the Mac; at least two blocks and at most 128 MB on iOS/tvOS (mem_limits.h)
 
 
 // The upload command buffer was discarded by the system (dropped along during GPU error recovery; the first frame on entering Travincal drops one every run): the objects of this batch of textures are built and the timestamps updated, but the content was never written in,
@@ -8956,7 +8970,7 @@ enum { POOL_FRAME_BYTES = 32u << 20, POOL_REQ_BYTES = 128u << 20, POOL_SUB_MS = 
 static uint64_t g_walk_frame = ~0ull, g_walk_spent, g_walk_sub = ~0ull; static double g_walk_ms; static int g_walk_over;
 static uint64_t pool_tex_size(const tex_t *t) { return t->L.size ? t->L.size : 1; }
 static int pool_size_cmp(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
-static uint64_t pool_budget(void) { return g_dev.recommendedMaxWorkingSetSize / 20; }
+static uint64_t pool_budget(void) { return MIN((uint64_t)g_dev.recommendedMaxWorkingSetSize / 20, g_pool_budget_cap); }
 static uint64_t g_walk_req;
 // A render target no pass has written holds nothing to read, and a pass makes its texture when it renders. Made for a read, one that only registers next frame's target took three times the
 // textures and 17 GB allocated on Ocarina of Time: the game re-registers its IDs with transient targets, whose IDs a shader read as the previous texture
