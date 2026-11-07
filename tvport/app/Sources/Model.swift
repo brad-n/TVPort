@@ -149,6 +149,13 @@ final class Library: ObservableObject {
     @Published var defaultBuildFolder = UserDefaults.standard.string(forKey: "DefaultBuildFolder") ?? "" {
         didSet { UserDefaults.standard.set(defaultBuildFolder, forKey: "DefaultBuildFolder") }
     }
+    @Published var keepSwitchTVCurrent = SwitchTVSync.keepUpToDate() {
+        didSet { UserDefaults.standard.set(keepSwitchTVCurrent, forKey: SwitchTVSync.keepKey) }
+    }
+    /// What SwitchTV's last update on the Apple TV did; a warning when it could not.
+    @Published private(set) var switchTVStatus: String?
+    @Published private(set) var updatingSwitchTV = false
+    private var switchTVSyncWanted = false
     private var building: Task<Void, Never>?
     private var previewTask: Task<Void, Never>?
     private var previewRequest = UUID()
@@ -220,7 +227,7 @@ final class Library: ObservableObject {
     func buildStatus(for gameID: Game.ID, built: Bool) -> String {
         buildBadge(for: gameID) ?? (built ? "Built" : "Ready to build")
     }
-    var isBusy: Bool { buildQueue.active != nil || !buildQueue.pending.isEmpty || run == .running || settingUp || transferringSaves || automaticallyBackingUp || checkingAddonGame != nil }
+    var isBusy: Bool { updatingSwitchTV || buildQueue.active != nil || !buildQueue.pending.isEmpty || run == .running || settingUp || transferringSaves || automaticallyBackingUp || checkingAddonGame != nil }
     // Package inspection reads local files; automatic save backups only read the TV.
     var canEditAddons: Bool { buildQueue.active == nil && buildQueue.pending.isEmpty && run != .running && !settingUp && !transferringSaves && checkingAddonGame == nil }
     /// Unknown until the first check, which then does not hold anything back.
@@ -272,6 +279,7 @@ final class Library: ObservableObject {
         recentArtwork.removeAll { $0 == game.id }
         games.removeAll { $0.id == game.id }
         save()
+        if SwitchTVSync.shouldSync(.gameRemoved, keepUpToDate: keepSwitchTVCurrent, device: device) { switchTVSyncWanted = true; startSwitchTVSyncIfDue() }
         if selection == game.id { selection = games.first?.id }
     }
 
@@ -497,7 +505,7 @@ final class Library: ObservableObject {
     }
 
     private func startNextBuild() {
-        guard !automaticallyBackingUp, !settingUp, !transferringSaves, checkingAddonGame == nil else { return }
+        guard !automaticallyBackingUp, !settingUp, !transferringSaves, !updatingSwitchTV, checkingAddonGame == nil else { return }
         guard let request = buildQueue.next() else { return }
         runGameID = request.gameID
         completedBuilds.removeValue(forKey: request.gameID)
@@ -527,9 +535,65 @@ final class Library: ObservableObject {
             }
             building = nil
             buildQueue.finish(succeeded: succeeded && !Task.isCancelled)
-            startNextBuild()
+            if SwitchTVSync.shouldSync(.gameBuilt(installed: request.install, succeeded: succeeded && !Task.isCancelled), keepUpToDate: keepSwitchTVCurrent, device: device) { switchTVSyncWanted = true }
+            if !startSwitchTVSyncIfDue() { startNextBuild() }
             if !Task.isCancelled && selection == request.gameID { await refresh() }
         }
+    }
+
+    /// The button: build SwitchTV and put it on the selected Apple TV now, with its progress in the same status area and log as a game build.
+    func installSwitchTV() {
+        guard let device, !isBusy, !updatingSwitchTV, !settingUp, setupMissing.isEmpty else { return }
+        runGameID = nil
+        run = .running; stage = "Starting"; progress = nil; log = []; notice = nil
+        updatingSwitchTV = true
+        building = Task {
+            var failure: String?
+            for await event in Backend.stream(["switchtv", "install", "--device", device] + (team.isEmpty ? [] : ["--team", team])) {
+                switch event {
+                case .stage(let name): stage = name; progress = nil; append(name)
+                case .log(let line): append(line)
+                case .progress(let value): progress = value
+                case .failed(let message): failure = message
+                case .done: break
+                }
+            }
+            if let failure { run = .failed(failure); switchTVStatus = SwitchTVSync.warning(failure) }
+            else { run = .succeeded; stage = "SwitchTV installed on the Apple TV"; switchTVStatus = "SwitchTV is up to date on the Apple TV." }
+            building = nil
+            updatingSwitchTV = false
+            startNextBuild()
+        }
+    }
+
+    /// After a game was installed or removed: refresh SwitchTV once the builds are done. Nothing to do when the catalogue is unchanged (the backend compares fingerprints).
+    /// Its output goes to the log only as a warning, so it never marks a game's build as failed.
+    @discardableResult
+    private func startSwitchTVSyncIfDue() -> Bool {
+        guard switchTVSyncWanted, let device,
+              SwitchTVSync.canRunNow(buildActive: buildQueue.active != nil, buildsWaiting: !buildQueue.pending.isEmpty, queuePaused: buildQueue.paused,
+                                     otherWork: updatingSwitchTV || settingUp || transferringSaves || automaticallyBackingUp || checkingAddonGame != nil || run == .running) else { return false }
+        switchTVSyncWanted = false
+        updatingSwitchTV = true
+        switchTVStatus = "Updating SwitchTV on the Apple TV…"
+        let arguments = ["switchtv", "sync", "--device", device] + (team.isEmpty ? [] : ["--team", team])
+        Task {
+            var failure: String?, result = ""
+            for await event in Backend.stream(arguments) {
+                switch event {
+                case .failed(let message): failure = message
+                case .log(let line) where line.contains("already lists"): result = line
+                default: break
+                }
+            }
+            if let failure {
+                switchTVStatus = SwitchTVSync.warning(failure)
+                append(SwitchTVSync.warning(failure.split(separator: "\n").last.map(String.init) ?? failure))
+            } else { switchTVStatus = result.isEmpty ? "SwitchTV updated on the Apple TV." : "SwitchTV is up to date on the Apple TV." }
+            updatingSwitchTV = false
+            if !startSwitchTVSyncIfDue() { startNextBuild() }
+        }
+        return true
     }
 
     func cancel() {

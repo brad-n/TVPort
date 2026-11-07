@@ -1254,6 +1254,151 @@ def cmd_save_import(args) -> None:
         raise Failure(f'The save operation could not complete: {error}') from error
 
 
+# ---- SwitchTV: the launcher app on the Apple TV (tvport/switchtv, tvport/switchtv_catalog.py) ----
+
+SWITCHTV_BUNDLE = 'dev.tvport.{team}.switchtv'
+
+
+def switchtv_cache() -> Path:
+    """Where the title database, banners and the build of SwitchTV live: TVPORT_SWITCHTV_CACHE, else inside TVPort's own data folder."""
+    return Path(os.environ.get('TVPORT_SWITCHTV_CACHE') or DATA / 'switchtv-cache')
+
+
+def read_library() -> list:
+    try:
+        library = json.loads((DATA / 'library.json').read_text())
+    except (OSError, ValueError):
+        return []
+    return library if isinstance(library, list) else []
+
+
+def switchtv_state_file() -> Path:
+    return switchtv_cache() / 'installed.json'
+
+
+def switchtv_state() -> dict:
+    try:
+        return json.loads(switchtv_state_file().read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def game_bundle_id(item: dict, team: str) -> str:
+    """The game's app bundle ID from its saved build state; the standard one when the build folder is not at hand."""
+    try:
+        return Game(Path(item['folder'])).bundle_id(team)
+    except (Failure, OSError, KeyError, ValueError):
+        return f'dev.tvport.{team.lower()}.g{item["titleID"].lower()}'
+
+
+def switchtv_icons(source: Path, work: Path) -> Path:
+    """The App Icon and Top Shelf images from the one logo, Branding/switchtv-icon-source.png: make_branding.swift cuts the mark (icon) and centres the whole logo (Top Shelf) on its own white,
+    tv_icon.swift lays them out as the layered tvOS assets with a flat backdrop of that white."""
+    brand = work / 'branding'
+    shutil.rmtree(brand, ignore_errors=True)
+    result = run(['xcrun', 'swift', source.parent / 'make_branding.swift', source, brand])
+    if result.returncode:
+        raise Failure(f'The SwitchTV logo could not be read: {result.stderr.strip()[-400:]}')
+    colors = dict(line.split() for line in (brand / 'colors.txt').read_text().splitlines())
+    catalog = work / 'Generated/Assets.xcassets'
+    shutil.rmtree(catalog, ignore_errors=True)
+    catalog.parent.mkdir(parents=True, exist_ok=True)
+    result = run(['xcrun', 'swift', REPO / 'dm/ios/tools/tv_icon.swift', brand / 'icon-art.png', catalog],
+                 env={**os.environ, 'DM_ICON_BACKDROP': colors['paper'], 'DM_TOP_SHELF_ART': str(brand / 'shelf-art.png')})
+    if result.returncode:
+        raise Failure(f'The SwitchTV icon could not be made: {result.stderr.strip()[-400:]}')
+    return catalog
+
+
+def prepare_switchtv(team: str) -> tuple:
+    """The SwitchTV project in the cache folder, with its catalogue; returns (project folder, catalogue, fingerprint). Nothing is built yet."""
+    import switchtv_catalog as sc
+    source, cache = REPO / 'tvport/switchtv', switchtv_cache()
+    if not (source / 'project.yml').is_file():
+        raise Failure('This TVPort has no SwitchTV app (tvport/switchtv)')
+    stage('Making the SwitchTV catalogue')
+    catalog_out = cache / 'catalog'
+    catalog = sc.build_catalog(read_library(), DATA, cache, catalog_out, lambda item: game_bundle_id(item, team), log=lambda line: emit('log', line=line))
+    emit('log', line=f'SwitchTV lists {len(catalog["games"])} games.')
+    for name, missing in sc.field_report(catalog).items():
+        emit('log', line=f'{name}: {"no " + ", ".join(missing) if missing else "all fields found"}')
+    print_fingerprint = sc.fingerprint(catalog_out, sc.sources_digest(source))
+    work = cache / 'project'
+    shutil.rmtree(work, ignore_errors=True)
+    shutil.copytree(source, work, ignore=shutil.ignore_patterns('Branding', '.DS_Store', 'Generated', 'Catalog'))
+    shutil.copytree(catalog_out, work / 'Catalog')
+    switchtv_icons(source / 'Branding/switchtv-icon-source.png', work)
+    spec = (work / 'project.yml').read_text()
+    schemes = ', '.join(g['scheme'] for g in catalog['games'])
+    spec = spec.replace('LSApplicationQueriesSchemes: []', f'LSApplicationQueriesSchemes: [{schemes}]')
+    for key, value in (('SWITCHTV_BUNDLE_ID', SWITCHTV_BUNDLE.format(team=team.lower())), ('SWITCHTV_TEAM', team), ('SWITCHTV_BUILD', str(int(time.time())))):
+        spec = spec.replace('${' + key + '}', value)
+    (work / 'project.yml').write_text(spec)
+    return work, catalog, print_fingerprint
+
+
+def compile_switchtv(work: Path, device: Optional[str]) -> Path:
+    stage('Building SwitchTV')
+    env = {**os.environ, 'PATH': os.pathsep.join(TOOL_PATHS + [os.environ.get('PATH', '')])}
+    result = run(['xcodegen', 'generate', '-q', '--spec', work / 'project.yml', '--project', work], env=env)
+    if result.returncode:
+        raise Failure(f'xcodegen failed: {(result.stderr or result.stdout).strip()[-500:]}')
+    derived = switchtv_cache() / 'derived'
+    stream(['xcodebuild', '-project', work / 'SwitchTV.xcodeproj', '-scheme', 'SwitchTV', '-configuration', 'Release', '-destination', f'platform=tvOS,id={device}' if device else 'generic/platform=tvOS',
+            '-derivedDataPath', derived, '-allowProvisioningUpdates', 'build'], env=env, log_filter=lambda x: bool(REASON.search(x)) or x.startswith(('CodeSign', '** ')))
+    app = derived / 'Build/Products/Release-appletvos/SwitchTV.app'
+    if not app.is_dir():
+        raise Failure('SwitchTV was built but its app is missing')
+    return app
+
+
+def install_switchtv(app: Path, device: str) -> None:
+    stage('Installing SwitchTV on the Apple TV')
+
+    def install_app():
+        result = run(['xcrun', 'devicectl', 'device', 'install', 'app', '--device', device, app])
+        return None if not result.returncode else (result.stderr.strip() or result.stdout.strip())[-900:] or 'The install failed'
+
+    with_retries('The SwitchTV install', install_app)
+
+
+def sync_switchtv(device: str, team: str, *, force: bool = False, prepare=None, compile_app=None, install_app=None) -> str:
+    """Make the SwitchTV on `device` match the library: 'unchanged' when its fingerprint is the one last installed there, else it is built and installed ('installed').
+    Cheap when nothing changed: only the catalogue is made (no Xcode)."""
+    prepare, compile_app, install_app = prepare or prepare_switchtv, compile_app or compile_switchtv, install_app or install_switchtv
+    work, catalog, fingerprint = prepare(team)
+    state = switchtv_state()
+    if not force and state.get(device) == fingerprint:
+        emit('log', line='SwitchTV on the Apple TV already lists these games.')
+        return 'unchanged'
+    app = compile_app(work, device)
+    install_app(app, device)
+    state[device] = fingerprint
+    switchtv_state_file().write_text(json.dumps(state, indent=1))
+    emit('log', line=f'SwitchTV installed with {len(catalog["games"])} games.')
+    return 'installed'
+
+
+def cmd_switchtv(args) -> None:
+    lock = one_build_at_a_time()   # SwitchTV's project is shared like a game's
+    team = args.team or known_team()
+    if not team:
+        raise Failure('No Apple signing team found. Open Xcode, sign in under Settings > Accounts, and build any app for the Apple TV once.')
+    if args.action == 'catalog':
+        work, catalog, fingerprint = prepare_switchtv(team)
+        emit('done', games=len(catalog['games']), fingerprint=fingerprint, project=str(work))
+        return
+    if args.action == 'build':
+        work, catalog, fingerprint = prepare_switchtv(team)
+        app = compile_switchtv(work, args.device)
+        emit('done', app=str(app), games=len(catalog['games']), fingerprint=fingerprint)
+        return
+    if not args.device:
+        raise Failure('Choose an Apple TV first')
+    result = sync_switchtv(args.device, team, force=args.action == 'install' or args.force)
+    emit('done', result=result)
+
+
 def main() -> int:
     global REPO
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1354,17 +1499,22 @@ def main() -> int:
     diagnose = commands.add_parser('diagnose')
     diagnose.add_argument('--device', required=True)
     diagnose.add_argument('--bundle', required=True)
+    switchtv = commands.add_parser('switchtv', help='the SwitchTV launcher app: catalog | build | install (always) | sync (only when the library changed)')
+    switchtv.add_argument('action', choices=('catalog', 'build', 'install', 'sync'))
+    switchtv.add_argument('--device')
+    switchtv.add_argument('--team')
+    switchtv.add_argument('--force', action='store_true', help='sync: install even when the installed SwitchTV already lists these games')
     commands.add_parser('doctor')
     commands.add_parser('setup')
     args = parser.parse_args()
-    streamed = args.command in ('build', 'setup')
+    streamed = args.command in ('build', 'setup', 'switchtv')
     try:
         if BUNDLED:
             if args.command == 'setup':
                 stage('Unpacking the engine')
             REPO = unpack_engine(HERE, DATA)
         {'devices': cmd_devices, 'inspect': cmd_inspect, 'check-addons': cmd_check_addons, 'preview': cmd_preview, 'build': cmd_build, 'backup': cmd_backup, 'launch': cmd_launch, 'diagnose': cmd_diagnose,
-         'doctor': cmd_doctor, 'setup': cmd_setup, 'autobackup': cmd_autobackup,
+         'doctor': cmd_doctor, 'setup': cmd_setup, 'switchtv': cmd_switchtv, 'autobackup': cmd_autobackup,
          **{name: cmd_save_import for name in ('installed-games', 'saved-games', 'save-targets', 'save-source', 'save-history', 'store-save', 'import-save', 'export-save', 'export-all-saves', 'restore-save')}}[args.command](args)
     except Failure as failure:
         if streamed:

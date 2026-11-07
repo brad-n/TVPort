@@ -20,6 +20,11 @@ struct DefaultBuildFolderSettings: View {
 
     var body: some View {
         Form {
+            Section("SwitchTV") {
+                Toggle("Keep SwitchTV up to date", isOn: $library.keepSwitchTVCurrent)
+                Text("SwitchTV is the launcher app that lists your games on the Apple TV. When this is on, TVPort refreshes it after every Build & Install and after you remove a game, so new games appear in it. Nothing is sent when the list is unchanged. Apple TV does not let one app put others in a home-screen folder: new apps appear at the end of the home screen, so make a “Games” folder there once by hand (hold the clickpad on an app, choose New Folder) to keep the top row clean.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
             Section("Default build folder") {
                 Text(library.defaultBuildFolder.isEmpty ? "Beside each game’s original files" : library.defaultBuildFolder)
                     .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
@@ -35,7 +40,7 @@ struct DefaultBuildFolderSettings: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
-        .formStyle(.grouped).frame(width: 560, height: 280)
+        .formStyle(.grouped).frame(width: 560, height: 440)
         .disabled(library.isBusy)
         .fileImporter(isPresented: $choosing, allowedContentTypes: [.folder]) { result in
             if case .success(let url) = result { library.defaultBuildFolder = url.path }
