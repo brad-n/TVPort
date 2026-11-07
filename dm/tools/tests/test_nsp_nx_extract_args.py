@@ -47,7 +47,7 @@ class NxExtractArgs(unittest.TestCase):
         self.assertIn('--html', run.call_args[0][0])
 
     def test_parser_has_the_options(self):
-        a = nsp.parse_args(['x', '--allow-damaged-manual', '--nx-extract-arg', '--q', '--nx-extract-arg=--r'])
+        a = nsp.parse_args(['x', '--allow-damaged-manual', '--nx-extract-arg=--q', '--nx-extract-arg=--r'])
         self.assertTrue(a.allow_damaged_manual)
         self.assertEqual(a.nx_extract_arg, ['--q', '--r'])
 

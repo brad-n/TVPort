@@ -2840,7 +2840,7 @@ def parse_args(argv):
     ap.add_argument('--program', type=int, default=None, help='a multi-program application (Super Mario 3D All-Stars): pack program N of the NSPs as a game of its own, title ID = the application\'s + N (default: the PROGRAM_INDEX setting, 0; a game whose profile lists programs packs them all as one from program 0: this is for bring-up)')
     ap.add_argument('--allow-damaged', action='store_true', help='a damaged NSP (files failing the NCA hash check), or files whose bytes do not start as their names promise (a .zs file that is no zstd stream): write them as read and go on instead of stopping')
     ap.add_argument('--allow-damaged-manual', action='store_true', help='a damaged offline HTML manual is extracted as read and the build goes on; damaged game data still stops it')
-    ap.add_argument('--nx-extract-arg', action='append', default=[], help='an extra argument for every nx_extract extraction call (repeatable; NX_EXTRACT_ARGS holds more, as shell words)')
+    ap.add_argument('--nx-extract-arg', action='append', default=[], help='an extra argument for every nx_extract extraction call (repeatable, written --nx-extract-arg=--option; NX_EXTRACT_ARGS holds more, as shell words)')
     ap.add_argument('--allow-shader-regressions', action='store_true', help='shaders that translated in the game\'s previous build and fail with the current translation chain: '
                     'pack the app without them instead of stopping')
     ap.add_argument('--allow-other-metal', action='store_true', help='an NVN game: build its shaders with this Mac\'s Metal compiler when it is not the one they were tested with '
