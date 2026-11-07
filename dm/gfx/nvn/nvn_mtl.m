@@ -26,6 +26,7 @@
 #include "../tex/nvn_deswizzle_gpu.h"
 #include "../tex/nvn_bcdec.h"
 #include "../tex/nvn_astc_cache.h"
+#include "../tex/nvn_astc_planes.h"
 static unsigned astc_block(void);   // DM_NVN_BC_ASTC (below, with bc_unpack)
 static int astc_sync(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_ASTC_MISS"); v = e && !strcmp(e, "sync"); } return v; }   // DM_NVN_ASTC_MISS=sync: phase A, a miss encodes on the calling thread
 #include "nvn_builtin.h"
@@ -2515,8 +2516,12 @@ static unsigned astc_block(void) {
                 [[NSFileManager defaultManager] createDirectoryAtPath:c withIntermediateDirectories:YES attributes:nil error:NULL];
                 setenv("DM_NVN_ASTC_CACHE", c.fileSystemRepresentation, 1);
             }
-            BOOL isdir = NO; NSString *ro = dir ? [dir stringByAppendingPathComponent:@"astc-ro"] : nil;
-            if (ro && !getenv("DM_NVN_ASTC_CACHE_RO") && [[NSFileManager defaultManager] fileExistsAtPath:ro isDirectory:&isdir] && isdir) setenv("DM_NVN_ASTC_CACHE_RO", ro.fileSystemRepresentation, 1);
+            // the prebuilt read-only cache: one pack file (astc-ro.pack, sent with devicectl as a single file) if there is one, else the astc-ro directory
+            BOOL isdir = NO; NSString *pk = dir ? [dir stringByAppendingPathComponent:@"astc-ro.pack"] : nil, *ro = dir ? [dir stringByAppendingPathComponent:@"astc-ro"] : nil;
+            if (!getenv("DM_NVN_ASTC_CACHE_RO")) {
+                if (pk && [[NSFileManager defaultManager] fileExistsAtPath:pk isDirectory:&isdir] && !isdir) setenv("DM_NVN_ASTC_CACHE_RO", pk.fileSystemRepresentation, 1);
+                else if (ro && [[NSFileManager defaultManager] fileExistsAtPath:ro isDirectory:&isdir] && isdir) setenv("DM_NVN_ASTC_CACHE_RO", ro.fileSystemRepresentation, 1);
+            }
         }
 #endif
         if (v) { MLOG("BC1/2/3/7 2D textures stored as ASTC %ux%u (content-addressed cache: %s, read-only cache: %s); a cache miss %s", v, v, getenv("DM_NVN_ASTC_CACHE") ?: "none", getenv("DM_NVN_ASTC_CACHE_RO") ?: "none",
@@ -2576,23 +2581,16 @@ static int astc_content_present(const tex_t *t) {
 }
 // Look every plane of the texture up in the cache (the caller's thread deswizzles and hashes, no more); the planes that miss are copied into the background queue (nvn_bc_astc_learn).
 // 1 when all of them were found
+// The planes are enumerated by nvn_astc_walk_planes (tex/nvn_astc_planes.c), the function the offline prebuild (dm/gfx/tools/bntx_astc.py) keys its planes with
+typedef struct { uint32_t format; unsigned block; int all; } astc_probe_ctx;
+static int astc_probe_plane(void *ctx, unsigned level, unsigned layer, uint32_t w, uint32_t h, const void *bc, size_t need) {
+    (void)level; (void)layer; astc_probe_ctx *c = ctx;
+    if (nvn_bc_astc_learn(c->format, bc, need, w, h, c->block, NULL) != 1) c->all = 0;   // a miss is queued; the walk goes on to queue the rest
+    return 0;
+}
 static int astc_probe(const tex_t *t) {
-    unsigned blk = astc_block(), sk = bc_skip(t), n = (t->d.levels ? t->d.levels : 1) - sk;
-    unsigned layers = (t->d.target == 4 || t->d.target == 9) ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 3 ? t->d.height : 1;
-    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
-    if (!bpb || bw != 4 || bh != 4) return 0;
-    int all = 1; uint8_t *buf = NULL; size_t cap = 0;
-    for (unsigned l = 0; l < n && all >= 0; l++) {
-        uint32_t w = MAX(t->d.width >> (l + sk), 1u), h = MAX(t->d.height >> (l + sk), 1u);
-        size_t pitch = (size_t)((w + 3) / 4) * bpb, need = pitch * ((h + 3) / 4);
-        if (need > cap) { free(buf); buf = malloc(need); cap = need; if (!buf) { all = -1; break; } }
-        for (unsigned y = 0; y < layers; y++) {
-            if (nvn_deswizzle(&t->d, l + sk, y, t->mem, buf, pitch)) { all = -1; break; }
-            if (nvn_bc_astc_learn(t->d.format, buf, need, w, h, blk, NULL) != 1) all = 0;
-        }
-    }
-    free(buf);
-    return all == 1;
+    astc_probe_ctx c = {t->d.format, astc_block(), 1};
+    return nvn_astc_walk_planes(&t->d, t->mem, bc_skip(t), astc_probe_plane, &c) == 0 && c.all;
 }
 static int astc_decision(const tex_t *t) {
     pthread_mutex_lock(&g_astc_mu); astc_dec *e = astc_slot(t->serial, 0); int known = e && (e->flags & 1), r = known ? (e->flags & 2) != 0 : 0; pthread_mutex_unlock(&g_astc_mu);

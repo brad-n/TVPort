@@ -229,6 +229,124 @@ static nvn_astc_cache_status cache_read_status(NSString *path, void *output, siz
 static int cache_read(NSString *path, void *output, size_t size) {
     return cache_read_status(path, output, size) == NVN_ASTC_CACHE_HIT;
 }
+// ---- The read-only prebuilt cache as ONE file (astc-ro.pack, written by dm/gfx/tools/bntx_astc.py) ----
+// Sending tens of thousands of small files to an Apple TV is far slower than sending one, so DM_NVN_ASTC_CACHE_RO may name a pack instead of a directory.
+// Layout (little-endian): a header of 80 bytes {"NXASTCPK", u32 version 1, u32 index entry size 48, u64 entry count, u64 index offset, u64 file size, 32-byte input fingerprint, 8 zero bytes};
+// the entries, each a complete cache file ("NXASTC01", SHA-256 of the blocks, the ASTC blocks) at a 16-byte boundary; at the end the index: count entries {32-byte key (the SHA-256 whose hex is
+// the cache file name), u64 offset, u64 size} sorted by key. The index is mapped and binary-searched; an entry is read with pread (the pages of a multi-GB pack are never resident) and
+// verified like a file. A pack whose header, size or index do not hold together is ignored whole: every lookup in it is a miss.
+#define PACK_HEAD 80u
+#define PACK_ENT 48u
+enum { PACK_PACK = 1, PACK_DIR, PACK_BAD };
+typedef struct { char *path; int kind, fd; uint64_t count, size; const uint8_t *index; void *map; size_t map_len; uint8_t fingerprint[32]; } nvn_pack;
+static pthread_mutex_t g_pack_mu = PTHREAD_MUTEX_INITIALIZER;
+static nvn_pack **g_packs; static size_t g_pack_n, g_pack_cap;
+static uint64_t le64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; i--) v = v << 8 | p[i]; return v; }
+static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+// Whether the file at `path` is a pack that holds together; fills p (descriptor and index mapping kept for the life of the process)
+static int pack_open(const char *path, nvn_pack *p) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC); struct stat st; uint8_t h[PACK_HEAD];
+    if (fd < 0) return 0;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || (uint64_t)st.st_size < PACK_HEAD || pread(fd, h, sizeof h, 0) != (ssize_t)sizeof h) { close(fd); return 0; }
+    uint64_t count = le64(h + 16), ioff = le64(h + 24), fsz = le64(h + 32);
+    if (memcmp(h, "NXASTCPK", 8) || le32(h + 8) != 1 || le32(h + 12) != PACK_ENT || fsz != (uint64_t)st.st_size || ioff < PACK_HEAD || ioff > fsz ||
+        (ioff & 15) || count > (fsz - ioff) / PACK_ENT || count * PACK_ENT != fsz - ioff) { close(fd); return 0; }
+    size_t page = (size_t)getpagesize(), lead = (size_t)(ioff % page), len = lead + (size_t)(count * PACK_ENT);
+    void *map = NULL; const uint8_t *index = NULL;
+    if (count) {
+        map = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, (off_t)(ioff - lead));
+        if (map == MAP_FAILED) { close(fd); return 0; }
+        index = (const uint8_t *)map + lead;
+    }
+    for (uint64_t i = 0; i < count; i++) {   // sorted, no duplicates, every entry inside the entries area
+        const uint8_t *e = index + i * PACK_ENT; uint64_t off = le64(e + 32), sz = le64(e + 40);
+        if ((i && memcmp(e - PACK_ENT, e, 32) >= 0) || off < PACK_HEAD || (off & 15) || sz <= 40 || off > ioff || sz > ioff - off) { if (map) munmap(map, len); close(fd); return 0; }
+    }
+    p->fd = fd; p->count = count; p->size = fsz; p->index = index; p->map = map; p->map_len = len; memcpy(p->fingerprint, h + 40, 32);
+    return 1;
+}
+// The pack that `root` names, or NULL when it is a directory, missing, or not a usable pack (one warning is printed for a file that is not). Remembered per path for the process
+static const nvn_pack *pack_for(const char *root) {
+    if (!root || !*root) return NULL;
+    pthread_mutex_lock(&g_pack_mu);
+    for (size_t i = 0; i < g_pack_n; i++) if (!strcmp(g_packs[i]->path, root)) { const nvn_pack *r = g_packs[i]->kind == PACK_PACK ? g_packs[i] : NULL; pthread_mutex_unlock(&g_pack_mu); return r; }
+    struct stat st; const nvn_pack *r = NULL;
+    if (!stat(root, &st)) {   // a path that is missing now may appear later: not remembered
+        nvn_pack *p = calloc(1, sizeof *p);
+        if (p) {
+            p->fd = -1; p->path = strdup(root);
+            p->kind = S_ISDIR(st.st_mode) ? PACK_DIR : pack_open(root, p) ? PACK_PACK : PACK_BAD;
+            if (p->kind == PACK_BAD) fprintf(stderr, "[dm] ASTC read-only cache %s is not a usable pack (corrupt or short): ignored\n", root);
+            if (g_pack_n == g_pack_cap) { g_pack_cap = g_pack_cap ? g_pack_cap * 2 : 4; g_packs = realloc(g_packs, g_pack_cap * sizeof *g_packs); }
+            g_packs[g_pack_n++] = p;
+            if (p->kind == PACK_PACK) r = p;
+        }
+    }
+    pthread_mutex_unlock(&g_pack_mu);
+    return r;
+}
+static int key_bytes(const char *hex, uint8_t out[32]) {
+    for (int i = 0; i < 32; i++) {
+        int v[2];
+        for (int j = 0; j < 2; j++) { char c = hex[i * 2 + j]; v[j] = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; if (v[j] < 0) return 0; }
+        out[i] = (uint8_t)(v[0] << 4 | v[1]);
+    }
+    return 1;
+}
+static int pack_find(const nvn_pack *p, const char *hex, uint64_t *off, uint64_t *size) {
+    uint8_t k[32]; uint64_t lo = 0, hi = p->count;
+    if (!key_bytes(hex, k)) return 0;
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2; const uint8_t *e = p->index + mid * PACK_ENT; int c = memcmp(e, k, 32);
+        if (!c) { *off = le64(e + 32); *size = le64(e + 40); return 1; }
+        if (c < 0) lo = mid + 1; else hi = mid;
+    }
+    return 0;
+}
+static int pread_full(int fd, void *buf, size_t size, uint64_t at) {
+    for (size_t got = 0; got < size;) {
+        ssize_t n = pread(fd, (uint8_t *)buf + got, size - got, (off_t)(at + got));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return 0;
+        got += (size_t)n;
+    }
+    return 1;
+}
+static nvn_astc_cache_status pack_read(const nvn_pack *p, const char *hex, void *output, size_t size) {
+    uint64_t off, sz; uint8_t header[40], digest[CC_SHA256_DIGEST_LENGTH];
+    if (!pack_find(p, hex, &off, &sz)) return NVN_ASTC_CACHE_MISSING;
+    if (sz != size + 40) return NVN_ASTC_CACHE_SIZE;
+    if (!pread_full(p->fd, header, sizeof header, off) || !pread_full(p->fd, output, size, off + 40)) return NVN_ASTC_CACHE_IO;
+    if (memcmp(header, cache_magic, sizeof cache_magic)) return NVN_ASTC_CACHE_HEADER;
+    payload_hash(output, size, digest);
+    if (memcmp(header + sizeof cache_magic, digest, sizeof digest)) return NVN_ASTC_CACHE_HASH;
+    atomic_fetch_add_explicit(&g_cache_disk_hits, 1, memory_order_relaxed);
+    return NVN_ASTC_CACHE_HIT;
+}
+// A read-only cache root is a pack file or a directory of <key>.astc files
+static nvn_astc_cache_status ro_read_status(const char *root, const char *key, void *output, size_t size) {
+    if (!root || !*root) return NVN_ASTC_CACHE_DISABLED;
+    const nvn_pack *p = pack_for(root);
+    return p ? pack_read(p, key, output, size) : cache_read_status(cache_path(root, key), output, size);
+}
+void nvn_bc_astc_plane_key(uint32_t format, uint32_t width, uint32_t height, unsigned block, const void *source, size_t source_size, nvn_astc_cache_key *key) {
+    cache_key(format, width, height, block, source, source_size, key->hex);
+}
+int nvn_bc_astc_pack_info(const char *path, uint64_t *entries, uint64_t *bytes, uint8_t fingerprint[32]) {
+    const nvn_pack *p = pack_for(path);
+    if (!p) return 0;
+    if (entries) *entries = p->count;
+    if (bytes) *bytes = p->size;
+    if (fingerprint) memcpy(fingerprint, p->fingerprint, 32);
+    return 1;
+}
+// The entries and bytes of a read-only root that is a pack; 0 when it is not one
+static int ro_pack_stats(const char *root, uint64_t *entries, uint64_t *bytes) {
+    const nvn_pack *p = pack_for(root);
+    if (!p) return 0;
+    *entries = p->count; *bytes = p->size; return 1;
+}
+
 void nvn_bc_astc_cache_stats(uint64_t *memory_hits, uint64_t *disk_hits, uint64_t *mapped_hits) {
     *memory_hits = atomic_load_explicit(&g_cache_memory_hits, memory_order_relaxed);
     *disk_hits = atomic_load_explicit(&g_cache_disk_hits, memory_order_relaxed);
@@ -321,7 +439,7 @@ int nvn_bc_astc_cache_read(const nvn_astc_cache_key *key, void *output, size_t s
     for (unsigned i = 0; i < 64; i++)
         if (!((key->hex[i] >= '0' && key->hex[i] <= '9') || (key->hex[i] >= 'a' && key->hex[i] <= 'f'))) return 0;
     @autoreleasepool {
-        return cache_read(cache_path(readonly_cache, key->hex), output, size) ||
+        return ro_read_status(readonly_cache, key->hex, output, size) == NVN_ASTC_CACHE_HIT ||
                cache_read(cache_path(cache, key->hex), output, size);
     }
 }
@@ -369,8 +487,8 @@ int nvn_bc_astc_encode_report(uint32_t format, const void *source, size_t source
     @autoreleasepool {
         char key[65]; cache_key(format, width, height, block, source, source_size, key);
         if (report) memcpy(report->key.hex, key, sizeof key);
-        NSString *path = cache_path(cache, key), *readonly_path = cache_path(readonly_cache, key);
-        nvn_astc_cache_status ro = cache_read_status(readonly_path, output, output_size), rw = NVN_ASTC_CACHE_UNCHECKED;
+        NSString *path = cache_path(cache, key), *readonly_path = pack_for(readonly_cache) ? nil : cache_path(readonly_cache, key);
+        nvn_astc_cache_status ro = ro_read_status(readonly_cache, key, output, output_size), rw = NVN_ASTC_CACHE_UNCHECKED;
         if (ro != NVN_ASTC_CACHE_HIT)
             rw = [path isEqualToString:readonly_path] ? ro : cache_read_status(path, output, output_size);
         if (report) { report->readonly_status = ro; report->writable_status = rw; }
@@ -550,7 +668,8 @@ static void *bg_scan_main(void *unused) {
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC), ce, cb, re, rb;
     char *cache = NULL, *ro = NULL;
     pthread_mutex_lock(&g_bg.mu); cache = g_bg.cache ? strdup(g_bg.cache) : NULL; ro = g_bg.readonly ? strdup(g_bg.readonly) : NULL; pthread_mutex_unlock(&g_bg.mu);
-    bg_scan(cache, &ce, &cb, 1); bg_scan(ro, &re, &rb, 0);
+    bg_scan(cache, &ce, &cb, 1);
+    if (!ro_pack_stats(ro, &re, &rb)) bg_scan(ro, &re, &rb, 0);
     atomic_store(&st_cache_entries, ce); atomic_store(&st_cache_bytes, cb); atomic_store(&st_ro_entries, re); atomic_store(&st_ro_bytes, rb);
     fprintf(stderr, "[dm] ASTC cache: writable %s: %llu entries, %.1f MB (cap %.0f MB, %.0f MB free on the disk, writes stop under %.0f MB); read-only %s: %llu entries, %.1f MB; "
             "misses encode in the background (%u threads, queue cap %.0f MB); scan %.1f ms\n",
@@ -656,6 +775,8 @@ static void bg_enqueue(uint32_t format, const void *source, size_t size, uint32_
 }
 static int cache_has(const char *root, const char *key, size_t payload) {
     if (!root || !*root) return 0;
+    const nvn_pack *pk = pack_for(root);
+    if (pk) { uint64_t off, sz; return pack_find(pk, key, &off, &sz) && sz == payload + 40; }
     @autoreleasepool {
         NSString *path = cache_path(root, key);
         if (atomic_load_explicit(&g_cache_small_ready, memory_order_acquire)) {
@@ -683,7 +804,7 @@ int nvn_bc_astc_fetch(uint32_t format, const void *source, size_t source_size, u
     char key[65]; cache_key(format, width, height, block, source, source_size, key);
     pthread_mutex_lock(&g_bg.mu); bg_env_config_locked(); NSString *ro = g_bg.readonly ? @(g_bg.readonly) : nil, *rw = g_bg.cache ? @(g_bg.cache) : nil; pthread_mutex_unlock(&g_bg.mu);
     @autoreleasepool {
-        if (cache_read(cache_path(ro.UTF8String, key), output, output_size) || cache_read(cache_path(rw.UTF8String, key), output, output_size)) { atomic_fetch_add(&st_hit, 1); return 1; }
+        if (ro_read_status(ro.UTF8String, key, output, output_size) == NVN_ASTC_CACHE_HIT || cache_read(cache_path(rw.UTF8String, key), output, output_size)) { atomic_fetch_add(&st_hit, 1); return 1; }
     }
     atomic_fetch_add(&st_fetch_miss, 1);
     bg_enqueue(format, source, source_size, width, height, block, key);

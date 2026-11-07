@@ -27,6 +27,11 @@ typedef struct {
     int write_attempted, write_error;
 } nvn_astc_cache_report;
 const char *nvn_bc_astc_cache_status_name(nvn_astc_cache_status status);
+// A read-only cache (DM_NVN_ASTC_CACHE_RO, `readonly_cache` below) is a directory of <key>.astc files or ONE pack file (astc-ro.pack, see nvn_astc_cache.m). 1 when `path` is a pack that
+// holds together (header, size and index): its entry count, size and the input fingerprint the writer recorded; 0 for a directory, a missing path or a corrupt or short pack (ignored)
+// The content address of a plane (the name of its cache entry): SHA-256 over the version tag, format, size, block and the tightly packed BC bytes. For tools that key planes without encoding them
+void nvn_bc_astc_plane_key(uint32_t format, uint32_t width, uint32_t height, unsigned block, const void *source, size_t source_size, nvn_astc_cache_key *key);
+int nvn_bc_astc_pack_info(const char *path, uint64_t *entries, uint64_t *bytes, uint8_t fingerprint[32]);
 // Restore a previously encoded plane without touching its BC source. The caller
 // must first prove that the source and its layout have not changed. A miss or a
 // corrupt entry returns zero and requires the normal source upload.

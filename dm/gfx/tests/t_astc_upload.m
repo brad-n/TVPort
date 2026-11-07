@@ -114,6 +114,22 @@ static void configure(const char *rw, size_t queue_cap, uint64_t cache_max, uint
 }
 static nvn_astc_bg_stats stats(void) { nvn_astc_bg_stats s; nvn_bc_astc_bg_stats(&s); return s; }
 static void subdir(char *out, size_t n, const char *dir, const char *name) { snprintf(out, n, "%s/%s", dir, name); mkdir(out, 0755); }
+// A pack (the layout of nvn_astc_cache.m, what bntx_astc.py writes) of the entries in a cache directory
+static void pack_dir(const char *dir, const char *pack_path) {
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (NSString *f in [NSFileManager.defaultManager contentsOfDirectoryAtPath:@(dir) error:NULL]) if (f.length == 69 && [f hasSuffix:@".astc"]) [names addObject:f];
+    [names sortUsingSelector:@selector(compare:)];
+    NSMutableData *file = [NSMutableData dataWithLength:80], *index = [NSMutableData data];
+    for (NSString *f in names) {
+        NSData *e = [NSData dataWithContentsOfFile:[@(dir) stringByAppendingPathComponent:f]];
+        uint8_t key[32]; for (int i = 0; i < 32; i++) { unsigned v; sscanf([f substringWithRange:NSMakeRange(2 * i, 2)].UTF8String, "%2x", &v); key[i] = (uint8_t)v; }
+        uint64_t off = file.length, len = e.length; [file appendData:e]; [file increaseLengthBy:-file.length & 15];
+        [index appendBytes:key length:32]; [index appendBytes:&off length:8]; [index appendBytes:&len length:8];
+    }
+    uint64_t ioff = file.length, count = names.count; [file appendData:index]; uint64_t total = file.length; uint32_t one = 1, esz = 48;
+    uint8_t *b = file.mutableBytes; memcpy(b, "NXASTCPK", 8); memcpy(b + 8, &one, 4); memcpy(b + 12, &esz, 4); memcpy(b + 16, &count, 8); memcpy(b + 24, &ioff, 8); memcpy(b + 32, &total, 8);
+    [file writeToFile:@(pack_path) atomically:NO];
+}
 static void run_background(const char *dir, int six) {
     unsigned blk = six ? 6 : 4;
     MTLPixelFormat astc_pf = six ? MTLPixelFormatASTC_6x6_LDR : MTLPixelFormatASTC_4x4_LDR;
@@ -212,6 +228,28 @@ static void run_background(const char *dir, int six) {
         fill_blocks(buf, bytes, 0x4d, 507); int again = nvn_bc_astc_learn(0x4d, buf, bytes, 256, 256, blk, NULL); CHECK(again == 0 || again == 1, "a later look-up of a dropped plane is valid");
         CHECK(nvn_bc_astc_bg_wait(120), "drains again");
         free(buf);
+    }
+    // 5b. the read-only cache as one pack file: the planes the first texture left in the writable directory are packed, the writable directory is replaced by an empty one, and a new texture of the same
+    // bytes is ASTC from the pack alone. A pack that does not hold together is ignored (the texture is decoded)
+    {
+        char pk[600]; snprintf(pk, sizeof pk, "%s/astc-ro.pack", dir); pack_dir(rw, pk);
+        char rw2[512]; subdir(rw2, sizeof rw2, dir, "rw2");
+        nvn_astc_bg_config c = {.cache = rw2, .readonly = pk, .queue_cap = 64u << 20, .cache_max = 1ull << 30, .min_free = 0, .threads = 1};
+        nvn_bc_astc_bg_configure(&c);
+        void *m3; tex_t t3 = fixture(d, &m3);
+        id<MTLTexture> mt3 = upload(&t3);
+        CHECK(mt3 && mt3.pixelFormat == astc_pf, "a texture whose planes are in the read-only pack is ASTC");
+        for (unsigned l = 0; mt3 && l < 4; l++) { double mean, peak; compare_level(mt3, &t3, d, l, 0, &mean, &peak); CHECK(mean < 0.04 * (six ? 6.0 : 1.0), "ASTC from the pack samples close to the BC decode"); }
+        nvn_astc_bg_stats ps = stats(); CHECK(ps.hits >= 4 && ps.misses == 0 && ps.fetch_misses == 0 && cache_files(rw2) == 0, "four hits in the pack, nothing missed or written");
+        defer_obj_release(mt3); release_fixture(m3);
+        FILE *f = fopen(pk, "r+b"); fseek(f, 0, SEEK_END); long n = ftell(f); fclose(f); CHECK(!truncate(pk, n - 20), "cut the index short");   // the whole pack is then ignored
+        char pk2[600]; snprintf(pk2, sizeof pk2, "%s/astc-ro-cut.pack", dir); rename(pk, pk2); c.readonly = pk2;
+        nvn_bc_astc_bg_configure(&c);
+        void *m4; tex_t t4 = fixture(d, &m4);
+        id<MTLTexture> mt4 = upload(&t4);
+        CHECK(mt4 && mt4.pixelFormat == MTLPixelFormatRGBA8Unorm, "a truncated pack is ignored: the texture stays decoded");
+        defer_obj_release(mt4); release_fixture(m4);
+        CHECK(nvn_bc_astc_bg_wait(120), "its planes drain into the writable directory");
     }
     // 6. cache size cap: room for two entries, four planes encoded, two written
     {

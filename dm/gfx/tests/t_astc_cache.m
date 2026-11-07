@@ -50,6 +50,107 @@ static size_t count_entries(NSString *dir) {
     size_t n = 0; for (NSString *f in [NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:NULL]) if (f.length == 69 && [f hasSuffix:@".astc"]) n++;
     return n;
 }
+// ---- the read-only cache as one pack file (astc-ro.pack): lookups, shared payloads, corrupt or short packs, and the pack and a directory both feeding the encoder, learn and fetch ----
+typedef struct { uint8_t key[32]; const uint8_t *payload; size_t size; } pk_entry;
+static NSString *hexkey(const uint8_t k[32]) { NSMutableString *s = [NSMutableString string]; for (int i = 0; i < 32; i++) [s appendFormat:@"%02x", k[i]]; return s; }
+static int pk_cmp(const void *a, const void *b) { return memcmp(a, b, 32); }
+// Writes a pack of the entries (a payload pointer may repeat: stored once); `damage` 0 none, 1 magic, 2 truncated short, 3 truncated mid-index, 4 index unsorted, 5 file size field wrong, 6 entry past the index, 7 version 2
+static void write_pack(NSString *path, pk_entry *ents, size_t n, int damage) {
+    qsort(ents, n, sizeof *ents, pk_cmp);
+    NSMutableData *file = [NSMutableData dataWithLength:80], *index = [NSMutableData data];
+    const uint8_t **seen = calloc(n, sizeof *seen); uint64_t *seen_off = calloc(n, 8); uint64_t *seen_len = calloc(n, 8); size_t ns = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t j; for (j = 0; j < ns; j++) if (seen[j] == ents[i].payload) break;
+        if (j == ns) {
+            uint8_t head[40]; memcpy(head, "NXASTC01", 8); CC_SHA256(ents[i].payload, (CC_LONG)ents[i].size, head + 8);
+            seen[ns] = ents[i].payload; seen_off[ns] = file.length; seen_len[ns] = 40 + ents[i].size; ns++;
+            [file appendBytes:head length:40]; [file appendBytes:ents[i].payload length:ents[i].size];
+            size_t pad = -file.length & 15; [file increaseLengthBy:pad];
+        }
+        uint64_t off = seen_off[j], len = seen_len[j];
+        [index appendBytes:ents[i].key length:32]; [index appendBytes:&off length:8]; [index appendBytes:&len length:8];
+    }
+    uint64_t ioff = file.length; [file appendData:index];
+    uint64_t total = file.length, count = n; uint32_t version = damage == 7 ? 2 : 1, esz = 48;
+    uint8_t *b = file.mutableBytes; memcpy(b, damage == 1 ? "NXASTCPX" : "NXASTCPK", 8); memcpy(b + 8, &version, 4); memcpy(b + 12, &esz, 4); memcpy(b + 16, &count, 8); memcpy(b + 24, &ioff, 8);
+    uint64_t sz = damage == 5 ? total + 16 : total; memcpy(b + 32, &sz, 8);
+    for (int i = 0; i < 32; i++) b[40 + i] = (uint8_t)(0xA0 + i);   // the input fingerprint
+    if (damage == 4 && n >= 2) { uint8_t tmp[48]; memcpy(tmp, b + ioff, 48); memcpy(b + ioff, b + ioff + 48, 48); memcpy(b + ioff + 48, tmp, 48); }
+    if (damage == 6 && n) { uint64_t off = total; memcpy(b + ioff + 32, &off, 8); }
+    if (damage == 2) [file setLength:50];
+    if (damage == 3) [file setLength:ioff + 60];
+    [file writeToFile:path atomically:NO];
+    free(seen); free(seen_off); free(seen_len);
+}
+static void pack_contract(NSString *root) {
+    uint8_t pa[100], pb[256], pc[64], got[256]; memset(pa, 0xA1, sizeof pa); memset(pb, 0xB2, sizeof pb); memset(pc, 0xC3, sizeof pc);
+    for (int i = 0; i < 256; i++) pb[i] = (uint8_t)(i * 7);
+    pk_entry e[4]; memset(e, 0, sizeof e);
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 32; j++) e[i].key[j] = (uint8_t)(i * 37 + j * 11 + 1);
+    e[0].payload = pa; e[0].size = sizeof pa; e[1].payload = pb; e[1].size = sizeof pb; e[2].payload = pc; e[2].size = sizeof pc; e[3].payload = pa; e[3].size = sizeof pa;   // e3 shares e0's payload
+    uint8_t k0[32], k1[32], k2[32], k3[32], absent[32]; memcpy(k0, e[0].key, 32); memcpy(k1, e[1].key, 32); memcpy(k2, e[2].key, 32); memcpy(k3, e[3].key, 32); memset(absent, 0x5a, 32);
+    NSString *pack = [root stringByAppendingPathComponent:@"ok.pack"];
+    write_pack(pack, e, 4, 0);
+    uint64_t entries, bytes; uint8_t fp[32];
+    CHECK(nvn_bc_astc_pack_info(pack.fileSystemRepresentation, &entries, &bytes, fp) && entries == 4 && bytes == [[NSFileManager.defaultManager attributesOfItemAtPath:pack error:NULL] fileSize] && fp[0] == 0xA0 && fp[31] == 0xBF);
+    nvn_astc_cache_key key; 
+    #define KEYOF(k) do { NSString *h = hexkey(k); memset(&key, 0, sizeof key); strcpy(key.hex, h.UTF8String); } while (0)
+    KEYOF(k0); CHECK(nvn_bc_astc_cache_read(&key, got, sizeof pa, NULL, pack.fileSystemRepresentation) && !memcmp(got, pa, sizeof pa));
+    KEYOF(k3); CHECK(nvn_bc_astc_cache_read(&key, got, sizeof pa, NULL, pack.fileSystemRepresentation) && !memcmp(got, pa, sizeof pa));   // an alias: the same payload
+    KEYOF(k1); CHECK(nvn_bc_astc_cache_read(&key, got, sizeof pb, NULL, pack.fileSystemRepresentation) && !memcmp(got, pb, sizeof pb));
+    KEYOF(k2); CHECK(nvn_bc_astc_cache_read(&key, got, sizeof pc, NULL, pack.fileSystemRepresentation) && !memcmp(got, pc, sizeof pc));
+    CHECK(!nvn_bc_astc_cache_read(&key, got, sizeof pc - 1, NULL, pack.fileSystemRepresentation));   // the wrong size is a miss
+    KEYOF(absent); CHECK(!nvn_bc_astc_cache_read(&key, got, sizeof pc, NULL, pack.fileSystemRepresentation));
+    CHECK(cache_has(pack.fileSystemRepresentation, hexkey(k1).UTF8String, sizeof pb) && !cache_has(pack.fileSystemRepresentation, hexkey(k1).UTF8String, sizeof pb + 1) && !cache_has(pack.fileSystemRepresentation, hexkey(absent).UTF8String, 1));
+    // one payload byte flipped: the hash catches it, that entry only
+    NSString *flip = [root stringByAppendingPathComponent:@"flip.pack"]; write_pack(flip, e, 4, 0);
+    { uint64_t off = 0; NSData *d = [NSData dataWithContentsOfFile:flip]; const uint8_t *b = d.bytes; uint64_t ioff; memcpy(&ioff, b + 24, 8);
+      for (int i = 0; i < 4; i++) if (!memcmp(b + ioff + 48 * i, k1, 32)) memcpy(&off, b + ioff + 48 * i + 32, 8);
+      FILE *f = fopen(flip.fileSystemRepresentation, "r+b"); fseek(f, (long)off + 40 + 5, SEEK_SET); fputc(0x77, f); fclose(f); }
+    KEYOF(k1); CHECK(!nvn_bc_astc_cache_read(&key, got, sizeof pb, NULL, flip.fileSystemRepresentation));
+    KEYOF(k2); CHECK(nvn_bc_astc_cache_read(&key, got, sizeof pc, NULL, flip.fileSystemRepresentation));
+    // corrupt or short packs are ignored whole: no hit, no crash, pack_info says so
+    const char *names[] = {"", "bad-magic", "short", "cut-index", "unsorted", "size-field", "past-index", "version2"};
+    for (int d = 1; d <= 7; d++) {
+        NSString *p = [root stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.pack", names[d]]]; write_pack(p, e, 4, d);
+        KEYOF(k0); CHECK(!nvn_bc_astc_pack_info(p.fileSystemRepresentation, NULL, NULL, NULL)); 
+        CHECK(!nvn_bc_astc_cache_read(&key, got, sizeof pa, NULL, p.fileSystemRepresentation));
+        if (!(d == 1 || d == 2 || d == 3 || d == 5 || d == 7 || d == 4 || d == 6)) CHECK(0);
+    }
+    { NSString *p = [root stringByAppendingPathComponent:@"empty.pack"]; [@"" writeToFile:p atomically:NO encoding:NSUTF8StringEncoding error:NULL];
+      KEYOF(k0); CHECK(!nvn_bc_astc_cache_read(&key, got, sizeof pa, NULL, p.fileSystemRepresentation)); }
+    // an empty but valid pack and a missing path are misses
+    write_pack([root stringByAppendingPathComponent:@"zero.pack"], e, 0, 0);
+    CHECK(nvn_bc_astc_pack_info([root stringByAppendingPathComponent:@"zero.pack"].fileSystemRepresentation, &entries, NULL, NULL) && entries == 0);
+    CHECK(!nvn_bc_astc_pack_info([root stringByAppendingPathComponent:@"nope.pack"].fileSystemRepresentation, NULL, NULL, NULL));
+    // the encoder, learn and fetch read a pack and a directory alike
+    const unsigned W = 64, H = 64; const size_t bc = (size_t)W * H, astc = (size_t)((W + 3) / 4) * ((H + 3) / 4) * 16;
+    uint8_t *plane = malloc(bc), *want = malloc(astc), *out = malloc(astc);
+    bc7_plane(plane, bc, 77);
+    NSString *dir = [root stringByAppendingPathComponent:@"ro-dir"]; int hit;
+    CHECK(!nvn_bc_astc_encode(0x4d, plane, bc, W, H, 4, want, astc, dir.fileSystemRepresentation, NULL, &hit) && !hit);
+    nvn_astc_cache_key pk; nvn_bc_astc_plane_key(0x4d, W, H, 4, plane, bc, &pk);
+    uint8_t realkey[32]; for (int i = 0; i < 32; i++) { unsigned v; sscanf(pk.hex + 2 * i, "%2x", &v); realkey[i] = (uint8_t)v; }
+    pk_entry real[2]; memset(real, 0, sizeof real); memcpy(real[0].key, realkey, 32); real[0].payload = want; real[0].size = astc;
+    memset(real[1].key, 0x11, 32); real[1].payload = pc; real[1].size = sizeof pc;
+    NSString *rp = [root stringByAppendingPathComponent:@"real.pack"]; write_pack(rp, real, 2, 0);
+    memset(out, 0, astc);
+    CHECK(!nvn_bc_astc_encode(0x4d, plane, bc, W, H, 4, out, astc, NULL, rp.fileSystemRepresentation, &hit) && hit && !memcmp(out, want, astc));   // hit in the pack, nothing encoded
+    memset(out, 0, astc);
+    CHECK(!nvn_bc_astc_encode(0x4d, plane, bc, W, H, 4, out, astc, NULL, dir.fileSystemRepresentation, &hit) && hit && !memcmp(out, want, astc));   // the directory
+    nvn_astc_bg_config cfg = {.cache = NULL, .readonly = rp.fileSystemRepresentation, .queue_cap = 1u << 20, .cache_max = 1ull << 30, .min_free = 0, .threads = 1};
+    nvn_bc_astc_bg_configure(&cfg);
+    memset(out, 0, astc);
+    CHECK(nvn_bc_astc_learn(0x4d, plane, bc, W, H, 4, NULL) == 1);
+    CHECK(nvn_bc_astc_fetch(0x4d, plane, bc, W, H, 4, out, astc) == 1 && !memcmp(out, want, astc));
+    bc7_plane(plane, bc, 78);   // another plane: a miss in the pack
+    CHECK(nvn_bc_astc_fetch(0x4d, plane, bc, W, H, 4, out, astc) == 0);
+    cfg.readonly = dir.fileSystemRepresentation; nvn_bc_astc_bg_configure(&cfg);
+    bc7_plane(plane, bc, 77);
+    CHECK(nvn_bc_astc_learn(0x4d, plane, bc, W, H, 4, NULL) == 1 && nvn_bc_astc_fetch(0x4d, plane, bc, W, H, 4, out, astc) == 1 && !memcmp(out, want, astc));
+    free(plane); free(want); free(out);
+    #undef KEYOF
+}
 static void background_contract(NSString *root) {
     const unsigned W = 128, H = 128; const size_t bytes = (size_t)W * H;   // BC7: 16 bytes a 4x4 block
     const size_t astc_bytes = (size_t)((W + 3) / 4) * ((H + 3) / 4) * 16;
@@ -405,6 +506,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     CHECK(mapped_mode ? mapped_hits > 0 : mapped_hits == 0);
     nvn_bc_astc_cache_prepare(NULL, NULL, 2u << 20, 0);
     CHECK(g_cache_small[small].length == 16);
+    pack_contract(root);
     background_contract(root);
     CHECK([NSFileManager.defaultManager removeItemAtPath:root error:NULL]);
     printf("ASTC cache: %u checks, %u failures, %zu retained bytes\n", checks, failures, used);
