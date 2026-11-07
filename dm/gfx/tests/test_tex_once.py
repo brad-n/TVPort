@@ -1,0 +1,505 @@
+"""tex_once.py and sparse_image.py (docs/texture_once.md sections 1, 2 and 4): the sparse image round trip, the Yaz0 encoder, the strip of every container kind and its self-check.
+
+Synthetic game files only (no game data). The strip tests need macOS with clang (they build the engine's texture code, as test_bntx_astc.py does).
+"""
+import hashlib
+import importlib.util
+import json
+import os
+import random
+import struct
+import sys
+import tempfile
+import unittest
+import zlib
+from pathlib import Path
+
+TESTS = Path(__file__).resolve().parent
+TOOLS = Path(__file__).resolve().parents[1] / 'tools'
+DM = TOOLS.parents[1]
+sys.path.insert(0, str(TOOLS)); sys.path.insert(0, str(TESTS)); sys.path.insert(0, str(DM / 'tools'))
+
+
+def load(name):
+    spec = importlib.util.spec_from_file_location(name, TOOLS / (name + '.py'))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+S = load('sparse_image')
+tool = load('tex_once')
+B = tool.B
+import test_bntx_astc as T   # the synthetic BNTX / SARC / Yaz0 / zstd builders
+import romfs_image
+
+
+def fake_pack(path, entries=3):
+    """A minimal valid NXASTCPK file (the sparse image embeds it unchanged)"""
+    body = b''.join(bytes([i + 1]) * 64 for i in range(entries))
+    ioff = 80 + len(body)
+    idx = b''.join(hashlib.sha256(bytes([i])).digest() + struct.pack('<QQ', 80 + 64 * i, 64) for i in range(entries))
+    size = ioff + len(idx)
+    Path(path).write_bytes(b'NXASTCPK' + struct.pack('<IIQQQ', 1, 48, entries, ioff, size) + bytes(32) + bytes(8) + body + idx)
+
+
+class SparseTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
+
+    def tearDown(self): self.tmp.cleanup()
+
+    def image(self, logical, pack=True):
+        """Logical bytes with holes: data, a 100 KB zero run, data, a short zero run (stays), data, a 50 KB zero tail"""
+        rng = random.Random(3)
+        a, b, c = rng.randbytes(5000), rng.randbytes(777), rng.randbytes(9000)
+        data = a + bytes(100_000) + b + bytes(3000) + c + bytes(50_000)
+        w = S.SparseWriter(str(self.root / 'x.img'), len(data))
+        w.put_scanned(0, data)
+        info = w.finish(str(self.root / 'x.pack') if pack else None)
+        return data, info
+
+    def test_round_trip_with_holes_and_trailer(self):
+        fake_pack(self.root / 'x.pack')
+        data, info = self.image(0)
+        self.assertLess(info['physical'], len(data) // 2)
+        s = S.SparseImage(str(self.root / 'x.img'))
+        self.assertEqual(s.logical_size, len(data))
+        self.assertEqual(s.read(0, len(data)), data)
+        for off, n in ((0, 1), (4999, 3), (5000, 100), (104_990, 5000), (len(data) - 10, 100), (len(data), 5), (60_000, 1)):
+            self.assertEqual(s.read(off, n), data[off:off + n])
+        self.assertEqual(len(s.read(len(data) - 3, 10)), 3)   # short at the end, like a file
+        ext = s.extents()
+        self.assertTrue(all(p % 16 == 0 for _, _, p in ext))
+        self.assertTrue(all(ext[i][0] + ext[i][1] <= ext[i + 1][0] for i in range(len(ext) - 1)))
+        self.assertEqual(len(ext), 2)                     # the 3,000-byte run stayed inside an extent; both long runs are holes
+        self.assertEqual(s.hole_bytes(), 100_000 + 50_000)
+        raw = (self.root / 'x.img').read_bytes()
+        self.assertEqual(raw[:8], b'DMSPARS1')
+        self.assertEqual(raw[-32:-24], b'DMSPEND1')
+        self.assertEqual(struct.unpack_from('<Q', raw, len(raw) - 24)[0], len(raw))
+        self.assertEqual(s.pack_offset % 16384, 0)
+        self.assertEqual(raw[s.pack_offset:s.pack_offset + s.pack_size], (self.root / 'x.pack').read_bytes())
+        self.assertEqual(s.read_pack(0, 8), b'NXASTCPK')
+        s.close()
+
+    def test_no_pack_and_all_zero_image(self):
+        data, info = self.image(0, pack=False)
+        with S.SparseImage(str(self.root / 'x.img')) as s: self.assertEqual((s.pack_offset, s.pack_size), (0, 0))
+        w = S.SparseWriter(str(self.root / 'z.img'), 1 << 20)
+        w.put_scanned(0, bytes(1 << 20)); w.finish()
+        with S.SparseImage(str(self.root / 'z.img')) as s:
+            self.assertEqual((s.count, s.read(100, 50)), (0, bytes(50)))
+        self.assertLess((self.root / 'z.img').stat().st_size, 200)
+
+    def test_truncated_and_damaged_files_are_rejected(self):
+        fake_pack(self.root / 'x.pack')
+        self.image(0)
+        raw = (self.root / 'x.img').read_bytes()
+        for cut in (len(raw) - 1, len(raw) - 32, len(raw) // 2, 64, 10, 0):
+            (self.root / 'cut.img').write_bytes(raw[:cut])
+            with self.assertRaises(S.SparseError, msg=cut): S.SparseImage(str(self.root / 'cut.img'))
+        bad = bytearray(raw); bad[len(raw) - 24] ^= 1   # the trailer's size
+        (self.root / 'bad.img').write_bytes(bytes(bad))
+        with self.assertRaises(S.SparseError): S.SparseImage(str(self.root / 'bad.img'))
+        bad = bytearray(raw); bad[0] = ord('X')
+        (self.root / 'bad.img').write_bytes(bytes(bad))
+        with self.assertRaises(S.SparseError): S.SparseImage(str(self.root / 'bad.img'))
+        bad = bytearray(raw); bad[8:12] = struct.pack('<I', 2)   # version
+        (self.root / 'bad.img').write_bytes(bytes(bad))
+        with self.assertRaises(S.SparseError): S.SparseImage(str(self.root / 'bad.img'))
+
+    def test_writer_rules(self):
+        w = S.SparseWriter(str(self.root / 'w.img'), 100)
+        w.put(10, b'abc')
+        with self.assertRaises(S.SparseError): w.put(5, b'x')            # out of order
+        with self.assertRaises(S.SparseError): w.put(99, b'xx')          # past the logical size
+        w.abort()
+        self.assertFalse((self.root / 'w.img.part').exists())
+        self.assertFalse((self.root / 'w.img').exists())
+
+    def test_zero_run_scan(self):
+        z = bytes(S.MIN_HOLE)
+        self.assertEqual(S.split_zero_runs(b''), [])
+        self.assertEqual(S.split_zero_runs(bytes(10_000)), [])
+        self.assertEqual(S.split_zero_runs(b'a' + bytes(S.MIN_HOLE - 1) + b'b'), [(0, S.MIN_HOLE + 1)])     # one byte short of a hole
+        self.assertEqual(S.split_zero_runs(b'a' + z + b'b'), [(0, 1), (S.MIN_HOLE + 1, S.MIN_HOLE + 2)])    # exactly a hole
+        self.assertEqual(S.split_zero_runs(z + b'abc' + z), [(S.MIN_HOLE, S.MIN_HOLE + 3)])
+
+    def test_logical_file_reads_like_the_plain_file(self):
+        fake_pack(self.root / 'x.pack')
+        data, _ = self.image(0)
+        with S.open_logical(str(self.root / 'x.img')) as f:
+            self.assertEqual(f.read(10), data[:10])
+            f.seek(104_000); self.assertEqual(f.read(2000), data[104_000:106_000])
+            f.seek(-5, 2); self.assertEqual(f.read(), data[-5:])
+        plain = self.root / 'p.img'; plain.write_bytes(b'hello')
+        with S.open_logical(str(plain)) as f: self.assertEqual(f.read(), b'hello')
+
+
+class RomfsViewTests(unittest.TestCase):
+    """romfs.py, romfs_image.py (identity, index, format check) see a DMSPARS1 file as the DMROMFS1 image it holds"""
+    def test_sparse_image_lists_reads_and_identifies_like_its_plain_image(self):
+        import romfs
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / 'src'
+            (src / 'a' / 'b').mkdir(parents=True)
+            (src / 'a' / 'one.bin').write_bytes(os.urandom(3000) + bytes(40_000) + b'tail')
+            (src / 'a' / 'b' / 'two.zs').write_bytes(bytes.fromhex('28b52ffd') + b'zzz')
+            (src / 'big.bin').write_bytes(bytes(300_000))
+            (src / 'x.txt').write_bytes(b'hello')
+            plain = root / 'plain' / 'RomFS.img'; plain.parent.mkdir()
+            romfs_image.pack(str(src), str(plain))
+            fake_pack(root / 'p.pack')
+            sparse = root / 'sparse' / 'romfs.img'; sparse.parent.mkdir()
+            data = plain.read_bytes()
+            w = S.SparseWriter(str(sparse), len(data)); w.put_scanned(0, data); w.finish(str(root / 'p.pack'))
+            self.assertLess(sparse.stat().st_size, len(data))
+            self.assertTrue(romfs.is_image(str(sparse)))
+            self.assertEqual(romfs_image.identity(str(sparse), 't', '1', '2'), romfs_image.identity(str(plain), 't', '1', '2'))
+            self.assertEqual(romfs_image.read_index(str(sparse)), romfs_image.read_index(str(plain)))
+            self.assertEqual(romfs_image.format_mismatches(str(sparse)), romfs_image.format_mismatches(str(plain)))
+            for name in ('a/one.bin', 'a/b/two.zs', 'big.bin', 'x.txt'):
+                self.assertEqual(romfs.Path(str(sparse) + '/' + name).read_bytes(), romfs.Path(str(plain) + '/' + name).read_bytes(), name)
+            self.assertEqual(sorted(romfs.os.listdir(str(sparse) + '/a')), sorted(romfs.os.listdir(str(plain) + '/a')))
+            self.assertEqual(sorted(r for r, _, _ in romfs.walk(str(sparse))), sorted(r.replace('plain/RomFS.img', 'sparse/romfs.img') for r, _, _ in romfs.walk(str(plain))))
+            self.assertEqual(romfs.stat(str(sparse) + '/big.bin').st_size, 300_000)
+            # mmap of a file inside the image (archive scans)
+            with romfs.open(str(sparse) + '/a/one.bin', 'rb') as f:
+                with romfs.mmap.mmap(f.fileno(), 0, access=romfs.mmap.ACCESS_READ) as m:
+                    full = (src / 'a' / 'one.bin').read_bytes()
+                    self.assertEqual((len(m), m[3000:3010], m.find(b'tail'), m[10]), (len(full), full[3000:3010], len(full) - 4, full[10]))
+            # the command line: --identity prints the same line
+            import subprocess
+            ids = [subprocess.run([sys.executable, '-I', str(DM / 'tools' / 'romfs_image.py'), '--identity', str(p), 't', '1', '2'], capture_output=True, text=True).stdout for p in (sparse, plain)]
+            self.assertEqual(ids[0], ids[1]); self.assertIn('DMROMFSID1', ids[0])
+            r = subprocess.run([sys.executable, '-I', str(DM / 'tools' / 'romfs.py'), str(sparse), 'x.txt'], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+
+class NativeYaz0Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.native = tool.native_open(tool.build_native(cls.tmp.name))
+
+    @classmethod
+    def tearDownClass(cls): cls.tmp.cleanup()
+
+    def decode(self, stream):
+        """The format's own definition (test_bntx_astc's decoder-by-definition), independent of the engine's C decoder"""
+        n = int.from_bytes(stream[4:8], 'big'); out = bytearray(); i = 16
+        while len(out) < n:
+            h = stream[i]; i += 1
+            for k in range(8):
+                if len(out) >= n: break
+                if h & (0x80 >> k): out.append(stream[i]); i += 1
+                else:
+                    b1, b2 = stream[i], stream[i + 1]; i += 2
+                    ln = b1 >> 4
+                    if ln: ln += 2
+                    else: ln = stream[i] + 0x12; i += 1
+                    d = ((b1 & 15) << 8 | b2) + 1
+                    for _ in range(ln): out.append(out[-d])
+        return bytes(out), i
+
+    def test_streams_decode_to_the_input(self):
+        rng = random.Random(8)
+        cases = [b'', b'a', b'ab', b'abc' * 3, bytes(5000), rng.randbytes(3000), (b'abcabcabd' * 300) + rng.randbytes(50), bytes(100_000) + rng.randbytes(100) + bytes(70_000),
+                 b''.join(rng.randbytes(40) + bytes(rng.randrange(0, 500)) for _ in range(200))]
+        for data in cases:
+            s = tool.yaz0_pack(self.native, data, len(data) + len(data) // 8 + 64)
+            self.assertIsNotNone(s, len(data))
+            self.assertEqual(s[:4], b'Yaz0'); self.assertEqual(int.from_bytes(s[4:8], 'big'), len(data))
+            dec, used = self.decode(s)
+            self.assertEqual(dec, data)
+            self.assertEqual(used, len(s))
+        self.assertLess(len(tool.yaz0_pack(self.native, bytes(1_000_000), 100_000)), 12000)   # zeros cost 3 bytes per 273
+
+    def test_a_stream_that_does_not_fit_is_refused(self):
+        data = random.Random(1).randbytes(5000)
+        self.assertIsNone(tool.yaz0_pack(self.native, data, 4000))
+        self.assertIsNotNone(tool.yaz0_pack(self.native, data, 6000))
+
+
+class ZstdSlotTests(unittest.TestCase):
+    def test_slot_is_filled_with_a_skippable_frame(self):
+        z = B.zstd_module()
+        data = random.Random(2).randbytes(3000) + bytes(40_000)
+        comp = z.compress(data, level=3)
+        for slot in (len(comp) + 8, len(comp) + 1000, len(comp)):
+            r = tool.zstd_slot(data, slot)
+            self.assertEqual(len(r), slot)
+            self.assertEqual(z.decompress(r), data)
+        self.assertIsNone(tool.zstd_slot(data, len(comp) - 100))
+        r = tool.zstd_slot(data, len(comp) + 3)       # 3 bytes cannot hold a frame header: a stronger level may fit exactly, else None
+        self.assertTrue(r is None or (len(r) == len(comp) + 3 and z.decompress(r) == data))
+        f = tool.skippable_frame(20)
+        self.assertEqual((len(f), f[:4], f[4:8], f[8:]), (20, bytes.fromhex('502a4d18'), struct.pack('<I', 12), bytes(12)))
+
+
+def swizzled(lib, tex, pkg_block_h):
+    """A texture's block-linear storage with the given packaged block height (0 = the automatic layout, as a NUTEXB has)"""
+    import ctypes
+    size = lib.dm_texture_size(tex.target, tex.nvn, tex.w, tex.h, tex.depth, tex.mips, pkg_block_h)
+    buf = ctypes.create_string_buffer(size)
+    for (l, y), plane in tex.planes.items():
+        pitch = ((max(tex.w >> l, 1) + 3) // 4) * T.BYTES_PER_BLOCK[tex.nvn]
+        assert lib.dm_swizzle(tex.target, tex.nvn, tex.w, tex.h, tex.depth, tex.mips, pkg_block_h, l, y, plane, pitch, buf) == 0
+    return buf.raw
+
+
+def nutexb(lib, tex, fmt_byte):
+    image = swizzled(lib, tex, 0)
+    footer = bytes(0x40) + struct.pack('<9I', tex.w, tex.h, 1, fmt_byte | 0x300, 4, tex.mips, 0x1000, 1, len(image)) + b' XET' + struct.pack('<I', 0x00020001)
+    assert len(footer) == 0x6c
+    return image + footer
+
+
+def skippable(n): return tool.skippable_frame(n)
+
+
+def smash_fs(entries, stored_placeholder=0):
+    """The inflated file system table of a data.arc with `entries` = [(offset in file section / 4, stored size, size)], all nutexb, one directory at offset 0 of the file section"""
+    n = len(entries)
+    hdr = bytearray(0x58)
+    tsize = 0x58 + 16 + 8 + n * 32 + n * 8 + 0x1c + n * 16 + n * 12 + n * 16 + n * 12 * 0
+    struct.pack_into('<12I', hdr, 0, tsize, n, n, 0, 1, 0, n, n, n, 0, 0, 0)
+    out = bytearray(hdr)
+    out += bytes(16) + struct.pack('<2I', 0, 0)                    # stream header, hash group header
+    ec, ew = zlib.crc32(b'nutexb'), 6
+    for i in range(n): out += struct.pack('<IIII', 0x1000 + i, (i << 8) | 8, ec, ew) + bytes(16)       # paths: {crc, len | index << 8}, extension
+    for i in range(n): out += struct.pack('<II', 0, i)                                                    # path-to-info: directory offset, file info
+    out += struct.pack('<Q', 0) + bytes(0x14)                                                            # directory offset 0
+    for i in range(n): out += struct.pack('<IIII', i, i, i, 0)                                           # file infos: path, path-to-info, info-to-data, flags
+    for i in range(n): out += struct.pack('<III', 0, i, 0)                                               # info-to-data: directory offset, file data
+    for off, csz, usz in entries: out += struct.pack('<IIII', off, csz, usz, 3 if csz != usz else 0)     # file data
+    struct.pack_into('<I', out, 0, len(out))
+    return bytes(out)
+
+
+def smash_arc_file(payloads):
+    """A data.arc holding the payloads (each (bytes, size inflated)), the table after them; -> (file bytes, [(offset, stored size, size)])"""
+    zstd = B.zstd_module()
+    file_off = 0x100
+    body = bytearray(); ents = []
+    for data, usz in payloads:
+        body += bytes(-len(body) % 4)
+        ents.append((len(body) // 4, len(data), usz)); body += data
+    fs = smash_fs(ents)
+    frame = zstd.compress(fs, level=19)
+    table_off = file_off + len(body) + (-len(body) % 16)
+    head = struct.pack('<Q', 0xABCDEF9876543210) + struct.pack('<6Q', 0, file_off, 0, table_off, table_off + 16 + len(frame), 0)
+    return bytes(head) + bytes(file_off - len(head)) + bytes(body) + bytes(table_off - file_off - len(body)) + struct.pack('<4I', 0x10, len(fs), len(frame), len(fs)) + frame + bytes(16), ents
+
+
+@unittest.skipUnless(sys.platform == 'darwin', 'builds the engine\'s Objective-C texture code')
+class StripTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(); cls.root = Path(cls.tmp.name)
+        cls.libpath = B.build_library(str(cls.root / 'lib'))
+        cls.lib = B.lib_open(cls.libpath)
+
+    @classmethod
+    def tearDownClass(cls): cls.tmp.cleanup()
+
+    def tree(self, name, arc=False):
+        lib = self.lib
+        ts = [T.Texture(0x2001, 64, 40, mips=4, pkg=2), T.Texture(0x1a06, 128, 64, mips=4, pkg=0), T.Texture(0x1a01, 64, 64, mips=3, layers=3, dim=5, pkg=1),
+              T.Texture(0x1c01, 128, 64, mips=5, pkg=3), T.Texture(0x1b01, 64, 64, mips=2), T.Texture(0x2006, 64, 64, mips=3, layers=6, dim=3, pkg=1),
+              T.Texture(0x1a01, 4, 4, mips=1, pkg=0)]          # the last: one 8-byte plane, under the 16-byte tag size
+        d = self.root / name
+        (d / 'Model').mkdir(parents=True)
+        (d / 'plain.bntx').write_bytes(T.bntx(lib, [ts[0], ts[6]]))
+        blob = b'FRES    ' + bytes(0x40) + T.bntx(lib, [ts[1], ts[2]]) + bytes(100)
+        inner = T.sarc([('a.bfres', blob), ('notes.txt', b'hello')])
+        yz = T.yaz0_encode(T.sarc([('kart.bfres', blob), ('inner.sarc', inner)]))
+        (d / 'Model' / 'kart.szs').write_bytes(yz + bytes(64))
+        z = B.zstd_module()
+        (d / 'tex.bntx.zs').write_bytes(z.compress(T.bntx(lib, ts[3:5]), level=19) + skippable(100))     # an input that already carries a padding frame
+        (d / 'pack.pack.zs').write_bytes(z.compress(T.sarc([('t.bntx', T.bntx(lib, [ts[5]]))]), level=19))
+        (d / 'astc.bntx').write_bytes(T.bntx(lib, [T.Texture(0x2d01, 32, 32, mips=1)]))
+        (d / 'data.bin').write_bytes(bytes(1000) + os.urandom(100))
+        self.ts = ts
+        if arc:
+            tex_a = T.Texture(0x1a01, 64, 64, mips=3, seed=5); tex_b = T.Texture(0x2001, 64, 64, mips=3, seed=6); tex_c = T.Texture(0x1c01, 32, 32, mips=2, seed=7)
+            a, b = nutexb(lib, tex_a, 0x80), nutexb(lib, tex_b, 0xe0)
+            c = z.compress(nutexb(lib, tex_c, 0xa0) + os.urandom(0), level=19)
+            payloads = [(a, len(a)), (c, len(nutexb(lib, tex_c, 0xa0))), (b, len(b)), (b'not a texture' * 5, 65)]
+            data, self.arc_entries = smash_arc_file(payloads)
+            (d / 'data.arc').write_bytes(data)
+        return d
+
+    def make(self, name, arc=False, cap=0):
+        d = self.tree(name, arc)
+        work = self.root / (name + '_work'); work.mkdir()
+        img = work / 'RomFS.img'
+        romfs_image.pack(str(d), str(img))
+        rep = B.prebuild(str(img), str(work / 'pack'), 4, workers=2, log=lambda *_: None, max_dim=cap)
+        return d, img, work / 'pack' / 'astc-ro.pack', work / 'out'
+
+    def run_tool(self, img, pack, out, cap=0, *extra):
+        argv = [str(img), '--pack', str(pack), '--out', str(out), '--workers', '2', '--max-dim', str(cap)] + list(extra)
+        old = sys.argv; sys.argv = ['tex_once.py'] + argv
+        try:
+            a = self.parse(argv)
+            return tool.run(a)
+        finally: sys.argv = old
+
+    def parse(self, argv):
+        import argparse
+        ns = argparse.Namespace(input=argv[0], pack=None, out=None, max_dim=0, block=4, workers=2, arc_mode='table', force=False, json=False)
+        i = 1
+        while i < len(argv):
+            k = argv[i]
+            if k == '--pack': ns.pack = argv[i + 1]; i += 2
+            elif k == '--out': ns.out = argv[i + 1]; i += 2
+            elif k == '--workers': ns.workers = int(argv[i + 1]); i += 2
+            elif k == '--max-dim': ns.max_dim = int(argv[i + 1]); i += 2
+            elif k == '--arc-mode': ns.arc_mode = argv[i + 1]; i += 2
+            elif k == '--force': ns.force = True; i += 1
+            else: i += 1
+        return ns
+
+    def report(self, out): return json.loads((out / 'report.json').read_text())
+
+    def test_every_container_kind_is_stripped_and_checked(self):
+        d, img, pack, out = self.make('t1')
+        self.assertEqual(self.run_tool(img, pack, out), 0)
+        rep = self.report(out)
+        self.assertTrue(rep['self_check']['passed'])
+        self.assertEqual(rep['bytes']['logical'], img.stat().st_size)
+        self.assertEqual(rep['bytes']['pack'], pack.stat().st_size)
+        self.assertEqual(rep['bytes']['physical'], (out / 'romfs.img').stat().st_size)
+        self.assertLess(rep['bytes']['physical'] - rep['bytes']['pack'], img.stat().st_size)
+        c = rep['containers']
+        self.assertGreaterEqual(c['yaz0'], 1); self.assertGreaterEqual(c['zstd'], 2); self.assertGreaterEqual(c['sarc'], 2)
+        self.assertGreaterEqual(c['recompressed:yaz0'], 1); self.assertGreaterEqual(c['recompressed:zstd'], 2)
+        self.assertEqual(rep['planes']['untouched_under_16_bytes'], 1)             # the 4x4 BC1
+        self.assertGreater(rep['planes']['tagged'], 20)
+        self.assertEqual(rep['planes']['skipped'], {})
+        # romfs.py reads the stripped image like a plain one: same listing, sizes, untouched files
+        import romfs
+        a, b = str(img), str(out / 'romfs.img')
+        self.assertEqual(sorted(romfs.os.listdir(a)), sorted(romfs.os.listdir(b)))
+        for name in ('astc.bntx', 'data.bin'):
+            self.assertEqual(romfs.Path(a + '/' + name).read_bytes(), romfs.Path(b + '/' + name).read_bytes())
+        for name in ('plain.bntx', 'tex.bntx.zs', 'pack.pack.zs', 'Model/kart.szs'):
+            self.assertEqual(romfs.stat(a + '/' + name).st_size, romfs.stat(b + '/' + name).st_size)
+            self.assertNotEqual(romfs.Path(a + '/' + name).read_bytes(), romfs.Path(b + '/' + name).read_bytes(), name)
+        self.assertEqual(romfs_image.identity(str(img)), romfs_image.identity(b))
+
+    def test_tags_equal_the_key_prefix_and_everything_else_is_zero_or_untouched(self):
+        d, img, pack, out = self.make('t2')
+        self.assertEqual(self.run_tool(img, pack, out), 0)
+        import romfs
+        orig = romfs.Path(str(img) + '/plain.bntx').read_bytes()
+        new = romfs.Path(str(out / 'romfs.img') + '/plain.bntx').read_bytes()
+        self.assertEqual(len(orig), len(new))
+        L = self.lib
+        idx = tool.PackIndex(str(pack))
+        t0 = self.ts[0]
+        tex = B.bntx_textures(orig, 0)[0]
+        start = tex['start']
+        cap = 40
+        planes = (B.Plane * cap)()
+        n = L.dm_texture_planes(1, t0.nvn, t0.w, t0.h, 1, t0.mips, t0.pkg + 1, B.addr(orig) + start, tex['size'], 4, 0, None, 0, planes, cap, 0)
+        self.assertEqual(n, t0.mips)
+        offs = [L.dm_level_offset(1, t0.nvn, t0.w, t0.h, 1, t0.mips, t0.pkg + 1, i) for i in range(t0.mips)]
+        total = L.dm_texture_size(1, t0.nvn, t0.w, t0.h, 1, t0.mips, t0.pkg + 1)
+        expect = bytearray(orig)
+        for i in range(n):
+            key = bytes.fromhex(planes[i].key.decode())
+            self.assertIn(key, idx.keys)
+            lo = start + offs[planes[i].level]; hi = start + (offs[i + 1] if i + 1 < n else total)
+            self.assertEqual(new[lo:lo + 8], key[:8])                      # the tag is the first 8 bytes of the pack key
+            self.assertEqual(new[lo + 8:hi], bytes(hi - lo - 8))           # then zeros
+            expect[lo:hi] = key[:8] + bytes(hi - lo - 8)
+        self.assertEqual(bytes(expect), new)                               # every other byte is the original's
+        # the plane under 16 bytes (second texture, one BC1 block) was not touched
+        t6 = B.bntx_textures(orig, 0)[1]
+        self.assertEqual(new[t6['start']:t6['start'] + t6['size']], orig[t6['start']:t6['start'] + t6['size']])
+
+    def test_texture_cap_zeroes_the_levels_the_runtime_never_loads(self):
+        d, img, pack, out = self.make('t3', cap=64)
+        self.assertEqual(self.run_tool(img, pack, out, 64), 0)
+        rep = self.report(out)
+        self.assertGreater(rep['planes']['zeroed_above_cap'], 0)
+        self.assertTrue(rep['self_check']['passed'])
+
+    def test_skip_when_inputs_are_unchanged_and_refuse_a_foreign_pack(self):
+        d, img, pack, out = self.make('t4')
+        self.assertEqual(self.run_tool(img, pack, out), 0)
+        stamp = (out / 'romfs.img').stat().st_mtime_ns
+        self.assertEqual(self.run_tool(img, pack, out), 0)
+        self.assertEqual((out / 'romfs.img').stat().st_mtime_ns, stamp)          # nothing rewritten
+        self.assertEqual(self.run_tool(img, pack, out, 0, '--force'), 0)
+        self.assertNotEqual((out / 'romfs.img').stat().st_mtime_ns, stamp)
+        # another cap: the pack was built for cap 0, so it is refused
+        self.assertEqual(self.run_tool(img, pack, self.root / 'out_cap', 512), 2)
+        self.assertFalse((self.root / 'out_cap' / 'romfs.img').exists())
+        # another RomFS: refused
+        other = self.root / 't4_work' / 'Other.img'
+        other.write_bytes(img.read_bytes() + b'')
+        self.assertEqual(self.run_tool(other, pack, self.root / 'out_other'), 2)
+
+    def test_self_check_catches_a_damaged_strip(self):
+        d, img, pack, out = self.make('t5')
+        lib = self.lib
+        w = tool.Walker(self.libpath, tool.build_native(str(self.root / 'lib')), 4, 0, tool.PackIndex(str(pack)), {})
+        o = T.bntx(lib, [self.ts[0]])
+        n = w.strip(o, 'x.bntx')
+        self.assertIsNotNone(n)
+        w.c = __import__('collections').Counter()
+        w.check(o, n, 'x.bntx')                                                       # the strip passes its own check
+        bad = bytearray(n); bad[-5] ^= 0xff                                           # inside the last plane's span
+        with self.assertRaises(tool.Mismatch): w.check(o, bytes(bad), 'x.bntx')
+        bad = bytearray(n); bad[0x58] ^= 1                                            # the header
+        with self.assertRaises(tool.Mismatch): w.check(o, bytes(bad), 'x.bntx')
+        t = B.bntx_textures(o, 0)[0]
+        bad = bytearray(n); bad[t['start']] ^= 1                                      # a tag
+        with self.assertRaises(tool.Mismatch): w.check(o, bytes(bad), 'x.bntx')
+        with self.assertRaises(tool.Mismatch): w.check(b'plain file', b'other file', 'f.bin')
+
+    def test_unknown_or_unfitting_containers_are_left_alone_and_reported(self):
+        d, img, pack, out = self.make('t6')
+        w = tool.Walker(self.libpath, tool.build_native(str(self.root / 'lib')), 4, 0, tool.PackIndex(str(pack)), {})
+        o = T.bntx(self.lib, [self.ts[0]])
+        z = B.zstd_module()
+        # a zstd slot with no room: the stored stream is the best that fits, the stripped data does not -> kept as is
+        tiny = z.compress(o, level=19)
+        r = w.strip(tiny[:len(tiny) - 0], 'a.bntx.zs')
+        self.assertIsNotNone(r); self.assertEqual(len(r), len(tiny))
+        # a Yaz0 slot far too small for what it expands to once tagged
+        noise = os.urandom(20000)
+        ytiny = tool.yaz0_pack(w.N, noise, 21000)
+        w.c.clear()
+        self.assertIsNone(w.strip(ytiny[:len(ytiny)], 'n.szs'))                         # no texture: nothing to do
+        self.assertEqual(w.c['other_files'], 1)
+
+    def test_smash_data_arc_entries_and_table(self):
+        import smash_arc
+        d, img, pack, out = self.make('t7', arc=True)
+        for mode in ('table', 'pad'):
+            o = self.root / ('out_' + mode)
+            self.assertEqual(self.run_tool(img, pack, o, 0, '--arc-mode', mode), 0, mode)
+            rep = self.report(o)
+            self.assertEqual(rep['arc_mode'], mode)
+            self.assertTrue(rep['self_check']['passed'])
+            import romfs
+            ents0 = smash_arc.files(str(img) + '/data.arc')
+            ents1 = smash_arc.files(str(o / 'romfs.img') + '/data.arc')
+            self.assertEqual([e[1] for e in ents0], [e[1] for e in ents1])             # same offsets
+            self.assertEqual([e[3] for e in ents0], [e[3] for e in ents1])             # same inflated sizes
+            stored0, stored1 = [e[2] for e in ents0], [e[2] for e in ents1]
+            if mode == 'table': self.assertLess(stored1[1], stored0[1])                # the compressed entry's stored size shrank
+            else: self.assertEqual(stored0, stored1)
+        # the entries are textures again after the strip
+        self.assertGreaterEqual(self.report(self.root / 'out_table')['planes']['tagged'], 6)
+
+
+if __name__ == '__main__':
+    unittest.main()

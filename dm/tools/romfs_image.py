@@ -14,7 +14,7 @@
 # Names are the guest names: a host name chosen on a case collision (.dm-case-N) is replaced by the one in its xattr, as hle_fs.c's guest_name does.
 # Usage: romfs_image.py [--reuse] <RomFS folder> <out image>   (written to <out>.part, renamed at the end)
 # --reuse checks the source tree's names and file metadata, the packer's version and the image's identity before keeping a previous image.
-import argparse, hashlib, json, os, struct, subprocess
+import argparse, hashlib, json, os, struct, subprocess, sys
 from pathlib import Path
 
 MAGIC = b'DMROMFS1'
@@ -126,8 +126,17 @@ def pack(src, dst, reuse=False):
     return len(ents)
 
 
+def _open_image(img):   # a RomFS image for reading as DMROMFS1: a DMSPARS1 file (dm/gfx/tools/sparse_image.py, textures stored once) reads as its logical image
+    with open(img, 'rb') as f: sparse = f.read(8) == b'DMSPARS1'
+    if not sparse: return open(img, 'rb'), os.path.getsize(img)
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'gfx', 'tools'))
+    import sparse_image
+    f = sparse_image.open_logical(img)
+    return f, f.raw.size
+
+
 def read_index(img):   # for tests and checks: {guest path: (is dir, offset, size)}
-    with open(img, 'rb') as f:
+    with _open_image(img)[0] as f:
         magic, ioff, isz, n = HEAD.unpack(f.read(HEAD.size))
         assert magic == MAGIC
         f.seek(ioff); raw = f.read(isz)
@@ -153,7 +162,7 @@ FORMAT_HEADS = {'.zs': ((b'\x28\xb5\x2f\xfd', b'\xff\xff\xff\xff'), (b'\x50\x2a\
 def format_mismatches(img, progress=None):   # [(guest path, size, first 4 bytes)] of the image's files whose bytes do not start as their name promises (FORMAT_HEADS); empty files are left out. progress(done, total): every 4,096 files
     files = sorted((off, size, p) for p, (d, off, size) in read_index(img).items() if not d and size and os.path.splitext(p)[1].lower() in FORMAT_HEADS)
     bad = []
-    with open(img, 'rb') as f:
+    with _open_image(img)[0] as f:
         for k, (off, size, p) in enumerate(files):   # in image order: one pass forward over the disk
             if progress and not k % 4096: progress(k, len(files))
             f.seek(off); head = f.read(min(size, 4))   # not into the next file's bytes
@@ -173,8 +182,8 @@ def _clean(text):   # one token of the identity line: no spaces, no newlines
 def identity(img, title='', version='', build=''):
     """The identity line of a complete image (dm/host/romfs_identity.h defines the format and the C reader): its size and an FNV-1a 64 hash of its header and index
     (the file data is not read, so a 14 GB image takes a moment). Raises ValueError for a cut off or invalid image."""
-    size = os.path.getsize(img)
-    with open(img, 'rb') as f:
+    f, size = _open_image(img)
+    with f:
         head = f.read(HEAD.size)
         if len(head) != HEAD.size: raise ValueError(f'not a RomFS image: {img}')
         magic, ioff, isz, _ = HEAD.unpack(head)

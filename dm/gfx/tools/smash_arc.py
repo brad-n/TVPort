@@ -17,21 +17,9 @@ def zstd_mod():   # compression.zstd from Python 3.14, its backport before (pip 
     return zstd
 
 
-def files(path, regions=False):
-    """Super Smash Bros. Ultimate's data.arc (17.6 GB at 13.0.5): u64 magic 0xABCDEF9876543210, then u64 offsets of the music section, the file section, the shared file section,
-    the file system table and its search table. The table is {u32 data start (0x10), u32 size, u32 stored size, u32 section size} and one zstd frame. Inflated: a 0x58-byte header
-    (u32 table size, path count, path-to-info index count, directory count, directory offset count, child hash count, file info count, info-to-data count, file data count,
-    second directory offset count, second file data count, 0, 0x10, 0x10, u8 region count, u8 language count, u16, u32 version (0x000d0005 = 13.0.5), extra directory offsets,
-    extra files, 0, extra files again, extra info-to-data, extra info-to-data sub count), the regions (12 bytes each), the stream header {quick directory count, stream hash count,
-    stream file index count, stream offset count} and those tables (12, 8 + 12, 4 and 16 bytes each), {u32 path hash group count, u32 bucket count} with the buckets (8) and groups (8),
-    then the paths (32 bytes: four Hash40 references {u32 CRC-32, u8 length, u24 index}: path, extension, parent, name), path-to-info indices (8: directory offset index, file info
-    index), directory hashes (8) and directory infos (0x34), directory offsets (0x1c: u64 offset in the file section, sizes, first file, file count, directory index), child hashes (8),
-    file infos (16: path index, path-to-info index, info-to-data index, flags), info-to-data (12: directory offset index, file data index, load type) and file data (16: offset in the
-    directory / 4, stored size, size, flags; 3 = zstd). A file's data is at file section + its directory offset + 4 × its offset. The table ends with a section the lookups do not use.
-    The update rewrote the archive in place and kept the superseded copies, which the file infos still reach (764 NROs for 98 paths); following each path to its file info gives the
-    current file only. A regional file (file info flag 0x8000) has one info-to-data entry per region from its index on (the header's region count, 14): regions=True gives every
-    region's data (the shader split: 128 of 13.0.5's effect shaders exist only in other regions' files), else the first.
-    → [(path Hash40, absolute offset, stored size, size, extension Hash40)] in offset order, one per data, or None for another file"""
+def table(path):
+    """The file system table of a data.arc, read and located: dict(fs=the inflated table, file_off, fs_off, stored (its zstd frame's size at fs_off + 16), P / IDX / DO / FI / F2D / FD (offsets of its
+    sections in fs), n_paths, n_idx, n_fi, n_f2d, n_do, n_fd, regions), or None for another file. files() reads its entries from this"""
     with open(path, 'rb') as f:
         h = f.read(0x38)
         if h[:8] != MAGIC: return None
@@ -51,6 +39,41 @@ def files(path, regions=False):
     F2D = o; n_f2d = n_sub + n_data2 + extra_f2d; o += n_f2d * 12
     FD = o; n_fd = n_data + n_data2 + extra_files; o += n_fd * 16
     if o > tsize: sys.exit(f'[RED] {path}: version {version:#x}: the file system table does not have the layout this reader knows (it would end at {o:#x} of {tsize:#x})')
+    return dict(fs=fs, file_off=file_off, fs_off=fs_off, stored=stored, P=P, IDX=IDX, DO=DO, FI=FI, F2D=F2D, FD=FD, n_paths=n_paths, n_idx=n_idx, n_fi=n_fi, n_f2d=n_f2d, n_do=n_do, n_fd=n_fd,
+                regions=fs[0x38])
+
+
+def fd_by_offset(T):
+    """{absolute offset of a file's data: [indices of every file data record that reaches it]}: the same bytes can be named by several paths (and a record's stored size is at FD + 16 * index + 4 of the table)"""
+    fs, out = T['fs'], {}
+    for f2di in range(T['n_f2d']):
+        doi, fdi = struct.unpack_from('<II', fs, T['F2D'] + 12 * f2di)
+        if doi >= T['n_do'] or fdi >= T['n_fd']: continue
+        at = T['file_off'] + struct.unpack_from('<Q', fs, T['DO'] + 0x1c * doi)[0] + 4 * struct.unpack_from('<I', fs, T['FD'] + 16 * fdi)[0]
+        lst = out.setdefault(at, [])
+        if fdi not in lst: lst.append(fdi)
+    return out
+
+
+def files(path, regions=False):
+    """Super Smash Bros. Ultimate's data.arc (17.6 GB at 13.0.5): u64 magic 0xABCDEF9876543210, then u64 offsets of the music section, the file section, the shared file section,
+    the file system table and its search table. The table is {u32 data start (0x10), u32 size, u32 stored size, u32 section size} and one zstd frame. Inflated: a 0x58-byte header
+    (u32 table size, path count, path-to-info index count, directory count, directory offset count, child hash count, file info count, info-to-data count, file data count,
+    second directory offset count, second file data count, 0, 0x10, 0x10, u8 region count, u8 language count, u16, u32 version (0x000d0005 = 13.0.5), extra directory offsets,
+    extra files, 0, extra files again, extra info-to-data, extra info-to-data sub count), the regions (12 bytes each), the stream header {quick directory count, stream hash count,
+    stream file index count, stream offset count} and those tables (12, 8 + 12, 4 and 16 bytes each), {u32 path hash group count, u32 bucket count} with the buckets (8) and groups (8),
+    then the paths (32 bytes: four Hash40 references {u32 CRC-32, u8 length, u24 index}: path, extension, parent, name), path-to-info indices (8: directory offset index, file info
+    index), directory hashes (8) and directory infos (0x34), directory offsets (0x1c: u64 offset in the file section, sizes, first file, file count, directory index), child hashes (8),
+    file infos (16: path index, path-to-info index, info-to-data index, flags), info-to-data (12: directory offset index, file data index, load type) and file data (16: offset in the
+    directory / 4, stored size, size, flags; 3 = zstd). A file's data is at file section + its directory offset + 4 × its offset. The table ends with a section the lookups do not use.
+    The update rewrote the archive in place and kept the superseded copies, which the file infos still reach (764 NROs for 98 paths); following each path to its file info gives the
+    current file only. A regional file (file info flag 0x8000) has one info-to-data entry per region from its index on (the header's region count, 14): regions=True gives every
+    region's data (the shader split: 128 of 13.0.5's effect shaders exist only in other regions' files), else the first.
+    → [(path Hash40, absolute offset, stored size, size, extension Hash40)] in offset order, one per data, or None for another file"""
+    T = table(path)
+    if T is None: return None
+    fs, file_off, P, IDX, DO, FI, F2D, FD = T['fs'], T['file_off'], T['P'], T['IDX'], T['DO'], T['FI'], T['F2D'], T['FD']
+    n_paths, n_idx, n_fi, n_f2d, n_do, n_fd = T['n_paths'], T['n_idx'], T['n_fi'], T['n_f2d'], T['n_do'], T['n_fd']
     out, seen = [], set()
     for i in range(n_paths):
         c, w = struct.unpack_from('<II', fs, P + 32 * i); k = w >> 8
