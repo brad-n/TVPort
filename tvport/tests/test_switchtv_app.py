@@ -39,7 +39,7 @@ func game(_ id: String, _ name: String, genres: [String] = [], card: String = ""
 
         // the store: records, a later one wins, launchable, junk ignored
         let store = SharedStore(backing: FolderBacking(root: root.appendingPathComponent("Keychain")))
-        assert(store.lastPlayed().isEmpty && store.launchable().isEmpty)
+        assert(store.lastPlayed().isEmpty && store.launchable() == nil)   // never written: nil, not empty
         store.record("0100000000000001", at: Date(timeIntervalSince1970: 1000))
         store.record("0100000000000001", at: Date(timeIntervalSince1970: 500))     // older: ignored
         store.record("0100000000000003", at: Date(timeIntervalSince1970: 3000))
@@ -47,19 +47,29 @@ func game(_ id: String, _ name: String, genres: [String] = [], card: String = ""
         assert(store.lastPlayed() == ["0100000000000001": 1000, "0100000000000003": 3000])
         store.setLaunchable(["0100000000000002"])
         assert(store.launchable() == ["0100000000000002"])
+        let fallback = Shelf.sections(catalog: catalog, lastPlayed: store.lastPlayed(), launchable: store.launchable(), imageFolder: catalogFolder)
+        let deleted = Dictionary(uniqueKeysWithValues: fallback[1].items.map { ($0.name, $0.action.absoluteString) })
+        assert(deleted["Zelda"] == "switchtv://game/0100000000000001")                // played once, but not installed now: no dead tile
+        store.setLaunchable([])
+        assert(store.launchable() == [])                                                // an empty set is written and read back as empty, not nil
+        assert(Shelf.sections(catalog: catalog, lastPlayed: store.lastPlayed(), launchable: store.launchable(), imageFolder: catalogFolder)[1].items.allSatisfy { $0.action.scheme == "switchtv" })
+        store.setLaunchable(["0100000000000002"])
 
         // a record the game app wrote itself (TVLastPlayed.m, into game_writer_root) is read by the same store
         let fromGame = SharedStore(backing: FolderBacking(root: game_writer_root))
         assert(fromGame.lastPlayed() == ["0100000000000004": 7777])
 
         // the Top Shelf plan: Recently Played (newest first) then All Games (A-Z); launchable or played = opens the game, else SwitchTV on that game
+        // without a launchable record (SwitchTV has not refreshed yet) a played game counts as installed
+        let noRecord = Shelf.sections(catalog: catalog, lastPlayed: store.lastPlayed(), launchable: nil, imageFolder: catalogFolder)
+        assert(noRecord[1].items.first { $0.name == "Zelda" }!.action.absoluteString == "switchtv-0100000000000001://play" && noRecord[1].items.first { $0.name == "Arms" }!.action.scheme == "switchtv")
         let sections = Shelf.sections(catalog: catalog, lastPlayed: store.lastPlayed(), launchable: store.launchable(), imageFolder: catalogFolder)
         assert(sections.map(\.title) == ["Recently Played", "All Games"])
         assert(sections[0].items.map(\.name) == ["Mario", "Zelda"])
         assert(sections[1].items.map(\.name) == ["Arms", "Kirby", "Mario", "Zelda"])
         let actions = Dictionary(uniqueKeysWithValues: sections[1].items.map { ($0.name, $0.action.absoluteString) })
         assert(actions["Arms"] == "switchtv-0100000000000002://play")                  // launchable.json
-        assert(actions["Zelda"] == "switchtv-0100000000000001://play")                 // played
+        assert(actions["Zelda"] == "switchtv://game/0100000000000001")                 // played but no longer installed (not in launchable)
         assert(actions["Kirby"] == "switchtv://game/0100000000000004")                 // neither: opens SwitchTV on the game
         assert(sections[0].items[0].image?.lastPathComponent == "0100000000000003-card.jpg")
         assert(Set(sections.flatMap(\.items).map(\.identifier)).count == 6)            // identifiers are unique across sections

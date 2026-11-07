@@ -80,8 +80,9 @@ struct SharedStore {
         backing.put(id, Data(String(format: "%.0f", date.timeIntervalSince1970).utf8))
     }
 
-    func launchable() -> Set<String> {
-        guard let data = backing.all()[Self.launchableAccount], let ids = try? JSONDecoder().decode([String].self, from: data) else { return [] }
+    /// The title IDs SwitchTV found installed on its last refresh; nil when it has never written the record (an empty set is a real answer: nothing is installed).
+    func launchable() -> Set<String>? {
+        guard let data = backing.all()[Self.launchableAccount], let ids = try? JSONDecoder().decode([String].self, from: data) else { return nil }
         return Set(ids.map { $0.uppercased() })
     }
 

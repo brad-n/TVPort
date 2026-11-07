@@ -118,6 +118,14 @@ class ProjectSpecTests(unittest.TestCase):
         self.assertIn('PRODUCT_BUNDLE_IDENTIFIER: dev.tvport.l9492k5865.switchtv.topshelf', spec)   # the extension's ID is the app's plus a suffix
         self.assertIn('LSApplicationQueriesSchemes: [switchtv-0100000000000001, switchtv-0100000000000002]', spec)
 
+    def test_extension_entry_point_and_string_versions(self):
+        spec = sc.render_spec(self.SPEC, 'L9492K5865', '77', [])
+        # TVServices exports _TVExtensionMain as a bare "ret" (the tv-app-extension default entry): the extension process returned at once, exit status 3, and never ran ContentProvider
+        self.assertIn('LD_ENTRY_POINT: _NSExtensionMain', spec)
+        # a number where Info.plist wants a string crashes CFNetwork (its user agent string) on the first request
+        self.assertEqual(spec.count('CFBundleVersion: "77"'), 2)
+        self.assertEqual(spec.count('CFBundleShortVersionString: "1.0"'), 2)
+
     def test_group_name_is_the_one_game_builds_derive(self):
         self.assertEqual(sc.group_id('L9492K5865'), 'L9492K5865.dev.tvport.switchtv')
         script = (Path(backend.REPO) / 'dm/ios/tools/build_ipa.sh').read_text()

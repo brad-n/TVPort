@@ -1,5 +1,6 @@
 // What the Top Shelf shows, decided apart from TVServices so it can be checked on its own: "Recently Played" (up to 8, newest first, only games that were played) then "All Games" (A-Z).
-// An item's action opens the game itself when its app answers its URL scheme (SwitchTV wrote it into launchable.json, or the game has been played, which proves it), else SwitchTV on that game.
+// An item's action opens the game itself when its app answers its URL scheme: SwitchTV writes that set (launchable) on every refresh and it is the truth once it exists, so a deleted game gets the details page, not a dead tile.
+// Only before SwitchTV has ever written it does "was played" stand in for it (playing proves the app was there).
 import Foundation
 
 struct ShelfItem: Equatable {
@@ -29,8 +30,8 @@ enum Shelf {
         return id.count == 16 && id.allSatisfy(\.isHexDigit) ? id : nil
     }
 
-    static func sections(catalog: Catalog, lastPlayed: [String: Double], launchable: Set<String>, imageFolder: URL) -> [ShelfSection] {
-        let playable = launchable.union(lastPlayed.keys)
+    static func sections(catalog: Catalog, lastPlayed: [String: Double], launchable: Set<String>?, imageFolder: URL) -> [ShelfSection] {
+        let playable = launchable ?? Set(lastPlayed.keys)
         func item(_ game: CatalogGame, prefix: String) -> ShelfItem {
             let image = game.card.isEmpty ? nil : imageFolder.appendingPathComponent(game.card)
             let action = playable.contains(game.titleID) ? (game.playURL ?? detailsURL(game.titleID)) : detailsURL(game.titleID)
