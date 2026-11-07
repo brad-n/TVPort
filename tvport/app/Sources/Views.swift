@@ -543,11 +543,12 @@ struct SettingsForm: View {
                             Text("Off").tag("off")
                         }
                         Picker("Block size", selection: compressedBlockBinding) {
+                            Text("Matched to the original").tag(0)
                             Text("4×4").tag(4)
                             Text("6×6").tag(6)
                         }
                         .pickerStyle(.segmented).disabled(library.games.first { $0.id == library.selection }?.compressedTextures == "off")
-                        note("The Apple TV's GPU has no BC texture formats, so the game's BC1/2/3/7 textures would be stored as RGBA8, 4 to 8 times their size. On, and Automatic, which is on for the Apple TV, prepares them as ASTC on this Mac while building and sends them with the game files (it can add several GB), and the game stores them that way. 4×4 is sharper; 6×6 is about 2.3 times smaller and a little softer. Off keeps them as RGBA8.")
+                        note("The Apple TV's GPU has no BC texture formats, so the game's BC1/2/3/7 textures would be stored as RGBA8, 4 to 8 times their size. On, and Automatic, which is on for the Apple TV, prepares them as ASTC on this Mac while building and sends them with the game files (it can add several GB), and the game stores them that way. Matched keeps each texture about its original size: BC1 textures (the most compact Switch format) are slightly softer at 6×6. 4×4 is sharpest but BC1 textures double in size; 6×6 for everything is smallest. Off keeps them as RGBA8.")
                         Picker("Store textures once", selection: textureOnceBinding) {
                             Text("Automatic").tag("")
                             Text("On").tag("on")
@@ -616,9 +617,9 @@ struct SettingsForm: View {
 
     private var compressedBlockBinding: Binding<Int> {
         let gameID = library.selection
-        return Binding(get: { library.games.first { $0.id == gameID }?.compressedTextureBlock ?? 4 }, set: { value in
+        return Binding(get: { library.games.first { $0.id == gameID }?.compressedTextureBlock ?? 0 }, set: { value in
             guard library.selection == gameID else { return }
-            library.update { $0.compressedTextureBlock = value == 6 ? 6 : nil }
+            library.update { $0.compressedTextureBlock = value == 6 || value == 4 ? value : nil }
         })
     }
 
