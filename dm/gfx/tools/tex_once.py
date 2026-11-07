@@ -170,6 +170,7 @@ class Walker:
         self.block, self.max_dim, self.pack, self.dicts = block, max_dim, pack, dicts
         self.bc1_block = bc1_block or block
         self.c = collections.Counter(); self.errors = []; self.new_csz = None
+        self.mf = []; self.meta = {}; self.item = ''   # --manifest: one record per tagged plane the strip keeps (meta: the planes of the texture being planned, by offset)
         self.zdicts = {}
 
     # -- textures
@@ -204,6 +205,7 @@ class Walker:
         skip = L.dm_skip_levels(target, nvn, t['w'], t['h'], depth, mips, self.max_dim)
         desc = NvnTexdesc(target, nvn, 0, 0, t['w'], t['h'], depth, mips, 0, pkg)
         mods, small = [], 0
+        self.meta = {}
         for i in range(n):
             p = out[i]
             key = bytes.fromhex(p.key.decode())
@@ -215,6 +217,7 @@ class Walker:
             if st[1] < MIN_PLANE: small += 1; continue
             if st[0] + st[1] > size: return ('skip', 'short', n)
             mods.append((start + st[0], st[1], tag, p.astc_bytes))
+            self.meta[start + st[0]] = (nvn, t['w'], t['h'], p.level, p.layer, p.astc_bytes, st[1], blk, key.hex())
         for level in range(skip):
             lo = offs[level]; hi = offs[level + 1] if level + 1 < mips else ls
             for layer in range(layers): mods.append((start + layer * ls + lo, hi - lo, None, 0))
@@ -248,6 +251,7 @@ class Walker:
                 if tag is None: buf[off:off + span] = bytes(span)
                 else: buf[off:off + 8] = tag; buf[off + 8:off + span] = bytes(span - 8)
                 c['planes_zeroed_cap' if tag is None else 'planes_tagged'] += 1
+                if tag is not None: self.mf.append((tag.hex(),) + self.meta[off] + (self.item,))
             for off, span, tag in fresh:
                 bisect.insort(taken, (off, off + span)); exact[off] = (span, tag)
             c['textures_changed'] += 1
@@ -311,17 +315,21 @@ class Walker:
 
     def sub(self, d, name, depth, hint, top=None):
         """strip() with its own counters: -> (new bytes or None, the counters it made); an error leaves the container as it is"""
-        saved = self.c; self.c = collections.Counter()
+        saved, saved_mf = self.c, self.mf; self.c = collections.Counter(); self.mf = []
         try: r = self._strip(d, name, depth, hint, top)
         except Exception as e:   # a container the walk cannot read stays untouched, counted, never fatal
-            self.c = collections.Counter(); self.c['container_errors'] += 1; self.errors.append(f'{name}: {type(e).__name__}: {e}'); r = None
-        delta = self.c; self.c = saved
+            self.c = collections.Counter(); self.mf = []; self.c['container_errors'] += 1; self.errors.append(f'{name}: {type(e).__name__}: {e}'); r = None
+        delta = self.c; delta.mf = self.mf; self.c, self.mf = saved, saved_mf
         return r, delta
 
     def strip(self, d, name, depth=0, hint='', top=None):
         r, delta = self.sub(d, name, depth, hint, top)
-        self.c.update(delta)
+        self.take(delta)
         return r
+
+    def take(self, delta):
+        """A container's counters (and manifest records) are kept"""
+        self.c.update(delta); self.mf += delta.mf
 
     def reject(self, delta, reason):
         """The container keeps its original bytes: what its textures would have changed is counted as skipped for `reason`"""
@@ -339,19 +347,19 @@ class Walker:
             c['zstd'] += 1
             dec = B.unzstd(d, self.dicts)
             r, delta = self.sub(dec, name, depth + 1, hint)
-            if r is None: c.update(delta); return None
+            if r is None: self.take(delta); return None
             new = self.fit_zstd(r, d, top)
             if new is None: self.reject(delta, 'zstd_no_fit'); c['recompress_failed:zstd'] += 1; return None
-            c.update(delta); c['recompressed:zstd'] += 1
+            self.take(delta); c['recompressed:zstd'] += 1
             return new
         if kind == 'yaz0':
             c['yaz0'] += 1
             dec = B.unyaz0(d, self.L)
             r, delta = self.sub(dec, name, depth + 1, hint)
-            if r is None: c.update(delta); return None
+            if r is None: self.take(delta); return None
             comp = yaz0_pack(self.N, r, len(d))
             if comp is None: self.reject(delta, 'yaz0_no_fit'); c['recompress_failed:yaz0'] += 1; return None
-            c.update(delta); c['recompressed:yaz0'] += 1
+            self.take(delta); c['recompressed:yaz0'] += 1
             return d[:16] + comp[16:] + bytes(len(d) - len(comp))
         if kind == 'sarc':
             c['sarc'] += 1
@@ -375,7 +383,7 @@ class Walker:
 
     def process_item(self, d, name, arc=False):
         """One file of the image (or one entry of data.arc): -> (new bytes of the same length or None, the entry's new stored size when it changed and the archive's table records it)"""
-        self.new_csz = None
+        self.new_csz = None; self.item = name
         r = self.strip(d, name, 0, '', 'arc' if arc else None)
         return r, self.new_csz
 
@@ -439,7 +447,7 @@ def pread_full(fd, n, off):
 def strip_task(task):
     w, fd = _W['w'], _W['fd']
     lo, hi, items = task['lo'], task['hi'], task['items']
-    w.c = collections.Counter(); w.errors = []
+    w.c = collections.Counter(); w.errors = []; w.mf = []
     buf = pread_full(fd, hi - lo, lo)
     mods = []
     for name, off, size, arc in items:
@@ -448,8 +456,8 @@ def strip_task(task):
         if r is not None:
             buf[off - lo:off - lo + size] = r
             mods.append((off, size, csz))
-    ext = [(lo + a, bytes(buf[a:b])) for a, b in S.split_zero_runs(buf)]
-    return dict(lo=lo, ext=ext, mods=mods, c=dict(w.c), errors=w.errors[:20], n_errors=len(w.errors))
+    ext = [] if _W['cfg'].get('manifest') else [(lo + a, bytes(buf[a:b])) for a, b in S.split_zero_runs(buf)]
+    return dict(lo=lo, ext=ext, mods=mods, c=dict(w.c), errors=w.errors[:20], n_errors=len(w.errors), mf=w.mf)
 
 
 def check_task(task):
@@ -741,6 +749,43 @@ def run(args):
     return 0 if passed else 1
 
 
+def run_manifest(args):
+    """--manifest FILE: the strip's walk of the ORIGINAL RomFS image with nothing written except FILE: one tab-separated line per tagged plane the strip keeps (the planes that count in report.json
+    planes.tagged): tag (8 bytes, hex), NVN format, width, height, level, layer, ASTC payload bytes, stored plane length, ASTC block, pack key (hex), file. tex_once_verify.sh feeds it to the engine's pack reader"""
+    t0 = time.monotonic()
+    romfs = B.find_romfs(args.input)
+    if not os.path.isfile(romfs) or S.is_sparse(romfs): log(f'[RED] {romfs} is no plain RomFS image'); return 2
+    block, max_dim = int(args.block), max(int(args.max_dim or 0), 0)
+    bc1 = int(args.bc1_block or block)
+    out = os.path.abspath(args.out); pack = os.path.abspath(args.pack)
+    os.makedirs(out, exist_ok=True)
+    if not B.read_pack_header(pack): log(f'[RED] {pack} is no complete ASTC pack'); return 2
+    lib = find_astc_lib(pack, out)
+    native = build_native(os.path.join(out, 'lib'))
+    files = B.image_files(romfs)
+    dicts = B.zs_dicts(romfs, files, lib)
+    arc = None
+    if any(n == '/data.arc' for n, _, _ in files):
+        arc = Arc(romfs, files, args.arc_mode == 'table')
+        if arc.T is None: arc = None
+    items = sorted((i for i in B.smash_arc_files(romfs, files) if i[2] > 0), key=lambda i: i[1])
+    if arc: arc.usable([i for i in items if i[0].startswith('/data.arc#')])
+    fd = os.open(romfs, os.O_RDONLY)
+    marks = [(off, size, (name, off, size, bool(arc and arc.table and name.startswith('/data.arc#'))), 'item') for name, off, size in items if candidate(fd, name, off, size)]
+    tasks = [t for t in partition(os.path.getsize(romfs), sorted(marks, key=lambda m: m[0])) if t['kind'] != 'table']
+    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs, manifest=True)
+    n = 0
+    with cf.ProcessPoolExecutor(args.workers, initializer=worker_init, initargs=(cfg,)) as ex, open(args.manifest + '.part', 'w') as f:
+        for i, r in enumerate(ex.map(strip_task, tasks)):
+            for rec in r['mf']: f.write('\t'.join(str(x) for x in rec) + '\n')
+            n += len(r['mf'])
+            if i % 50 == 0: log(f'manifest {i}/{len(tasks)} tasks, {n} planes, {time.monotonic() - t0:.0f} s')
+    os.replace(args.manifest + '.part', args.manifest)
+    os.close(fd)
+    log(f'manifest: {n} tagged planes, {time.monotonic() - t0:.0f} s')
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('input', help='RomFS.img, or a build folder (its newest extract/<version>/RomFS.img)')
@@ -754,9 +799,10 @@ def main():
     ap.add_argument('--arc-mode', choices=('table', 'pad'), default='table', help="Smash's data.arc: update the table's stored sizes (default), or pad entries with skippable frames and leave the table")
     ap.add_argument('--force', action='store_true', help='rewrite even if the inputs are unchanged')
     ap.add_argument('--json', action='store_true', help='print the whole report')
+    ap.add_argument('--manifest', metavar='FILE', help='write FILE (one line per tagged plane the strip keeps) from the ORIGINAL RomFS image and write nothing else; --out holds only the helper libraries')
     a = ap.parse_args()
     a.workers = a.workers or os.cpu_count() or 4
-    sys.exit(run(a))
+    sys.exit(run_manifest(a) if a.manifest else run(a))
 
 
 if __name__ == '__main__':
