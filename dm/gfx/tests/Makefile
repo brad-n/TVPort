@@ -63,6 +63,9 @@ t_astc_bench: t_astc_bench.m ../tex/nvn_astc_cache.m ../tex/nvn_astc_cache.h ../
 # DM_NVN_BC_ASTC on the GPU: uploads of BC1/2/3/7 as ASTC against the CPU decode (DM_TEST_NO_BC and the variable are set by the test)
 t_astc_upload: t_astc_upload.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_astc_upload.m $(MTL_T_SRC) $(FW)
+# BC6H on a GPU without BC: unsigned as RG11B10Float (DM_BC6H_R11G11B10), signed as RGBA16Float. Runs on the Mac GPU with DM_TEST_NO_BC=1
+t_bc6h: t_bc6h.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_bc6h.m $(MTL_T_SRC) $(FW)
 t_dirty_slots: t_dirty_slots.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
 	clang $(CFLAGS) -o $@ t_dirty_slots.c ../../host/crash.c ../nvn/nvn_dirty.c
 t_dirty_race: t_dirty_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)

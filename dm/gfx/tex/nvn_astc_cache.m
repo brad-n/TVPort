@@ -33,7 +33,7 @@ static int nvn_bc_format(uint32_t format, nvn_bc_format_info *info) {
 }
 int nvn_bc_astc_format(uint32_t format, unsigned block, uint32_t *pixel_format) {
     nvn_bc_format_info info;
-    if ((block != 4 && block != 6) || !nvn_bc_format(format, &info) || info.pixel_bytes != 4) return 0;
+    if ((block != 4 && block != 6) || !nvn_bc_format(format, &info) || (info.pixel_format != MTLPixelFormatRGBA8Unorm && info.pixel_format != MTLPixelFormatRGBA8Unorm_sRGB)) return 0;   // RGBA8 only: not BC4/5 nor BC6H (RG11B10Float is 4 bytes too)
     int srgb = info.pixel_format == MTLPixelFormatRGBA8Unorm_sRGB;
     if (pixel_format) *pixel_format = block == 4 ? (srgb ? MTLPixelFormatASTC_4x4_sRGB : MTLPixelFormatASTC_4x4_LDR)
                                                 : (srgb ? MTLPixelFormatASTC_6x6_sRGB : MTLPixelFormatASTC_6x6_LDR);

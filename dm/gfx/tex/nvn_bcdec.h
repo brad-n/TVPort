@@ -4,6 +4,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Unsigned BC6H (0x50) is decoded into RG11B10Float (4 bytes a pixel) unless DM_BC6H_R11G11B10=0; signed BC6H (0x4f) is RGBA16Float (8 bytes). The _set form is for tests
+int nvn_bc6h_r11g11b10(void);
+void nvn_bc6h_r11g11b10_set(int on);
 // NVN format is BC → returns 1, *mtl_pf = Metal pixel format after decompression, *bpp = bytes per pixel after decompression; returns 0 if not BC
 int nvn_bc_unpacked(uint32_t nvn_fmt, uint32_t *mtl_pf, int *bpp);
 // Decode a w×h pixel region: src is laid out by block rows (pitch bytes per block row), dst has dpitch bytes per pixel row. Returns 0 on success

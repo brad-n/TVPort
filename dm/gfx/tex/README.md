@@ -53,7 +53,15 @@ On a GPU without BC formats (the Apple TV 4K's A15) BC textures are stored decod
 
 `nvn_astc_cache.m` decodes the deswizzled BC plane (stripes of at most 4 MB), encodes it with Arm's astc-encoder at ASTCENC_PRE_FASTEST, and keeps the result in a content-addressed cache: `<sha256(version tag, format, width, height, block, BC bytes)>.astc` under `DM_NVN_ASTC_CACHE` (written on a miss), read first from `DM_NVN_ASTC_CACHE_RO` if set. The key depends on the BC bytes, never on the machine, so a cache filled on a Mac is valid on the Apple TV. A buffer-to-texture copy into a BC texture is transcoded the same way (ASTC 4x4: any block-aligned region; 6x6: only regions on the 6x6 grid), a new texture reads zero blocks as the BC format would (void-extent blocks), and views of an ASTC texture are the ASTC format of the BC view format. Algorithm and cache layout follow [yuchanns/nxnative-tvos](https://github.com/yuchanns/nxnative-tvos) (MIT, `LICENSE.nxnative-tvos`).
 
-Tests: `dm/gfx/tests/t_astc_cache` (CPU, ASan/UBSan), `t_astc_upload` (Mac GPU: formats, sampled error against the CPU decode, the cache, buffer-to-texture copies; `T_ASTC_BLOCK=6` runs the 6x6 case).
+Tests: `dm/gfx/tests/t_astc_cache` (CPU, ASan/UBSan), `t_astc_upload` (Mac GPU: formats, sampled error against the CPU decode, the cache, buffer-to-texture copies; `T_ASTC_BLOCK=6` runs the 6x6 case; `T_ASTC_MODE=maxdim` runs it with `DM_BC_MAX_DIM=64`).
+
+### Texture cap (`DM_BC_MAX_DIM`)
+
+`DM_BC_MAX_DIM` (TVPort's per-game Texture Detail) makes a 2D or 2D-array BC texture with a mip chain start at its first level whose longest side fits the cap (the last level when none does): `nvn_bc_skip_levels` in `nvn_astc_planes.c`. The runtime (`bc_skip` in `nvn_mtl.m`: the Metal texture's size and level count, the upload, the plane look-up, views and copies) and the offline prebuild (`bntx_astc.py --max-dim N`, which TVPort passes) both use that one function, so the pack holds exactly the planes the runtime asks for under the game's cap and none of the finer levels it skips. The cap is part of the pack's fingerprint: another cap rebuilds the pack.
+
+## BC6H without BC formats (`DM_BC6H_R11G11B10`)
+
+Unsigned BC6H (NVN `BPTC_UFLOAT`, 0x50) is decoded on the CPU into `RG11B10Float` (4 bytes a pixel; BC6H has no alpha and Metal samples 1 for it) instead of `RGBA16Float` (8 bytes); the half-float texels are rounded to the format's 6 (red, green) and 5 (blue) mantissa bits and clamped to its range. Signed BC6H (`BPTC_SFLOAT`, 0x4f) has negative texels, which `RG11B10Float` cannot hold, so it stays `RGBA16Float`. `DM_BC6H_R11G11B10=0` turns this off. Both are CPU paths (the GPU decoder `bcd` does not take BC6H) and go through `nvn_bc_unpacked`, so uploads, views, buffer-to-texture copies and memory accounting see one format. Test: `dm/gfx/tests/t_bc6h`.
 
 ### Cache misses (`DM_NVN_ASTC_MISS`)
 
