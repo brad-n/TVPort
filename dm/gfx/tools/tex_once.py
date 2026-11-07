@@ -40,6 +40,7 @@ ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
 SKIPPABLE_FIRST = 0x184d2a50
 YAZ0_CHAIN = 64
 ZSTD_LEVELS = (3, 10, 19)
+TABLE_LEVELS = (22,)      # Smash's data.arc table is stored at the strongest level: a weaker one does not fit its slot (level 19: 142 KB too big, level 22: 146 KB to spare)
 MIN_PLANE = 16            # planes whose stored length (nvn_astc_plane_storage) is under this are never tagged (a tag is 8 bytes)
 BC1_FORMATS = (0x1a01, 0x1a06)
 NATIVE_SOURCE = os.path.join(HERE, 'tex_once_native.c')
@@ -90,10 +91,10 @@ def zstd_stream(data, slot, zd=None):
     return None
 
 
-def zstd_slot(data, slot, zd=None, min_tail=0):
+def zstd_slot(data, slot, zd=None, min_tail=0, levels=None):
     """`data` compressed into exactly `slot` bytes: the stream, then one skippable frame of zeros to the slot's end. None when it does not fit, or leaves a tail of 1..7 bytes (no room for the frame's header)"""
     z = B.zstd_module()
-    for level in ZSTD_LEVELS[:2 if len(data) > (32 << 20) else 3]:
+    for level in levels or ZSTD_LEVELS[:2 if len(data) > (32 << 20) else 3]:
         comp = z.compress(data, level=level, zstd_dict=zd) if zd else z.compress(data, level=level)
         tail = slot - len(comp)
         if tail == 0 and not min_tail: return comp
@@ -533,7 +534,7 @@ class Arc:
         self.table = False
         if want_table:
             fs = bytes(self.T['fs'])
-            fits = zstd_slot(fs, self.T['stored'], min_tail=64) is not None   # with room to spare: the rewritten table compresses a little differently
+            fits = zstd_slot(fs, self.T['stored'], min_tail=64, levels=TABLE_LEVELS) is not None   # with room to spare: the rewritten table compresses a little differently
             self.table = fits and self.table_off + self.table_size <= self.base + self.size
 
     def usable(self, entries):
@@ -549,7 +550,7 @@ class Arc:
             for fdi in self.fd.get(at, ()):
                 p = T['FD'] + 16 * fdi + 4
                 if struct.unpack_from('<I', fs, p)[0] == old[at]: struct.pack_into('<I', fs, p, new); n += 1
-        slot = zstd_slot(bytes(fs), T['stored'])
+        slot = zstd_slot(bytes(fs), T['stored'], levels=TABLE_LEVELS)
         if slot is None: raise RuntimeError('the rewritten data.arc table does not fit its slot')
         return orig[:16] + slot, bytes(fs)
 
