@@ -238,32 +238,54 @@ static int cache_read(NSString *path, void *output, size_t size) {
 #define PACK_HEAD 80u
 #define PACK_ENT 48u
 enum { PACK_PACK = 1, PACK_DIR, PACK_BAD };
-typedef struct { char *path; int kind, fd; uint64_t count, size; const uint8_t *index; void *map; size_t map_len; uint8_t fingerprint[32]; } nvn_pack;
+typedef struct { char *path; int kind, fd; uint64_t base, count, size; const uint8_t *index; void *map; size_t map_len; uint8_t fingerprint[32]; } nvn_pack;   // base: where the pack starts in fd (0 for a file of its own; an image's embedded pack: DMSPARS1 pack offset)
 static pthread_mutex_t g_pack_mu = PTHREAD_MUTEX_INITIALIZER;
 static nvn_pack **g_packs; static size_t g_pack_n, g_pack_cap;
 static uint64_t le64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; i--) v = v << 8 | p[i]; return v; }
 static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
-// Whether the file at `path` is a pack that holds together; fills p (descriptor and index mapping kept for the life of the process)
-static int pack_open(const char *path, nvn_pack *p) {
-    int fd = open(path, O_RDONLY | O_CLOEXEC); struct stat st; uint8_t h[PACK_HEAD];
-    if (fd < 0) return 0;
-    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || (uint64_t)st.st_size < PACK_HEAD || pread(fd, h, sizeof h, 0) != (ssize_t)sizeof h) { close(fd); return 0; }
+// Whether the `size` bytes at `base` of fd are a pack that holds together (all offsets in it are relative to base); fills p (descriptor and index mapping kept for the life of the process)
+static int pack_open_at(int fd, uint64_t base, uint64_t size, nvn_pack *p) {
+    uint8_t h[PACK_HEAD];
+    if (size < PACK_HEAD || pread(fd, h, sizeof h, (off_t)base) != (ssize_t)sizeof h) return 0;
     uint64_t count = le64(h + 16), ioff = le64(h + 24), fsz = le64(h + 32);
-    if (memcmp(h, "NXASTCPK", 8) || le32(h + 8) != 1 || le32(h + 12) != PACK_ENT || fsz != (uint64_t)st.st_size || ioff < PACK_HEAD || ioff > fsz ||
-        (ioff & 15) || count > (fsz - ioff) / PACK_ENT || count * PACK_ENT != fsz - ioff) { close(fd); return 0; }
-    size_t page = (size_t)getpagesize(), lead = (size_t)(ioff % page), len = lead + (size_t)(count * PACK_ENT);
+    if (memcmp(h, "NXASTCPK", 8) || le32(h + 8) != 1 || le32(h + 12) != PACK_ENT || fsz != size || ioff < PACK_HEAD || ioff > fsz ||
+        (ioff & 15) || count > (fsz - ioff) / PACK_ENT || count * PACK_ENT != fsz - ioff) return 0;
+    size_t page = (size_t)getpagesize(), lead = (size_t)((base + ioff) % page), len = lead + (size_t)(count * PACK_ENT);
     void *map = NULL; const uint8_t *index = NULL;
     if (count) {
-        map = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, (off_t)(ioff - lead));
-        if (map == MAP_FAILED) { close(fd); return 0; }
+        map = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, (off_t)(base + ioff - lead));
+        if (map == MAP_FAILED) return 0;
         index = (const uint8_t *)map + lead;
     }
     for (uint64_t i = 0; i < count; i++) {   // sorted, no duplicates, every entry inside the entries area
         const uint8_t *e = index + i * PACK_ENT; uint64_t off = le64(e + 32), sz = le64(e + 40);
-        if ((i && memcmp(e - PACK_ENT, e, 32) >= 0) || off < PACK_HEAD || (off & 15) || sz <= 40 || off > ioff || sz > ioff - off) { if (map) munmap(map, len); close(fd); return 0; }
+        if ((i && memcmp(e - PACK_ENT, e, 32) >= 0) || off < PACK_HEAD || (off & 15) || sz <= 40 || off > ioff || sz > ioff - off) { if (map) munmap(map, len); return 0; }
     }
-    p->fd = fd; p->count = count; p->size = fsz; p->index = index; p->map = map; p->map_len = len; memcpy(p->fingerprint, h + 40, 32);
+    p->fd = fd; p->base = base; p->count = count; p->size = fsz; p->index = index; p->map = map; p->map_len = len; memcpy(p->fingerprint, h + 40, 32);
     return 1;
+}
+// Whether the file at `path` is a pack that holds together; fills p (descriptor and index mapping kept for the life of the process)
+static int pack_open(const char *path, nvn_pack *p) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC); struct stat st;
+    if (fd < 0) return 0;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || !pack_open_at(fd, 0, (uint64_t)st.st_size, p)) { close(fd); return 0; }
+    return 1;
+}
+// The pack a romfs image embeds (DMSPARS1, dm/host/romfs_sparse.h, docs/texture_once.md section 1): `fd` (kept open for the life of the process; closed here when the pack is not usable)
+// holds it at [offset, offset + size). It is registered under the pseudo-root NVN_ASTC_EMBEDDED_ROOT, which any read-only-cache argument or DM_NVN_ASTC_CACHE_RO may then name; 1 when it holds together
+int nvn_bc_astc_use_embedded_pack(int fd, uint64_t offset, uint64_t size) {
+    pthread_mutex_lock(&g_pack_mu);
+    for (size_t i = 0; i < g_pack_n; i++) if (!strcmp(g_packs[i]->path, NVN_ASTC_EMBEDDED_ROOT)) { pthread_mutex_unlock(&g_pack_mu); close(fd); return g_packs[i]->kind == PACK_PACK; }   // once per process
+    nvn_pack *p = calloc(1, sizeof *p); int ok = 0;
+    if (p) {
+        p->fd = -1; p->path = strdup(NVN_ASTC_EMBEDDED_ROOT);
+        ok = pack_open_at(fd, offset, size, p); p->kind = ok ? PACK_PACK : PACK_BAD;
+        if (!ok) { close(fd); fprintf(stderr, "[RED] ASTC: the pack embedded in the RomFS image is not usable (corrupt or short)\n"); }
+        if (g_pack_n == g_pack_cap) { g_pack_cap = g_pack_cap ? g_pack_cap * 2 : 4; g_packs = realloc(g_packs, g_pack_cap * sizeof *g_packs); }
+        g_packs[g_pack_n++] = p;
+    } else close(fd);
+    pthread_mutex_unlock(&g_pack_mu);
+    return ok;
 }
 // The pack that `root` names, or NULL when it is a directory, missing, or not a usable pack (one warning is printed for a file that is not). Remembered per path for the process
 static const nvn_pack *pack_for(const char *root) {
@@ -271,6 +293,7 @@ static const nvn_pack *pack_for(const char *root) {
     pthread_mutex_lock(&g_pack_mu);
     for (size_t i = 0; i < g_pack_n; i++) if (!strcmp(g_packs[i]->path, root)) { const nvn_pack *r = g_packs[i]->kind == PACK_PACK ? g_packs[i] : NULL; pthread_mutex_unlock(&g_pack_mu); return r; }
     struct stat st; const nvn_pack *r = NULL;
+    if (!strcmp(root, NVN_ASTC_EMBEDDED_ROOT)) { pthread_mutex_unlock(&g_pack_mu); return NULL; }   // the embedded pack is registered by nvn_bc_astc_use_embedded_pack, never found by a path
     if (!stat(root, &st)) {   // a path that is missing now may appear later: not remembered
         nvn_pack *p = calloc(1, sizeof *p);
         if (p) {
@@ -312,16 +335,76 @@ static int pread_full(int fd, void *buf, size_t size, uint64_t at) {
     }
     return 1;
 }
-static nvn_astc_cache_status pack_read(const nvn_pack *p, const char *hex, void *output, size_t size) {
-    uint64_t off, sz; uint8_t header[40], digest[CC_SHA256_DIGEST_LENGTH];
-    if (!pack_find(p, hex, &off, &sz)) return NVN_ASTC_CACHE_MISSING;
+// The entry at pack offset off, sz bytes (a cache file: header and blocks), verified and read into output
+static nvn_astc_cache_status pack_read_entry(const nvn_pack *p, uint64_t off, uint64_t sz, void *output, size_t size) {
+    uint8_t header[40], digest[CC_SHA256_DIGEST_LENGTH];
     if (sz != size + 40) return NVN_ASTC_CACHE_SIZE;
-    if (!pread_full(p->fd, header, sizeof header, off) || !pread_full(p->fd, output, size, off + 40)) return NVN_ASTC_CACHE_IO;
+    if (!pread_full(p->fd, header, sizeof header, p->base + off) || !pread_full(p->fd, output, size, p->base + off + 40)) return NVN_ASTC_CACHE_IO;
     if (memcmp(header, cache_magic, sizeof cache_magic)) return NVN_ASTC_CACHE_HEADER;
     payload_hash(output, size, digest);
     if (memcmp(header + sizeof cache_magic, digest, sizeof digest)) return NVN_ASTC_CACHE_HASH;
     atomic_fetch_add_explicit(&g_cache_disk_hits, 1, memory_order_relaxed);
     return NVN_ASTC_CACHE_HIT;
+}
+static nvn_astc_cache_status pack_read(const nvn_pack *p, const char *hex, void *output, size_t size) {
+    uint64_t off, sz;
+    if (!pack_find(p, hex, &off, &sz)) return NVN_ASTC_CACHE_MISSING;
+    return pack_read_entry(p, off, sz, output, size);
+}
+// ---- Tagged planes (docs/texture_once.md section 2) ----
+// A plane the stripping tool covered holds the first 8 bytes of its pack key, then zeros: its ASTC blocks are looked up by that prefix, without deswizzling or hashing
+static _Atomic uint64_t g_tag_hits, g_tag_unresolved, g_tag_decoded;
+int nvn_bc_astc_looks_tagged(const void *plane, size_t length) {
+    const uint8_t *p = plane; uint64_t head;
+    if (!p || length < 16) return 0;
+    memcpy(&head, p, 8);
+    if (!head) return 0;
+    const uint8_t *q = p + 8, *end = p + length;
+    while (q < end && ((uintptr_t)q & 7)) { if (*q++) return 0; }
+    for (; q + 8 <= end; q += 8) { uint64_t w; memcpy(&w, q, 8); if (w) return 0; }
+    for (; q < end; q++) if (*q) return 0;
+    return 1;
+}
+int nvn_bc_astc_looks_tagged_rows(const void *plane, size_t row_bytes, size_t stride, size_t rows) {
+    const uint8_t *p = plane;
+    if (!p || !row_bytes || !rows || row_bytes * rows < 16) return 0;
+    if (stride == row_bytes) return nvn_bc_astc_looks_tagged(p, row_bytes * rows);
+    uint64_t head;
+    if (row_bytes < 8) return 0;
+    memcpy(&head, p, 8);
+    if (!head) return 0;
+    for (size_t r = 0; r < rows; r++) {
+        const uint8_t *q = p + r * stride + (r ? 0 : 8), *end = p + r * stride + row_bytes;
+        for (; q < end; q++) if (*q) return 0;
+    }
+    return 1;
+}
+// The entries whose key starts with tag and whose payload is `payload` bytes: 1 only when there is exactly one
+static int pack_tag_find(const nvn_pack *p, const uint8_t *tag, size_t payload, uint64_t *off, uint64_t *sz) {
+    uint64_t lo = 0, hi = p->count, found = 0;
+    while (lo < hi) { uint64_t mid = lo + (hi - lo) / 2; if (memcmp(p->index + mid * PACK_ENT, tag, 8) < 0) lo = mid + 1; else hi = mid; }
+    for (uint64_t i = lo; i < p->count; i++) {
+        const uint8_t *e = p->index + i * PACK_ENT;
+        if (memcmp(e, tag, 8)) break;
+        if (le64(e + 40) == payload + 40) { if (++found > 1) return 0; *off = le64(e + 32); *sz = le64(e + 40); }
+    }
+    return found == 1;
+}
+static nvn_astc_tag_result tag_fetch_pack(const nvn_pack *p, const void *plane, size_t astc_size, void *output) {   // the plane looks tagged
+    uint64_t off, sz;
+    if (!p || !astc_size || !pack_tag_find(p, plane, astc_size, &off, &sz)) return NVN_TAG_MISS;
+    if (!output) return NVN_TAG_HIT;
+    if (pack_read_entry(p, off, sz, output, astc_size) != NVN_ASTC_CACHE_HIT) return NVN_TAG_MISS;
+    atomic_fetch_add(&g_tag_hits, 1);
+    return NVN_TAG_HIT;
+}
+nvn_astc_tag_result nvn_bc_astc_tag_fetch_root(const char *readonly_cache, const void *plane, size_t length, size_t astc_size, void *output) {
+    if (!nvn_bc_astc_looks_tagged(plane, length)) return NVN_TAG_NONE;
+    return tag_fetch_pack(pack_for(readonly_cache), plane, astc_size, output);
+}
+void nvn_bc_astc_tag_note(int kind) { atomic_fetch_add(kind == NVN_TAG_NOTE_DECODED ? &g_tag_decoded : &g_tag_unresolved, 1); }
+void nvn_bc_astc_tag_stats(uint64_t *hits, uint64_t *unresolved, uint64_t *decoded) {
+    *hits = atomic_load(&g_tag_hits); *unresolved = atomic_load(&g_tag_unresolved); *decoded = atomic_load(&g_tag_decoded);
 }
 // A read-only cache root is a pack file or a directory of <key>.astc files
 static nvn_astc_cache_status ro_read_status(const char *root, const char *key, void *output, size_t size) {
@@ -798,7 +881,7 @@ int nvn_bc_astc_learn(uint32_t format, const void *source, size_t source_size, u
     bg_enqueue(format, source, source_size, width, height, block, key);
     return 0;
 }
-int nvn_bc_astc_fetch(uint32_t format, const void *source, size_t source_size, uint32_t width, uint32_t height, unsigned block, void *output, size_t output_size) {
+static int fetch_impl(uint32_t format, const void *source, size_t source_size, uint32_t width, uint32_t height, unsigned block, void *output, size_t output_size, int queue) {
     size_t astc_size;
     if (!plane_valid(format, source, source_size, width, height, block, &astc_size) || output_size != astc_size) return -1;
     char key[65]; cache_key(format, width, height, block, source, source_size, key);
@@ -807,8 +890,21 @@ int nvn_bc_astc_fetch(uint32_t format, const void *source, size_t source_size, u
         if (ro_read_status(ro.UTF8String, key, output, output_size) == NVN_ASTC_CACHE_HIT || cache_read(cache_path(rw.UTF8String, key), output, output_size)) { atomic_fetch_add(&st_hit, 1); return 1; }
     }
     atomic_fetch_add(&st_fetch_miss, 1);
-    bg_enqueue(format, source, source_size, width, height, block, key);
+    if (queue) bg_enqueue(format, source, source_size, width, height, block, key);
     return 0;
+}
+int nvn_bc_astc_fetch(uint32_t format, const void *source, size_t source_size, uint32_t width, uint32_t height, unsigned block, void *output, size_t output_size) {
+    return fetch_impl(format, source, source_size, width, height, block, output, output_size, 1);
+}
+int nvn_bc_astc_fetch_noqueue(uint32_t format, const void *source, size_t source_size, uint32_t width, uint32_t height, unsigned block, void *output, size_t output_size) {
+    return fetch_impl(format, source, source_size, width, height, block, output, output_size, 0);
+}
+int nvn_bc_astc_has_plane(uint32_t format, const void *source, size_t source_size, uint32_t width, uint32_t height, unsigned block) {
+    size_t astc_size;
+    if (!plane_valid(format, source, source_size, width, height, block, &astc_size)) return -1;
+    char key[65]; cache_key(format, width, height, block, source, source_size, key);
+    pthread_mutex_lock(&g_bg.mu); bg_env_config_locked(); const char *ro = g_bg.readonly, *rw = g_bg.cache; pthread_mutex_unlock(&g_bg.mu);
+    return cache_has(ro, key, astc_size) || cache_has(rw, key, astc_size);
 }
 int nvn_bc_astc_readonly_ready(void) {
     pthread_mutex_lock(&g_bg.mu); bg_env_config_locked(); NSString *ro = g_bg.readonly ? @(g_bg.readonly) : nil; pthread_mutex_unlock(&g_bg.mu);
@@ -816,4 +912,9 @@ int nvn_bc_astc_readonly_ready(void) {
     if (pack_for(ro.UTF8String)) return 1;
     BOOL isdir = NO;
     return [NSFileManager.defaultManager fileExistsAtPath:ro isDirectory:&isdir] && isdir;
+}
+nvn_astc_tag_result nvn_bc_astc_tag_fetch(const void *plane, size_t length, size_t astc_size, void *output) {
+    if (!nvn_bc_astc_looks_tagged(plane, length)) return NVN_TAG_NONE;
+    pthread_mutex_lock(&g_bg.mu); bg_env_config_locked(); NSString *ro = g_bg.readonly ? @(g_bg.readonly) : nil; pthread_mutex_unlock(&g_bg.mu);
+    return tag_fetch_pack(pack_for(ro.UTF8String), plane, astc_size, output);
 }

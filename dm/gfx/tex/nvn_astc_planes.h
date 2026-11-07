@@ -8,6 +8,12 @@
 // Called for each plane, level by level and layer by layer within a level: the level (counted from the texture's level 0) and layer, the plane's width and height in texels,
 // and its tightly packed BC blocks. A non-zero return stops the walk and is returned by it.
 typedef int (*nvn_astc_plane_fn)(void *ctx, unsigned level, unsigned layer, uint32_t width, uint32_t height, const void *bc, size_t bc_size);
+// Where a plane's STORED bytes lie in the texture's storage (block-linear, exactly as in the file and in guest memory): offset from the storage's start and the length the layout gives the plane
+// (whole GOBs: ceil(row bytes / 64) x ceil(rows / block height) blocks). docs/texture_once.md section 2 tags the first 8 of these bytes and zeros the rest. -1 for a texture that cannot be deswizzled
+int nvn_astc_plane_storage(const nvn_texdesc *d, unsigned level, unsigned layer, uint64_t *offset, uint64_t *length);
+// Called for each plane before it is deswizzled, with its stored bytes: > 0 means it was handled (no deswizzle, fn is not called for it), 0 goes on as nvn_astc_walk_planes does, < 0 stops the walk with that value
+typedef int (*nvn_astc_raw_fn)(void *ctx, unsigned level, unsigned layer, uint32_t width, uint32_t height, const void *storage, size_t storage_len);
+int nvn_astc_walk_planes_raw(const nvn_texdesc *d, const void *storage, unsigned skip, nvn_astc_raw_fn raw, nvn_astc_plane_fn fn, void *ctx);
 // Layers the walk visits for each level: the array layers, 6 for a cube, 1 for a plain 2D texture
 unsigned nvn_astc_layers(const nvn_texdesc *d);
 // Deswizzle every level from `skip` on of the texture whose block-linear storage is `storage` and hand each (level, layer) plane to fn. 0 when the walk finished; -1 for a format
