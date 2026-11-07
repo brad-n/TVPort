@@ -67,7 +67,7 @@ static id<MTLComputePipelineState> sampler_pipeline(int array) {
 static float srgb_to_linear(float c) { return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f); }
 
 // Mean and maximum absolute channel error of ASTC level `level` (as sampled) against the CPU decode of the same BC blocks; both in the sampled (linear for sRGB) space
-static void compare_level(id<MTLTexture> mt, tex_t *texture, nvn_texdesc d, unsigned level, unsigned layer, double *mean, double *peak) {
+static void compare_level_sk(id<MTLTexture> mt, tex_t *texture, nvn_texdesc d, unsigned level, unsigned layer, double *mean, double *peak, unsigned skip) {   // level: the NVN level; the Metal texture starts at NVN level `skip`
     uint32_t row, rows, depth, bpb; uint64_t base; unsigned th, td;
     nvn_deswizzle_geom(&d, level, 0, &row, &rows, &depth, &base, &th, &td, &bpb);
     uint32_t w = MAX(d.width >> level, 1u), h = MAX(d.height >> level, 1u);
@@ -77,7 +77,7 @@ static void compare_level(id<MTLTexture> mt, tex_t *texture, nvn_texdesc d, unsi
     uint8_t *expected = malloc((size_t)w * h * 4);
     CHECK(!nvn_bc_decode(d.format, linear, row, w, h, expected, (size_t)w * 4), "CPU decode of the fixture");
     id<MTLBuffer> out = [g_dev newBufferWithLength:(size_t)w * h * 16 options:MTLResourceStorageModeShared];
-    uint32_t sel[2] = {level, layer};
+    uint32_t sel[2] = {level - skip, layer};
     id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
     [e setComputePipelineState:sampler_pipeline(mt.textureType == MTLTextureType2DArray)]; [e setTexture:mt atIndex:0]; [e setBuffer:out offset:0 atIndex:0]; [e setBytes:sel length:sizeof sel atIndex:1];
     [e dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(MIN(w, 8u), MIN(h, 8u), 1)];
@@ -93,6 +93,8 @@ static void compare_level(id<MTLTexture> mt, tex_t *texture, nvn_texdesc d, unsi
     *mean = sum / ((double)w * h * 4); *peak = max;
     free(linear); free(expected);
 }
+
+#define compare_level(mt, texture, d, level, layer, mean, peak) compare_level_sk(mt, texture, d, level, layer, mean, peak, 0)
 
 static size_t cache_files(const char *dir) {
     size_t n = 0; DIR *d = opendir(dir); struct dirent *e;
@@ -129,6 +131,29 @@ static void pack_dir(const char *dir, const char *pack_path) {
     uint64_t ioff = file.length, count = names.count; [file appendData:index]; uint64_t total = file.length; uint32_t one = 1, esz = 48;
     uint8_t *b = file.mutableBytes; memcpy(b, "NXASTCPK", 8); memcpy(b + 8, &one, 4); memcpy(b + 12, &esz, 4); memcpy(b + 16, &count, 8); memcpy(b + 24, &ioff, 8); memcpy(b + 32, &total, 8);
     [file writeToFile:@(pack_path) atomically:NO];
+}
+// DM_BC_MAX_DIM=64 with ASTC (T_ASTC_MODE=maxdim): the finest levels left out are neither requested from the cache nor stored, and the Metal texture made for the kept ones is ASTC of the right size
+static void run_maxdim(const char *dir) {
+    char rw[512]; subdir(rw, sizeof rw, dir, "rw");
+    configure(rw, 64u << 20, 1ull << 30, 0, 2);
+    nvn_texdesc d = {.target = NVN_TEXTURE_TARGET_2D, .format = 0x4d, .width = 256, .height = 128, .depth = 1, .levels = 6, .samples = 1};   // 256x128 .. 8x4; the cap of 64 keeps NVN levels 2..5
+    void *m1, *m2; tex_t t1 = fixture(d, &m1);
+    unsigned sk = bc_skip(&t1);
+    CHECK(sk == 2, "DM_BC_MAX_DIM=64 leaves out the two finest levels of a 256x128 texture");
+    CHECK(nvn_bc_skip_levels(&d, 64) == 2 && nvn_bc_skip_levels(&d, 0) == 0 && nvn_bc_skip_levels(&d, 4) == 5, "nvn_bc_skip_levels: cap 64 -> 2, no cap -> 0, a cap nothing fits keeps the last level");
+    nvn_texdesc one = d; one.levels = 1; CHECK(nvn_bc_skip_levels(&one, 64) == 0, "a texture without a mip chain keeps its only level");
+    nvn_texdesc cube = d; cube.target = NVN_TEXTURE_TARGET_3D; CHECK(nvn_bc_skip_levels(&cube, 64) == 0, "a 3D texture is not cut");
+    id<MTLTexture> mt1 = upload(&t1);
+    CHECK(mt1 && mt1.pixelFormat == MTLPixelFormatRGBA8Unorm && mt1.width == 64 && mt1.height == 32 && mt1.mipmapLevelCount == 4, "a miss: decoded, 64x32 with four levels");
+    CHECK(nvn_bc_astc_bg_wait(120), "the queue drains");
+    nvn_astc_bg_stats s = stats();
+    CHECK(s.misses == 4 && s.queued == 4 && cache_files(rw) == 4, "the runtime looked up and queued only the four kept planes, not six");
+    tex_t t2 = fixture(d, &m2);
+    id<MTLTexture> mt2 = upload(&t2);
+    CHECK(mt2 && mt2.pixelFormat == MTLPixelFormatASTC_4x4_LDR && mt2.width == 64 && mt2.height == 32 && mt2.mipmapLevelCount == 4, "the texture made when all kept planes are cached is ASTC 64x32 with four levels");
+    CHECK(mt2 && mt2.textureType == MTLTextureType2D, "and 2D");
+    for (unsigned l = sk; mt2 && l < d.levels; l++) { double mean, peak; compare_level_sk(mt2, &t2, d, l, 0, &mean, &peak, sk); printf("maxdim ASTC NVN level %u: mean error %.4f\n", l, mean); CHECK(mean < 0.04, "ASTC level samples like the BC decode of the NVN level it came from"); }
+    defer_obj_release(mt1); defer_obj_release(mt2); release_fixture(m1); release_fixture(m2);
 }
 static void run_background(const char *dir, int six) {
     unsigned blk = six ? 6 : 4;
@@ -340,9 +365,16 @@ int main(int argc, char **argv) { @autoreleasepool {
     (void)argc; (void)argv;
     char dir[] = "/tmp/t_astc_upload.XXXXXX";
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
-    setenv("DM_TEST_NO_BC", "1", 1); const char *mode = getenv("T_ASTC_MODE"); int background = mode && !strcmp(mode, "background"); setenv("DM_NVN_ASTC_MISS", background ? "background" : "sync", 1); const char *which = getenv("T_ASTC_BLOCK"); int six = which && atoi(which) == 6; setenv("DM_NVN_BC_ASTC", six ? "6" : "4", 1); setenv("DM_NVN_ASTC_CACHE", dir, 1); unsetenv("DM_NVN_ASTC_CACHE_RO");
+    setenv("DM_TEST_NO_BC", "1", 1); const char *mode = getenv("T_ASTC_MODE"); int maxdim = mode && !strcmp(mode, "maxdim"), background = (mode && !strcmp(mode, "background")) || maxdim; if (maxdim) setenv("DM_BC_MAX_DIM", "64", 1); setenv("DM_NVN_ASTC_MISS", background ? "background" : "sync", 1); const char *which = getenv("T_ASTC_BLOCK"); int six = which && atoi(which) == 6; setenv("DM_NVN_BC_ASTC", six ? "6" : "4", 1); setenv("DM_NVN_ASTC_CACHE", dir, 1); unsetenv("DM_NVN_ASTC_CACHE_RO");
     mtl_init();
     CHECK(astc_block() == (six ? 6u : 4u), "DM_NVN_BC_ASTC is on (with DM_TEST_NO_BC)");
+    if (maxdim) {
+        run_maxdim(dir);
+        mtl_drain();
+        { char cmd[128]; snprintf(cmd, sizeof cmd, "rm -rf %s", dir); system(cmd); }
+        printf("ASTC upload (DM_BC_MAX_DIM=64): %d checks, %d failures\n", checks, failed);
+        return failed ? 1 : 0;
+    }
     if (background) {
         run_background(dir, six);
         mtl_drain();

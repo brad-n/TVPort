@@ -12,7 +12,7 @@ Nothing in Python hashes or encodes a texel. The Python side only finds textures
 Texture sources (any RomFS image, `RomFS.img`, or an extracted folder): BNTX files and BNTX embedded in other files (BFRES), also inside zstd, Yaz0 and SARC containers, nested.
 Super Smash Bros. Ultimate keeps its textures as NUTEXB in data.arc (dm/gfx/tools/smash_arc.py): its current files are read from the archive, NUTEXB ones as textures.
 
-Usage: bntx_astc.py <RomFS.img | RomFS folder | build folder> --out DIR [--block 4|6] [--workers N] [--scan-only] [--force]
+Usage: bntx_astc.py <RomFS.img | RomFS folder | build folder> --out DIR [--block 4|6] [--max-dim N] [--workers N] [--scan-only] [--force]
 Output DIR: cache/<key>.astc (the entries), astc-ro.pack (the pack, with the input fingerprint in its header), report.json.
 """
 import argparse
@@ -109,8 +109,10 @@ def lib_open(path):
     if _LIB is not None and _LIB[0] == path: return _LIB[1]
     L = ctypes.CDLL(path)
     L.dm_texture_planes.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint64,
-                                    ctypes.c_uint, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(Plane), ctypes.c_uint32]
+                                    ctypes.c_uint, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(Plane), ctypes.c_uint32, ctypes.c_int]
     L.dm_texture_planes.restype = ctypes.c_int
+    L.dm_skip_levels.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int]
+    L.dm_skip_levels.restype = ctypes.c_uint
     L.dm_texture_size.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int]
     L.dm_texture_size.restype = ctypes.c_uint64
     L.dm_level_offset.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint]
@@ -244,8 +246,8 @@ def nutexb_texture(d):
 
 class Job:
     """One worker's state: counters and the planes it keyed"""
-    def __init__(self, lib, block, cache, encode, dicts):
-        self.L, self.block, self.cache, self.encode, self.dicts = lib_open(lib), block, cache, encode, dicts
+    def __init__(self, lib, block, cache, encode, dicts, max_dim=0):
+        self.L, self.block, self.cache, self.encode, self.dicts, self.max_dim = lib_open(lib), block, cache, encode, dicts, max_dim
         self.c = collections.Counter(); self.planes = []; self.formats = collections.Counter(); self.seen = set(); self.errors = []
 
     def texture(self, d, t, name):
@@ -276,7 +278,7 @@ class Job:
         self.seen.add(ident)
         cap = t['mips'] * (depth + 1) + 8
         out = (Plane * cap)()
-        n = self.L.dm_texture_planes(target, nvn, t['w'], t['h'], depth, t['mips'], pkg, addr(d) + start, size, self.block, alt, self.cache.encode() if self.cache else None, int(self.encode), out, cap)
+        n = self.L.dm_texture_planes(target, nvn, t['w'], t['h'], depth, t['mips'], pkg, addr(d) + start, size, self.block, alt, self.cache.encode() if self.cache else None, int(self.encode), out, cap, self.max_dim)
         if n < 0: c['layout_failed'] += 1; self.errors.append(f'{name}: layout failed ({n})'); return
         c['converted'] += 1
         for i in range(n):
@@ -374,8 +376,8 @@ def folder_files(path):
     return out
 
 
-def fingerprint(romfs, block):
-    h = hashlib.sha256(); h.update(sources_hash().encode()); h.update(b'block %d\0' % block)
+def fingerprint(romfs, block, max_dim=0):
+    h = hashlib.sha256(); h.update(sources_hash().encode()); h.update(b'block %d\0max_dim %d\0' % (block, max_dim))   # the texture cap decides which levels the pack holds
     with open(os.path.abspath(__file__), 'rb') as f: h.update(f.read())   # the tool's own logic (what it finds and how it names it) is part of what the pack holds
     if os.path.isfile(romfs):
         st = os.stat(romfs); h.update(b'img %d %d\0' % (st.st_size, st.st_mtime_ns)); h.update(os.path.basename(romfs).encode())
@@ -389,13 +391,13 @@ def fingerprint(romfs, block):
 _STATE = {}
 
 
-def init_worker(lib, block, cache, encode, romfs, dicts):
-    _STATE.update(lib=lib, block=block, cache=cache, encode=encode, romfs=romfs, dicts=dicts, fd=os.open(romfs, os.O_RDONLY) if os.path.isfile(romfs) else None)
+def init_worker(lib, block, cache, encode, romfs, dicts, max_dim=0):
+    _STATE.update(lib=lib, block=block, max_dim=max_dim, cache=cache, encode=encode, romfs=romfs, dicts=dicts, fd=os.open(romfs, os.O_RDONLY) if os.path.isfile(romfs) else None)
 
 
 def work(batch):
     s = _STATE
-    job = Job(s['lib'], s['block'], s['cache'], s['encode'], s['dicts'])
+    job = Job(s['lib'], s['block'], s['cache'], s['encode'], s['dicts'], s['max_dim'])
     for name, off, size in batch:
         if s['fd'] is not None: head = os.pread(s['fd'], 4, off)
         else:
@@ -475,14 +477,14 @@ def batches(files, n):
     if batch: yield batch
 
 
-def prebuild(inp, out, block=4, workers=None, scan_only=False, force=False, log=print, drop_cache=False, verbose=False):
+def prebuild(inp, out, block=4, workers=None, scan_only=False, force=False, log=print, drop_cache=False, verbose=False, max_dim=0):
     t0 = time.monotonic()
-    block = int(block)
+    block = int(block); max_dim = max(int(max_dim or 0), 0)
     if block not in (4, 6): raise SystemExit('--block must be 4 or 6')
     romfs = find_romfs(inp)
     os.makedirs(out, exist_ok=True)
     pack, cache = os.path.join(out, 'astc-ro.pack'), os.path.join(out, 'cache')
-    fp = fingerprint(romfs, block)
+    fp = fingerprint(romfs, block, max_dim)
     have = read_pack_header(pack)
     if have and have['fingerprint'] == fp and not force and not scan_only:
         rep = {}
@@ -496,13 +498,13 @@ def prebuild(inp, out, block=4, workers=None, scan_only=False, force=False, log=
     files = image_files(romfs) if os.path.isfile(romfs) else folder_files(romfs)
     files = smash_arc_files(romfs, files)
     dicts = zs_dicts(romfs, files, lib)
-    log(f'astc: {romfs}: {len(files)} files, {sum(f[2] for f in files) / 2**30:.1f} GiB; ASTC {block}x{block}; library {os.path.basename(lib)}')
+    log(f'astc: {romfs}: {len(files)} files, {sum(f[2] for f in files) / 2**30:.1f} GiB; ASTC {block}x{block}; texture cap {max_dim or 'none'}; library {os.path.basename(lib)}')
     workers = workers or os.cpu_count() or 4
     total = collections.Counter(); formats = collections.Counter(); keys = {}; errors = []; plane_count = 0; hits = 0
     unique = {}
     scanned = 0; t1 = time.monotonic()
     chunks = list(batches(files, 64 << 20 if len(files) > workers * 8 else 1))
-    with cf.ProcessPoolExecutor(workers, initializer=init_worker, initargs=(lib, block, cache, not scan_only, romfs, dicts)) as ex:
+    with cf.ProcessPoolExecutor(workers, initializer=init_worker, initargs=(lib, block, cache, not scan_only, romfs, dicts, max_dim)) as ex:
         for r in ex.map(work, chunks):
             total.update(r['c']); formats.update(r['formats']); errors += r['errors']; total['n_errors'] += r['n_errors']
             for key, key2, w, h, astc, hit in r['planes']:
@@ -516,7 +518,7 @@ def prebuild(inp, out, block=4, workers=None, scan_only=False, force=False, log=
     t_scan = time.monotonic() - t1
     rgba = sum(w * h * 4 for w, h, _ in unique.values())
     digest = hashlib.sha256(b''.join(bytes.fromhex(k) for k in sorted(unique))).hexdigest()
-    rep = dict(input=romfs, block=block, files=len(files), textures_found=total['textures'], bntx_files=total['bntx'], eligible_textures=total['eligible'], converted_textures=total['converted'],
+    rep = dict(input=romfs, block=block, max_dim=max_dim, files=len(files), textures_found=total['textures'], bntx_files=total['bntx'], eligible_textures=total['eligible'], converted_textures=total['converted'],
                repeated_textures=total['repeat'], nutexb_files=total['nutexb'], layout_differs=total['layout_differs'], layout_failed=total['layout_failed'], unparsed=total['unparsed'], short=total['short'],
                ineligible_shape=total['ineligible_shape'], container_errors=total['container_errors'], plane_errors=total['plane_errors'], planes=plane_count, unique_planes=len(unique), keys_sha256=digest,
                decoded_rgba_bytes_covered=rgba, astc_bytes=sum(a for _, _, a in unique.values()), formats=dict(formats.most_common()), encoded_now=len(unique) - hits, cached_before=hits,
@@ -539,6 +541,7 @@ def main():
     ap.add_argument('input', help='RomFS.img, a RomFS folder, or a build folder (its newest extract/<version>/RomFS.img)')
     ap.add_argument('--out', required=True, help='output folder: cache/, astc-ro.pack, report.json')
     ap.add_argument('--block', type=int, default=4, choices=(4, 6), help='ASTC block size (the runtime reads the same DM_NVN_BC_ASTC)')
+    ap.add_argument('--max-dim', type=int, default=0, help="the game's texture cap (DM_BC_MAX_DIM, 0 = none): only the mip levels the runtime keeps under it are packed")
     ap.add_argument('--workers', type=int, default=0, help='processes (default: every core)')
     ap.add_argument('--scan-only', action='store_true', help='find and key the planes; encode and write nothing')
     ap.add_argument('--force', action='store_true', help='rebuild even if the pack is up to date')
@@ -549,7 +552,7 @@ def main():
     if a.auto_layout:
         if not a.scan_only: ap.error('--auto-layout is a diagnostic: use it with --scan-only')
         os.environ['BNTX_ASTC_AUTO_LAYOUT'] = '1'
-    prebuild(a.input, a.out, a.block, a.workers or None, a.scan_only, a.force, drop_cache=a.drop_cache, verbose=a.json)
+    prebuild(a.input, a.out, a.block, a.workers or None, a.scan_only, a.force, drop_cache=a.drop_cache, verbose=a.json, max_dim=a.max_dim)
 
 
 if __name__ == '__main__':

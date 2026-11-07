@@ -44,18 +44,23 @@ static int plane_cb(void *p, unsigned level, unsigned layer, uint32_t w, uint32_
 
 // The planes of one texture, as the runtime enumerates them. `storage` is the texture's block-linear image (a BNTX's data from its first byte); pkg_block_h is the packaged layout's
 // byte 0 + 1 (0: the automatic block height). encode=0 only keys the planes. Returns the plane count (>= 0), -1 for a texture the engine cannot lay out or whose storage is too short,
-// -2 when out is too small
+// -2 when out is too small. max_dim is the game's texture cap (DM_BC_MAX_DIM, 0 = none): only the levels the runtime keeps under it are walked (nvn_bc_skip_levels, the runtime's own computation)
 int dm_texture_planes(int target, int format, uint32_t width, uint32_t height, uint32_t depth, uint32_t levels, int pkg_block_h,
-                      const void *storage, uint64_t storage_size, unsigned block, int alt_format, const char *cache, int encode, dm_plane *out, uint32_t cap) {
+                      const void *storage, uint64_t storage_size, unsigned block, int alt_format, const char *cache, int encode, dm_plane *out, uint32_t cap, int max_dim) {
     nvn_texdesc d = {.target = target, .format = format, .width = width, .height = height, .depth = depth, .levels = levels, .pkg_block_h = pkg_block_h};
     nvn_texlayout L; nvn_tex_layout(&d, &L);
     if (!L.bpb || L.size > storage_size || nvn_bc_astc_format((uint32_t)format, block, NULL) != 1) return -1;
     walk_ctx c = {.format = (uint32_t)format, .alt_format = (uint32_t)alt_format, .block = block, .cache = cache, .encode = encode, .out = out, .cap = cap};
     @autoreleasepool {
-        int r = nvn_astc_walk_planes(&d, storage, 0, plane_cb, &c);
+        int r = nvn_astc_walk_planes(&d, storage, nvn_bc_skip_levels(&d, max_dim), plane_cb, &c);
         if (c.overflow) return -2;
         return r ? -1 : (int)c.n;
     }
+}
+// How many finest levels the runtime leaves out of this texture under the cap (nvn_mtl.m bc_skip)
+unsigned dm_skip_levels(int target, int format, uint32_t width, uint32_t height, uint32_t depth, uint32_t levels, int max_dim) {
+    nvn_texdesc d = {.target = target, .format = format, .width = width, .height = height, .depth = depth, .levels = levels};
+    return nvn_bc_skip_levels(&d, max_dim);
 }
 // The storage bytes the engine's layout gives the texture (0 when it cannot lay it out)
 uint64_t dm_texture_size(int target, int format, uint32_t width, uint32_t height, uint32_t depth, uint32_t levels, int pkg_block_h) {

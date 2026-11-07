@@ -949,14 +949,14 @@ def astc_block(args) -> int:
     return 6 if getattr(args, 'astc_block', 4) == 6 else 4
 
 
-def prebuild_astc(game: Game, block: int, python: str) -> Optional[Path]:
+def prebuild_astc(game: Game, block: int, python: str, texture_cap: int = 0) -> Optional[Path]:
     """Run the engine's prebuild (dm/gfx/tools/bntx_astc.py) over the extracted game: every BC1/2/3/7 texture encoded to ASTC on this Mac and packed into one astc-ro.pack. It is incremental: with the same game files, engine and block size it
     returns the pack it made before at once. A failure is not fatal: the game then encodes textures while it runs (slower the first time, and the textures stay uncompressed until it has)."""
     stage('Preparing compressed textures')
     out = game.build / 'tvport-astc'
     pack = out / 'astc-ro.pack'
     try:
-        stream([python, '-I', REPO / 'dm/gfx/tools/bntx_astc.py', game.romfs, '--out', out, '--block', str(block), '--drop-cache'], cwd=REPO, log_filter=lambda line: line.startswith('astc'))
+        stream([python, '-I', REPO / 'dm/gfx/tools/bntx_astc.py', game.romfs, '--out', out, '--block', str(block), '--max-dim', str(texture_cap), '--drop-cache'], cwd=REPO, log_filter=lambda line: line.startswith('astc'))
     except Failure as failure:
         emit('log', line=f'Compressed textures could not be prepared ({str(failure).splitlines()[-1][:300] if str(failure) else "no reason given"}). The game prepares them while it runs instead.')
         return None
@@ -1101,7 +1101,7 @@ def cmd_build(args) -> None:
         game = prepare_game(game, args.keys, team, python, args)
     bundle = game.bundle_id(team)
     block = astc_block(args)
-    pack = prebuild_astc(game, block, python) if block else None   # the game's files are extracted: encode its BC textures once, here
+    pack = prebuild_astc(game, block, python, args.texture_cap) if block else None   # the game's files are extracted: encode its BC textures once, here
     if args.device:
         remember_shaders(game, args.device, bundle)
         stage('Backing up saves to this Mac')

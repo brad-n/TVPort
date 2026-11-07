@@ -190,14 +190,17 @@ class PrebuildTests(unittest.TestCase):
         (d / 'data.bin').write_bytes(bytes(1000))
         return d, ts
 
-    def runtime_finds(self, ts, pack):
-        """Every plane of every texture, as the RUNTIME enumerates and looks it up (nvn_astc_walk_planes + nvn_bc_astc_learn / fetch with the pack as the read-only cache)"""
+    def runtime_finds(self, ts, pack, cap=0, absent=None):
+        """Every plane of every texture, as the RUNTIME enumerates and looks it up (nvn_astc_walk_planes + nvn_bc_astc_learn / fetch with the pack as the read-only cache).
+        cap is DM_BC_MAX_DIM: the runtime skips nvn_bc_skip_levels(d, cap) levels (its bc_skip calls that function); the walk here starts there. Every plane of a skipped level is appended to `absent` when the pack lacks it"""
         L = self.lib
         L.nvn_bc_astc_bg_configure.argtypes = [ctypes.POINTER(Config)]
         L.nvn_bc_astc_learn.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint, ctypes.c_void_p]
         L.nvn_bc_astc_fetch.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t]
         L.nvn_bc_astc_encode.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_char_p,
                                          ctypes.POINTER(ctypes.c_int)]
+        L.nvn_bc_skip_levels.argtypes = [ctypes.POINTER(NvnTexdesc), ctypes.c_int]
+        L.nvn_bc_skip_levels.restype = ctypes.c_uint
         L.nvn_astc_walk_planes.argtypes = [ctypes.POINTER(NvnTexdesc), ctypes.c_void_p, ctypes.c_uint, PLANE_FN, ctypes.c_void_p]
         L.nvn_bc_astc_bg_configure(ctypes.byref(Config(None, str(pack).encode(), 1 << 20, 1 << 30, 0, 1)))
         found = []
@@ -208,6 +211,7 @@ class PrebuildTests(unittest.TestCase):
                 d = NvnTexdesc(t.target, fmt, 0, 1, t.w, t.h, t.depth, t.mips, 0, t.pkg + 1)
                 storage = ctypes.create_string_buffer(t.storage(L))
                 seen = []
+                skip = L.nvn_bc_skip_levels(ctypes.byref(d), cap)
 
                 def cb(_, level, layer, w, h, bc, size):
                     plane = ctypes.string_at(bc, size)
@@ -222,9 +226,15 @@ class PrebuildTests(unittest.TestCase):
                     found.append(ok)
                     return 0
                 fn = PLANE_FN(cb)
-                self.assertEqual(L.nvn_astc_walk_planes(ctypes.byref(d), ctypes.cast(storage, ctypes.c_void_p), 0, fn, None), 0)
+                self.assertEqual(L.nvn_astc_walk_planes(ctypes.byref(d), ctypes.cast(storage, ctypes.c_void_p), skip, fn, None), 0)
                 self.assertTrue(all(s[2] for s in seen), (t.fmt, seen))
-                self.assertEqual(len(seen), t.mips * t.layers if t.target != 8 else t.mips * 6)
+                self.assertEqual(len(seen), (t.mips - skip) * (t.layers if t.target != 8 else 6))
+                if absent is not None:   # the levels the runtime leaves out: not in the pack
+                    for level in range(skip):
+                        for layer in range(t.layers if t.target != 8 else 6):
+                            w, h = max(t.w >> level, 1), max(t.h >> level, 1)
+                            plane = t.planes[(level, layer)]
+                            absent.append(L.nvn_bc_astc_fetch(fmt, plane, len(plane), w, h, 4, ctypes.create_string_buffer(((w + 3) // 4) * 16 * ((h + 3) // 4)), ((w + 3) // 4) * 16 * ((h + 3) // 4)) != 1)
         return found
 
     def test_flags_match_the_host_makefile(self):
@@ -256,6 +266,31 @@ class PrebuildTests(unittest.TestCase):
         found = self.runtime_finds(ts, pack)
         self.assertEqual(len(found), expect_planes + sum(t.mips * t.layers for t in ts if t.fmt == 0x1a01))   # BC1 is looked up under both of its NVN formats
         self.assertTrue(all(found), 'a plane the runtime walks is missing from the pack or differs from the runtime encoder')
+
+    def test_texture_cap_packs_only_the_levels_the_runtime_keeps(self):
+        lib = self.lib
+        ts = [Texture(0x1a01, 2048, 1024, mips=6, pkg=4), Texture(0x1c01, 1024, 1024, mips=4, layers=2, dim=5, pkg=3), Texture(0x1a06, 1024, 1024, mips=3, layers=6, dim=3, pkg=1),
+              Texture(0x1c01, 1024, 512, mips=1, pkg=2), Texture(0x1a06, 600, 300, mips=2, pkg=1)]
+        d = self.root / 'captree'
+        d.mkdir()
+        (d / 'a.bntx').write_bytes(bntx(lib, ts))
+        out = self.root / 'capout'
+        base = tool.prebuild(str(d), str(self.root / 'capfull'), 4, workers=2, log=lambda *_: None)
+        rep = tool.prebuild(str(d), str(out), 4, workers=2, log=lambda *_: None, max_dim=512)
+        self.assertEqual(rep['max_dim'], 512)
+        # 2048x1024 x6 mips: levels 0-1 left out (1024 > 512); 1024 array x4: level 0 left out; cube and a single-level texture are never cut; 600x300 x2: level 0 (600 > 512) left out, the last level stays
+        kept = (6 - 2) + (4 - 1) * 2 + 3 * 6 + 1 + 1
+        self.assertEqual(rep['unique_planes'], kept)
+        self.assertEqual(base['unique_planes'], 6 + 4 * 2 + 3 * 6 + 1 + 2)
+        self.assertLess(rep['pack_bytes'], base['pack_bytes'])
+        absent = []
+        found = self.runtime_finds(ts, out / 'astc-ro.pack', cap=512, absent=absent)
+        self.assertTrue(found and all(found), 'a plane the runtime asks for under the cap is missing from the pack')
+        self.assertEqual(len(absent), 2 * 2 + 1 * 2 + 1)   # the BC1 texture is looked up under both its NVN formats
+        self.assertTrue(all(absent), 'the pack holds a level the runtime skips under the cap')
+        # a cap change is another pack; the same cap is the same pack
+        self.assertTrue(tool.prebuild(str(d), str(out), 4, workers=2, log=lambda *_: None, max_dim=512)['up_to_date'])
+        self.assertFalse(tool.prebuild(str(d), str(out), 4, workers=2, log=lambda *_: None, max_dim=256)['up_to_date'])
 
     def test_pack_is_sorted_and_shares_the_bc1_payloads(self):
         d, ts = self.build_tree('tree2')

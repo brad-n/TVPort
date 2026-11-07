@@ -1,6 +1,7 @@
 // See nvn_astc_planes.h
 #include "nvn_astc_planes.h"
 #include "nvn_deswizzle.h"
+#include "nvn_bcdec.h"
 #include <stdlib.h>
 
 unsigned nvn_astc_layers(const nvn_texdesc *d) {
@@ -26,4 +27,11 @@ int nvn_astc_walk_planes(const nvn_texdesc *d, const void *storage, unsigned ski
     }
     free(buf);
     return result;
+}
+unsigned nvn_bc_skip_levels(const nvn_texdesc *d, int cap) {
+    uint32_t pf; int bpp;
+    if (cap <= 0 || (d->target != 1 && d->target != 4) || !nvn_bc_unpacked(d->format, &pf, &bpp)) return 0;
+    unsigned s = 0, n = d->levels ? d->levels : 1;
+    while (s + 1 < n && (d->width >> s > d->height >> s ? d->width >> s : d->height >> s) > (unsigned)cap) s++;
+    return s;
 }

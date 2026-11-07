@@ -2552,11 +2552,7 @@ static void astc_void_block(uint32_t format, uint8_t out[16]) {
 // The Metal texture then starts at NVN level bc_skip: uploads, views and copies shift by it. Normalized sampling still reads the right picture; 0 or unset keeps every level
 static unsigned bc_skip(const tex_t *t) {
     static int cap = -1; if (cap < 0) { const char *e = getenv("DM_BC_MAX_DIM"); cap = e ? atoi(e) : 0; if (cap > 0) MLOG("BC textures: finest levels dropped down to %d pixels (DM_BC_MAX_DIM)", cap); }
-    uint32_t pf; int bpp;
-    if (cap <= 0 || (t->d.target != 1 && t->d.target != 4) || !bc_unpack(t->d.format, &pf, &bpp)) return 0;
-    unsigned s = 0, n = t->d.levels ? t->d.levels : 1;
-    while (s + 1 < n && MAX(t->d.width >> s, t->d.height >> s) > (unsigned)cap) s++;
-    return s;
+    return cap > 0 && no_bc() ? nvn_bc_skip_levels(&t->d, cap) : 0;   // the one computation the offline prebuild shares (tex/nvn_astc_planes.c)
 }
 // DM_NVN_ASTC_MISS=background: the per-texture decision, by serial, kept for the texture's lifetime (flags: 1 decided, 2 ASTC, 4 its planes were looked up in the cache and the misses queued)
 typedef struct { uint64_t serial; uint8_t flags; } astc_dec;
