@@ -46,3 +46,11 @@ make -C dm/gfx/tex/tests run       # run t_fmt_mtl and t_tex
 - `nvn_deswizzle()` does not support multisampled textures, textures with the LINEAR flag (which are linear to begin with) or the BUFFER target; it returns -1 when it encounters them.
 - Cubes and cube arrays are handled as layered textures.
 - The component bit order of the 16-bit packed formats (565 / 5551 / 4444) is mapped according to the format names and has not been checked with real data; they are marked as "substitute" in the format table.
+
+## BC textures as ASTC (`DM_NVN_BC_ASTC`)
+
+On a GPU without BC formats (the Apple TV 4K's A15) BC textures are stored decoded: BC1 as RGBA8 (8 times the Switch size), BC2/3/7 as RGBA8 (4 times). With `DM_NVN_BC_ASTC=4` or `=6` the 2D and 2D-array BC1/2/3/7 textures are stored as ASTC 4x4 / 6x6 LDR instead (ASTC 4x4 is 1 byte a texel, a quarter of RGBA8, the Switch's own size for BC2/3/7 and twice it for BC1; 6x6 is 0.44 byte a texel); BC4/5, BC6H and 3D textures keep the decoded path. Unset or 0 changes nothing. The switch only acts where BC is stored decoded (`DM_TEST_NO_BC=1` makes a Mac do the same, for tests and for filling a cache).
+
+`nvn_astc_cache.m` decodes the deswizzled BC plane (stripes of at most 4 MB), encodes it with Arm's astc-encoder at ASTCENC_PRE_FASTEST on the calling (submit) thread, and keeps the result in a content-addressed cache: `<sha256(version tag, format, width, height, block, BC bytes)>.astc` under `DM_NVN_ASTC_CACHE` (written on a miss), read first from `DM_NVN_ASTC_CACHE_RO` if set. The key depends on the BC bytes, never on the machine, so a cache filled on a Mac is valid on the Apple TV. A buffer-to-texture copy into a BC texture is transcoded the same way (ASTC 4x4: any block-aligned region; 6x6: only regions on the 6x6 grid), a new texture reads zero blocks as the BC format would (void-extent blocks), and views of an ASTC texture are the ASTC format of the BC view format. Algorithm and cache layout follow [yuchanns/nxnative-tvos](https://github.com/yuchanns/nxnative-tvos) (MIT, `LICENSE.nxnative-tvos`).
+
+Tests: `dm/gfx/tests/t_astc_cache` (CPU, ASan/UBSan), `t_astc_upload` (Mac GPU: formats, sampled error against the CPU decode, the cache, buffer-to-texture copies; `T_ASTC_BLOCK=6` runs the 6x6 case).
