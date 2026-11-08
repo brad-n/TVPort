@@ -1565,8 +1565,8 @@ def decoder_host_key(host):
     return None
 
 
-# The static libraries dm/host's dmhost rule links (VPX_LIB, DAV1D_LIB, ASTC_LIB): build_mac_host builds them before taking the compile line from make -n.
-HOST_LIBS = ('gen/vpx/libvpx.a', 'gen/dav1d/libdav1d.a', 'gen/astc/libastcenc.a')
+# The static libraries dm/host's dmhost rule links (VPX_LIB, DAV1D_LIB, ASTC_LIB, ZSTD_LIB): build_mac_host builds them before taking the compile line from make -n.
+HOST_LIBS = ('gen/vpx/libvpx.a', 'gen/dav1d/libdav1d.a', 'gen/astc/libastcenc.a', 'gen/zstd/libzstd.a')
 
 
 def build_mac_host(repo, out, env, logs, g):
@@ -1583,7 +1583,7 @@ def build_mac_host(repo, out, env, logs, g):
     kf, tp = out.with_name(out.name + '.key'), repo / 'dm/third_party'
     srcs = [p for d in HOST_DIRS for p in sorted((repo / d).iterdir()) if p.is_file() and p.suffix in ('.c', '.m', '.h', '.S', '.inc')]
     common = fingerprint(cmd, ('files', [host / f'gen/{g.id}/game_profile.h', host / 'gen/msl-macosx/host_msl_gen.h', *(host / lib for lib in HOST_LIBS), tp / 'stb_vorbis/stb_vorbis.c']),
-                         ('tree', tp / 'vulkan-headers/include'), ('tree', tp / 'libvpx/vpx'), ('tree', tp / 'dav1d/include'), ('cmd', ['clang', '--version']), ('cmd', ['xcrun', '--show-sdk-build-version']), env=env)
+                         ('tree', tp / 'vulkan-headers/include'), ('tree', tp / 'libvpx/vpx'), ('tree', tp / 'dav1d/include'), ('tree', tp / 'zstd'), ('cmd', ['clang', '--version']), ('cmd', ['xcrun', '--show-sdk-build-version']), env=env)
     key = fingerprint(common, ('files', srcs))
     chain = repo / CHAIN_H
     # The decoder serves game bytes before rendering. DMSH_CHAIN selects translated shader libraries and appears in the startup log; it cannot change decompression.
