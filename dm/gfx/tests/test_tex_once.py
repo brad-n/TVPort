@@ -584,5 +584,27 @@ class StripTests(unittest.TestCase):
         self.assertGreaterEqual(self.report(self.root / 'out_table')['planes']['tagged'], 6)
 
 
+class ZstdHeaderLayout(unittest.TestCase):
+    """A re-packed frame keeps the original frame's header layout (Smash decodes only frames without a content size / single segment, 2026-11-08)"""
+    def test_new_frame_copies_original_header(self):
+        z = tool.B.zstd_module(); P = z.CompressionParameter
+        data = random.Random(7).randbytes(60000)
+        orig = z.compress(data, options={P.compression_level: 3, P.content_size_flag: 0, P.window_log: 17})
+        self.assertEqual(tool.zstd_header(orig)[0], 0)
+        zeroed = data[:1000] + bytes(len(data) - 1000)
+        new = tool.zstd_slot(zeroed, len(orig), like=orig)
+        self.assertIsNotNone(new)
+        self.assertEqual(tool.zstd_header(new)[0], tool.zstd_header(orig)[0])
+        self.assertEqual(tool.zstd_header(new), tool.zstd_header(orig))   # same descriptor and the same window
+        self.assertEqual(z.decompress(new), zeroed)
+        stream = tool.zstd_stream(zeroed, len(orig), like=orig)
+        self.assertEqual(tool.zstd_header(stream)[0], 0)
+
+    def test_without_original_defaults_stay(self):
+        z = tool.B.zstd_module()
+        data = bytes(5000)
+        self.assertNotEqual(tool.zstd_header(tool.zstd_stream(data, 4096))[0], 0)   # zstd's own default: a content size
+
+
 if __name__ == '__main__':
     unittest.main()
