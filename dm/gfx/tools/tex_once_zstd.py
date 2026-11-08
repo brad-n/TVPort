@@ -124,13 +124,14 @@ def compress(data, level, dict_content=None, like=None):
     return out.raw[:n]
 
 
-def frame_features(buf, max_frames=1 << 20):
+def frame_features(buf, max_frames=1 << 20, zero_tail=False):
     """What a run of zstd frames is made of: {'frames', 'skippable', 'blocks': set of 'raw'/'rle'/'compressed', 'literals': set of 'raw'/'rle'/'huffman'/'treeless',
-    'headers': [(descriptor, window descriptor)]}. Raises ValueError on bytes that are not a frame"""
+    'headers': [(descriptor, window descriptor)], 'tail': zero bytes after the last frame (only with zero_tail)}. Raises ValueError on bytes that are not a frame"""
     mv = memoryview(buf)
     p, n = 0, len(mv)
-    res = dict(frames=0, skippable=0, blocks=set(), literals=set(), headers=[])
+    res = dict(frames=0, skippable=0, blocks=set(), literals=set(), headers=[], tail=0)
     while p < n and res['frames'] + res['skippable'] < max_frames:
+        if zero_tail and mv[p] == 0 and bytes(mv[p:]).count(0) == n - p: res['tail'] = n - p; return res
         if n - p < 8: raise ValueError('bytes after the last frame')
         magic = struct.unpack_from('<I', mv, p)[0]
         if 0x184d2a50 <= magic <= 0x184d2a5f:
@@ -155,12 +156,12 @@ def frame_features(buf, max_frames=1 << 20):
     return res
 
 
-def forbidden(new, orig=None):
+def forbidden(new, orig=None, skippable_ok=False):
     """Reasons a frame `new` uses a zstd feature that the archive's own frames (`orig`, when given) do not: block types outside raw/compressed, literal types outside raw/Huffman/treeless,
-    a skippable frame where the original has none. -> list of strings"""
+    a skippable frame where the original has none (unless skippable_ok). -> list of strings"""
     f = frame_features(new)
     bad = []
     if f['blocks'] - ALLOWED_BLOCKS: bad.append(f'block types {sorted(f["blocks"] - ALLOWED_BLOCKS)}')
     if f['literals'] - ALLOWED_LITERALS: bad.append(f'literal types {sorted(f["literals"] - ALLOWED_LITERALS)}')
-    if f['skippable'] and (orig is None or not frame_features(orig)['skippable']): bad.append('a skippable frame')
+    if f['skippable'] and not skippable_ok and (orig is None or not frame_features(orig)['skippable']): bad.append('a skippable frame')
     return bad

@@ -83,11 +83,6 @@ def skippable_frame(n):
     return struct.pack('<II', SKIPPABLE_FIRST, n - 8) + bytes(n - 8)
 
 
-def has_skippable(f):
-    try: return bool(Z.frame_features(f)['skippable'])
-    except (ValueError, IndexError): return False
-
-
 def zstd_header(f):
     """The layout of a zstd frame's header: (frame header descriptor byte, window descriptor byte or None), or None for no frame"""
     return Z.frame_header(f)
@@ -108,14 +103,13 @@ def zstd_stream(data, slot, zd=None, like=None):
     return None
 
 
-def zstd_slot(data, slot, zd=None, min_tail=0, levels=None, like=None, skippable=True):
-    """`data` compressed into exactly `slot` bytes: the stream, then one skippable frame of zeros to the slot's end. None when it does not fit, or leaves a tail of 1..7 bytes (no room for the frame's header),
-    or leaves a tail with skippable off (the original has no skippable frame, so the new file has none either)"""
+def zstd_slot(data, slot, zd=None, min_tail=0, levels=None, like=None):
+    """`data` compressed into exactly `slot` bytes: the stream, then one skippable frame of zeros to the slot's end. None when it does not fit, or leaves a tail of 1..7 bytes (no room for the frame's header)"""
     for level in levels or ZSTD_LEVELS[:2 if len(data) > (32 << 20) else 3]:
         comp = zstd_compress(data, level, zd, like)
         tail = slot - len(comp)
         if tail == 0 and not min_tail: return comp
-        if skippable and tail >= max(8, min_tail): return comp + skippable_frame(tail)
+        if tail >= max(8, min_tail): return comp + skippable_frame(tail)
     return None
 
 
@@ -336,7 +330,7 @@ class Walker:
             if comp is None: return None
             self.new_csz = len(comp)
             return comp + bytes(len(orig) - len(comp))
-        return zstd_slot(data, len(orig), self.zdict(orig), like=orig, skippable=has_skippable(orig))
+        return zstd_slot(data, len(orig), self.zdict(orig), like=orig)
 
     def sub(self, d, name, depth, hint, top=None):
         """strip() with its own counters: -> (new bytes or None, the counters it made); an error leaves the container as it is"""
@@ -425,7 +419,7 @@ class Walker:
                 nn = n[:top_csz]
             if nn[:4] != ZSTD_MAGIC and not (len(nn) >= 4 and struct.unpack('<I', nn[:4])[0] in B.SKIPPABLE): raise Mismatch(f'{name}: no zstd frame')
             if o != n:
-                try: bad = Z.forbidden(nn, o)
+                try: bad = Z.forbidden(nn, o, skippable_ok=top_csz is None)   # a data.arc entry never gets a skippable frame (zero tail); other zstd files are padded with one to fill their slot
                 except (ValueError, IndexError) as e: raise Mismatch(f'{name}: the new zstd data is not a readable frame run ({e})')
                 if bad: raise Mismatch(f'{name}: the new zstd frame uses {bad}, which the original does not; the game decodes only the original archive\'s features')
             ho, hn = zstd_header(o), zstd_header(nn)

@@ -290,7 +290,7 @@ def smash_arc_file(payloads):
         body += bytes(-len(body) % 4)
         ents.append((len(body) // 4, len(data), usz)); body += data
     fs = smash_fs(ents)
-    frame = zstd.compress(fs, level=19) + bytes(64)     # the table's slot has a little slack after its frame, as a rewrite needs
+    frame = zstd.compress(fs, level=1)          # a weak level: the rewrite (level 22) fits with room to spare
     table_off = file_off + len(body) + (-len(body) % 16)
     head = struct.pack('<Q', 0xABCDEF9876543210) + struct.pack('<6Q', 0, file_off, 0, table_off, table_off + 16 + len(frame), 0)
     return bytes(head) + bytes(file_off - len(head)) + bytes(body) + bytes(table_off - file_off - len(body)) + struct.pack('<4I', 0x10, len(fs), len(frame), len(fs)) + frame + bytes(16), ents
