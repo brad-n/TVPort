@@ -188,10 +188,11 @@ def sarc_ranges(d):
 
 # ---- the walker: strip and check share the container dispatch and the texture plan -----------------------------------------------------------------------------------------------
 class Walker:
-    def __init__(self, lib, native, block, max_dim, pack, dicts, bc1_block=None):
+    def __init__(self, lib, native, block, max_dim, pack, dicts, bc1_block=None, fmt_blocks=None):
         self.L, self.N = B.lib_open(lib), native_open(native)
         self.block, self.max_dim, self.pack, self.dicts = block, max_dim, pack, dicts
         self.bc1_block = bc1_block or block
+        self.fmt_blocks = B.norm_fmt_blocks(*(fmt_blocks or ()))   # BC4 / BC5 / BC6H blocks (0: the pack does not hold the format)
         self.c = collections.Counter(); self.errors = []; self.new_csz = None
         self.mf = []; self.meta = {}; self.item = ''   # --manifest: one record per tagged plane the strip keeps (meta: the planes of the texture being planned, by offset)
         self.zdicts = {}
@@ -204,6 +205,7 @@ class Walker:
         if 'bad' in t: return None
         eligible = B.BC_ELIGIBLE.get(t['fmt'])
         if not eligible: return None
+        if not B.block_of(eligible[0], self.block, self.bc1_block, self.fmt_blocks): return None   # a format the pack was built without (--bc4-block 0 and the like)
         tg = B.target_of(t)
         if tg is None or t['samples'] > 1 or t['dimension'] == 2: return ('skip', 'ineligible_shape', 0)
         target, depth = tg
@@ -222,7 +224,7 @@ class Walker:
         ls = total // layers
         cap = mips * (depth + 1) + 8
         out = (B.Plane * cap)()
-        blk = self.bc1_block if t['fmt'] in BC1_FORMATS else self.block        # BC1 has its own ASTC block (DM_NVN_BC1_ASTC), every other format the general one
+        blk = B.block_of(nvn, self.block, self.bc1_block, self.fmt_blocks)        # BC1 has its own ASTC block (DM_NVN_BC1_ASTC), BC4 / BC5 / BC6H theirs, every other format the general one
         n = L.dm_texture_planes(target, nvn, t['w'], t['h'], depth, mips, pkg, B.addr(d) + start, size, blk, alt, None, 0, out, cap, self.max_dim)
         if n < 0: return ('skip', 'layout_failed', 0)
         skip = L.dm_skip_levels(target, nvn, t['w'], t['h'], depth, mips, self.max_dim)
@@ -462,7 +464,7 @@ _W = {}
 def worker_init(cfg):
     if cfg.get('zstd_work'): Z.configure(cfg['zstd_work'])
     pack = PackIndex(cfg['pack'])
-    _W.update(cfg=cfg, w=Walker(cfg['lib'], cfg['native'], cfg['block'], cfg['max_dim'], pack, cfg['dicts'], cfg.get('bc1_block')), fd=os.open(cfg['romfs'], os.O_RDONLY))
+    _W.update(cfg=cfg, w=Walker(cfg['lib'], cfg['native'], cfg['block'], cfg['max_dim'], pack, cfg['dicts'], cfg.get('bc1_block'), cfg.get('fmt_blocks')), fd=os.open(cfg['romfs'], os.O_RDONLY))
     if cfg.get('sparse'): _W['sparse'] = S.SparseImage(cfg['sparse'])
 
 
@@ -670,12 +672,14 @@ def run(args):
     if S.is_sparse(romfs): log(f'[RED] {romfs} is already a DMSPARS1 image'); return 2
     block, max_dim = int(args.block), max(int(args.max_dim or 0), 0)
     bc1 = int(args.bc1_block or block)
+    fb = B.norm_fmt_blocks(getattr(args, 'bc4_block', None), getattr(args, 'bc5_block', None), getattr(args, 'bc6h_block', None))
     out = os.path.abspath(args.out); pack = os.path.abspath(args.pack)
     os.makedirs(out, exist_ok=True)
     zl = zlevel_of(args)
     have = B.read_pack_header(pack)
     if not have: log(f'[RED] {pack} is no complete ASTC pack'); return 2
     fp_args = {} if bc1 == block else {'bc1_block': bc1}      # a pack built without --bc1-block is the pack of today: same fingerprint
+    fp_args['fmt_blocks'] = fb
     expect = None
     if not args.no_pack_check:
         try: expect = B.fingerprint(romfs, block, max_dim, **fp_args)
@@ -722,7 +726,7 @@ def run(args):
     if arc and arc.table: marks.append((arc.table_off, arc.table_size, None, 'table'))
     marks.sort(key=lambda m: m[0])
     tasks = partition(logical, marks)
-    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs, zstd_work=os.path.join(out, 'lib'), zlevel=zl)
+    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, fmt_blocks=fb, max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs, zstd_work=os.path.join(out, 'lib'), zlevel=zl)
     writer = S.SparseWriter(target, logical, version=2 if zl is not None else 1)
     totals = collections.Counter(); errors = []; n_errors = 0
     updates, mods_by_task, table_new = {}, {}, None
@@ -948,6 +952,7 @@ def run_manifest(args):
     if not os.path.isfile(romfs) or S.is_sparse(romfs): log(f'[RED] {romfs} is no plain RomFS image'); return 2
     block, max_dim = int(args.block), max(int(args.max_dim or 0), 0)
     bc1 = int(args.bc1_block or block)
+    fb = B.norm_fmt_blocks(getattr(args, 'bc4_block', None), getattr(args, 'bc5_block', None), getattr(args, 'bc6h_block', None))
     out = os.path.abspath(args.out); pack = os.path.abspath(args.pack)
     os.makedirs(out, exist_ok=True)
     if not B.read_pack_header(pack): log(f'[RED] {pack} is no complete ASTC pack'); return 2
@@ -965,7 +970,7 @@ def run_manifest(args):
     fd = os.open(romfs, os.O_RDONLY)
     marks = [(off, size, (name, off, size, bool(arc and arc.table and name.startswith('/data.arc#'))), 'item') for name, off, size in items if candidate(fd, name, off, size)]
     tasks = [t for t in partition(os.path.getsize(romfs), sorted(marks, key=lambda m: m[0])) if t['kind'] != 'table']
-    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs, manifest=True, zstd_work=os.path.join(out, 'lib'))
+    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, fmt_blocks=B.norm_fmt_blocks(getattr(args, 'bc4_block', None), getattr(args, 'bc5_block', None), getattr(args, 'bc6h_block', None)), max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs, manifest=True, zstd_work=os.path.join(out, 'lib'))
     n = 0
     with cf.ProcessPoolExecutor(args.workers, initializer=worker_init, initargs=(cfg,)) as ex, open(args.manifest + '.part', 'w') as f:
         for i, r in enumerate(ex.map(strip_task, tasks)):
@@ -989,6 +994,7 @@ def main():
     ap.add_argument('--max-dim', type=int, default=0, help='the texture cap the pack was built with (0 = none)')
     ap.add_argument('--block', type=int, default=4, choices=(4, 6))
     ap.add_argument('--workers', type=int, default=0, help='processes (default: every core)')
+    for nm in ('bc4', 'bc5', 'bc6h'): ap.add_argument('--%s-block' % nm, type=int, default=None, choices=(0, 4, 5, 6), help='ASTC block of the %s textures (default 6 / 4 / 4 for BC4 / BC5 / BC6H); the pack must have been built with it' % nm.upper())
     ap.add_argument('--bc1-block', type=int, default=None, choices=(4, 5, 6), help='ASTC block of BC1 textures when it differs from --block (default: --block); the pack must have been built with it')
     ap.add_argument('--no-pack-check', action='store_true', help=argparse.SUPPRESS)   # tests only: a pack made by hand
     ap.add_argument('--arc-mode', choices=('table', 'pad'), default='table', help="Smash's data.arc: update the table's stored sizes (default), or pad entries with skippable frames and leave the table")

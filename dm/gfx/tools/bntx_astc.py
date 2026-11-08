@@ -12,7 +12,7 @@ Nothing in Python hashes or encodes a texel. The Python side only finds textures
 Texture sources (any RomFS image, `RomFS.img`, or an extracted folder): BNTX files and BNTX embedded in other files (BFRES), also inside zstd, Yaz0 and SARC containers, nested.
 Super Smash Bros. Ultimate keeps its textures as NUTEXB in data.arc (dm/gfx/tools/smash_arc.py): its current files are read from the archive, NUTEXB ones as textures.
 
-Usage: bntx_astc.py <RomFS.img | RomFS folder | build folder> --out DIR [--block 4|6] [--bc1-block 4|5|6] [--max-dim N] [--workers N] [--scan-only] [--force]
+Usage: bntx_astc.py <RomFS.img | RomFS folder | build folder> --out DIR [--block 4|6] [--bc1-block 4|5|6] [--bc4-block 0|4|5|6] [--bc5-block 0|4|5|6] [--bc6h-block 0|4|5|6] [--max-dim N] [--workers N] [--scan-only] [--force]
 Output DIR: cache/<key>.astc (the entries), astc-ro.pack (the pack, with the input fingerprint in its header), report.json.
 """
 import argparse
@@ -44,7 +44,9 @@ SKIPPABLE = range(0x184d2a50, 0x184d2a60)
 
 # BNTX format (type << 8 | data type) -> (NVN format, the second NVN format with the same blocks or 0). BC1 is RGB_DXT1 (0x41) or RGBA_DXT1 (0x42) in NVN: the blocks decode the same, the cache key
 # differs by the format, so the pack answers to both (one payload, two index entries)
-BC_ELIGIBLE = {0x1a01: (0x42, 0x41), 0x1a06: (0x46, 0x45), 0x1b01: (0x43, 0), 0x1b06: (0x47, 0), 0x1c01: (0x44, 0), 0x1c06: (0x48, 0), 0x2001: (0x4d, 0), 0x2006: (0x4e, 0)}
+# BC4 / BC5 / BC6H are the UNSIGNED ones only (0x1d01, 0x1e01, 0x1f0a): the signed forms (0x1d02, 0x1e02, 0x1f05) hold negative texels ASTC cannot, the runtime keeps them decoded.
+BC_ELIGIBLE = {0x1a01: (0x42, 0x41), 0x1a06: (0x46, 0x45), 0x1b01: (0x43, 0), 0x1b06: (0x47, 0), 0x1c01: (0x44, 0), 0x1c06: (0x48, 0), 0x2001: (0x4d, 0), 0x2006: (0x4e, 0),
+               0x1d01: (0x49, 0), 0x1e01: (0x4b, 0), 0x1f0a: (0x50, 0)}
 FORMAT_NAMES = {0x0201: 'R4G4', 0x0701: 'R5G6B5', 0x0b01: 'R8G8', 0x0901: 'R8', 0x0a01: 'R8G8', 0x0b06: 'R8G8_SRGB', 0x1201: 'R16', 0x1401: 'R16', 0x1901: 'RGBA16', 0x1a01: 'BC1', 0x1a06: 'BC1_SRGB', 0x1b01: 'BC2', 0x1b06: 'BC2_SRGB',
                 0x1c01: 'BC3', 0x1c06: 'BC3_SRGB', 0x1d01: 'BC4U', 0x1d02: 'BC4S', 0x1e01: 'BC5U', 0x1e02: 'BC5S', 0x1f05: 'BC6HS', 0x1f0a: 'BC6HU', 0x2001: 'BC7', 0x2006: 'BC7_SRGB',
                 0x0101: 'R4G4B4A4', 0x0201 + 1: 'R5G5B5A1', 0x0301: 'A1B5G5R5', 0x0501: 'R5G6B5', 0x0b06 + 1: 'R8G8B8A8', 0x0b01 + 5: 'R8G8B8A8_SRGB', 0x3b01: 'BGR5A1'}
@@ -259,9 +261,10 @@ def nutexb_texture(d):
 
 class Job:
     """One worker's state: counters and the planes it keyed"""
-    def __init__(self, lib, block, cache, encode, dicts, max_dim=0, bc1_block=0):
+    def __init__(self, lib, block, cache, encode, dicts, max_dim=0, bc1_block=0, fmt_blocks=None):
         self.L, self.block, self.cache, self.encode, self.dicts, self.max_dim = lib_open(lib), block, cache, encode, dicts, max_dim
         self.bc1_block = bc1_block or block
+        self.fmt_blocks = norm_fmt_blocks(*(fmt_blocks or ()))
         self.c = collections.Counter(); self.planes = []; self.formats = collections.Counter(); self.seen = set(); self.errors = []
 
     def texture(self, d, t, name):
@@ -277,7 +280,8 @@ class Job:
         if t['w'] == 0 or t['h'] == 0 or (not t['offs'] and not t.get('auto')) or t['w'] > 16384 or t['h'] > 16384: c['unparsed'] += 1; return
         c['eligible'] += 1
         nvn, alt = eligible
-        block = block_of(nvn, self.block, self.bc1_block)   # what the runtime's astc_block_for(format) answers
+        block = block_of(nvn, self.block, self.bc1_block, self.fmt_blocks)   # what the runtime's astc_block_for(format) answers
+        if not block: c['format_off'] += 1; return   # --bc4-block 0 (and the like): the pack does not cover the format
         pkg = 0 if t.get('auto') or os.environ.get('BNTX_ASTC_AUTO_LAYOUT') else (t['layout'] & 0xff) + 1   # SetPackagedTextureLayout's byte 0 (a NUTEXB has none: the automatic block height); --auto-layout is a diagnostic
         start, size = t['start'], t['size']
         if start + size > t['end']: c['short'] += 1; return
@@ -295,11 +299,11 @@ class Job:
         out = (Plane * cap)()
         n = self.L.dm_texture_planes(target, nvn, t['w'], t['h'], depth, t['mips'], pkg, addr(d) + start, size, block, alt, self.cache.encode() if self.cache else None, int(self.encode), out, cap, self.max_dim)
         if n < 0: c['layout_failed'] += 1; self.errors.append(f'{name}: layout failed ({n})'); return
-        c['converted'] += 1
+        c['converted'] += 1; c['conv_' + FORMAT_NAMES.get(t['fmt'], '%#x' % t['fmt'])] += 1
         for i in range(n):
             p = out[i]
             if p.error: c['plane_errors'] += 1; self.errors.append(f'{name}: plane {p.level}/{p.layer} error'); continue
-            self.planes.append((p.key.decode(), p.key2.decode() if alt else '', p.width, p.height, p.astc_bytes, p.hit))
+            self.planes.append((p.key.decode(), p.key2.decode() if alt else '', p.width, p.height, p.astc_bytes, p.hit, DECODED_BPP.get(nvn, 4)))
 
     def blob(self, d, name, depth=0, hint=''):
         c = self.c
@@ -394,13 +398,29 @@ def folder_files(path):
 BC1_NVN = (0x41, 0x42, 0x45, 0x46)   # NVN BC1 formats and their sRGB forms
 
 
-def block_of(nvn, block, bc1_block):
-    """The ASTC block a plane of this NVN format is keyed and encoded at (the runtime's astc_block_for)"""
+# BC4 (0x49) / BC5 (0x4b) / unsigned BC6H (0x50) have blocks of their own (the runtime's DM_NVN_BC4_ASTC / DM_NVN_BC5_ASTC / DM_NVN_BC6H_ASTC): default 6, 4, 4; 0 leaves the format out of the pack.
+# Bytes a texel takes in today's decoded storage (R8, RG8, RG11B10Float; RGBA8 for the rest): what the pack's planes replace
+FMT_NVN = (0x49, 0x4b, 0x50)
+FMT_DEFAULT_BLOCKS = (6, 4, 4)
+DECODED_BPP = {0x49: 1, 0x4b: 2, 0x50: 4}
+
+
+def norm_fmt_blocks(bc4=None, bc5=None, bc6h=None):
+    """(BC4, BC5, BC6H) ASTC blocks; None is the runtime's default, 0 leaves the format out"""
+    out = tuple(d if v is None else int(v) for v, d in zip((bc4, bc5, bc6h), FMT_DEFAULT_BLOCKS))
+    if any(v not in (0, 4, 5, 6) for v in out): raise SystemExit('--bc4-block, --bc5-block and --bc6h-block must be 0, 4, 5 or 6')
+    return out
+
+
+def block_of(nvn, block, bc1_block, fmt_blocks=None):
+    """The ASTC block a plane of this NVN format is keyed and encoded at (the runtime's astc_block_for); 0: the pack does not hold the format"""
+    if nvn in FMT_NVN: return norm_fmt_blocks(*(fmt_blocks or ()))[FMT_NVN.index(nvn)]
     return (bc1_block or block) if nvn in BC1_NVN else block
 
 
-def fingerprint(romfs, block, max_dim=0, bc1_block=0):
+def fingerprint(romfs, block, max_dim=0, bc1_block=0, fmt_blocks=None):
     h = hashlib.sha256(); h.update(sources_hash().encode()); h.update(b'block %d\0max_dim %d\0' % (block, max_dim))
+    h.update(b'bc4 %d bc5 %d bc6h %d\0' % norm_fmt_blocks(*(fmt_blocks or ())))   # the blocks BC4 / BC5 / BC6H planes are keyed and encoded at
     h.update(b'bc1_block %d\0' % (bc1_block or block))   # BC1 planes are keyed and encoded at their own block   # the texture cap decides which levels the pack holds
     with open(os.path.abspath(__file__), 'rb') as f: h.update(f.read())   # the tool's own logic (what it finds and how it names it) is part of what the pack holds
     if os.path.isfile(romfs):
@@ -415,13 +435,13 @@ def fingerprint(romfs, block, max_dim=0, bc1_block=0):
 _STATE = {}
 
 
-def init_worker(lib, block, cache, encode, romfs, dicts, max_dim=0, bc1_block=0):
-    _STATE.update(lib=lib, block=block, bc1_block=bc1_block, max_dim=max_dim, cache=cache, encode=encode, romfs=romfs, dicts=dicts, fd=os.open(romfs, os.O_RDONLY) if os.path.isfile(romfs) else None)
+def init_worker(lib, block, cache, encode, romfs, dicts, max_dim=0, bc1_block=0, fmt_blocks=None):
+    _STATE.update(lib=lib, block=block, bc1_block=bc1_block, fmt_blocks=fmt_blocks, max_dim=max_dim, cache=cache, encode=encode, romfs=romfs, dicts=dicts, fd=os.open(romfs, os.O_RDONLY) if os.path.isfile(romfs) else None)
 
 
 def work(batch):
     s = _STATE
-    job = Job(s['lib'], s['block'], s['cache'], s['encode'], s['dicts'], s['max_dim'], s['bc1_block'])
+    job = Job(s['lib'], s['block'], s['cache'], s['encode'], s['dicts'], s['max_dim'], s['bc1_block'], s['fmt_blocks'])
     for name, off, size in batch:
         if s['fd'] is not None: head = os.pread(s['fd'], 4, off)
         else:
@@ -501,15 +521,16 @@ def batches(files, n):
     if batch: yield batch
 
 
-def prebuild(inp, out, block=4, workers=None, scan_only=False, force=False, log=print, drop_cache=False, verbose=False, max_dim=0, bc1_block=0):
+def prebuild(inp, out, block=4, workers=None, scan_only=False, force=False, log=print, drop_cache=False, verbose=False, max_dim=0, bc1_block=0, fmt_blocks=None):
     t0 = time.monotonic()
+    fmt_blocks = norm_fmt_blocks(*(fmt_blocks or ()))
     block = int(block); max_dim = max(int(max_dim or 0), 0); bc1_block = int(bc1_block or block)
     if block not in (4, 6): raise SystemExit('--block must be 4 or 6')
     if bc1_block not in (4, 5, 6): raise SystemExit('--bc1-block must be 4, 5 or 6')
     romfs = find_romfs(inp)
     os.makedirs(out, exist_ok=True)
     pack, cache = os.path.join(out, 'astc-ro.pack'), os.path.join(out, 'cache')
-    fp = fingerprint(romfs, block, max_dim, bc1_block)
+    fp = fingerprint(romfs, block, max_dim, bc1_block, fmt_blocks)
     have = read_pack_header(pack)
     if have and have['fingerprint'] == fp and not force and not scan_only:
         rep = {}
@@ -523,30 +544,32 @@ def prebuild(inp, out, block=4, workers=None, scan_only=False, force=False, log=
     files = image_files(romfs) if os.path.isfile(romfs) else folder_files(romfs)
     files = smash_arc_files(romfs, files)
     dicts = zs_dicts(romfs, files, lib)
-    log(f'astc: {romfs}: {len(files)} files, {sum(f[2] for f in files) / 2**30:.1f} GiB; ASTC {block}x{block}{f' (BC1 {bc1_block}x{bc1_block})' if bc1_block != block else ''}; texture cap {max_dim or 'none'}; library {os.path.basename(lib)}')
+    log(f'astc: {romfs}: {len(files)} files, {sum(f[2] for f in files) / 2**30:.1f} GiB; ASTC {block}x{block}{f' (BC1 {bc1_block}x{bc1_block})' if bc1_block != block else ''}; BC4/BC5/BC6H blocks {'/'.join(str(b) for b in fmt_blocks)}; texture cap {max_dim or 'none'}; library {os.path.basename(lib)}')
     workers = workers or os.cpu_count() or 4
     total = collections.Counter(); formats = collections.Counter(); keys = {}; errors = []; plane_count = 0; hits = 0
     unique = {}
     scanned = 0; t1 = time.monotonic()
     chunks = list(batches(files, 64 << 20 if len(files) > workers * 8 else 1))
-    with cf.ProcessPoolExecutor(workers, initializer=init_worker, initargs=(lib, block, cache, not scan_only, romfs, dicts, max_dim, bc1_block)) as ex:
+    with cf.ProcessPoolExecutor(workers, initializer=init_worker, initargs=(lib, block, cache, not scan_only, romfs, dicts, max_dim, bc1_block, fmt_blocks)) as ex:
         for r in ex.map(work, chunks):
             total.update(r['c']); formats.update(r['formats']); errors += r['errors']; total['n_errors'] += r['n_errors']
-            for key, key2, w, h, astc, hit in r['planes']:
+            for key, key2, w, h, astc, hit, bpp in r['planes']:
                 plane_count += 1
                 if key not in unique:
-                    unique[key] = (w, h, astc); hits += hit
+                    unique[key] = (w, h, astc, bpp); hits += hit
                     keys[key] = key
                 if key2 and key2 not in keys: keys[key2] = key
             scanned += 1
             if scanned % 20 == 0: log(f'astc: {scanned}/{len(chunks)} batches, {len(unique)} unique planes, {time.monotonic() - t1:.0f} s')
     t_scan = time.monotonic() - t1
-    rgba = sum(w * h * 4 for w, h, _ in unique.values())
+    rgba = sum(w * h * 4 for w, h, _, _ in unique.values())   # as RGBA8 (the pack's convention)
+    decoded = sum(w * h * bpp for w, h, _, bpp in unique.values())   # in the storage the runtime uses without the pack (R8, RG8, RG11B10Float, RGBA8)
     digest = hashlib.sha256(b''.join(bytes.fromhex(k) for k in sorted(unique))).hexdigest()
     rep = dict(input=romfs, block=block, bc1_block=bc1_block, max_dim=max_dim, files=len(files), textures_found=total['textures'], bntx_files=total['bntx'], eligible_textures=total['eligible'], converted_textures=total['converted'],
                repeated_textures=total['repeat'], nutexb_files=total['nutexb'], layout_differs=total['layout_differs'], layout_failed=total['layout_failed'], unparsed=total['unparsed'], short=total['short'],
                ineligible_shape=total['ineligible_shape'], container_errors=total['container_errors'], plane_errors=total['plane_errors'], planes=plane_count, unique_planes=len(unique), keys_sha256=digest,
-               decoded_rgba_bytes_covered=rgba, astc_bytes=sum(a for _, _, a in unique.values()), formats=dict(formats.most_common()), encoded_now=len(unique) - hits, cached_before=hits,
+               decoded_rgba_bytes_covered=rgba, astc_bytes=sum(a for _, _, a, _ in unique.values()), decoded_bytes_covered=decoded, fmt_blocks=dict(zip(('bc4', 'bc5', 'bc6h'), fmt_blocks)),
+               converted_by_format={k[5:]: v for k, v in sorted(total.items()) if k.startswith('conv_')}, formats=dict(formats.most_common()), encoded_now=len(unique) - hits, cached_before=hits,
                scan_seconds=round(t_scan, 1), error_samples=errors[:20])
     if scan_only:
         log('astc: ' + json.dumps({k: v for k, v in rep.items() if k not in ('formats', 'error_samples')}) if not verbose else json.dumps(rep, indent=1)); return rep
@@ -567,6 +590,8 @@ def main():
     ap.add_argument('--out', required=True, help='output folder: cache/, astc-ro.pack, report.json')
     ap.add_argument('--block', type=int, default=4, choices=(4, 6), help='ASTC block size (the runtime reads the same DM_NVN_BC_ASTC)')
     ap.add_argument('--bc1-block', type=int, default=0, choices=(0, 4, 5, 6), help='ASTC block size of the BC1 textures (the runtime reads DM_NVN_BC1_ASTC); default: --block')
+    for nm, dflt, rt in (('bc4', 6, 'DM_NVN_BC4_ASTC'), ('bc5', 4, 'DM_NVN_BC5_ASTC'), ('bc6h', 4, 'DM_NVN_BC6H_ASTC')):
+        ap.add_argument('--%s-block' % nm, type=int, default=None, choices=(0, 4, 5, 6), help='ASTC block size of the %s textures (the runtime reads %s; default %d); 0 leaves the format out of the pack' % (nm.upper(), rt, dflt))
     ap.add_argument('--max-dim', type=int, default=0, help="the game's texture cap (DM_BC_MAX_DIM, 0 = none): only the mip levels the runtime keeps under it are packed")
     ap.add_argument('--workers', type=int, default=0, help='processes (default: every core)')
     ap.add_argument('--scan-only', action='store_true', help='find and key the planes; encode and write nothing')
@@ -578,7 +603,7 @@ def main():
     if a.auto_layout:
         if not a.scan_only: ap.error('--auto-layout is a diagnostic: use it with --scan-only')
         os.environ['BNTX_ASTC_AUTO_LAYOUT'] = '1'
-    prebuild(a.input, a.out, a.block, a.workers or None, a.scan_only, a.force, drop_cache=a.drop_cache, verbose=a.json, max_dim=a.max_dim, bc1_block=a.bc1_block)
+    prebuild(a.input, a.out, a.block, a.workers or None, a.scan_only, a.force, drop_cache=a.drop_cache, verbose=a.json, max_dim=a.max_dim, bc1_block=a.bc1_block, fmt_blocks=(a.bc4_block, a.bc5_block, a.bc6h_block))
 
 
 if __name__ == '__main__':
