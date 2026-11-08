@@ -158,13 +158,13 @@ def frame_features(buf, max_frames=1 << 20, zero_tail=False):
     return res
 
 
-def forbidden(new, orig=None, skippable_ok=False):
+def forbidden(new, orig=None, skippable_ok=False, rle_literals=False):
     """Reasons a frame `new` uses a zstd feature that the archive's own frames (`orig`, when given) do not: block types outside raw/compressed, literal types outside raw/Huffman/treeless,
     a skippable frame where the original has none (unless skippable_ok). -> list of strings"""
     f = frame_features(new)
     bad = []
     if f['blocks'] - ALLOWED_BLOCKS: bad.append(f'block types {sorted(f["blocks"] - ALLOWED_BLOCKS)}')
-    if f['literals'] - ALLOWED_LITERALS: bad.append(f'literal types {sorted(f["literals"] - ALLOWED_LITERALS)}')
+    if f['literals'] - (ALLOWED_LITERALS | {'rle'} if rle_literals else ALLOWED_LITERALS): bad.append(f'literal types {sorted(f["literals"] - ALLOWED_LITERALS)}')
     if f['skippable'] and not skippable_ok and (orig is None or not frame_features(orig)['skippable']): bad.append('a skippable frame')
     return bad
 
@@ -174,9 +174,9 @@ def forbidden(new, orig=None, skippable_ok=False):
 # their content (no content size in the header). Re-packing with that encoder, at the level that reproduces each original frame, gives frames the game's own decoder reads.
 
 def build_exact(work):
-    """libzstd v1.3.5 (tex_once_zstd135_norlelit.patch), cached in work by its patch's and script's hash. -> path"""
+    """libzstd v1.3.5, unpatched, cached in work by its script's hash. -> path"""
     h = hashlib.sha256()
-    for f in ('tex_once_zstd135_norlelit.patch', 'tex_once_zstd135_build.sh'):
+    for f in ('tex_once_zstd135_build.sh',):
         with open(os.path.join(HERE, f), 'rb') as fh: h.update(fh.read())
     lib = os.path.join(work, f'libzstd135-{h.hexdigest()[:16]}.dylib')
     if os.path.exists(lib): return lib

@@ -1,8 +1,8 @@
 #!/bin/sh
 # Builds libzstd v1.3.5, the encoder Nintendo packed Super Smash Bros. Ultimate's data.arc with, as a dylib. Streaming API at an unknown size reproduces the archive's frames byte for byte.
-# One minimal patch (tex_once_zstd135_norlelit.patch): no RLE literals, a feature the archive's frames never use (v1.3.5 never emits RLE blocks).
+# Unpatched: v1.3.5 never emits RLE blocks, and the RLE literals it does emit are in the archive's own frames (an entry at offset 9515678648 has them).
 #   usage: tex_once_zstd135_build.sh <work dir> <output dylib>
-# Fetches facebook/zstd at the pinned tag into <work dir>/zstd135-src (once; ZSTD135_SRC=<a clone that has the tag> skips the network), verifies the commit, applies the patch, compiles lib/common + lib/compress.
+# Fetches facebook/zstd at the pinned tag into <work dir>/zstd135-src (once; ZSTD135_SRC=<a clone that has the tag> skips the network), verifies the commit, compiles lib/common + lib/compress.
 set -eu
 TAG=v1.3.5
 COMMIT=90ae50224d15e8dbcb9fa26b9be096366733db8e
@@ -15,7 +15,6 @@ if [ ! -d "$SRC/.git" ]; then
 fi
 [ "$(git -C "$SRC" rev-parse HEAD)" = "$COMMIT" ] || { echo "zstd source is not $TAG ($COMMIT)" >&2; exit 1; }
 git -C "$SRC" checkout -q -- .
-git -C "$SRC" apply "$HERE/tex_once_zstd135_norlelit.patch"
 MAC=""; [ "$(uname)" = Darwin ] && MAC="-dynamiclib -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET:-12.0}" || MAC="-shared"
 clang -O2 -fPIC -DZSTD_MULTITHREAD=0 -DZSTD_LEGACY_SUPPORT=0 $MAC -I"$SRC/lib" -I"$SRC/lib/common" -I"$SRC/lib/compress" \
   "$SRC"/lib/common/*.c "$SRC"/lib/compress/*.c -o "$OUT.$$.part"

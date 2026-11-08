@@ -981,7 +981,7 @@ class ExactEncoderTests(unittest.TestCase):
             f = tool.Z.exact_compress(data, level)
             self.assertEqual(tool.zstd_header(f), (0x00, window))         # no content size, no checksum, no dictionary; the level's window
             self.assertEqual(z.decompress(f), data)
-            self.assertEqual(tool.Z.forbidden(f), [])
+            self.assertEqual(tool.Z.forbidden(f, rle_literals=True), [])
         self.assertEqual(z.decompress(tool.Z.exact_compress(b'', 9)), b'')
 
     def test_no_rle_blocks_or_literals_in_zeroed_data(self):
@@ -989,7 +989,7 @@ class ExactEncoderTests(unittest.TestCase):
         for data in (bytes(3 << 20), bytes(100), b'ab' * 40 + bytes(5000), NoRleZstdTests.sparse_data(), b'\x07' * 70_000 + b'\x01' * 300):
             for level in (1, 9, 19, 22):
                 f = tool.Z.exact_compress(data, level)
-                self.assertEqual(tool.Z.forbidden(f), [], (len(data), level))
+                self.assertEqual(tool.Z.forbidden(f, rle_literals=True), [], (len(data), level))   # no RLE blocks; RLE literals are what the game's own archive has too
                 self.assertEqual(z.decompress(f), data)
 
     def test_level_detection(self):

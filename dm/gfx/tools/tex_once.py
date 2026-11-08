@@ -351,7 +351,7 @@ class Walker:
         if lv is None: self.c['encoder_unmatched'] += 1; return None
         comp = Z.exact_compress(data, lv)
         new = self.pad_exact(comp, len(orig), top)
-        if new is None or Z.forbidden(comp): self.c['encoder_exact_unusable'] += 1; return None
+        if new is None or Z.forbidden(comp, rle_literals=True): self.c['encoder_exact_unusable'] += 1; return None
         self.c['encoder_matched'] += 1; self.c[f'encoder_level:{lv}'] += 1
         if top == 'arc': self.new_csz = len(comp)
         return new
@@ -458,7 +458,7 @@ class Walker:
                 nn = n[:top_csz]
             if nn[:4] != ZSTD_MAGIC and not (len(nn) >= 4 and struct.unpack('<I', nn[:4])[0] in B.SKIPPABLE): raise Mismatch(f'{name}: no zstd frame')
             if o != n:
-                try: bad = Z.forbidden(nn, o, skippable_ok=top_csz is None)   # a data.arc entry never gets a skippable frame (zero tail); other zstd files are padded with one to fill their slot
+                try: bad = Z.forbidden(nn, o, skippable_ok=top_csz is None, rle_literals=Z.match_level(o, B.unzstd(o, self.dicts)) is not None)   # a data.arc entry never gets a skippable frame (zero tail); other zstd files are padded with one to fill their slot
                 except (ValueError, IndexError) as e: raise Mismatch(f'{name}: the new zstd data is not a readable frame run ({e})')
                 if bad: raise Mismatch(f'{name}: the new zstd frame uses {bad}, which the original does not; the game decodes only the original archive\'s features')
             ho, hn = zstd_header(o), zstd_header(nn)
@@ -639,7 +639,7 @@ class Arc:
         frame, lv = None, Z.match_level(orig[16:16 + T['stored']], bytes(T['fs']))
         if lv is not None:
             frame = Z.exact_compress(bytes(fs), lv)
-            if len(frame) > T['stored'] or Z.forbidden(frame): frame, lv = None, None
+            if len(frame) > T['stored'] or Z.forbidden(frame, rle_literals=True): frame, lv = None, None
         self.encoder = dict(level=lv) if lv is not None else dict(unmatched=True)
         if frame is None: frame = zstd_table_frame(bytes(fs), T['stored'], orig[16:16 + T['stored']])
         if frame is None: raise RuntimeError('the rewritten data.arc table does not fit its slot')
@@ -658,7 +658,7 @@ def log(msg): print('tex_once: ' + msg, file=sys.stderr, flush=True)
 
 def tool_hash():
     h = hashlib.sha256()
-    for f in ('tex_once.py', 'sparse_image.py', 'tex_once_native.c', 'tex_once_zstd.py', 'tex_once_zstd_norle.patch', 'tex_once_zstd_build.sh', 'tex_once_zstd135_norlelit.patch', 'tex_once_zstd135_build.sh'):
+    for f in ('tex_once.py', 'sparse_image.py', 'tex_once_native.c', 'tex_once_zstd.py', 'tex_once_zstd_norle.patch', 'tex_once_zstd_build.sh', 'tex_once_zstd135_build.sh'):
         with open(os.path.join(HERE, f), 'rb') as fh: h.update(fh.read())
     return h.digest()
 

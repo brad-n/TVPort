@@ -42,7 +42,7 @@ def work(job):
         if sa == sb and da == db: c['identical'] += 1; continue
         try: ia, ib = _inflate(da), _inflate(db)
         except Exception as e: c['undecodable'] += 1; bad.append((off, str(e)[:80])); continue
-        if ia[:size] == ib[:size] and len(ia) == len(ib): c['same_content_different_bytes'] += 1
+        if ia[:size] == ib[:size] and len(ia) == len(ib): c['same_content_different_bytes'] += 1; bad.append((off, f'recompressed: stored {sa} -> {sb}, inflated {len(ia)}, header {da[4:6].hex()} -> {db[4:6].hex()}'))
         else: c['content_changed'] += 1; bad.append((off, 'content'))
         if sb < sa: c['stored_smaller'] += 1
         elif sb > sa: c['stored_larger'] += 1
