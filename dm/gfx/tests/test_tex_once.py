@@ -566,6 +566,7 @@ class StripTests(unittest.TestCase):
             elif k == '--force': ns.force = True; i += 1
             elif k == '--bc1-block': ns.bc1_block = int(argv[i + 1]); i += 2
             elif k == '--no-pack-check': ns.no_pack_check = True; i += 1
+            elif k in ('--bc4-block', '--bc5-block', '--bc6h-block'): setattr(ns, k[2:].replace('-', '_'), int(argv[i + 1])); i += 2
             elif k == '--compress': ns.compress = argv[i + 1]; i += 2
             elif k == '--zlevel': ns.zlevel = int(argv[i + 1]); i += 2
             else: i += 1
