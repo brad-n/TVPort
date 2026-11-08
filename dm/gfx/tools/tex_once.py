@@ -82,20 +82,49 @@ def skippable_frame(n):
     return struct.pack('<II', SKIPPABLE_FIRST, n - 8) + bytes(n - 8)
 
 
-def zstd_stream(data, slot, zd=None):
-    """`data` as one zstd frame of at most `slot` bytes (tries stronger levels when the first does not fit), or None"""
+def zstd_header(f):
+    """The layout of a zstd frame's header: (frame header descriptor byte, window descriptor byte or None), or None for no frame"""
+    if len(f) < 5 or f[:4] != ZSTD_MAGIC: return None
+    return f[4], (None if (f[4] >> 5) & 1 else (f[5] if len(f) > 5 else None))
+
+
+def zstd_options(z, level, like):
+    """Compression options that give the new frame the header layout of `like`, the original frame it replaces.
+    Smash's own zstd decoder takes only the layout the game shipped with (every frame in its data.arc, table included: descriptor 0 = no content
+    size, a window descriptor, no checksum, no dictionary ID). Frames with a content size / single segment (zstd's defaults) hung it at boot
+    (2026-11-08), so the new frame copies the original's flags and its window."""
+    P = z.CompressionParameter
+    opts = {P.compression_level: level}
+    h = zstd_header(like) if like else None
+    if h is None: return opts
+    fhd, wd = h
+    opts[P.checksum_flag] = (fhd >> 2) & 1
+    opts[P.dict_id_flag] = 1 if fhd & 3 else 0
+    opts[P.content_size_flag] = 1 if (fhd >> 6) or ((fhd >> 5) & 1) else 0
+    if wd is not None:
+        opts[P.window_log] = max(10, 10 + (wd >> 3) + (1 if wd & 7 else 0))   # the power of two covering the original's window
+    return opts
+
+
+def zstd_compress(z, data, level, zd=None, like=None):
+    opts = zstd_options(z, level, like)
+    return z.compress(data, options=opts, zstd_dict=zd) if zd else z.compress(data, options=opts)
+
+
+def zstd_stream(data, slot, zd=None, like=None):
+    """`data` as one zstd frame of at most `slot` bytes (tries stronger levels when the first does not fit), or None. like: the original frame, whose header layout the new one copies"""
     z = B.zstd_module()
     for level in ZSTD_LEVELS[:2 if len(data) > (32 << 20) else 3]:
-        comp = z.compress(data, level=level, zstd_dict=zd) if zd else z.compress(data, level=level)
+        comp = zstd_compress(z, data, level, zd, like)
         if len(comp) <= slot: return comp
     return None
 
 
-def zstd_slot(data, slot, zd=None, min_tail=0, levels=None):
+def zstd_slot(data, slot, zd=None, min_tail=0, levels=None, like=None):
     """`data` compressed into exactly `slot` bytes: the stream, then one skippable frame of zeros to the slot's end. None when it does not fit, or leaves a tail of 1..7 bytes (no room for the frame's header)"""
     z = B.zstd_module()
     for level in levels or ZSTD_LEVELS[:2 if len(data) > (32 << 20) else 3]:
-        comp = z.compress(data, level=level, zstd_dict=zd) if zd else z.compress(data, level=level)
+        comp = zstd_compress(z, data, level, zd, like)
         tail = slot - len(comp)
         if tail == 0 and not min_tail: return comp
         if tail >= max(8, min_tail): return comp + skippable_frame(tail)
@@ -307,11 +336,11 @@ class Walker:
         """`data` compressed into the slot of `orig`: the stream and one skippable frame of zeros to the slot's end (a data.arc entry whose size the table records: the stream and a zero tail).
         None when it does not fit (or leaves a tail under 8 bytes, too short for the frame's header)"""
         if top == 'arc':
-            comp = zstd_stream(data, len(orig), self.zdict(orig))
+            comp = zstd_stream(data, len(orig), self.zdict(orig), like=orig)
             if comp is None: return None
             self.new_csz = len(comp)
             return comp + bytes(len(orig) - len(comp))
-        return zstd_slot(data, len(orig), self.zdict(orig))
+        return zstd_slot(data, len(orig), self.zdict(orig), like=orig)
 
     def sub(self, d, name, depth, hint, top=None):
         """strip() with its own counters: -> (new bytes or None, the counters it made); an error leaves the container as it is"""
@@ -399,6 +428,9 @@ class Walker:
                 if n[top_csz:].count(0) != len(n) - top_csz: raise Mismatch(f'{name}: bytes after the new stream are not zero')
                 nn = n[:top_csz]
             if nn[:4] != ZSTD_MAGIC and not (len(nn) >= 4 and struct.unpack('<I', nn[:4])[0] in B.SKIPPABLE): raise Mismatch(f'{name}: no zstd frame')
+            ho, hn = zstd_header(o), zstd_header(nn)
+            if ho is not None and hn is not None and o != n and (ho[0] != hn[0] or (ho[1] is None) != (hn[1] is None)):
+                raise Mismatch(f'{name}: zstd frame header layout changed ({ho[0]:#04x} -> {hn[0]:#04x}); the game decodes only the original layout')
             do, dn = B.unzstd(o, self.dicts), B.unzstd(nn, self.dicts)
             if len(do) != len(dn): raise Mismatch(f'{name}: the inflated size changed')
             self.check(do, dn, name, depth + 1, hint)
@@ -558,8 +590,9 @@ class Arc:
             for fdi in self.fd.get(at, ()):
                 p = T['FD'] + 16 * fdi + 4
                 if struct.unpack_from('<I', fs, p)[0] == old[at]: struct.pack_into('<I', fs, p, new); n += 1
-        slot = zstd_slot(bytes(fs), T['stored'], levels=TABLE_LEVELS)
+        slot = zstd_slot(bytes(fs), T['stored'], levels=TABLE_LEVELS, like=orig[16:])
         if slot is None: raise RuntimeError('the rewritten data.arc table does not fit its slot')
+        if zstd_header(slot) != zstd_header(orig[16:]): raise RuntimeError(f'the rewritten data.arc table frame has header {zstd_header(slot)}, the original {zstd_header(orig[16:])}: the game decodes only the original layout')
         return orig[:16] + slot, bytes(fs)
 
 
