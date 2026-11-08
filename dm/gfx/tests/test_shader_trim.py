@@ -206,7 +206,7 @@ class Split(unittest.TestCase):
 @unittest.skipUnless(have_zstd() and sys.platform == 'darwin' and shutil.which('clang') and shutil.which('xcrun'), 'needs libzstd, macOS, clang and the Metal toolchain')
 class Host(unittest.TestCase):
     def test_host_reads_and_compiles_source_entries(self):
-        game = os.environ.get('DM_TEST_GAME', '0100152000022000')
+        game = '0100152000022000'   # any profile builds the host test
         gfx = DM / 'gfx/tests'
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -1,6 +1,53 @@
 # Shader trimming: ship the used shaders compiled, the rest as compressed MSL
 
-Status: design, with measurements from the apps built on the Mac mini. Nothing here is implemented. The A15 compile cost is not measured yet (test app: `~/workspace/TVPort-spikes/shader-compile/` on the mini).
+Status: built (branch feat/shader-trim). The design and measurements below are the spike's; the section "As built" is what the code does. The A15 numbers are from the test app (`~/workspace/TVPort-spikes/shader-compile/results-A15-2026-11-08`): newLibraryWithSource costs about 129 ms per vertex shader, 46 ms per pixel shader and 58 ms per kernel cold, 76 ms of wall time per shader with 4 threads, and Metal returns an unchanged source in about 0 ms on the next launch (the cache persists across launches). Pipeline creation is about 0.1 ms.
+
+## As built
+
+**Image.** `dm/gfx/tools/shader_trim.py split` makes one image, `b-<chain>.img`, the same romfs format as before (`dm/tools/shader_lib.py`, read in place by `msl_image.h`), from the app image of the build (`shader/ios/b-<chain>.img`, compiled) and the Mac cache image of the same build (`shader/cache/b-<chain>.img`, which keeps each shader's `_b.metal`). A vertex or pixel shader whose key is in the used list keeps all its compiled files. Every other vertex or pixel shader becomes source entries, zstd level 19 with a dictionary trained on the game's own sources (112 KB for the MSL, 32 KB for the reflection json):
+
+| entry | holds |
+|---|---|
+| `<key>_b.msl` | the shader's plain MSL (`_b.metal` of the cache image) |
+| `<key>_bp.msl` | the pulling vertex library's MSL, only when the reflection has `pull` (`dmsh_pull.variant`) |
+| `<key>_bv.msl` | the shadow-input library's MSL, only when the reflection has `vin` (`dmsh_vin.variant`) |
+| `<key>_bu.msl` | the compile unit that `_bx` (alpha test, logic operation) and `_bf` (readable tile) are cut from at build time (`dmsh_side.unit`, folded by `dmsh_fetch.fold` when the reflection has `fetch`); one library serves both names on the device. Only when the reflection has `alpha`, `logic` or `fetch` |
+| `<key>_b.jsonz` | the reflection json, zstd with its own dictionary (the host reads it where it read `<key>_b.json`) |
+| `trim.dict`, `trim_json.dict`, `trim.tsv` | the dictionaries, and the index of what is in source form |
+
+The variants are regenerated from `_b.metal` by the functions `dmsh_build.py` calls, so the sidecar libraries are the build's own (checked: the `_b`, `_bp` and `_bv` libraries compiled from the entries are byte-identical to the shipped ones; `_bx` and `_bf` are cuts of a compile of `_bu`, so only their function lists can be compared). The sidecar sources live in the same image because the host's one reader (`msl_image_find`) finds them by name. Compute, geometry and tessellation shaders, shaders without a source in the cache image, and the files that are not a shader's (`inputs.tsv`, the geometry kernels) stay compiled. `shader_trim.py` also writes `shader_map.tsv` with a sixth column, `form`: `lib` (a compiled library in the image, as before) or `src`. A map without the column is all `lib`. `shader_trim.py check <dir>` verifies image against map; `count --used` counts the shaders the lists name.
+
+**Used list.** Keys of the S and C rows, and the vertex and fragment keys of the R rows (`pso_skey_hex`), of the Apple TV's recorded list (`<build>/tvport-shaders.tsv`, kept by `remember_shaders`) and the profile's `pso_manifest.tsv`.
+
+**Runtime.** `dm/gfx/nvn/nvn_shader_trim.m` (module) and `nvn_mtl.m` (wiring):
+- `shmap_read` reads column 6, starts `nvn_shader_trim.m`'s compile threads (3; `DM_SHADER_TRIM_JOBS`, 2 to 4 sensible) and gives it the `src` keys.
+- `shader_load` of a `src` key asks the module for the shader (`trim_ensure`). The first request queues one job that, on a compile thread, inflates every source entry of the shader (zstd with the dictionary, 0.1 to 0.3 ms) and compiles it with `newLibraryWithSource`; the shader is ready when all its libraries are, so its sidecars never compile on the submit thread. Until then `shader_load` returns nil with `t_trim_pending` set: no error line, nothing recorded.
+- Three request modes: the prefetch (`mtl_prog_prefetch`, `shader_prefetch_rest`) queues behind the rest, a draw's `prog_get` goes to the front, the prewarm (`warm_task`, which runs while the game loads) goes to the front and waits.
+- `prog_get`: a program with a pending shader is returned incomplete, flagged `trim_pending`, kept apart from the serial table (so the stage is not lost for good) and reused until its shaders are ready; it is then built normally. The draw (`draw`, "a shader is compiling from source") skips a draw with a flagged program: counted per draw, logged once per shader (the first 200).
+- Recording: once a shader has loaded, `shader_get` writes its S row to `pso_user.tsv` exactly as for a compiled one, so `remember_shaders` folds it into the next build's used list and it ships compiled next time. A shader that was only skipped is not recorded until it has loaded (the game keeps drawing, so that is the next frame).
+- `lib_from_file` serves a source shader's `_b`, `_bp`, `_bv`, `_bx`, `_bf` from the module; `msl_data` serves its json from `<key>_b.jsonz`.
+- Counters on the `[bootprof]` line and the "pipeline prewarm done" neighbourhood: shaders compiled on the device, libraries, compile time, failures, draws skipped and shaders skipped.
+- Compile options (`trim_compile_options`): `mathMode = relaxed`, `preserveInvariance = YES`, MSL 3.2 (iOS 18), the default optimization level. Not matchable: `-O1` (`MTLCompileOptions` has only Default and Size), `-fbracket-depth=1024` (the front end keeps its 256 nested brackets, so a shader that needs more fails on the device; the build's largest need to be checked on the TV), the precompiled header (an output-neutral speed-up). The device compiler is also the OS's, not the build's `metal` of Xcode, so the machine code can differ.
+
+**TVPort.** Advanced > Trim shaders: Automatic (on when the used list, the TV's and the profile's together, names at least 1,000 shaders) / On / Off. `--trim-shaders auto|on|off` of `backend.py build`; `trim_shaders` runs `shader_trim.py split` into `<build>/tvport-shadertrim` (cached by a fingerprint of the images, the lists, the map and the tool), `generate_project` builds against it (`MSL_IOS`) and copies its shader map over the project's. Any failure builds the full set with one log line. A pipeline archive (`--gpu`) is made from the same image, so it covers the compiled shaders only.
+
+**Numbers (this Mac, `shader_trim.py split`, level 19, 4 threads, 12 to 14 minutes each).** Image `b-<chain>.img` of the game's app, from the build folders in `~/Downloads/switch games`, lists = the Apple TV's recorded list plus the profile's:
+
+| | image today | trimmed image | compiled | source + json | used / all shaders | source-form shaders |
+|---|---|---|---|---|---|---|
+| Mario Kart 8 Deluxe | 2,091 MB | 1,043 MB (-50%) | 837 MB + 37 MB json | 112 MB + 2 MB | 12,641 / 29,651 | 16,998 (57%), 34,006 source entries |
+| Super Smash Bros. Ultimate | 2,618 MB | 934 MB (-64%) | 633 MB + 32 MB json | 218 MB + 2 MB | 10,891 / 35,012 | 24,088 (69%), 48,176 source entries |
+
+The rest of the app is unchanged (MK8 about 0.1 GB, Smash about 0.5 GB), so the apps come to about 1.15 GB (was 2.1 GB) and 1.45 GB (was 2.9 GB). A random sample of the trimmed shaders (300 from MK8, 200 from Smash, all their libraries: 598 and 400) inflated and compiled on the Mac mini (M2 Pro, 3 threads) with the runtime's own module and options with no failure, about 100 ms of wall time per shader with the machine busy; the A15 is slower (the spike's 76 ms per shader with 4 threads, so a scene that meets 50 new shaders is without them for a few seconds).
+
+**Open risks.** Not measured on the Apple TV (nothing was installed): the A15 compile time under real play, whether Metal's source cache survives eviction between launches, memory while 3 compiles run beside the game (the 2 GB limit), and whether a shader that needs more than 256 nested brackets (the build uses 1024) fails to compile on the device (the 500 samples all compiled on the Mac, which has the same limit). A scene that meets many new shaders draws without those objects until they compile (their draws are skipped, not stalled); the first run of a game with a short list is mostly this. All of a shader's libraries compile together, so a pulling or alpha-test library that would be used late is compiled early. A pipeline archive (`--gpu`) covers the compiled shaders only. `_bx` and `_bf` come from one compile of the unit and not the build's two cuts, so their machine code can differ from a full build's.
+
+---
+
+# Design and measurements (the spike)
+
+Status of this part: the design as written before the build, with its measurements; "As built" above is what the code does (the differences: one image, not a second file; sidecar libraries regenerated from `_b.metal`; the unit serves `_bx` and `_bf`; misses are not recorded but pending).
+
 
 ## App contents (measured)
 

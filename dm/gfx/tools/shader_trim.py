@@ -135,7 +135,7 @@ def entries_of(path):
     return {e.name: e.stat().st_size for e in romfs.Path(path).iterdir()}
 
 
-def split(compiled, sources, map_path, used_paths, out_dir, level=19, jobs=4, say=print, limit=None, bf_want=frozenset()):
+def split(compiled, sources, map_path, used_paths, out_dir, level=19, jobs=4, say=lambda *a: print(*a, flush=True), limit=None, bf_want=frozenset()):
     """Writes out_dir/b-<chain>.img (trimmed), out_dir/shader_map.tsv and out_dir/trim_report.json. → the report dict"""
     t0 = time.time(); z = Zstd()
     used, rows = read_used(used_paths)
@@ -185,9 +185,7 @@ def split(compiled, sources, map_path, used_paths, out_dir, level=19, jobs=4, sa
             if blobs is None: skipped.append((k, info)); continue
             files.update(blobs); src_keys[k] = info
             if i % 2000 == 0: say(f'  {i}/{len(trim)} sources compressed ({time.time() - t0:.0f} s)')
-    gone = set()
-    for k in src_keys:
-        gone.update(n for n in cnames if n.startswith(k + '_b') and KEY.fullmatch(n))
+    gone = {n for n in cnames if (m := KEY.fullmatch(n)) and m.group(1) in src_keys}   # every compiled file of a shader that is in source form
     for n in cnames:
         if n not in gone: files[n] = str(cimg / n)
     files[DICT_MSL], files[DICT_JSON] = d_msl, d_json
