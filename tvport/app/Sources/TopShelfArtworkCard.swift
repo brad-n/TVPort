@@ -39,7 +39,7 @@ struct TopShelfArtworkCard: View {
             .accessibilityLabel("Top Shelf visible-area preview. Drop a PNG or JPEG. Recommended size 1920 by 720 pixels.")
             .dropDestination(for: URL.self) { urls, _ in
                 guard let url = urls.first, url.isFileURL else { return false }
-                if ["nsp", "xci", "nsz", "xcz"].contains(url.pathExtension.lowercased()) || url.hasDirectoryPath {
+                if ["nsp", "xci", "nsz", "xcz", "nup"].contains(url.pathExtension.lowercased()) || url.hasDirectoryPath {
                     if let game = library.current { library.attachAddons(urls, to: game.id) }
                     return true
                 }

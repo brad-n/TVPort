@@ -31,7 +31,7 @@ struct GameFolderDropTarget: ViewModifier {
             .alert("Couldn’t add this item", isPresented: $showingDropError) {
                 Button("OK", role: .cancel) {}
             } message: {
-                Text("Drop a game folder or an .nsp, .xci, .nsz or .xcz file. Make sure the drive is connected and the item is accessible.")
+                Text("Drop a game folder or an .nsp, .xci, .nsz, .xcz or .nup file. Make sure the drive is connected and the item is accessible.")
             }
     }
 }

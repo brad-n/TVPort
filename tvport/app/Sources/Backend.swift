@@ -28,6 +28,7 @@ struct GameInfo: Codable {
     let name: String
     let version: String
     let sources: [String]
+    let keyless: Bool?        // only NUP containers (Switch 2): no prod.keys needed
     let prepared: Bool
     let built: Bool?
     let render_scale: Bool?   // the rewritten game has a render-scale stub (backend.py render_scale_supported)
