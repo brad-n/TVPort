@@ -347,7 +347,7 @@ class StoreTexturesOnce(unittest.TestCase):
     def test_the_build_uses_the_stripped_image_for_the_app_and_the_install(self):
         generate, install, store = self.build(image=self.once)
         self.assertEqual(store.call_args.args[1:], (self.pack, 4, 'python3', 512, 4, True))
-        self.assertEqual(generate.call_args.args[5], self.once)
+        self.assertIsNone(generate.call_args.args[5])   # the app project always reads the plain RomFS.img: its build scripts run on the system Python (no zstd, 3.9), and the identity is the same
         self.assertEqual(install.call_args.args[3:], (self.pack, self.once))
 
     def test_the_build_skips_the_tool_when_off_or_without_compressed_textures(self):
@@ -470,14 +470,14 @@ class StoreTexturesOnce(unittest.TestCase):
     def test_with_the_stripped_image_the_no_pack_run_is_not_made(self):
         generate, install, store = self.build(image=self.once, nopack=self.root / 'np.img')
         self.compress_mock.assert_not_called()
-        self.assertEqual(generate.call_args.args[5], self.once)
+        self.assertIsNone(generate.call_args.args[5])   # the app project always reads the plain RomFS.img: its build scripts run on the system Python (no zstd, 3.9), and the identity is the same
 
     def test_without_a_stripped_image_the_build_compresses_the_whole_game_files(self):
         nopack = self.root / 'build/tvport-compress/romfs.img'
         for options in ({'image': None}, {'once': 'off'}, {'astc': 'off', 'pack': None}):
             generate, install, store = self.build(nopack=nopack, **options)
             self.compress_mock.assert_called_once()
-            self.assertEqual(generate.call_args.args[5], nopack, options)
+            self.assertIsNone(generate.call_args.args[5], options)   # the app project reads the plain RomFS.img (see cmd_build)
             self.assertEqual(install.call_args.args[4], nopack, options)
 
     def test_compress_off_builds_as_before_and_tells_texture_once_not_to_compress(self):

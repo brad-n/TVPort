@@ -1244,7 +1244,10 @@ def cmd_build(args) -> None:
     once = store_textures_once(game, pack, block, python, args.texture_cap, bc1_block, compress) if pack and texture_once_enabled(args, block) else None
     if once is None and compress:
         once = compress_game_data(game, python)   # no stripped image: the compressed whole RomFS.img (install sends the ASTC pack beside it when it does not carry one)
-    project = generate_project(game, args, team, bundle, python, once)
+    # The Xcode project reads the PLAIN RomFS.img (resources it copies, romfs.id identity): its build-phase scripts run on the system
+    # Python (3.9, no zstd module), which cannot read a compressed DMSPARS1 v2 image. Stripping and compressing never change the
+    # logical index or size, so the identity is the same and the app accepts the stripped/compressed image install() sends.
+    project = generate_project(game, args, team, bundle, python, None)
     bundle_shaders(game, project)
     compile_app(game, project, args.device)
     game.save_state(bundle_id=bundle, art=str(args.art) if args.art else None, mode=args.mode, texture_cap=args.texture_cap, render_scale=args.render_scale, source_signature=signature)
