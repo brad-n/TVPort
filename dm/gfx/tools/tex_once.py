@@ -108,6 +108,12 @@ def zstd_options(z, level, like):
 
 def zstd_compress(z, data, level, zd=None, like=None):
     opts = zstd_options(z, level, like)
+    h = zstd_header(like) if like else None
+    if h is not None and h[1] is not None and not (h[0] >> 6):
+        # The original declares no content size: compress as a stream of unknown size, so zstd keeps the window it is given
+        # (a one-shot compress knows the size and shrinks the window, which changes the window descriptor)
+        c = z.ZstdCompressor(options=opts, zstd_dict=zd) if zd else z.ZstdCompressor(options=opts)
+        return c.compress(data, mode=c.CONTINUE) + c.flush(mode=c.FLUSH_FRAME)
     return z.compress(data, options=opts, zstd_dict=zd) if zd else z.compress(data, options=opts)
 
 
@@ -429,8 +435,8 @@ class Walker:
                 nn = n[:top_csz]
             if nn[:4] != ZSTD_MAGIC and not (len(nn) >= 4 and struct.unpack('<I', nn[:4])[0] in B.SKIPPABLE): raise Mismatch(f'{name}: no zstd frame')
             ho, hn = zstd_header(o), zstd_header(nn)
-            if ho is not None and hn is not None and o != n and (ho[0] != hn[0] or (ho[1] is None) != (hn[1] is None)):
-                raise Mismatch(f'{name}: zstd frame header layout changed ({ho[0]:#04x} -> {hn[0]:#04x}); the game decodes only the original layout')
+            if ho is not None and hn is not None and o != n and ho != hn:
+                raise Mismatch(f'{name}: zstd frame header changed ({ho} -> {hn}); the game decodes only the original layout')
             do, dn = B.unzstd(o, self.dicts), B.unzstd(nn, self.dicts)
             if len(do) != len(dn): raise Mismatch(f'{name}: the inflated size changed')
             self.check(do, dn, name, depth + 1, hint)

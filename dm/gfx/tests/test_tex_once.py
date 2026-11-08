@@ -595,7 +595,7 @@ class ZstdHeaderLayout(unittest.TestCase):
         new = tool.zstd_slot(zeroed, len(orig), like=orig)
         self.assertIsNotNone(new)
         self.assertEqual(tool.zstd_header(new)[0], tool.zstd_header(orig)[0])
-        self.assertIsNotNone(tool.zstd_header(new)[1])
+        self.assertEqual(tool.zstd_header(new), tool.zstd_header(orig))   # same descriptor and the same window
         self.assertEqual(z.decompress(new), zeroed)
         stream = tool.zstd_stream(zeroed, len(orig), like=orig)
         self.assertEqual(tool.zstd_header(stream)[0], 0)
