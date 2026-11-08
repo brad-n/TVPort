@@ -208,7 +208,7 @@ def bntx_ok(d, p):
     bom, = struct.unpack_from('<H', d, p + 0xc)
     size, = struct.unpack_from('<I', d, p + 0x1c)
     count, = struct.unpack_from('<I', d, p + 0x24)
-    return bom == 0xfeff and d[p + 0x20:p + 0x24] == b'NX  ' and 0x60 <= size <= len(d) - p and count < 100000
+    return bom == 0xfeff and d[p + 0x20:p + 0x24] in (b'NX  ', b'Ounc') and 0x60 <= size <= len(d) - p and count < 100000
 
 
 def bntx_textures(d, p):
