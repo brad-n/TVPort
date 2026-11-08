@@ -19,6 +19,7 @@
 #include <dirent.h>
 #include <pthread.h>
 #include <pthread/qos.h>
+#include "../../third_party/zstd/zstd.h"   // decoder only (docs/texture_once.md section 7b)
 
 // BC1/2/3/7 (RGBA8 once decoded) are the formats ASTC LDR can stand in for. This tree's
 // decoder reports the decoded pixel format through nvn_bc_unpacked; the encoded block
@@ -236,10 +237,13 @@ static int cache_read(NSString *path, void *output, size_t size) {
 // the entries, each a complete cache file ("NXASTC01", SHA-256 of the blocks, the ASTC blocks) at a 16-byte boundary; at the end the index: count entries {32-byte key (the SHA-256 whose hex is
 // the cache file name), u64 offset, u64 size} sorted by key. The index is mapped and binary-searched; an entry is read with pread (the pages of a multi-GB pack are never resident) and
 // verified like a file. A pack whose header, size or index do not hold together is ignored whole: every lookup in it is a miss.
+// Version 2 (docs/texture_once.md section 7b): index entry size 56, {32-byte key, u64 offset, u64 stored size, u64 size}; `size` is what v1 calls size (the cache file: 40-byte header and the blocks) and what every
+// size check uses. An entry whose stored size < size is ONE zstd frame inflating to exactly `size` bytes, read into a buffer here and checked like a raw entry; stored size == size is raw. v1 packs (48) read as before.
 #define PACK_HEAD 80u
-#define PACK_ENT 48u
+#define PACK_ENT1 48u
+#define PACK_ENT2 56u
 enum { PACK_PACK = 1, PACK_DIR, PACK_BAD };
-typedef struct { char *path; int kind, fd; uint64_t base, count, size; const uint8_t *index; void *map; size_t map_len; uint8_t fingerprint[32]; } nvn_pack;   // base: where the pack starts in fd (0 for a file of its own; an image's embedded pack: DMSPARS1 pack offset)
+typedef struct { char *path; int kind, fd; unsigned ent; uint64_t base, count, size; const uint8_t *index; void *map; size_t map_len; uint8_t fingerprint[32]; } nvn_pack;   // base: where the pack starts in fd (0 for a file of its own; an image's embedded pack: DMSPARS1 pack offset)
 static pthread_mutex_t g_pack_mu = PTHREAD_MUTEX_INITIALIZER;
 static nvn_pack **g_packs; static size_t g_pack_n, g_pack_cap;
 static uint64_t le64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; i--) v = v << 8 | p[i]; return v; }
@@ -249,9 +253,10 @@ static int pack_open_at(int fd, uint64_t base, uint64_t size, nvn_pack *p) {
     uint8_t h[PACK_HEAD];
     if (size < PACK_HEAD || pread(fd, h, sizeof h, (off_t)base) != (ssize_t)sizeof h) return 0;
     uint64_t count = le64(h + 16), ioff = le64(h + 24), fsz = le64(h + 32);
-    if (memcmp(h, "NXASTCPK", 8) || le32(h + 8) != 1 || le32(h + 12) != PACK_ENT || fsz != size || ioff < PACK_HEAD || ioff > fsz ||
-        (ioff & 15) || count > (fsz - ioff) / PACK_ENT || count * PACK_ENT != fsz - ioff) return 0;
-    size_t page = (size_t)getpagesize(), lead = (size_t)((base + ioff) % page), len = lead + (size_t)(count * PACK_ENT);
+    uint32_t ver = memcmp(h, "NXASTCPK", 8) ? 0 : le32(h + 8); unsigned ent = ver == 1 ? PACK_ENT1 : ver == 2 ? PACK_ENT2 : 0;
+    if (!ent || le32(h + 12) != ent || fsz != size || ioff < PACK_HEAD || ioff > fsz ||
+        (ioff & 15) || count > (fsz - ioff) / ent || count * ent != fsz - ioff) return 0;
+    size_t page = (size_t)getpagesize(), lead = (size_t)((base + ioff) % page), len = lead + (size_t)(count * ent);
     void *map = NULL; const uint8_t *index = NULL;
     if (count) {
         map = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, (off_t)(base + ioff - lead));
@@ -259,10 +264,10 @@ static int pack_open_at(int fd, uint64_t base, uint64_t size, nvn_pack *p) {
         index = (const uint8_t *)map + lead;
     }
     for (uint64_t i = 0; i < count; i++) {   // sorted, no duplicates, every entry inside the entries area
-        const uint8_t *e = index + i * PACK_ENT; uint64_t off = le64(e + 32), sz = le64(e + 40);
-        if ((i && memcmp(e - PACK_ENT, e, 32) >= 0) || off < PACK_HEAD || (off & 15) || sz <= 40 || off > ioff || sz > ioff - off) { if (map) munmap(map, len); return 0; }
+        const uint8_t *e = index + i * ent; uint64_t off = le64(e + 32), stored = le64(e + 40), sz = ent == PACK_ENT2 ? le64(e + 48) : stored;
+        if ((i && memcmp(e - ent, e, 32) >= 0) || off < PACK_HEAD || (off & 15) || sz <= 40 || stored == 0 || stored > sz || off > ioff || stored > ioff - off) { if (map) munmap(map, len); return 0; }
     }
-    p->fd = fd; p->base = base; p->count = count; p->size = fsz; p->index = index; p->map = map; p->map_len = len; memcpy(p->fingerprint, h + 40, 32);
+    p->ent = ent; p->fd = fd; p->base = base; p->count = count; p->size = fsz; p->index = index; p->map = map; p->map_len = len; memcpy(p->fingerprint, h + 40, 32);
     return 1;
 }
 // Whether the file at `path` is a pack that holds together; fills p (descriptor and index mapping kept for the life of the process)
@@ -317,12 +322,19 @@ static int key_bytes(const char *hex, uint8_t out[32]) {
     }
     return 1;
 }
-static int pack_find(const nvn_pack *p, const char *hex, uint64_t *off, uint64_t *size) {
+// The entry of a pack: where it is, how many bytes it occupies there, and `size`, the bytes it holds (equal for a raw or v1 entry)
+typedef struct { uint64_t off, stored, size; } pack_ent;
+static pack_ent pack_ent_at(const nvn_pack *p, uint64_t i) {
+    const uint8_t *e = p->index + i * p->ent; pack_ent r = { le64(e + 32), le64(e + 40), le64(e + 40) };
+    if (p->ent == PACK_ENT2) r.size = le64(e + 48);
+    return r;
+}
+static int pack_find(const nvn_pack *p, const char *hex, pack_ent *out) {
     uint8_t k[32]; uint64_t lo = 0, hi = p->count;
     if (!key_bytes(hex, k)) return 0;
     while (lo < hi) {
-        uint64_t mid = lo + (hi - lo) / 2; const uint8_t *e = p->index + mid * PACK_ENT; int c = memcmp(e, k, 32);
-        if (!c) { *off = le64(e + 32); *size = le64(e + 40); return 1; }
+        uint64_t mid = lo + (hi - lo) / 2; int c = memcmp(p->index + mid * p->ent, k, 32);
+        if (!c) { *out = pack_ent_at(p, mid); return 1; }
         if (c < 0) lo = mid + 1; else hi = mid;
     }
     return 0;
@@ -336,11 +348,33 @@ static int pread_full(int fd, void *buf, size_t size, uint64_t at) {
     }
     return 1;
 }
-// The entry at pack offset off, sz bytes (a cache file: header and blocks), verified and read into output
-static nvn_astc_cache_status pack_read_entry(const nvn_pack *p, uint64_t off, uint64_t sz, void *output, size_t size) {
+// A compressed entry (one zstd frame in `in`, stored bytes) inflated to exactly 40 + size bytes: the cache file header into header, the blocks into output. 1 when the frame is whole, valid and exactly that long
+static int pack_inflate(const uint8_t *in, size_t stored, uint8_t header[40], void *output, size_t size) {
+    ZSTD_DCtx *dc = ZSTD_createDCtx(); int ok = 0; size_t r = 1;
+    if (!dc) return 0;
+    ZSTD_inBuffer ib = { in, stored, 0 };
+    ZSTD_outBuffer hb = { header, 40, 0 }, ob = { output, size, 0 };
+    while (r && hb.pos < hb.size) { r = ZSTD_decompressStream(dc, &hb, &ib); if (ZSTD_isError(r) || (r && hb.pos < hb.size && ib.pos == ib.size)) goto done; }
+    while (r && ob.pos < ob.size) { r = ZSTD_decompressStream(dc, &ob, &ib); if (ZSTD_isError(r) || (r && ob.pos < ob.size && ib.pos == ib.size)) goto done; }
+    if (r) { uint8_t extra; ZSTD_outBuffer xb = { &extra, 1, 0 }; r = ZSTD_decompressStream(dc, &xb, &ib); if (ZSTD_isError(r) || xb.pos) goto done; }   // output is full: the frame must end here
+    ok = !r && hb.pos == 40 && ob.pos == size && ib.pos == ib.size;   // and no bytes follow it
+done:
+    ZSTD_freeDCtx(dc);
+    return ok;
+}
+// The entry at pack offset e.off (a cache file: header and blocks, e.size bytes once inflated), verified and read into output
+static nvn_astc_cache_status pack_read_entry(const nvn_pack *p, pack_ent e, void *output, size_t size) {
     uint8_t header[40], digest[CC_SHA256_DIGEST_LENGTH];
-    if (sz != size + 40) return NVN_ASTC_CACHE_SIZE;
-    if (!pread_full(p->fd, header, sizeof header, p->base + off) || !pread_full(p->fd, output, size, p->base + off + 40)) return NVN_ASTC_CACHE_IO;
+    if (e.size != size + 40) return NVN_ASTC_CACHE_SIZE;
+    if (e.stored == e.size) {
+        if (!pread_full(p->fd, header, sizeof header, p->base + e.off) || !pread_full(p->fd, output, size, p->base + e.off + 40)) return NVN_ASTC_CACHE_IO;
+    } else {   // compressed (v2)
+        uint8_t *in = e.stored < e.size && e.stored <= SIZE_MAX ? malloc((size_t)e.stored) : NULL;
+        if (!in) return NVN_ASTC_CACHE_IO;
+        if (!pread_full(p->fd, in, (size_t)e.stored, p->base + e.off)) { free(in); return NVN_ASTC_CACHE_IO; }
+        int ok = pack_inflate(in, (size_t)e.stored, header, output, size); free(in);
+        if (!ok) { fprintf(stderr, "[RED] ASTC: a compressed pack entry is corrupt (stored %llu, size %llu)\n", (unsigned long long)e.stored, (unsigned long long)e.size); return NVN_ASTC_CACHE_IO; }
+    }
     if (memcmp(header, cache_magic, sizeof cache_magic)) return NVN_ASTC_CACHE_HEADER;
     payload_hash(output, size, digest);
     if (memcmp(header + sizeof cache_magic, digest, sizeof digest)) return NVN_ASTC_CACHE_HASH;
@@ -348,9 +382,9 @@ static nvn_astc_cache_status pack_read_entry(const nvn_pack *p, uint64_t off, ui
     return NVN_ASTC_CACHE_HIT;
 }
 static nvn_astc_cache_status pack_read(const nvn_pack *p, const char *hex, void *output, size_t size) {
-    uint64_t off, sz;
-    if (!pack_find(p, hex, &off, &sz)) return NVN_ASTC_CACHE_MISSING;
-    return pack_read_entry(p, off, sz, output, size);
+    pack_ent e;
+    if (!pack_find(p, hex, &e)) return NVN_ASTC_CACHE_MISSING;
+    return pack_read_entry(p, e, output, size);
 }
 // ---- Tagged planes (docs/texture_once.md section 2) ----
 // A plane the stripping tool covered holds the first 8 bytes of its pack key, then zeros: its ASTC blocks are looked up by that prefix, without deswizzling or hashing
@@ -381,21 +415,21 @@ int nvn_bc_astc_looks_tagged_rows(const void *plane, size_t row_bytes, size_t st
     return 1;
 }
 // The entries whose key starts with tag and whose payload is `payload` bytes: 1 only when there is exactly one
-static int pack_tag_find(const nvn_pack *p, const uint8_t *tag, size_t payload, uint64_t *off, uint64_t *sz) {
+static int pack_tag_find(const nvn_pack *p, const uint8_t *tag, size_t payload, pack_ent *out) {
     uint64_t lo = 0, hi = p->count, found = 0;
-    while (lo < hi) { uint64_t mid = lo + (hi - lo) / 2; if (memcmp(p->index + mid * PACK_ENT, tag, 8) < 0) lo = mid + 1; else hi = mid; }
+    while (lo < hi) { uint64_t mid = lo + (hi - lo) / 2; if (memcmp(p->index + mid * p->ent, tag, 8) < 0) lo = mid + 1; else hi = mid; }
     for (uint64_t i = lo; i < p->count; i++) {
-        const uint8_t *e = p->index + i * PACK_ENT;
-        if (memcmp(e, tag, 8)) break;
-        if (le64(e + 40) == payload + 40) { if (++found > 1) return 0; *off = le64(e + 32); *sz = le64(e + 40); }
+        if (memcmp(p->index + i * p->ent, tag, 8)) break;
+        pack_ent e = pack_ent_at(p, i);
+        if (e.size == payload + 40) { if (++found > 1) return 0; *out = e; }
     }
     return found == 1;
 }
 static nvn_astc_tag_result tag_fetch_pack(const nvn_pack *p, const void *plane, size_t astc_size, void *output) {   // the plane looks tagged
-    uint64_t off, sz;
-    if (!p || !astc_size || !pack_tag_find(p, plane, astc_size, &off, &sz)) return NVN_TAG_MISS;
+    pack_ent e;
+    if (!p || !astc_size || !pack_tag_find(p, plane, astc_size, &e)) return NVN_TAG_MISS;
     if (!output) return NVN_TAG_HIT;
-    if (pack_read_entry(p, off, sz, output, astc_size) != NVN_ASTC_CACHE_HIT) return NVN_TAG_MISS;
+    if (pack_read_entry(p, e, output, astc_size) != NVN_ASTC_CACHE_HIT) return NVN_TAG_MISS;
     atomic_fetch_add(&g_tag_hits, 1);
     return NVN_TAG_HIT;
 }
@@ -860,7 +894,7 @@ static void bg_enqueue(uint32_t format, const void *source, size_t size, uint32_
 static int cache_has(const char *root, const char *key, size_t payload) {
     if (!root || !*root) return 0;
     const nvn_pack *pk = pack_for(root);
-    if (pk) { uint64_t off, sz; return pack_find(pk, key, &off, &sz) && sz == payload + 40; }
+    if (pk) { pack_ent e; return pack_find(pk, key, &e) && e.size == payload + 40; }
     @autoreleasepool {
         NSString *path = cache_path(root, key);
         if (atomic_load_explicit(&g_cache_small_ready, memory_order_acquire)) {

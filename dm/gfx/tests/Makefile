@@ -15,7 +15,10 @@ CFLAGS=-O1 -g -Wall -Wno-unused-function -I../nvn/include -I$(dir $(GAME_H)) -I$
 ASTC_LIB=../../host/gen/astc/libastcenc.a
 $(ASTC_LIB): $(wildcard ../../third_party/astc-encoder/*.cpp ../../third_party/astc-encoder/*.h)
 	$(MAKE) -C ../../host GAME=$(GAME) gen/astc/libastcenc.a
-GFX=$(filter-out ../nvn/hle_nvn.c,$(sort $(wildcard ../nvn/*.c ../nvn/*.m ../nvn/*.S ../tex/*.c ../tex/*.m ../tex/*.mm)) $(ASTC_LIB))
+ZSTD_LIB=../../host/gen/zstd/libzstd.a   # the decoder nvn_astc_cache.m inflates NXASTCPK v2 entries with
+$(ZSTD_LIB): $(wildcard ../../third_party/zstd/*.h ../../third_party/zstd/*/*.[ch])
+	$(MAKE) -C ../../host GAME=$(GAME) gen/zstd/libzstd.a
+GFX=$(filter-out ../nvn/hle_nvn.c,$(sort $(wildcard ../nvn/*.c ../nvn/*.m ../nvn/*.S ../tex/*.c ../tex/*.m ../tex/*.mm)) $(ASTC_LIB) $(ZSTD_LIB))
 GFX_H=$(wildcard ../nvn/*.h ../nvn/*.inc ../nvn/include/*.h ../tex/*.h) $(GAME_H) $(MSL_H)
 .DEFAULT_GOAL := t_nvn   # the profile header rule comes first, so keep the default goal as before
 $(GAME_H):
@@ -55,11 +58,11 @@ t_gfx_suspend: t_gfx_suspend.c ../nvn/hle_nvn.c ../../host/crash.c ../../host/hl
 t_nvn: t_nvn.c ../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(FW)
 # ASTC cache (DM_NVN_BC_ASTC, dm/gfx/tex/nvn_astc_cache.m): the CPU half (decode, ASTC encode, content-addressed cache), under ASan and UBSan
-t_astc_cache: t_astc_cache.m ../tex/nvn_astc_cache.m ../tex/nvn_astc_cache.h ../tex/nvn_astc.mm ../tex/nvn_astc.h ../tex/nvn_bcdec.c ../tex/nvn_bcdec.h $(ASTC_LIB)
-	clang $(CFLAGS) -fobjc-arc -fsanitize=address,undefined -o $@ t_astc_cache.m ../tex/nvn_bcdec.c ../tex/nvn_astc.mm $(ASTC_LIB) -lc++ -framework Foundation -framework Metal
+t_astc_cache: t_astc_cache.m ../tex/nvn_astc_cache.m ../tex/nvn_astc_cache.h ../tex/nvn_astc.mm ../tex/nvn_astc.h ../tex/nvn_bcdec.c ../tex/nvn_bcdec.h $(ASTC_LIB) $(ZSTD_LIB)
+	clang $(CFLAGS) -fobjc-arc -fsanitize=address,undefined -o $@ t_astc_cache.m ../tex/nvn_bcdec.c ../tex/nvn_astc.mm $(ASTC_LIB) $(ZSTD_LIB) -lc++ -framework Foundation -framework Metal
 # Encode throughput of the transcoder (prints numbers, not a test; no sanitizers): make t_astc_bench && ./t_astc_bench
-t_astc_bench: t_astc_bench.m ../tex/nvn_astc_cache.m ../tex/nvn_astc_cache.h ../tex/nvn_astc.mm ../tex/nvn_astc.h ../tex/nvn_bcdec.c ../tex/nvn_bcdec.h $(ASTC_LIB)
-	clang -O2 -g -Wall -Wno-unused-function -I../nvn/include -fobjc-arc -o $@ t_astc_bench.m ../tex/nvn_bcdec.c ../tex/nvn_astc.mm $(ASTC_LIB) -lc++ -framework Foundation -framework Metal
+t_astc_bench: t_astc_bench.m ../tex/nvn_astc_cache.m ../tex/nvn_astc_cache.h ../tex/nvn_astc.mm ../tex/nvn_astc.h ../tex/nvn_bcdec.c ../tex/nvn_bcdec.h $(ASTC_LIB) $(ZSTD_LIB)
+	clang -O2 -g -Wall -Wno-unused-function -I../nvn/include -fobjc-arc -o $@ t_astc_bench.m ../tex/nvn_bcdec.c ../tex/nvn_astc.mm $(ASTC_LIB) $(ZSTD_LIB) -lc++ -framework Foundation -framework Metal
 # DM_NVN_BC_ASTC on the GPU: uploads of BC1/2/3/7 as ASTC against the CPU decode (DM_TEST_NO_BC and the variable are set by the test)
 t_astc_upload: t_astc_upload.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_astc_upload.m $(MTL_T_SRC) $(FW)

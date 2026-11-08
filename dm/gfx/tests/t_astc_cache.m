@@ -421,6 +421,75 @@ static void tag_contract(NSString *root) {
     { uint8_t *back = malloc(sizeof logical); CHECK(romfs_src_read(&s, back, sizeof logical, 0) && !memcmp(back, logical, sizeof logical)); free(back); }
     romfs_src_free(&s); free(wrapped);
 }
+
+// ---- NXASTCPK version 2 (docs/texture_once.md section 7b): compressed and raw entries, `size` in every size check, as a file, and embedded in a DMSPARS1 version 2 ----
+static void pack_v2_contract(NSString *root) {
+    enum { N = 5 };
+    uint8_t pa[100], pb[256], pb2[300], pc[4000], pd[100]; memset(pa, 0xA1, sizeof pa); for (int i = 0; i < 256; i++) pb[i] = (uint8_t)(i * 7 + 1); memset(pb2, 0x5C, sizeof pb2); memset(pc, 0xC3, sizeof pc); for (int i = 0; i < 100; i++) pd[i] = (uint8_t)(i * 3 + 2);
+    const uint8_t *pay[N] = {pa, pb, pb2, pc, pd}; size_t len[N] = {100, 256, 300, 4000, 100};
+    uint8_t keys[N][32], hash[N][32];
+    for (int i = 0; i < N; i++) { for (int j = 0; j < 32; j++) keys[i][j] = (uint8_t)(0x10 * (i + 1) + j * 7 + i); CC_SHA256(pay[i], (CC_LONG)len[i], hash[i]); }
+    // entry 2 shares entry 1's 8-byte prefix and sorts right after it; keys[2] > keys[1] by its last byte, keys[3] > keys[2] by its first byte
+    memcpy(keys[2], keys[1], 32); keys[2][31] += 1; for (int j = 0; j < 32; j++) { keys[3][j] = (uint8_t)(0x40 + j * 3); keys[4][j] = (uint8_t)(0x50 + j * 5); }
+    unsigned zmask = 1u << 0 | 1u << 2 | 1u << 3;   // a, b2 and c compressed; b and d raw
+    uint8_t *pk; size_t pkn = fx_pack2(&pk, N, keys, pay, len, hash, zmask);
+    CHECK(pkn > 0 && pk[8] == 2 && pk[12] == 56);
+    NSString *path = [root stringByAppendingPathComponent:@"v2.pack"]; [[NSData dataWithBytes:pk length:pkn] writeToFile:path atomically:NO];
+    const char *ro = path.fileSystemRepresentation;
+    uint64_t entries, bytes; CHECK(nvn_bc_astc_pack_info(ro, &entries, &bytes, NULL) && entries == N && bytes == pkn);
+    // stored sizes: the compressed entries are smaller than their size, the raw ones equal
+    { const uint8_t *ix = pk + le64(pk + 24); int c = 0, r = 0; for (int i = 0; i < N; i++) { uint64_t st = le64(ix + 56 * i + 40), sz = le64(ix + 56 * i + 48); CHECK(sz == 40 + len[i]); if (st < sz) c++; else if (st == sz) r++; } CHECK(c == 3 && r == 2); }
+    uint8_t got[4000]; nvn_astc_cache_key key;
+    for (int i = 0; i < N; i++) {
+        strcpy(key.hex, hexkey(keys[i]).UTF8String); memset(got, 0, sizeof got);
+        CHECK(nvn_bc_astc_cache_read(&key, got, len[i], NULL, ro) && !memcmp(got, pay[i], len[i]));
+        CHECK(!nvn_bc_astc_cache_read(&key, got, len[i] - 1, NULL, ro) && !nvn_bc_astc_cache_read(&key, got, len[i] + 1, NULL, ro));
+    }
+    // the tag lookup compares `size`: entry 1 and 2 share a prefix and differ in size, entry 0 is compressed
+    uint8_t plane[64], out[4000];
+    memset(plane, 0, sizeof plane); memcpy(plane, keys[1], 8);
+    memset(out, 0, sizeof out); CHECK(nvn_bc_astc_tag_fetch_root(ro, plane, sizeof plane, 256, out) == NVN_TAG_HIT && !memcmp(out, pb, 256));
+    memset(out, 0, sizeof out); CHECK(nvn_bc_astc_tag_fetch_root(ro, plane, sizeof plane, 300, out) == NVN_TAG_HIT && !memcmp(out, pb2, 300));
+    CHECK(nvn_bc_astc_tag_fetch_root(ro, plane, sizeof plane, 301, out) == NVN_TAG_MISS && nvn_bc_astc_tag_fetch_root(ro, plane, sizeof plane, 300, NULL) == NVN_TAG_HIT);
+    memset(plane, 0, sizeof plane); memcpy(plane, keys[3], 8); memset(out, 0, sizeof out);
+    CHECK(nvn_bc_astc_tag_fetch_root(ro, plane, sizeof plane, 4000, out) == NVN_TAG_HIT && !memcmp(out, pc, 4000));
+    uint64_t h0, u0, d0, h1, u1, d1; nvn_bc_astc_tag_stats(&h0, &u0, &d0);
+    memset(plane, 0, sizeof plane); memcpy(plane, keys[0], 8); CHECK(nvn_bc_astc_tag_fetch_root(ro, plane, sizeof plane, 100, out) == NVN_TAG_HIT && !memcmp(out, pa, 100));
+    nvn_bc_astc_tag_stats(&h1, &u1, &d1); CHECK(h1 == h0 + 1);
+    // a damaged compressed entry (frame magic, and a flipped payload run byte) is a miss, never wrong bytes or a hit; truncated stored size too
+    for (int dmg = 0; dmg < 3; dmg++) {
+        uint8_t *bad = malloc(pkn); memcpy(bad, pk, pkn); const uint8_t *ix = bad + le64(bad + 24); uint64_t off = 0, st = 0;
+        for (int i = 0; i < N; i++) if (!memcmp(ix + 56 * i, keys[3], 32)) { off = le64(ix + 56 * i + 32); st = le64(ix + 56 * i + 40); }
+        if (dmg == 0) bad[off] ^= 0xFF; else if (dmg == 1) bad[off + st - 1] ^= 0x01; else { for (int i = 0; i < N; i++) if (!memcmp(ix + 56 * i, keys[3], 32)) fx_put64(bad + le64(bad + 24) + 56 * i + 40, st - 2); }
+        NSString *bp = [root stringByAppendingPathComponent:[NSString stringWithFormat:@"v2bad%d.pack", dmg]]; [[NSData dataWithBytes:bad length:pkn] writeToFile:bp atomically:NO]; free(bad);
+        strcpy(key.hex, hexkey(keys[3]).UTF8String); memset(got, 0, sizeof got);
+        CHECK(!nvn_bc_astc_cache_read(&key, got, 4000, NULL, bp.fileSystemRepresentation));
+        memset(plane, 0, sizeof plane); memcpy(plane, keys[3], 8); nvn_bc_astc_tag_stats(&h0, &u0, &d0);
+        CHECK(nvn_bc_astc_tag_fetch_root(bp.fileSystemRepresentation, plane, sizeof plane, 4000, out) == NVN_TAG_MISS); nvn_bc_astc_tag_stats(&h1, &u1, &d1); CHECK(h1 == h0);
+        strcpy(key.hex, hexkey(keys[0]).UTF8String); CHECK(nvn_bc_astc_cache_read(&key, got, 100, NULL, bp.fileSystemRepresentation) && !memcmp(got, pa, 100));
+    }
+    // a v2 header with the v1 entry size (or the reverse) is refused whole
+    { uint8_t *bad = malloc(pkn); memcpy(bad, pk, pkn); fx_put32(bad + 12, 48); NSString *bp = [root stringByAppendingPathComponent:@"v2mismatch.pack"]; [[NSData dataWithBytes:bad length:pkn] writeToFile:bp atomically:NO]; free(bad);
+      CHECK(!nvn_bc_astc_pack_info(bp.fileSystemRepresentation, NULL, NULL, NULL)); }
+    // embedded in a DMSPARS1 version 2 image (the pack stays raw there); a child process, since the embedded pack registers once per process
+    { uint8_t logical[40000]; for (int i = 0; i < 40000; i++) logical[i] = (uint8_t)(i / 5000 % 2 ? 0x31 : 1 + (i * 37u >> 3) % 250);
+      uint8_t *w; size_t wn; long nz; fx_write_sparse2(logical, sizeof logical, 8192, 1, pk, pkn, &w, &wn, &nz);
+      NSString *img = [root stringByAppendingPathComponent:@"wrapped2.img"]; [[NSData dataWithBytes:w length:wn] writeToFile:img atomically:NO];
+      pid_t kid = fork();
+      if (!kid) {
+          unsigned fail0 = failures;
+          int fd = open(img.fileSystemRepresentation, O_RDONLY); romfs_src s; CHECK(romfs_src_open(fd, &s) && s.sparse && s.pack_size == pkn && nz > 0);
+          CHECK(nvn_bc_astc_use_embedded_pack(fd, s.pack_off, s.pack_size));
+          uint8_t *back = malloc(sizeof logical); CHECK(romfs_src_read(&s, back, sizeof logical, 0) && !memcmp(back, logical, sizeof logical)); free(back);
+          for (int i = 0; i < N; i++) { strcpy(key.hex, hexkey(keys[i]).UTF8String); memset(got, 0, sizeof got); CHECK(nvn_bc_astc_cache_read(&key, got, len[i], NULL, NVN_ASTC_EMBEDDED_ROOT) && !memcmp(got, pay[i], len[i])); }
+          memset(plane, 0, sizeof plane); memcpy(plane, keys[3], 8); memset(out, 0, sizeof out);
+          CHECK(nvn_bc_astc_tag_fetch_root(NVN_ASTC_EMBEDDED_ROOT, plane, sizeof plane, 4000, out) == NVN_TAG_HIT && !memcmp(out, pc, 4000));
+          _exit(failures != fail0 ? 1 : 0);
+      }
+      int st = 0; waitpid(kid, &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+      free(w); }
+    free(pk);
+}
 // Block 5 (BC1 at 5x5 beside 4x4 / 6x6 for the rest): the format mapping, the keys, and a plane whose stripes (16384 texels wide: 60 rows at a time) must start on a BC and an ASTC row
 static void block5_contract(NSString *root) {
     uint32_t pf;
@@ -625,6 +694,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     nvn_bc_astc_cache_prepare(NULL, NULL, 2u << 20, 0);
     CHECK(g_cache_small[small].length == 16);
     pack_contract(root);
+    pack_v2_contract(root);   // before tag_contract: that one registers the process's embedded pack; the v2 one runs in a child
     tag_contract(root);
     background_contract(root);
     CHECK([NSFileManager.defaultManager removeItemAtPath:root error:NULL]);

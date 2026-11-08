@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include "../romfs_image.h"
 #include "../romfs_identity.h"
 #include "romfs_sparse_fixture.h"
@@ -24,6 +25,167 @@ static int opens(const uint8_t *f, size_t n, romfs_src *out) {   // the file's b
     if (ok && out) *out = s; else if (ok) romfs_src_free(&s);
     if (!ok || !out) close(fd);
     return ok && s.sparse;
+}
+
+
+// ---- Version 2: compressed extents (docs/texture_once.md section 7a) ----
+static int red_count;   // [RED] lines seen by the last red_capture_end
+static int g_save_err = -1;
+static void red_capture_begin(void) { fflush(stderr); g_save_err = dup(2); int tf = open(path("err.txt"), O_CREAT | O_TRUNC | O_WRONLY, 0644); dup2(tf, 2); close(tf); }
+static void red_capture_end(void) {
+    fflush(stderr); dup2(g_save_err, 2); close(g_save_err);
+    FILE *f = fopen(path("err.txt"), "r"); char line[600]; red_count = 0;
+    while (f && fgets(line, sizeof line, f)) if (strstr(line, "[RED]")) red_count++;
+    if (f) fclose(f);
+}
+static int open_file(const char *name, romfs_src *s) { int fd = open(path(name), O_RDONLY); return fd >= 0 && romfs_src_open(fd, s) && s->sparse; }
+static uint64_t tab_at(const uint8_t *file, size_t k) { return romfs_src_le64(file + 32) + k * 32; }
+typedef struct { const romfs_src *s; const uint8_t *L; uint64_t n; unsigned seed; int bad; } reader_arg;
+static void *reader_main(void *vp) {
+    reader_arg *a = vp; uint8_t *b = malloc(70000); uint32_t r = a->seed;
+    for (int i = 0; i < 3000; i++) {
+        r = r * 1664525u + 1013904223u; uint64_t off = (r >> 8) % (a->n + 20); r = r * 1664525u + 1013904223u; size_t len = (r >> 8) % 60000;
+        ssize_t got = romfs_src_pread(a->s, b, len, off);
+        size_t want = off >= a->n ? 0 : (len < a->n - off ? len : (size_t)(a->n - off));
+        if (got != (ssize_t)want || (want && memcmp(b, a->L + off, want))) a->bad++;
+    }
+    free(b); return NULL;
+}
+static void v2_tests(void) {
+    printf("version 2: compressed extents\n");
+    enum { BLK = 20000, P = 40, N2 = BLK * P };
+    uint8_t *L = malloc(N2);
+    for (int p = 0; p < P; p++) {
+        uint8_t *q = L + (size_t)p * BLK;
+        if (p % 5 == 0) memset(q, (uint8_t)(0x30 + p), BLK);               // a run: compresses
+        else if (p % 5 == 1) memset(q, 0, BLK);                             // a hole
+        else if (p % 5 == 2) { for (int i = 0; i < BLK; i++) q[i] = (uint8_t)(1 + rnd() % 255); }   // noise
+        else if (p % 5 == 3) { for (int i = 0; i < BLK; i++) q[i] = (uint8_t)(i < 7000 ? 0x77 : 1 + rnd() % 255); }   // run, then noise
+        else fx_real_plain(q);                                              // a real zstd frame (fx_real_frame)
+    }
+    unsetenv("DM_ROMFS_ZCACHE_MB");
+    for (int zmode = 0; zmode <= 3; zmode++) {
+        uint8_t *f; size_t fn; long nz; long ne = fx_write_sparse2(L, N2, BLK, zmode, NULL, 0, &f, &fn, &nz);
+        write_file(path("v2.img"), f, fn);
+        romfs_src s; CHECK(open_file("v2.img", &s), "v2 zmode %d opens (errno %d)", zmode, errno);
+        CHECK(s.n == (uint64_t)ne && s.logical == N2 && (nz ? s.zc != NULL : s.zc == NULL) && (!nz || s.zc->cap == (16u << 20)), "zmode %d: %ld extents, %ld zstd, default cache 16 MiB", zmode, ne, nz);
+        int zk = 0, rk = 0; for (uint64_t i = 0; i < s.n; i++) { if (s.ext[i].kind == 1) zk++; else rk++; }
+        CHECK(zmode == 0 ? !zk : zmode == 1 ? !rk : zmode == 2 ? zk && rk : zk && rk, "zmode %d: kinds (%d zstd, %d raw)", zmode, zk, rk);
+        uint8_t *got = malloc(N2 + 50);
+        CHECK(romfs_src_pread(&s, got, N2, 0) == N2 && !memcmp(got, L, N2), "zmode %d: the whole logical image reads back", zmode);
+        int bad = 0;
+        for (int k = 0; k < 3000; k++) {   // random windows and every extent edge (reads that span blocks)
+            uint64_t off = rnd() % (N2 + 30); size_t len = rnd() % 70000;
+            if (k < (int)s.n * 4) { const romfs_ext *x = &s.ext[k / 4]; off = x->lo + ((k & 1) ? x->len : 0) - 1 + (k & 2); len = 1 + (size_t)(k % 9) * 4000; }
+            if (off > N2) off = N2;
+            ssize_t r = romfs_src_pread(&s, got, len, off); size_t want = off >= N2 ? 0 : (len < N2 - off ? len : N2 - off);
+            if (r != (ssize_t)want || (want && memcmp(got, L + off, want))) bad++;
+        }
+        CHECK(!bad, "zmode %d: %d windows differ", zmode, bad);
+        if (zmode == 1) {   // everything was read once: the cache holds the blocks, so damaged frames on disk are not met again (a hit never reads the file)
+            uint64_t held = 0; for (romfs_zblk *b = s.zc->head; b; b = b->next) held += b->len;
+            CHECK(held == s.zc->used && s.zc->used > 0 && s.zc->used <= s.zc->cap, "cache holds %llu bytes", (unsigned long long)s.zc->used);
+            int wfd = open(path("v2.img"), O_WRONLY); for (uint64_t i = 0; i < s.n; i++) if (s.ext[i].kind == 1) { uint8_t junk[16]; memset(junk, 0xEE, sizeof junk); pwrite(wfd, junk, sizeof junk, (off_t)s.ext[i].phys); }
+            close(wfd);
+            CHECK(romfs_src_pread(&s, got, N2, 0) == N2 && !memcmp(got, L, N2), "a second whole read is served from the cache (frames on disk now damaged)");
+        }
+        close(s.fd); romfs_src_free(&s); free(got); free(f);
+    }
+
+    printf("version 2: the block cache is bounded and shared\n");
+    {   uint8_t *f; size_t fn; fx_write_sparse2(L, N2, BLK, 1, NULL, 0, &f, &fn, NULL); write_file(path("v2.img"), f, fn);
+        const char *mbs[] = {"0.05", "0", "0.1", "bogus"};
+        for (int m = 0; m < 4; m++) {
+            setenv("DM_ROMFS_ZCACHE_MB", mbs[m], 1);
+            romfs_src s; CHECK(open_file("v2.img", &s), "opens with DM_ROMFS_ZCACHE_MB=%s", mbs[m]);
+            size_t cap = m == 3 ? (16u << 20) : (size_t)(strtod(mbs[m], NULL) * 1048576.0);
+            CHECK(s.zc && s.zc->cap == cap, "cache cap for %s is %zu", mbs[m], cap);
+            uint8_t *got = malloc(N2); int bad = 0, over = 0;
+            for (int k = 0; k < 400; k++) {
+                uint64_t off = rnd() % N2; size_t len = 1 + rnd() % 50000;
+                ssize_t r = romfs_src_pread(&s, got, len, off); size_t want = len < N2 - off ? len : N2 - off;
+                if (r != (ssize_t)want || memcmp(got, L + off, want)) bad++;
+                if (s.zc->used > s.zc->cap) over++;
+            }
+            CHECK(!bad && !over, "cap %s: %d wrong windows, %d times over the cap (kept %zu)", mbs[m], bad, over, s.zc->used);
+            if (m == 0) { int nb = 0; for (romfs_zblk *b = s.zc->head; b; b = b->next) nb++; CHECK(nb == 2 && s.zc->used == 2 * BLK, "a 0.05 MiB cache keeps 2 blocks of 20000 (%d, %zu)", nb, s.zc->used); }
+            if (m == 1) CHECK(s.zc->used == 0 && !s.zc->head, "a zero cache keeps nothing and still reads");
+            // concurrent readers on one source, the cache small enough to evict all the time
+            if (m == 2) {
+                pthread_t th[8]; reader_arg ra[8];
+                for (int t = 0; t < 8; t++) { ra[t] = (reader_arg){&s, L, N2, 777u + (unsigned)t * 31u, 0}; pthread_create(&th[t], NULL, reader_main, &ra[t]); }
+                int badt = 0; for (int t = 0; t < 8; t++) { pthread_join(th[t], NULL); badt += ra[t].bad; }
+                CHECK(!badt && s.zc->used <= s.zc->cap, "8 concurrent readers all got the same bytes (%d wrong)", badt);
+                for (romfs_zblk *b = s.zc->head; b; b = b->next) if (b->refs) badt++;
+                CHECK(!badt, "no block is left pinned after the readers finish");
+            }
+            free(got); close(s.fd); romfs_src_free(&s);
+        }
+        unsetenv("DM_ROMFS_ZCACHE_MB");
+        // the same with a roomy cache, 8 readers
+        romfs_src s; CHECK(open_file("v2.img", &s), "the file opens"); pthread_t th[8]; reader_arg ra[8]; int badt = 0;
+        for (int t = 0; t < 8; t++) { ra[t] = (reader_arg){&s, L, N2, 99u + (unsigned)t * 17u, 0}; pthread_create(&th[t], NULL, reader_main, &ra[t]); }
+        for (int t = 0; t < 8; t++) { pthread_join(th[t], NULL); badt += ra[t].bad; }
+        CHECK(!badt, "8 concurrent readers, default cache: %d wrong", badt);
+        close(s.fd); romfs_src_free(&s); free(f);
+    }
+
+    printf("version 2: damaged frames are read errors, never zeros\n");
+    {   enum { B3 = 10000 }; uint8_t L3[B3 * 3]; memset(L3, 0x55, B3); memset(L3 + B3, 0, B3); for (int i = 0; i < B3; i++) L3[2 * B3 + i] = (uint8_t)(i < 3000 ? 0x66 : 1 + rnd() % 255);
+        uint8_t *f; size_t fn; long nz; fx_write_sparse2(L3, sizeof L3, B3, 1, NULL, 0, &f, &fn, &nz);   // extents: 0 (zstd, run) and 1 (zstd, run then noise), a hole between
+        CHECK(nz == 2, "two zstd extents (%ld)", nz);
+        uint8_t got[sizeof L3];
+        struct { const char *what; int ext, field; uint64_t val; int frame_byte; int open_fails; } cases[] = {
+            {"a clean file", -1, 0, 0, -1, 0},
+            {"frame magic damaged", 0, 0, 0, 0, 0},
+            {"block header damaged (size too large)", 0, 0, 0, 10, 0},
+            {"stored length 1 (frame cut)", 0, 24, 1, -1, 0},
+            {"stored length 2 (frame cut)", 0, 24, 2, -1, 0},
+            {"frame inflates to fewer bytes than the extent's length", 0, 8, B3 + 1, -1, 0},
+            {"frame inflates to more bytes than the extent's length", 0, 8, B3 - 1, -1, 0},
+            {"second frame cut by a short file table", 1, 24, 3, -1, 0},
+            {"kind 2", 0, 28, 2, -1, 1},
+            {"raw extent with stored != length", 0, 28, 0, -1, 1},
+            {"zstd stored length zero", 0, 24, 0, -1, 1},
+            {"stored length past the file", 0, 24, 0x7fffffff, -1, 1},
+        };
+        for (unsigned c = 0; c < sizeof cases / sizeof *cases; c++) {
+            uint8_t *g = malloc(fn); memcpy(g, f, fn);
+            uint8_t *e = g + tab_at(f, cases[c].ext < 0 ? 0 : (size_t)cases[c].ext);
+            if (cases[c].ext >= 0 && cases[c].frame_byte < 0) {
+                if (cases[c].field == 24 || cases[c].field == 28) fx_put32(e + cases[c].field, (uint32_t)cases[c].val); else fx_put64(e + cases[c].field, cases[c].val);
+            }
+            if (cases[c].frame_byte >= 0) g[romfs_src_le64(e + 16) + (size_t)cases[c].frame_byte] ^= 0xFF;
+            write_file(path("bad2.img"), g, fn);
+            romfs_src s; int opened = open_file("bad2.img", &s);
+            if (cases[c].open_fails) { CHECK(!opened, "%s: the file is refused at open", cases[c].what); }
+            else if (c == 0) {
+                CHECK(opened && romfs_src_pread(&s, got, sizeof got, 0) == (ssize_t)sizeof got && !memcmp(got, L3, sizeof L3), "%s reads back", cases[c].what);
+            } else if (opened) {
+                red_capture_begin();
+                memset(got, 0xAB, sizeof got);
+                errno = 0; ssize_t r = romfs_src_pread(&s, got, sizeof got, 0); int en = errno;
+                red_capture_end();
+                CHECK(r < 0 || r < (ssize_t)sizeof got, "%s: the read fails (returned %zd)", cases[c].what, r);
+                CHECK(r < 0 ? en == EIO : 1, "%s: errno EIO (%d)", cases[c].what, en);
+                CHECK(red_count == 1, "%s: exactly one [RED] line (%d)", cases[c].what, red_count);
+                int zeros = 1; for (size_t i = 0; i < (size_t)(r < 0 ? 0 : r); i++) if (got[i] != L3[i]) zeros = 0;
+                CHECK(zeros, "%s: the bytes before the damage are right", cases[c].what);
+                CHECK(!romfs_src_read(&s, got, sizeof got, 0), "%s: romfs_src_read fails", cases[c].what);
+            }
+            else CHECK(0, "%s: did not open", cases[c].what);
+            if (opened) { close(s.fd); romfs_src_free(&s); }
+            free(g);
+        }
+        free(f);
+        // a zstd extent longer than 256 KiB is refused at open (a raw one of any length is fine)
+        {   enum { BIG = (256 << 10) + 4096 }; uint8_t *big = malloc(BIG), *g; size_t gn; memset(big, 0x42, BIG); romfs_src s2;
+            fx_write_sparse2(big, BIG, BIG, 1, NULL, 0, &g, &gn, NULL); write_file(path("big.img"), g, gn); CHECK(!open_file("big.img", &s2), "a zstd extent of 256 KiB + 4096 is refused"); free(g);
+            fx_write_sparse2(big, BIG, BIG, 0, NULL, 0, &g, &gn, NULL); write_file(path("big.img"), g, gn);
+            CHECK(open_file("big.img", &s2) && s2.zc == NULL, "and a raw one of that length is fine"); if (s2.sparse) { uint8_t *b2 = malloc(BIG); CHECK(romfs_src_read(&s2, b2, BIG, 0) && !memcmp(b2, big, BIG), "and reads"); free(b2); close(s2.fd); romfs_src_free(&s2); }
+            free(g); free(big); }
+    }
+    free(L);
 }
 
 int main(void) {
@@ -152,6 +314,7 @@ int main(void) {
         free(img); free(spf); free(pk);
     }
     free(L); free(got);
+    v2_tests();
     char cmd[1300]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", g_dir); if (system(cmd)) {}
     printf("%d checks, %d failed\n", checks, failed);
     return failed != 0;
