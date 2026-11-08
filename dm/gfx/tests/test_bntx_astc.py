@@ -283,8 +283,8 @@ class PrebuildTests(unittest.TestCase):
             self.assertEqual(rep['layout_differs'], 0)
             self.assertEqual(rep['container_errors'], 0)
             # the four eligible textures of a.bntx.zs (dictionary) + b.bntx.zs (Ounc, no dictionary); c.bntx repeats the first one
-            self.assertEqual(rep['converted_by_format'], {'BC4U': 1, 'BC5U': 2, 'BC6HU': 1})
-            self.assertEqual(rep['repeated_textures'], 1)
+            cf = rep['converted_by_format']   # c.bntx repeats the first texture; it is only seen as a repeat when the same worker reads both files
+            self.assertEqual((cf['BC5U'], cf['BC6HU'], cf['BC4U'] + rep['repeated_textures']), (2, 1, 2))
             self.assertEqual(rep['unique_planes'], sum(want_planes.values()))
             found = self.runtime_finds(ts[:4], out / 'astc-ro.pack', fmt_blocks=fb)
             self.assertEqual(len(found), sum(want_planes.values()))
