@@ -3,9 +3,11 @@
 Status: building (2026-11-07). Owner decision: build it as a TVPort feature for every game; Smash is the first verification game.
 
 ## Why
-On an A15 Apple TV each BC1/2/3/7 texture is stored twice: the original BC bytes inside romfs.img and the ASTC copy in astc-ro.pack
+On an A15 Apple TV each BC1/2/3/7 (and unsigned BC4/BC5/BC6H, dm/gfx/tex/README.md) texture is stored twice: the original BC bytes inside romfs.img and the ASTC copy in astc-ro.pack
 (dm/gfx/tex/README.md). Measured (spike/texture-once d9f9d29e, ~/workspace/TVPort-texmap/*.json): Smash at cap 512 goes from 26.6 GB to
 18.1 GB on the TV (original RomFS 17.6), MK8 at cap 0 from 21.5 to 18.2 GB (4x4).
+
+Switch 2 games (BNTX platform tag `Ounc`, `.bntx.zs` files with or without a `Pack/ZsDic.pack.zs` dictionary) are read the same way; BC4/BC5/BC6H are half of their texture bytes. The signed forms are not covered (they stay in the game files untouched).
 
 ## Shape
 Build time: every plane the pack covers is overwritten IN PLACE in the game files by a tag + zeros (sizes and offsets never change; compressed
