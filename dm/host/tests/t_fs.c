@@ -186,6 +186,37 @@ int main(void) {
             CHECK(read_fs("rom:/data/c", got, sizeof got) && !strcmp(got, "xy"), "a file with no holes, behind an extent boundary");
             g_nmnt = 0; setenv("DM_ROMFS", ip, 1);
         }
+        {   // a DMSPARS1 version 2 (zstd + raw extents, docs/texture_once.md section 7a) mounted as the RomFS: ReadFile across block boundaries, the end of a file, and a damaged frame as a failed read
+            enum { K = 3 }; size_t fsz[K] = {40000, 30000, 7}; uint8_t *d[K];
+            for (int i = 0; i < K; i++) { d[i] = malloc(fsz[i]); for (size_t j = 0; j < fsz[i]; j++) d[i][j] = (uint8_t)(i == 1 ? 1 + (j * 2654435761u >> 13) % 255 : (j / 3000) % 4 ? 0x40 + (uint8_t)(j / 3000) : 1 + (j * 40503u >> 7) % 250); }
+            uint8_t *im; size_t imn = fx_romfs(&im, K, (const uint8_t *const *)d, fsz);
+            uint8_t *w; size_t wn; long nz; long ne = fx_write_sparse2(im, imn, 4096, 2, NULL, 0, &w, &wn, &nz); CHECK(ne > 8 && nz > 3, "wrap the image in 4096-byte extents, zstd and raw mixed (%ld extents, %ld zstd)", ne, nz);
+            char wp[1100]; snprintf(wp, sizeof wp, "%s/sparse2.img", root); FILE *f = fopen(wp, "wb"); fwrite(w, 1, wn, f); fclose(f);
+            setenv("DM_ROMFS", wp, 1); g_nmnt = 0; CHECK(h_fs_MountRom("rom", NULL, 0) == RES_OK && g_mnt[0].img && g_mnt[0].img->src.sparse && g_mnt[0].img->src.zc, "a DMSPARS1 version 2 mounts as the RomFS");
+            for (int i = 0; i < K; i++) {
+                char name[32]; snprintf(name, sizeof name, "rom:/data/f%d", i); uint64_t h; size_t n = 0; uint8_t *b = malloc(fsz[i] + 10); memset(b, 7, fsz[i] + 10);
+                CHECK(h_fs_OpenFile(&h, name, MODE_READ) == RES_OK && h_fs_ReadFile(&n, h, 0, b, fsz[i] + 10) == RES_OK && n == fsz[i] && !memcmp(b, d[i], fsz[i]) && b[fsz[i]] == 7, "f%d reads in full and stops at its end (got %zu)", i, n);
+                int bad = 0;
+                for (int k = 0; k < 200 && fsz[i] > 10; k++) { int64_t off = (int64_t)(k * 997u % fsz[i]); size_t len = 1 + (k * 131u) % 9000; n = 0;
+                    if (h_fs_ReadFile(&n, h, off, b, len) != RES_OK) { bad++; continue; }
+                    size_t want = (size_t)off + len > fsz[i] ? fsz[i] - (size_t)off : len; if (n != want || memcmp(b, d[i] + off, want)) bad++; }
+                CHECK(!bad, "f%d: %d of 200 windows across blocks differ", i, bad);
+                h_fs_CloseFile(h); free(b);
+            }
+            // a damaged frame is a failed ReadFile (one [RED] line), not zeros; the rest of the image still reads
+            { romfs_src s2; int fd2 = open(wp, O_RDONLY); romfs_src_open(fd2, &s2); uint64_t bad_phys = 0; size_t bad_k = 0;
+              for (uint64_t k = 0; k < s2.n; k++) if (s2.ext[k].kind == 1 && s2.ext[k].lo >= 32 + 4096 && !bad_phys) { bad_phys = s2.ext[k].phys; bad_k = (size_t)k; }
+              uint64_t bad_lo = s2.ext[bad_k].lo; close(fd2); romfs_src_free(&s2);
+              CHECK(bad_phys != 0, "found a zstd extent to damage");
+              w[bad_phys] ^= 0xFF; f = fopen(wp, "wb"); fwrite(w, 1, wn, f); fclose(f);
+              g_nmnt = 0; CHECK(h_fs_MountRom("rom", NULL, 0) == RES_OK, "the damaged image still mounts (its index is intact)");
+              int fails = 0, oks = 0;
+              for (int i = 0; i < K; i++) { char name[32]; snprintf(name, sizeof name, "rom:/data/f%d", i); uint64_t h; size_t n = 0; uint8_t *b = malloc(fsz[i]); memset(b, 0, fsz[i]);
+                  if (h_fs_OpenFile(&h, name, MODE_READ) == RES_OK) { if (h_fs_ReadFile(&n, h, 0, b, fsz[i]) != RES_OK) fails++; else { oks++; CHECK(!memcmp(b, d[i], fsz[i]), "f%d reads right", i); } h_fs_CloseFile(h); } free(b); }
+              CHECK(fails >= 1 && oks >= 1, "the file holding the damaged frame (logical %llu) fails to read, the others read (%d failed, %d read)", (unsigned long long)bad_lo, fails, oks); }
+            for (int i = 0; i < K; i++) free(d[i]);
+            free(im); free(w); g_nmnt = 0; setenv("DM_ROMFS", ip, 1);
+        }
     }
     snprintf(save, sizeof save, "%s/save", root); snprintf(work, sizeof work, "%s.work", save);
     mkdir(save, 0755); snprintf(p, sizeof p, "%s/a", save); put(p, "old");
