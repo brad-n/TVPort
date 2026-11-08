@@ -751,7 +751,7 @@ def run(args):
         if os.path.exists(f): os.unlink(f)
     lib = find_astc_lib(pack, out)
     native = build_native(os.path.join(out, 'lib'))
-    Z.configure(os.path.join(out, 'lib')); Z.build(os.path.join(out, 'lib'))
+    Z.configure(os.path.join(out, 'lib')); Z.build(os.path.join(out, 'lib')); Z.build_exact(os.path.join(out, 'lib'))
     files = B.image_files(romfs)
     dicts = B.zs_dicts(romfs, files, lib)
     arc = None
@@ -1016,7 +1016,7 @@ def run_manifest(args):
     if not B.read_pack_header(pack): log(f'[RED] {pack} is no complete ASTC pack'); return 2
     lib = find_astc_lib(pack, out)
     native = build_native(os.path.join(out, 'lib'))
-    Z.configure(os.path.join(out, 'lib')); Z.build(os.path.join(out, 'lib'))
+    Z.configure(os.path.join(out, 'lib')); Z.build(os.path.join(out, 'lib')); Z.build_exact(os.path.join(out, 'lib'))
     files = B.image_files(romfs)
     dicts = B.zs_dicts(romfs, files, lib)
     arc = None
