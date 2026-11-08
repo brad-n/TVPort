@@ -41,6 +41,7 @@ static int astc_sync(void) { static int v = -1; if (v < 0) { const char *e = get
 #include "nvn_primitive.h"
 #include "nvn_timestamp.h"
 #include "msl_image.h"
+#include "nvn_shader_trim.h"   // shaders the app carries as compressed MSL source (dm/gfx/tools/shader_trim.py), compiled on the device
 #include "dmsh_chain.h"   // DMSH_CHAIN: the translation chain version of the B shader library expected by this source tree, one for every game (beside this file, tools/dmsh_chain.py --header)
 #include "game_profile.h"   // game profile constants (profile id, the profile's switches)
 // Texture slot table per stage: 0-127 the combined handles (nvnCommandBufferBindTexture), 128-255 the separate texture binds (NVN_SEPTEX_SLOT0, nvn_obj.h)
@@ -5523,11 +5524,19 @@ static const img_ent *msl_image_file(NSString *path, romfs_img **img) {
     *img = m;
     return m ? msl_image_find(m, path.lastPathComponent.UTF8String) : NULL;
 }
+// Shader trimming: the shader map marks some keys `src` (column 6): their libraries are compressed MSL in the image, compiled on the device in the background (nvn_shader_trim.m). A request for
+// such a shader that is not compiled yet makes shader_load return nil with t_trim_pending set, and the draw that needs it is skipped; t_trim_sync (the prewarm's threads) waits for it instead
+static __thread int t_trim_sync, t_trim_pending;
+static int g_trim_any;
 static NSData *msl_data(NSString *path) {   // a file of the library, nil when it has none
     NSData *d = [NSData dataWithContentsOfFile:path];
     if (d) return d;
     romfs_img *m; const img_ent *x = msl_image_file(path, &m);
-    if (!x) return nil;
+    if (!x) {
+        NSString *n = path.lastPathComponent;   // <key>_b.json of a shader in source form: its reflection is a zstd entry
+        if (g_trim_any && n.length == 23 && [n hasSuffix:@"_b.json"] && trim_is_source([n substringToIndex:16])) return trim_json([n substringToIndex:16]);
+        return nil;
+    }
     NSMutableData *o = [NSMutableData dataWithLength:(NSUInteger)x->b];
     return romfs_image_read(m, o.mutableBytes, (size_t)x->b, x->a) ? o : nil;
 }
@@ -5552,10 +5561,12 @@ static void shmap_read(void) {
     NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
     if (!txt) MDIE("cannot read the shader map %s (DM_NVN_SHMAP can name another)", path.UTF8String);
     g_shmap = [NSMutableDictionary dictionary];
+    NSMutableArray<NSString *> *src_keys = [NSMutableArray array];   // column 6 = src: the shader is compressed source in the image (shader trimming)
     for (NSString *ln in [txt componentsSeparatedByString:@"\n"]) {
         if (!ln.length || [ln hasPrefix:@"#"] || [ln hasPrefix:@"package"]) continue;
         NSArray *c = [ln componentsSeparatedByString:@"\t"];
         if (c.count > 3) g_shmap[c[3]] = c[2];
+        if (c.count > 5 && [c[5] isEqualToString:@"src"]) [src_keys addObject:c[3]];
     }
     g_shmap_path = path;
     const char *m = getenv("DM_MSL_DIR");
@@ -5598,6 +5609,14 @@ static void shmap_read(void) {
             g_cb_ext = d; MLOG("uniform read extents: %lu shaders (cb_extent.tsv)", (unsigned long)d.count); }
     }
     MLOG("shader route B (translated Switch originals): shader map %lu entries (%s), metallib directory %s", (unsigned long)g_shmap.count, path.UTF8String, g_msl_dir.UTF8String);
+    if (src_keys.count) {   // shader trimming: compile threads (DM_SHADER_TRIM_JOBS, 2 to 4; 3 by default), and which keys they serve
+        const char *jobs = getenv("DM_SHADER_TRIM_JOBS");
+        trim_configure(g_dev, ^NSData *(NSString *entry) { return msl_data([NSString stringWithFormat:@"%@/%@", g_msl_dir, entry]); }, ^(NSString *line) { MLOG("%s", line.UTF8String); }, jobs ? atoi(jobs) : 3);
+        for (NSString *k in src_keys) trim_add_source_key(k);
+        g_trim_any = 1;
+        MLOG("shader trimming: %lu of the %lu shaders are compressed source, compiled on the device in the background by %d threads (their draws are skipped until they are ready); compile options: %s", (unsigned long)src_keys.count,
+             (unsigned long)g_shmap.count, jobs ? atoi(jobs) : 3, "mathMode relaxed, preserveInvariance, MSL 3.2 (not matched: -O1, -fbracket-depth=1024)");
+    }
 }
 
 @interface NvShader : NSObject { @public id<MTLFunction> fn, tf_fn, discard_fn, fn_u, fn_m, fn_d, geo_fn; uint8_t mask_m;   // fn_u: the integer-output entry point (dmsh_build.py fs_uint), for pipelines whose colour attachments are all unsigned integer (pso_desc); fn_m: the mixed one, its outputs in mask_m unsigned integer; fn_d: the dual-source one (dmsh_build.py fs_dual)
@@ -5632,7 +5651,7 @@ typedef struct { int8_t fx[32]; uint8_t fbmask, lmap[8]; } bf_key;
 #include "nvn_pso_skey.h"
 #include "nvn_geometry.h"
 #include "nvn_feedback.h"
-@interface NvProg : NSObject { @public NvShader *sh[6]; char gs_miss[17]; NvProg *geo_raster, *geo_lean_raster; int8_t c_sw, c_iw, c_img; } @end   // c_sw / c_iw / c_img: prog_swrites, udc_note_draw's image write, image_prepare's written image slots; + 1 once known (the shaders are fixed once made)   // geo_raster: GS output reader paired with this program's fragment stage; geo_lean_raster: its own vertex and fragment stages (a lean passthrough kernel)
+@interface NvProg : NSObject { @public NvShader *sh[6]; char gs_miss[17]; NvProg *geo_raster, *geo_lean_raster; int8_t c_sw, c_iw, c_img; int trim_pending; uint64_t trim_serial; NSArray<NSString *> *trim_keys; } @end   // c_sw / c_iw / c_img: prog_swrites, udc_note_draw's image write, image_prepare's written image slots; + 1 once known (the shaders are fixed once made)   // geo_raster: GS output reader paired with this program's fragment stage; geo_lean_raster: its own vertex and fragment stages (a lean passthrough kernel)
 @implementation NvProg @end
 // Warm-up entry: built in the background, waiting to be taken by the submit thread. vs / fs are strong references (in pso they are only raw pointers, and the background dictionary is released when the task ends)
 @interface WarmItem : NSObject { @public int kind, record; NSString *key, *vs_key, *fs_key; NvShader *shader, *vs, *fs; pso_key pso; id<MTLFunction> fsfn; id object; } @end   // record: a prefetched library, written to the prewarm lists when claimed (shader_get's lines)
@@ -5735,6 +5754,17 @@ static void pso_user_record(const char *fmt, ...) {
 // while the default soft limit of an iOS process is 256; new shaders created in other acts raise it further). Here the file is mapped into memory and closed immediately, and the library is built from the in-memory data; the mapping is released when the library's data object is freed
 static __thread int t_lib_layer;
 static id<MTLLibrary> lib_from_file(NSString *path, NSError **err) {
+    if (g_trim_any) {   // a shader in source form: its library is made by nvn_shader_trim.m (ready, or not yet: nil, and t_trim_pending says to try again later)
+        NSString *n = path.lastPathComponent;
+        if ([n hasSuffix:@".metallib"] && n.length >= 27 && trim_is_source([n substringToIndex:16])) {
+            NSString *name = [n substringToIndex:n.length - 9]; int st = trim_ensure([n substringToIndex:16], t_trim_sync), layer = 0;
+            id<MTLLibrary> lib = st == TRIM_READY ? trim_library(name, &layer) : nil;
+            if (lib) t_lib_layer = layer;
+            else { if (st == TRIM_PENDING) t_trim_pending = 1;
+                   if (err) *err = [NSError errorWithDomain:@"dm" code:2 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"%@: %s", name, st == TRIM_PENDING ? "compiling from source" : st == TRIM_FAILED ? "its source did not compile" : "no such library"]}]; }
+            return lib;
+        }
+    }
     int fd = open(path.fileSystemRepresentation, O_RDONLY); struct stat st;
     if (fd < 0) {   // not in the folder: the library's image, whose one descriptor is shared, and only this file's pages are mapped
         int open_errno = errno; romfs_img *img; const img_ent *x = msl_image_file(path, &img); msl_map f;
@@ -5829,6 +5859,7 @@ static id<MTLComputePipelineState> cps_new(id<MTLFunction> f, NSError **e);   //
 // layer: a vertex shader's layer entry points (entry_layer / entry_layer_z, which also write the layer) instead of main0 / main0_z, for a program whose geometry shader is a slice writer (prog_fold_gs)
 static NvShader *shader_load(NSString *pc, int stage, int layer) {
     NSError *e = nil;
+    if (g_trim_any && pc.length == 18 && [pc hasSuffix:@"_b"] && trim_ensure([pc substringToIndex:16], t_trim_sync) == TRIM_PENDING) { t_trim_pending = 1; return nil; }   // compiling from source: not an error
     NSData *jd = msl_data([NSString stringWithFormat:@"%@/%@.json", g_msl_dir, pc]);
     NSDictionary *j = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
     if (j && stage == 2 && [j[@"gs_slice"] isKindOfClass:[NSDictionary class]] && [j[@"chain"] isEqual:@DMSH_CHAIN]) {   // a slice-writing geometry shader has no library: a stub prog_fold_gs replaces
@@ -6024,6 +6055,12 @@ static NvShader *builtin_get(const char *ctl) {
     return nil;
 }
 static void up_mfx_read_color(NvShader *cs, const NVNshaderData *sd);
+// Shader trimming: a program with a shader that is still compiling from source is not put in the serial table (it would keep the missing stage for good). It is held here by program until its
+// shaders are ready, and draws with it are skipped (draw_encode). prog_get returns unretained objects, so a replaced one is parked in a ring rather than freed under a caller
+static NSMutableDictionary<NSNumber *, NvProg *> *g_trim_progs; static NvProg *g_trim_parked[256]; static unsigned g_trim_park_n;
+static void trim_park(NvProg *o) { g_trim_parked[g_trim_park_n++ % 256] = o; }
+static int trim_keys_pending(NSArray<NSString *> *keys) { for (NSString *k in keys) if (trim_state(k) == TRIM_PENDING) return 1; return 0; }
+static void trim_skip_draw(NvProg *pr) { for (NSString *k in pr->trim_keys) trim_note_skip(k); }
 static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // Called only on the submit thread
     prog_t *p = (prog_t *)cp;
     static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;   // Last result: same object, same serial and unchanged serial table means it is used directly
@@ -6032,7 +6069,11 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // Called only
     __unsafe_unretained NvProg *have = p->serial ? serial_get(p->serial) : nil;
     if (have) { lp = p; lser = p->serial; lgen = gen; lpr = have; return have; }
     shmap_load();
-    NvProg *o = [NvProg new];
+    if (g_trim_any && g_trim_progs) {
+        NSNumber *tk = @((uintptr_t)p); NvProg *w = g_trim_progs[tk];
+        if (w) { if (w->trim_serial == p->serial && trim_keys_pending(w->trim_keys)) return w; trim_park(w); [g_trim_progs removeObjectForKey:tk]; }
+    }
+    NvProg *o = [NvProg new]; NSMutableArray<NSString *> *trim_wait = nil;
     for (unsigned i = 0; i < p->nstage; i++) {
         // Key = sha256(first 0x880 bytes of the control section + code area): many of Mario's shaders share a control section but differ in code (dm/gfx/tools/shader_split.py). It was computed at SetShaders (hle_nvn.c): by now the game may have freed the control section
         uint8_t md[8]; prog_key(p, i, md);
@@ -6051,16 +6092,27 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // Called only
             continue;
         }
         int st = stage_of(stage);
+        t_trim_pending = 0;
         NvShader *sh = st >= 0 ? shader_get([k stringByAppendingString:@"_b"], st) : nil;
-        if (sh) o->sh[st] = sh; else MLOG("[RED] shader %s (%s) failed to load: build the shaders with dm/gfx/tools/dmsh_build.py first", k.UTF8String, stage.UTF8String);
+        if (sh) o->sh[st] = sh;
+        else if (t_trim_pending) { if (!trim_wait) trim_wait = [NSMutableArray array]; [trim_wait addObject:k]; continue; }   // compiling from source: the program waits for it
+        else MLOG("[RED] shader %s (%s) failed to load: build the shaders with dm/gfx/tools/dmsh_build.py first", k.UTF8String, stage.UTF8String);
         if (sh && st == 5) up_mfx_read_color(sh, &p->sd[i]);
         if (!sh && st == 2) strlcpy(o->gs_miss, k.UTF8String, sizeof o->gs_miss);
+    }
+    if (trim_wait) {   // not complete: kept apart from the serial table, and its draws are skipped until the shaders are ready
+        if (!g_trim_progs) g_trim_progs = [NSMutableDictionary dictionary];
+        o->trim_pending = 1; o->trim_keys = trim_wait; o->trim_serial = p->serial; g_trim_progs[@((uintptr_t)p)] = o;
+        return o;
     }
     prog_fold_gs(o);   // a slice-writing geometry shader: the vertex shader's layer entry points instead
     if (p->serial) serial_put(p->serial, o);
     return o;
 }
-void mtl_prog_release(prog_t *p) { if (p->serial) serial_del(p->serial); }
+void mtl_prog_release(prog_t *p) {
+    if (p->serial) serial_del(p->serial);
+    if (g_trim_progs) { NSNumber *tk = @((uintptr_t)p); NvProg *w = g_trim_progs[tk]; if (w) { trim_park(w); [g_trim_progs removeObjectForKey:tk]; } }
+}
 
 // ---------- Descriptor pool: texture ID / sampler ID → object ----------
 // At registration the whole texture object is snapshotted (NVN semantics: the descriptor has been written into the pool); view: the MTLTexture for that ID (a view or the base texture, held via CFBridgingRetain) and the serial-table / guest-write generations at the time it was obtained
@@ -8891,7 +8943,7 @@ static NSArray<WarmTask *> *warm_parse(NSArray<NSString *> *paths, long *lines) 
     }
     *lines = n; return tasks;
 }
-static void warm_task(WarmTask *t) {
+static void warm_task_(WarmTask *t) {
     @autoreleasepool {
         if (t->kind == 0) {
             NvShader *sh = warm_shader(t->key, t->stage);
@@ -8924,6 +8976,11 @@ static void warm_task(WarmTask *t) {
             warm_enqueue(item); g_warm_rps++;
         }
     }
+}
+static void warm_task(WarmTask *t) {
+    int sync = t_trim_sync; t_trim_sync = 1;   // the prewarm waits for a shader in source form (nothing is drawn yet)
+    warm_task_(t);
+    t_trim_sync = sync;
 }
 static void warm_finish(void) {
     MLOG("pipeline prewarm done: shaders %llu / render pipelines %llu (specialized fragment skipped %llu) / compute pipelines %llu, background time %.1f ms; shader keys not in the shader map (another game version) %llu",
@@ -12698,6 +12755,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     g_mdxc.next = NULL;
     if (!S.prog) { RED_ONCE(18, "no program bound before the draw"); PD("Z %llu draw skipped: no program bound", g_stat_pass + !g_enc); return; }
     __unsafe_unretained NvProg *pr = g_geo_program ? g_geo_program : prog_get(S.prog);
+    if (pr && pr->trim_pending) { trim_skip_draw(pr); PD("Z %llu draw skipped: a shader is compiling from source (shader trimming)", g_stat_pass + !g_enc); return; }
     image_prepare(pr, 0x1f);
     draw_gs_check(pr);   // a geometry stage left with no function (see prog_fold_gs)
     if (!g_geo_program && S.rast_discard && S.tf_on) { tf_draw(pr, dw, di); return; }
@@ -15099,6 +15157,8 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
              g_bp_lib_n, g_bp_lib_ns / 1e6, g_bp_pso_n, g_bp_pso_ns / 1e6, g_warm_claim_shaders, g_warm_claim_rps, g_warm_claim_cps,
              g_bp_up_bytes / 1048576.0, g_pkg_uploads, g_pkg_reuploads,
              g_up_total_ns / 1e6, g_bp_first_present / 1e9);
+        if (g_trim_any) { trim_stats_t ts = trim_stats(); MLOG("[bootprof] shader trimming: %llu source shaders in the app, %llu compiled on the device (%llu libraries, %.1f ms of compiling, %llu failed), %llu draws skipped while compiling (%llu shaders)",
+                                                          (unsigned long long)ts.source_keys, (unsigned long long)ts.compiled, (unsigned long long)ts.libs, ts.compile_ns / 1e6, (unsigned long long)ts.failed, (unsigned long long)ts.skipped_draws, (unsigned long long)ts.skipped_shaders); }
     }
     PD("X ser=%llu", t->serial);
     id<MTLTexture> src = tex_mtl(t);
