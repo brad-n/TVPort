@@ -2658,14 +2658,14 @@ static pthread_mutex_t g_astc_mu = PTHREAD_MUTEX_INITIALIZER; static astc_dec *g
 static _Atomic uint64_t g_astc_n_astc, g_astc_n_decoded;
 static _Atomic uint64_t g_astc_copy_first, g_astc_copy_astc, g_astc_copy_partial, g_astc_copy_ns, g_astc_copy_bytes;   // textures created empty and filled by copy (astc_first_copy)
 static astc_dec *astc_slot(uint64_t serial, int add) {   // g_astc_mu held; the pointer is good until the next add
-    if (add && (g_astc_n + 1) * 2 > g_astc_capdim) {
-        size_t ncap = g_astc_capdim ? g_astc_capdim * 2 : 4096; astc_dec *nt = calloc(ncap, sizeof *nt); if (!nt) MDIE("ASTC decision table of %zu entries", ncap);
-        for (size_t i = 0; i < g_astc_capdim; i++) if (g_astc_tab[i].serial) { size_t j = (g_astc_tab[i].serial * 0x9E3779B97F4A7C15ull >> 32) & (ncap - 1); while (nt[j].serial) j = (j + 1) & (ncap - 1); nt[j] = g_astc_tab[i]; }
-        free(g_astc_tab); g_astc_tab = nt; g_astc_capdim = ncap;
+    if (add && (g_astc_n + 1) * 2 > g_astc_cap) {
+        size_t ncap = g_astc_cap ? g_astc_cap * 2 : 4096; astc_dec *nt = calloc(ncap, sizeof *nt); if (!nt) MDIE("ASTC decision table of %zu entries", ncap);
+        for (size_t i = 0; i < g_astc_cap; i++) if (g_astc_tab[i].serial) { size_t j = (g_astc_tab[i].serial * 0x9E3779B97F4A7C15ull >> 32) & (ncap - 1); while (nt[j].serial) j = (j + 1) & (ncap - 1); nt[j] = g_astc_tab[i]; }
+        free(g_astc_tab); g_astc_tab = nt; g_astc_cap = ncap;
     }
-    if (!g_astc_capdim) return NULL;
-    size_t j = (serial * 0x9E3779B97F4A7C15ull >> 32) & (g_astc_capdim - 1);
-    while (g_astc_tab[j].serial) { if (g_astc_tab[j].serial == serial) return &g_astc_tab[j]; j = (j + 1) & (g_astc_capdim - 1); }
+    if (!g_astc_cap) return NULL;
+    size_t j = (serial * 0x9E3779B97F4A7C15ull >> 32) & (g_astc_cap - 1);
+    while (g_astc_tab[j].serial) { if (g_astc_tab[j].serial == serial) return &g_astc_tab[j]; j = (j + 1) & (g_astc_cap - 1); }
     if (!add) return NULL;
     g_astc_tab[j].serial = serial; g_astc_n++; return &g_astc_tab[j];
 }
