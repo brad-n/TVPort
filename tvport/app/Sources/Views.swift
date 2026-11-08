@@ -135,7 +135,7 @@ struct ContentView: View {
                     ContentUnavailableView {
                         Label("No games yet", systemImage: "appletv")
                     } description: {
-                        Text("Drop a game folder or an .nsp, .xci, .nsz or .xcz file here. A dropped file adds its containing folder, including updates and DLC.")
+                        Text("Drop a game folder or an .nsp, .xci, .nsz, .xcz or .nup file here. A dropped file adds its containing folder, including updates and DLC.")
                     } actions: {
                         Button("Drop game folder here") { choosingFolder = true }
                             .buttonStyle(.borderedProminent)
@@ -215,7 +215,7 @@ struct GameView: View {
                     AutomaticBackupStatus()
                     if let notice = library.notice { NoticeBar(text: notice) }
                     if let info = library.info, !info.prepared, info.sources.isEmpty {
-                        NoticeBar(text: "This folder has no .nsp, .xci, .nsz or .xcz files. TVPort builds only from games you dumped from your own Switch.")
+                        NoticeBar(text: "This folder has no .nsp, .xci, .nsz, .xcz or .nup files. TVPort builds only from games you dumped from your own Switch.")
                     }
                     HStack(alignment: .top, spacing: 20) {
                         VStack(alignment: .leading, spacing: 24) {
@@ -282,7 +282,7 @@ struct GameView: View {
 
     private var canBuild: Bool {
         guard let info = library.info, info.folder == library.current?.folder, library.device != nil, library.setupMissing.isEmpty, !library.settingUp, !library.transferringSaves, library.checkingAddonGame == nil else { return false }
-        return info.prepared || (!info.sources.isEmpty && library.keys != nil)
+        return info.prepared || (!info.sources.isEmpty && (library.keys != nil || info.keyless == true))
     }
 }
 
@@ -430,7 +430,7 @@ struct ArtworkCard: View {
             .accessibilityLabel("App icon preview. Drop an image to replace it.")
             .dropDestination(for: URL.self) { urls, _ in
                 guard let url = urls.first, url.isFileURL else { return false }
-                if ["nsp", "xci", "nsz", "xcz"].contains(url.pathExtension.lowercased()) || url.hasDirectoryPath {
+                if ["nsp", "xci", "nsz", "xcz", "nup"].contains(url.pathExtension.lowercased()) || url.hasDirectoryPath {
                     guard library.canEditAddons else { return false }
                     if let game = library.current { library.attachAddons(urls, to: game.id) }
                     return true

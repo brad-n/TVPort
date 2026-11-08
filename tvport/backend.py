@@ -32,7 +32,7 @@ HERE = Path(__file__).resolve().parent
 BUNDLED = (HERE / 'engine.json').is_file()
 REPO = HERE.parent   # the engine: this checkout, or for the app the copy it unpacked (main)
 TITLE_RE = re.compile(r'^([0-9A-Fa-f]{16})_build$')
-SOURCE_SUFFIXES = {'.nsp', '.xci', '.nsz', '.xcz'}
+SOURCE_SUFFIXES = {'.nsp', '.xci', '.nsz', '.xcz', '.nup'}   # .nup: a Switch 2 game in one NUP container (scripts/pack_nup.py), which needs no prod.keys
 ENGINE_PACKAGES = ('fontTools', 'capstone', 'lz4')
 SUPPORT = Path.home() / 'Library/Application Support'
 DATA = Path(os.environ.get('TVPORT_DATA') or SUPPORT / 'TVPort')   # the app's library, the build lock, and the app's engine and Python; TVPORT_DATA moves it, for a test run
@@ -238,12 +238,52 @@ class Game:
             return self.title_id.upper()
         # Filename lookup is only a hint for artwork, never an identity used for building.
         ids = {match.upper() for name in self.sources for match in re.findall(r'(?<![0-9A-Fa-f])([0-9A-Fa-f]{16})(?![0-9A-Fa-f])', name)
-               if match.upper().startswith('0100') and match.endswith('000')}
+               if match.upper().startswith(('0100', '0400')) and match.endswith('000')}   # 0100…: Switch 1, 0400…: Switch 2
         return next(iter(ids)) if len(ids) == 1 else ''
 
     @property
     def sources(self) -> list:
         return sorted(p.name for p in self.folder.iterdir() if p.suffix.lower() in SOURCE_SUFFIXES)
+
+    @property
+    def keyless(self) -> bool:
+        """Whether the game is only NUP containers: they carry their files unencrypted, so no prod.keys is needed (a Switch 2 game; the NSP script takes no -k for it)"""
+        names = self.sources
+        return bool(names) and all(name.lower().endswith('.nup') for name in names)
+
+    def nup_info(self) -> dict:
+        """What the folder's NUP says about the game, read from the container itself (title ID from its code's NPDM, newest update version, name from its control data), else from the
+        `[title ID][v<version>]` of its file name. {} when the folder holds no NUP. Never raises: a damaged or unreadable NUP reports `error` and the file name's hints."""
+        names = [name for name in self.sources if name.lower().endswith('.nup')]
+        if not names:
+            return {}
+        path = self.folder / names[0]
+        hint_id = re.search(r'\[([0-9A-Fa-f]{16})\]', path.name)
+        hint_version = re.search(r'\[v(\d+)\]', path.name)
+        info = {'file': path.name, 'title_id': hint_id.group(1).upper() if hint_id else '', 'version': int(hint_version.group(1)) if hint_version else None, 'name': '', 'icon': None, 'from_container': False}
+        if len(names) > 1:
+            info['error'] = f'More than one NUP in this folder ({", ".join(names)}): keep one game per folder.'
+        try:
+            sys.path.insert(0, str(REPO / 'scripts'))
+            import pack_nup
+            container = pack_nup.Nup(path)
+            try:
+                app, base, updates, dlc = pack_nup.scan(container)
+                info.update(title_id=f'{app:016X}', from_container=True, updates=sorted(updates), dlc=len(dlc))
+                if updates and info['version'] is None:
+                    info['version'] = max(updates)
+                meta = pack_nup.app_package(container).meta()
+                nacp = meta.get(pack_nup.T_NACP)
+                if nacp:
+                    with tempfile.TemporaryDirectory() as folder:
+                        (Path(folder) / 'control.nacp').write_bytes(nacp)
+                        info['name'] = nacp_text(Path(folder) / 'control.nacp')
+                info['icon'] = bool(meta.get(pack_nup.T_ICON) or meta.get(pack_nup.T_LICONS))
+            finally:
+                container.close()
+        except Exception as error:   # a NUP that cannot be read still builds or fails in the engine with its own message; here it only costs the details
+            info.setdefault('error', f'Could not read the NUP: {error}')
+        return info
 
     @property
     def package(self) -> Optional[str]:
@@ -511,7 +551,8 @@ def cmd_inspect(args) -> None:
     app = game.earlier_app() if game.build else None
     profile = provisioning(app)
     team = profile.get('team') or known_team()
-    print(json.dumps({'folder': str(game.folder), 'title_id': game.title_id, 'artwork_title_id': game.artwork_title_id, 'name': game.name() if game.build else game.folder.name, 'version': game.version() if game.build else '',
+    nup = game.nup_info()
+    print(json.dumps({'folder': str(game.folder), 'title_id': game.title_id, 'keyless': game.keyless, 'nup': nup or None, 'artwork_title_id': game.artwork_title_id or nup.get('title_id', ''), 'name': game.name() if game.build else nup.get('name') or game.folder.name, 'version': game.version() if game.build else '',
                       'build_folder': str(game.build_parent), 'build_path': str(game.build) if game.build else None, 'built': app is not None,
                       'sources': game.sources, 'prepared': game.prepared, 'render_scale': game.render_scale_supported() if game.build else False, 'frame_step': game.frame_step_supported() if game.build else False, 'fps_target': int(game.profile_value('fps_target') or 0) if game.title_id else 0, 'icon': str(game.icon) if game.icon else None, 'team': team,
                       'bundle_id': game.bundle_id(team) if game.build and team else None, 'signing': profile, 'saved': game.state(),
@@ -519,6 +560,9 @@ def cmd_inspect(args) -> None:
 
 
 def check_addons(game: Game, sources, keys=None, python=None) -> dict:
+    if game.keyless:   # a NUP holds its updates and DLC itself, and the keys check reads NSP / XCI metadata
+        emit('log', line='This game is a NUP container: its updates and DLC are inside it, so there is nothing to verify.')
+        return {'title_id': game.nup_info().get('title_id', ''), 'addons': []}
     keys = keys if keys and keys.is_file() else find_keys(game)
     if not keys:
         raise Failure('Choose your prod.keys file in this game’s settings first, so TVPort can verify the update or DLC.')
@@ -842,9 +886,11 @@ def extractor_options(args) -> list:
 def prepare_game(game: Game, keys: Optional[Path], team: str, python: str, args=None) -> Game:
     stage('Extracting the game, rewriting its code and building shaders')
     emit('log', line='This can take 30 to 60 minutes the first time, and again when the game version changes.')
-    keys = keys if keys and keys.is_file() else find_keys(game)
-    if not keys:
-        raise Failure('This game has not been built yet, so it needs your prod.keys file')
+    keys = None if game.keyless else keys if keys and keys.is_file() else find_keys(game)
+    if game.keyless:
+        emit('log', line='NUP container (Switch 2): no prod.keys needed. TVPort reads the game as it is; this is not a Switch 1 build, so expect it to stop where the engine lacks Switch 2 support.')
+    elif not keys:
+        raise Failure('This game has not been built yet, so it needs your prod.keys file. (A Switch 2 game packed as a .nup needs none: its files are not encrypted. A Switch 1 game, or a Switch 2 game as an .nsp or .xci, needs keys from your own Switch.)')
     signature = game.input_signature()
     state = game.state()
     profiles = dict(state.get('profiles_by_source') or {})
@@ -854,7 +900,7 @@ def prepare_game(game: Game, keys: Optional[Path], team: str, python: str, args=
     # A provisional survey contains build-specific addresses and memory settings.
     # Different inputs must not reuse it; keep each survey so switching back is safe.
     profile = profiles.get(signature, f'profiles/{signature}') if game.build else None
-    command = [python, REPO / 'scripts/build_ipa_from_nsp.py', game.folder, '-k', keys, '--prepare-xcode', '--keep-extracted', '--gpu', pipeline_gpu(args), '--romfs', 'separate', '--allow-other-metal', '--progress', 'lines']
+    command = [python, REPO / 'scripts/build_ipa_from_nsp.py', game.folder, *(['-k', keys] if keys else []), '--prepare-xcode', '--keep-extracted', '--gpu', pipeline_gpu(args), '--romfs', 'separate', '--allow-other-metal', '--progress', 'lines']
     command += extractor_options(args)
     if game.title_id:
         command += ['--title-id', game.title_id]

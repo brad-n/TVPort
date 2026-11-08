@@ -4,7 +4,7 @@ enum GameDropImport {
     /// The backend builds a folder, including its updates and DLC. A dropped
     /// game file selects that folder in place, including on external volumes.
     static func folders(from urls: [URL]) -> [URL] {
-        let gameExtensions: Set<String> = ["nsp", "xci", "nsz", "xcz"]
+        let gameExtensions: Set<String> = ["nsp", "xci", "nsz", "xcz", "nup"]
         var seen = Set<String>()
         return urls.compactMap { url in
             guard url.isFileURL,

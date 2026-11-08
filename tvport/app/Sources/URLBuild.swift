@@ -48,7 +48,7 @@ extension Library {
         }
         // Read-only look at the game (not the selection), so a keys problem refuses before anything changes.
         guard let found = try? await Backend.ask(GameInfo.self, ["inspect", game.folder]) else { return refuse("could not read the game") }
-        let hasKeys = (game.keys ?? games.compactMap(\.keys).first ?? found.keys) != nil
+        let hasKeys = found.keyless == true || (game.keys ?? games.compactMap(\.keys).first ?? found.keys) != nil
         guard found.prepared || (!found.sources.isEmpty && hasKeys) else { return refuse("keys missing") }
         if busy() { return refuse("already building or queued") }
 
