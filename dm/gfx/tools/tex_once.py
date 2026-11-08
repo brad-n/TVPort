@@ -47,6 +47,15 @@ BC1_FORMATS = (0x1a01, 0x1a06)
 NATIVE_SOURCE = os.path.join(HERE, 'tex_once_native.c')
 
 
+def debug_mode():
+    """Hidden bisect switch TEX_ONCE_DEBUG (Smash boot hang, 2026-11-08); empty = the normal tool.
+    repack-only: every container the normal run touches is re-packed the same way, but its planes are left as they are (the decompressed contents equal the original; no pack is embedded).
+    zero-only: planes are tagged + zeroed only in containers that need no re-compression (raw NUTEXB / BNTX / SARC, uncompressed data.arc entries); every zstd / Yaz0 container and the data.arc table stay byte-identical."""
+    m = os.environ.get('TEX_ONCE_DEBUG', '')
+    if m not in ('', 'repack-only', 'zero-only'): raise SystemExit(f'TEX_ONCE_DEBUG={m!r}: expected repack-only or zero-only')
+    return m
+
+
 class Mismatch(Exception):
     """The self-check found a difference the strip must not make"""
 
@@ -191,6 +200,7 @@ class Walker:
         self.c = collections.Counter(); self.errors = []; self.new_csz = None
         self.mf = []; self.meta = {}; self.item = ''   # --manifest: one record per tagged plane the strip keeps (meta: the planes of the texture being planned, by offset)
         self.zdicts = {}
+        self.debug = debug_mode()
 
     # -- textures
     def plan(self, d, t):
@@ -266,6 +276,7 @@ class Walker:
             if conflict:
                 c['textures_skipped:overlap'] += 1; c['planes_skipped:overlap'] += len(mods); continue
             if buf is None: buf = bytearray(d)
+            if self.debug == 'repack-only': continue     # the container counts as touched (it is re-packed by the caller) but its planes stay
             for off, span, tag, astc in mods:
                 if tag is None: buf[off:off + span] = bytes(span)
                 else: buf[off:off + 8] = tag; buf[off + 8:off + span] = bytes(span - 8)
@@ -362,6 +373,7 @@ class Walker:
         c = self.c
         if depth > B.MAX_DEPTH: c['too_deep'] += 1; return None
         kind = self.kind(d, name, hint)
+        if self.debug == 'zero-only' and kind in ('zstd', 'yaz0'): c['debug_compressed_left'] += 1; return None
         if kind == 'zstd':
             c['zstd'] += 1
             dec = B.unzstd(d, self.dicts)
@@ -634,6 +646,8 @@ def split_counters(c):
 
 def run(args):
     t0 = time.monotonic()
+    dbg = debug_mode()
+    if dbg: log(f'DEBUG MODE {dbg}: not a shippable image')
     romfs = B.find_romfs(args.input)
     if not os.path.isfile(romfs): log(f'[RED] {romfs} is a folder: tex_once needs a RomFS image'); return 2
     if S.is_sparse(romfs): log(f'[RED] {romfs} is already a DMSPARS1 image'); return 2
@@ -653,7 +667,7 @@ def run(args):
     import romfs as romfs_mod
     img = romfs_mod.Image(romfs)
     logical = os.path.getsize(romfs)
-    fp = hashlib.sha256(b'tex_once %d\0' % TOOL_VERSION + tool_hash() + b'size %d\0max_dim %d\0block %d\0bc1 %d\0arc %s\0' % (logical, max_dim, block, bc1, args.arc_mode.encode())
+    fp = hashlib.sha256(b'tex_once %d\0' % TOOL_VERSION + tool_hash() + b'size %d\0max_dim %d\0block %d\0bc1 %d\0arc %s\0dbg %s\0' % (logical, max_dim, block, bc1, args.arc_mode.encode(), dbg.encode())
                         + hashlib.sha256(img.index).digest() + have['fingerprint'] + b'%d' % have['bytes']).hexdigest()
     target, rep_path = os.path.join(out, 'romfs.img'), os.path.join(out, 'report.json')
     old = read_report(rep_path)
@@ -673,7 +687,7 @@ def run(args):
     dicts = B.zs_dicts(romfs, files, lib)
     arc = None
     if any(n == '/data.arc' for n, _, _ in files):
-        arc = Arc(romfs, files, args.arc_mode == 'table')
+        arc = Arc(romfs, files, args.arc_mode == 'table' and dbg != 'zero-only')       # zero-only: the table is never rewritten
         if arc.T is None: arc = None
     arc_base = arc.base if arc else 0
     items = B.smash_arc_files(romfs, files)
@@ -724,7 +738,8 @@ def run(args):
                 fill()
     except BaseException:
         writer.abort(); raise
-    stats = writer.finish(pack)
+    embed = dbg != 'repack-only'
+    stats = writer.finish(pack if embed else None)
     strip_seconds = time.monotonic() - t1
     log(f'written: {stats["physical"] / 2**30:.2f} GB ({stats["stored"] / 2**30:.2f} GB of RomFS + {stats["pack_size"] / 2**30:.2f} GB pack), {strip_seconds:.0f} s; checking')
     # ---- self-check
@@ -748,7 +763,9 @@ def run(args):
         if sp.read(0, 32) != os.pread(fd, 32, 0): problems.append('DMROMFS1 header differs')
         ioff = struct.unpack_from('<Q', os.pread(fd, 32, 0), 8)[0]
         if sp.read(ioff, len(img.index)) != img.index: problems.append('DMROMFS1 index differs')
-        if sp.pack_offset == 0 or sp.pack_size != have['bytes']: problems.append('embedded pack missing or of another size')
+        if not embed:
+            if sp.pack_offset != 0: problems.append('repack-only: a pack is embedded')
+        elif sp.pack_offset == 0 or sp.pack_size != have['bytes']: problems.append('embedded pack missing or of another size')
         else:
             h = hashlib.sha256()
             for o in range(0, sp.pack_size, 8 << 20): h.update(sp.read_pack(o, 8 << 20))
