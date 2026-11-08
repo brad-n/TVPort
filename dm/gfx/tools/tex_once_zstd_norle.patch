@@ -1,0 +1,50 @@
+diff --git a/lib/compress/zstd_compress.c b/lib/compress/zstd_compress.c
+index d928b1d..e3426e5 100644
+--- a/lib/compress/zstd_compress.c
++++ b/lib/compress/zstd_compress.c
+@@ -3570,6 +3570,11 @@ size_t ZSTD_mergeBlockDelimiters(ZSTD_Sequence* sequences, size_t seqsSize) {
+ 
+ /* Unrolled loop to read four size_ts of input at a time. Returns 1 if is RLE, 0 if not. */
+ static int ZSTD_isRLE(const BYTE* src, size_t length) {
++    /* TVPort tex_once: never report a block as RLE, so no caller (ZSTD_compressBlock_internal, the block splitter,
++     * the superblock path, ZSTD_compressSequences) ever emits an RLE block (Block_Type 1) */
++    (void)src; (void)length;
++    return 0;
++#if 0
+     const BYTE* ip = src;
+     const BYTE value = ip[0];
+     const size_t valueST = (size_t)((U64)value * 0x0101010101010101ULL);
+@@ -3589,6 +3594,7 @@ static int ZSTD_isRLE(const BYTE* src, size_t length) {
+                 return 0;
+     }   }   }
+     return 1;
++#endif
+ }
+ 
+ /* Returns true if the given block may be RLE.
+@@ -3678,8 +3684,9 @@ ZSTD_buildBlockEntropyStats_literals(void* const src, size_t srcSize,
+         FORWARD_IF_ERROR(largest, "HIST_count_wksp failed");
+         if (largest == srcSize) {
+             /* only one literal symbol */
+-            DEBUGLOG(5, "set_rle");
+-            hufMetadata->hType = set_rle;
++            /* TVPort tex_once: no RLE literals; a single-symbol literals section is stored raw */
++            DEBUGLOG(5, "set_basic - single symbol, RLE literals disabled");
++            hufMetadata->hType = set_basic;
+             return 0;
+         }
+         if (largest <= (srcSize >> 7)+4) {
+diff --git a/lib/compress/zstd_compress_literals.c b/lib/compress/zstd_compress_literals.c
+index 06036de..b76b973 100644
+--- a/lib/compress/zstd_compress_literals.c
++++ b/lib/compress/zstd_compress_literals.c
+@@ -197,7 +197,8 @@ size_t ZSTD_compressLiterals (
+          * Therefore, in such a case, actively check that all bytes are identical. */
+         if ((srcSize >= 8) || allBytesIdentical(src, srcSize)) {
+             ZSTD_memcpy(nextHuf, prevHuf, sizeof(*prevHuf));
+-            return ZSTD_compressRleLiteralsBlock(dst, dstCapacity, src, srcSize);
++            /* TVPort tex_once: no RLE literals; store them raw */
++            return ZSTD_noCompressLiterals(dst, dstCapacity, src, srcSize);
+     }   }
+ 
+     if (hType == set_compressed) {

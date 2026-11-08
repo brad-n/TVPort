@@ -290,8 +290,7 @@ def smash_arc_file(payloads):
         body += bytes(-len(body) % 4)
         ents.append((len(body) // 4, len(data), usz)); body += data
     fs = smash_fs(ents)
-    frame = zstd.compress(fs, level=19)
-    frame += tool.skippable_frame(200)          # slack in the table's slot, as the rewrite needs
+    frame = zstd.compress(fs, level=1)          # a weak level: the rewrite (level 22) fits with room to spare
     table_off = file_off + len(body) + (-len(body) % 16)
     head = struct.pack('<Q', 0xABCDEF9876543210) + struct.pack('<6Q', 0, file_off, 0, table_off, table_off + 16 + len(frame), 0)
     return bytes(head) + bytes(file_off - len(head)) + bytes(body) + bytes(table_off - file_off - len(body)) + struct.pack('<4I', 0x10, len(fs), len(frame), len(fs)) + frame + bytes(16), ents
@@ -604,6 +603,92 @@ class ZstdHeaderLayout(unittest.TestCase):
         z = tool.B.zstd_module()
         data = bytes(5000)
         self.assertNotEqual(tool.zstd_header(tool.zstd_stream(data, 4096))[0], 0)   # zstd's own default: a content size
+
+
+class NoRleZstdTests(unittest.TestCase):
+    """The re-packed frames use only what Smash's data.arc frames use: raw / compressed blocks, raw / Huffman / treeless literals, no skippable frame where the original has none"""
+    @staticmethod
+    def sparse_data():
+        return random.Random(11).randbytes(3000) + bytes(200_000) + b'\x07' * 70_000 + random.Random(12).randbytes(500) + bytes(300_000)
+
+    def test_stock_zstd_makes_rle_blocks_ours_does_not(self):
+        z = B.zstd_module(); P = z.CompressionParameter
+        data = self.sparse_data()
+        stock = z.compress(data, options={P.compression_level: 3, P.content_size_flag: 0, P.window_log: 17})
+        self.assertIn('rle', tool.Z.frame_features(stock)['blocks'])          # why the tool has its own encoder
+        orig = z.compress(random.Random(3).randbytes(len(data)), options={P.compression_level: 3, P.content_size_flag: 0, P.window_log: 17})
+        for level in (3, 10, 19):
+            new = tool.zstd_compress(data, level, None, orig)
+            f = tool.Z.frame_features(new)
+            self.assertFalse(f['blocks'] - {'raw', 'compressed'}, f)
+            self.assertFalse(f['literals'] - {'raw', 'huffman', 'treeless'}, f)
+            self.assertEqual(z.decompress(new), data)
+            self.assertEqual(tool.zstd_header(new), tool.zstd_header(orig))
+            self.assertEqual(tool.Z.forbidden(new, orig), [])
+        # a short run of one byte (stock zstd: an RLE literals section) and an all-zero block
+        for data in (bytes(100), b'ab' * 40 + bytes(5000), bytes(1 << 20)):
+            new = tool.zstd_compress(data, 3, None, orig)
+            self.assertEqual(tool.Z.forbidden(new, orig), [])
+            self.assertEqual(z.decompress(new), data)
+
+    def test_one_shot_path_has_no_rle_either(self):
+        z = B.zstd_module()
+        data = self.sparse_data()
+        new = tool.zstd_compress(data, 19)                  # no original: zstd's defaults, still no RLE
+        self.assertEqual(tool.Z.forbidden(new), [])
+        self.assertEqual(z.decompress(new), data)
+
+    def test_feature_check_rejects_rle_block_and_literals(self):
+        z = B.zstd_module(); P = z.CompressionParameter
+        stock = z.compress(self.sparse_data(), options={P.compression_level: 3})
+        self.assertTrue(any('block types' in b for b in tool.Z.forbidden(stock)))
+        lit = tool.ZSTD_MAGIC + bytes([0x00, 0x58]) + struct.pack('<I', 1 | (2 << 1) | (3 << 3))[:3] + bytes([0x01 | (5 << 3), 0x41, 0x00])   # a compressed block whose literals are 5 x 'A'
+        self.assertEqual(tool.Z.frame_features(lit)['literals'], {'rle'})
+        self.assertTrue(any('literal types' in b for b in tool.Z.forbidden(lit)))
+        rle_block = tool.ZSTD_MAGIC + bytes([0x00, 0x58]) + struct.pack('<I', 1 | (1 << 1) | (100 << 3))[:3] + b'\x00'
+        self.assertEqual(tool.Z.frame_features(rle_block)['blocks'], {'rle'})
+        self.assertTrue(tool.Z.forbidden(rle_block))
+        skip = z.compress(b'x' * 100) + tool.skippable_frame(32)
+        self.assertEqual(tool.Z.forbidden(skip, z.compress(b'x')), ['a skippable frame'])
+        self.assertEqual(tool.Z.forbidden(skip, skip), [])
+
+    def test_check_raises_mismatch_on_rle(self):
+        z = B.zstd_module(); P = z.CompressionParameter
+        w = tool.Walker.__new__(tool.Walker)
+        w.dicts, w.c = {}, __import__('collections').Counter()
+        data = self.sparse_data()
+        orig = z.compress(random.Random(5).randbytes(len(data)), options={P.compression_level: 3, P.content_size_flag: 0, P.window_log: 17})
+        w.kind = lambda o, name, hint: 'zstd'
+        stock = z.compress(data, options={P.compression_level: 3, P.content_size_flag: 0, P.window_log: 17})
+        self.assertIn('rle', tool.Z.frame_features(stock)['blocks'])
+        with self.assertRaises(tool.Mismatch) as cm: w.check(orig, stock + bytes(len(orig) - len(stock)) if len(stock) < len(orig) else stock, 'x', top_csz=len(stock))
+        self.assertIn('block types', str(cm.exception))
+
+
+class TableSlotTests(unittest.TestCase):
+    def test_table_is_one_frame_with_stored_size_of_that_frame(self):
+        payloads = [(random.Random(i).randbytes(5000), 5000) for i in range(3)]
+        raw, ents = smash_arc_file(payloads)
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / 'data.arc'; f.write_bytes(raw)
+            arc = tool.Arc.__new__(tool.Arc)
+            import smash_arc
+            arc.sa = smash_arc; arc.T = smash_arc.table(str(f)); arc.fd = smash_arc.fd_by_offset(arc.T)
+            arc.table_off = arc.T['fs_off']; arc.table_size = 16 + arc.T['stored']
+            self.assertIsNotNone(tool.zstd_table_frame(bytes(arc.T['fs']), arc.T['stored'], None))
+            orig = raw[arc.table_off:arc.table_off + arc.table_size]
+            arc.old_csz = {arc.T['file_off'] + 4 * e[0]: e[1] for e in ents}
+            at = arc.T['file_off'] + 4 * ents[0][0]
+            slot, fs = arc.build_table(orig, {at: 123})
+            self.assertEqual(len(slot), len(orig))
+            stored = struct.unpack_from('<I', slot, 8)[0]
+            frame = slot[16:16 + stored]
+            self.assertEqual(tool.Z.frame_features(frame)['frames'], 1)
+            self.assertEqual(tool.Z.frame_features(frame)['skippable'], 0)
+            self.assertEqual(slot[16 + stored:], bytes(len(slot) - 16 - stored))
+            self.assertEqual((slot[:8], slot[12:16]), (orig[:8], orig[12:16]))        # start, size and section size unchanged
+            self.assertEqual(tool.Z.forbidden(frame), [])
+            self.assertEqual(bytes(B.unzstd(frame, {})), fs)
 
 
 if __name__ == '__main__':
