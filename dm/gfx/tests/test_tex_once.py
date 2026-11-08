@@ -999,7 +999,7 @@ class ExactEncoderTests(unittest.TestCase):
             f = tool.Z.exact_compress(data, level)
             lv = tool.Z.match_level(f, data)
             self.assertEqual(tool.Z.exact_compress(data, lv), f)                                       # the level found reproduces the frame (neighbouring levels may make the same bytes)
-            if level in (9, 22): self.assertEqual(lv, level)
+            if level == 22: self.assertEqual(lv, level)                                                # (levels that make the same bytes for this content are interchangeable)
             level = lv
             self.assertEqual(tool.Z.match_level(f + bytes(500), data), level)                          # a zero tail (data.arc entry)
             self.assertEqual(tool.Z.match_level(f + tool.skippable_frame(64), data), level)            # a skippable pad (other zstd files)
@@ -1026,7 +1026,7 @@ class ExactEncoderTests(unittest.TestCase):
             comp = tool.Z.exact_compress(new, level)
             self.assertEqual(r, comp + bytes(len(orig) - len(comp)))
             self.assertEqual(w.new_csz, len(comp))
-            self.assertEqual((w.c['encoder_matched'], w.c['encoder_unmatched'], w.c[f'encoder_level:{level}']), (1, 0, 1))
+            self.assertEqual((w.c['encoder_matched'], w.c['encoder_unmatched'], sum(v for k, v in w.c.items() if k.startswith('encoder_level:'))), (1, 0, 1))
             w = self.walker()
             orig = tool.Z.exact_compress(dec, level) + tool.skippable_frame(300)
             r = w.fit_zstd(new, orig, None, dec)
@@ -1049,6 +1049,25 @@ class ExactEncoderTests(unittest.TestCase):
         orig = tool.Z.exact_compress(dec, 9)
         self.assertIsNone(w.exact_fit(random.Random(9).randbytes(len(dec)), orig, dec, 'arc'))
         self.assertEqual(w.c['encoder_exact_unusable'], 1)
+
+    def test_a_stronger_level_of_the_same_window_rescues_a_frame_that_grew(self):
+        dec = Path(tool.__file__).read_bytes()                                                          # text: levels differ in size
+        new = bytearray(dec)
+        for k in (5000, 20000, 40000): new[k] ^= 1                                                      # a few scattered changes
+        new = bytes(new)
+        orig = tool.Z.exact_compress(dec, 6) + bytes(64); slot = len(orig) - 64
+        self.assertGreater(len(tool.Z.exact_compress(new, 6)), slot)                                    # the original's own level no longer fits ...
+        self.assertLessEqual(len(tool.Z.exact_compress(new, 9)), slot)                                  # ... a stronger one of the same window (6..11) does
+        w = self.walker()
+        r = w.fit_zstd(new, orig[:slot], 'arc', dec)
+        self.assertIsNotNone(r); self.assertEqual(len(r), slot)
+        self.assertEqual((w.c['encoder_matched'], w.c['encoder_stronger_level'], w.c['encoder_exact_unusable']), (1, 1, 0))
+        self.assertEqual(tool.zstd_header(r), tool.zstd_header(orig))                                   # the window is the original's
+        self.assertEqual(B.zstd_module().decompress(r[:w.new_csz]), new)
+        w.kind = lambda o, name, hint: 'zstd'
+        inner = w.check; w.check = lambda o, n, name, depth=0, *a, **k: inner(o, n, name, depth, *a, **k) if depth == 0 else None
+        w.check(orig[:slot], r, 'x', top_csz=w.new_csz)                                                 # the identity check follows the same rule
+        self.assertEqual(w.c['encoder_identity_checked'], 1)
 
     def test_table_frame_is_rewritten_with_the_detected_level(self):
         payloads = [(random.Random(i).randbytes(5000), 5000) for i in range(3)]

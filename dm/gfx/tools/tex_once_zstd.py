@@ -237,6 +237,13 @@ def tail_ok(tail):
     return f['frames'] == 0
 
 
+def same_window_levels(level):
+    """The levels of the encoder that give frames the header (window) of `level`'s, `level` first, then the stronger ones ascending, then the weaker ones descending"""
+    w = level_window(level)
+    same = [lv for lv in range(1, 23) if level_window(lv) == w]
+    return [level] + [lv for lv in same if lv > level] + [lv for lv in reversed(same) if lv < level]
+
+
 def match_level(orig, dec, big=8 << 20):
     """The level at which exact_compress(dec) reproduces the zstd frame at the start of `orig` byte for byte (the rest of `orig` being zeros or skippable frames), or None.
     Only levels with the frame's window descriptor are tried: the one that matched last for that window first, then 9, 22, then the rest (the rest only for content under `big` bytes; stronger levels are slow).

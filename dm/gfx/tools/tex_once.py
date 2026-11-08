@@ -344,16 +344,27 @@ class Walker:
         if top == 'arc' or tail == 0: return comp + bytes(tail)
         return comp + skippable_frame(tail) if tail >= 8 else None
 
+    def exact_slot(self, data, orig, dec, top, level=None):
+        """`data` re-packed with the encoder the game's own frames came from (zstd v1.3.5 streaming) into the slot of `orig`, whose content is `dec`: -> (the slot's new bytes, the level used, the level
+        that reproduces `orig`), or (None, None, level or None) when the original frame is not reproducible or no level with its window (so its header) gives a frame that fits. The matched level first,
+        then stronger levels of the same window: a texture with small planes can compress a few bytes worse after the strip"""
+        lv = level if level is not None else Z.match_level(orig, dec)
+        if lv is None: return None, None, None
+        for use in Z.same_window_levels(lv) if len(data) < (8 << 20) else [lv]:
+            comp = Z.exact_compress(data, use)
+            new = self.pad_exact(comp, len(orig), top)
+            if new is not None and not Z.forbidden(comp, rle_literals=True):
+                if top == 'arc': self.new_csz = len(comp)
+                return new, use, lv
+        return None, None, lv
+
     def exact_fit(self, data, orig, dec, top):
-        """`data` re-packed with the encoder the game's own frames came from (zstd v1.3.5 streaming, at the level that reproduces `orig` from its content `dec`): the slot's new bytes, or None
-        (the original frame is not reproducible, or the new frame does not fit: counted, the caller falls back to the header-copying no-RLE encoder)"""
-        lv = Z.match_level(orig, dec)
+        """exact_slot() with the counters; None when the caller must fall back to the header-copying no-RLE encoder"""
+        new, used, lv = self.exact_slot(data, orig, dec, top)
         if lv is None: self.c['encoder_unmatched'] += 1; return None
-        comp = Z.exact_compress(data, lv)
-        new = self.pad_exact(comp, len(orig), top)
-        if new is None or Z.forbidden(comp, rle_literals=True): self.c['encoder_exact_unusable'] += 1; return None
-        self.c['encoder_matched'] += 1; self.c[f'encoder_level:{lv}'] += 1
-        if top == 'arc': self.new_csz = len(comp)
+        if new is None: self.c['encoder_exact_unusable'] += 1; return None
+        self.c['encoder_matched'] += 1; self.c[f'encoder_level:{used}'] += 1
+        if used != lv: self.c['encoder_stronger_level'] += 1
         return new
 
     def fit_zstd(self, data, orig, top, dec=None):
@@ -464,13 +475,11 @@ class Walker:
             ho, hn = zstd_header(o), zstd_header(nn)
             do, dn = B.unzstd(o, self.dicts), B.unzstd(nn, self.dicts)
             if o != n and self.zdict(o) is None:   # encoder identity: where the original frame is reproducible, the new one is exactly what the same encoder makes of the new content
-                lv = Z.match_level(o, do)
+                exp, used, lv = self.exact_slot(dn, o, do, 'arc' if top_csz is not None else None)
                 if lv is None: self.c['encoder_identity_unmatched'] += 1
-                else:
-                    exp = self.pad_exact(Z.exact_compress(dn, lv), len(o), 'arc' if top_csz is not None else None)
-                    if exp is None: self.c['encoder_identity_fallback'] += 1
-                    elif exp != n: raise Mismatch(f'{name}: the new zstd frame is not what the original encoder (zstd v1.3.5, level {lv}) makes of the new content')
-                    else: self.c['encoder_identity_checked'] += 1
+                elif exp is None: self.c['encoder_identity_fallback'] += 1
+                elif exp != n: raise Mismatch(f'{name}: the new zstd frame is not what the original encoder (zstd v1.3.5, level {used}) makes of the new content')
+                else: self.c['encoder_identity_checked'] += 1
             if ho is not None and hn is not None and o != n and ho != hn:
                 raise Mismatch(f'{name}: zstd frame header changed ({ho} -> {hn}); the game decodes only the original layout')
             if len(do) != len(dn): raise Mismatch(f'{name}: the inflated size changed')
@@ -882,7 +891,7 @@ def run(args):
                 except ValueError as e: problems.append(f'data.arc table frame unreadable: {e}')
     enc = {k: v for k, v in sorted(totals.items()) if k.startswith('encoder_')}
     enc_check = {k[len('encoder_identity_'):]: v for k, v in sorted(vtotals.items()) if k.startswith('encoder_identity_')}
-    encoder_rep = dict(encoder='zstd v1.3.5 streaming, level detected per frame', matched=enc.pop('encoder_matched', 0), unmatched=enc.pop('encoder_unmatched', 0), unusable=enc.pop('encoder_exact_unusable', 0),
+    encoder_rep = dict(encoder='zstd v1.3.5 streaming, level detected per frame', matched=enc.pop('encoder_matched', 0), unmatched=enc.pop('encoder_unmatched', 0), unusable=enc.pop('encoder_exact_unusable', 0), stronger_level=enc.pop('encoder_stronger_level', 0),
                        levels={k.split(':', 1)[1]: enc.pop(k) for k in [k for k in enc if k.startswith('encoder_level:')]}, table=dict(arc.encoder or {}, identical_to_original=table_same, identity_checked=table_identity) if arc else None,
                        identity_check=enc_check)
     writer_c = collections.Counter({k: totals[k] for k in ('planes_tagged', 'planes_zeroed_cap', 'textures_changed')})
