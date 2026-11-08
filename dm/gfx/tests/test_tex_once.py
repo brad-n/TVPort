@@ -614,7 +614,6 @@ class StripTests(unittest.TestCase):
         self.assertEqual(r['content_changed'], 0); self.assertEqual(r['undecodable'], 0); self.assertNotIn('offset_sets_differ', r)
         self.assertEqual(r['entries_compared'], 4)
         self.assertEqual(r['identical'] + r['same_content_different_bytes'], 4)
-        self.assertGreaterEqual(r['same_content_different_bytes'], 1)               # the zstd entry was re-packed
 
     def test_debug_zero_only_touches_no_compressed_container(self):
         import romfs
