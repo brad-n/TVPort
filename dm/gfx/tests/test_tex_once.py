@@ -826,6 +826,67 @@ class StripTests(unittest.TestCase):
         self.assertGreaterEqual(self.report(self.root / 'out_table')['planes']['tagged'], 6)
 
 
+    # -- hidden bisect switches (TEX_ONCE_DEBUG): what each mode claims
+    def debug_run(self, mode, name):
+        d, img, pack, out = self.make(name, arc=True)
+        old = os.environ.get('TEX_ONCE_DEBUG')
+        os.environ['TEX_ONCE_DEBUG'] = mode
+        try: self.assertEqual(self.run_tool(img, pack, out, 0), 0)
+        finally:
+            if old is None: os.environ.pop('TEX_ONCE_DEBUG', None)
+            else: os.environ['TEX_ONCE_DEBUG'] = old
+        return d, img, out
+
+    def test_debug_repack_only_changes_no_content(self):
+        import romfs
+        z = B.zstd_module()
+        cmp = load('tex_once_arc_compare')
+        d, img, out = self.debug_run('repack-only', 'd1')
+        rep = self.report(out)
+        self.assertTrue(rep['self_check']['passed'])
+        self.assertEqual(rep['planes']['tagged'], 0); self.assertEqual(rep['planes']['zeroed_above_cap'], 0)
+        self.assertEqual(rep['bytes']['pack'], 0)                                   # no pack embedded
+        self.assertGreaterEqual(rep['containers']['recompressed:zstd'], 2)           # the containers were re-packed all the same
+        a, b = str(img), str(out / 'romfs.img')
+        for name in ('plain.bntx', 'astc.bntx', 'data.bin', 'Model/kart.szs'):       # not zstd: the bytes did not change
+            self.assertEqual(romfs.Path(a + '/' + name).read_bytes(), romfs.Path(b + '/' + name).read_bytes(), name)
+        for name in ('tex.bntx.zs', 'pack.pack.zs'):                                 # zstd: same content (the bytes may or may not be the original encoder's)
+            ra, rb = romfs.Path(a + '/' + name).read_bytes(), romfs.Path(b + '/' + name).read_bytes()
+            self.assertEqual(B.unzstd(ra, {}), B.unzstd(rb, {}), name)
+        r = cmp.compare(a, b, 1)
+        self.assertEqual(r['content_changed'], 0); self.assertEqual(r['undecodable'], 0); self.assertNotIn('offset_sets_differ', r)
+        self.assertEqual(r['entries_compared'], 4)
+        self.assertEqual(r['identical'] + r['same_content_different_bytes'], 4)
+        self.assertGreaterEqual(r['same_content_different_bytes'], 1)               # the zstd entry was re-packed
+
+    def test_debug_zero_only_touches_no_compressed_container(self):
+        import romfs
+        cmp = load('tex_once_arc_compare')
+        d, img, out = self.debug_run('zero-only', 'd2')
+        rep = self.report(out)
+        self.assertTrue(rep['self_check']['passed'])
+        self.assertGreater(rep['planes']['tagged'], 6)
+        self.assertEqual(rep['arc_mode'], 'pad')
+        self.assertEqual(rep['containers'].get('recompressed:zstd', 0), 0); self.assertEqual(rep['containers'].get('recompressed:yaz0', 0), 0)
+        a, b = str(img), str(out / 'romfs.img')
+        for name in ('tex.bntx.zs', 'pack.pack.zs', 'Model/kart.szs', 'data.bin', 'astc.bntx'):    # compressed: byte-identical
+            self.assertEqual(romfs.Path(a + '/' + name).read_bytes(), romfs.Path(b + '/' + name).read_bytes(), name)
+        self.assertNotEqual(romfs.Path(a + '/plain.bntx').read_bytes(), romfs.Path(b + '/plain.bntx').read_bytes())     # raw BNTX: tagged
+        r = cmp.compare(a, b, 1)
+        self.assertTrue(r['table_slot_bytes_identical']); self.assertTrue(r['table_inflated_identical'])
+        self.assertEqual(r['content_changed'], 2)                                    # the two uncompressed texture entries (the zstd one and the junk one are untouched)
+        self.assertEqual(r['identical'], 2)
+        self.assertEqual(r['same_content_different_bytes'], 0)
+
+    def test_debug_switch_rejects_unknown_mode(self):
+        old = os.environ.get('TEX_ONCE_DEBUG'); os.environ['TEX_ONCE_DEBUG'] = 'bogus'
+        try:
+            with self.assertRaises(SystemExit): tool.debug_mode()
+        finally:
+            if old is None: os.environ.pop('TEX_ONCE_DEBUG', None)
+            else: os.environ['TEX_ONCE_DEBUG'] = old
+
+
 class ZstdHeaderLayout(unittest.TestCase):
     """A re-packed frame keeps the original frame's header layout (Smash decodes only frames without a content size / single segment, 2026-11-08)"""
     def test_new_frame_copies_original_header(self):
