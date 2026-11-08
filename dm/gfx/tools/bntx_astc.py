@@ -37,6 +37,8 @@ TOOL_VERSION = 1
 # Engine sources the library is built from, and the flags the astc-encoder objects are built with (dm/host/Makefile builds them the same way; test_bntx_astc.py checks the flags match)
 LIB_SOURCES = ['gfx/tools/astc_prebuild.m', 'gfx/tex/nvn_astc_cache.m', 'gfx/tex/nvn_astc.mm', 'gfx/tex/nvn_bcdec.c', 'gfx/tex/nvn_deswizzle.c', 'gfx/tex/nvn_astc_planes.c', 'gfx/nvn/nvn_tex.c']
 LIB_HEADERS = ['gfx/tex/nvn_astc_cache.h', 'gfx/tex/nvn_astc.h', 'gfx/tex/nvn_bcdec.h', 'gfx/tex/nvn_deswizzle.h', 'gfx/tex/nvn_astc_planes.h', 'gfx/nvn/nvn_tex.h']
+# The zstd decoder nvn_astc_cache.m links for NXASTCPK v2 entries (dm/host/Makefile builds dm/third_party/zstd with these flags)
+ZSTD_FLAGS = ['-O2', '-g', '-DNDEBUG', '-DZSTD_DISABLE_ASM', '-DZSTD_MULTITHREAD=0']
 ASTC_FLAGS = ['-O3', '-g', '-DNDEBUG', '-std=c++14', '-ffp-contract=off', '-DASTCENC_BLOCK_MAX_TEXELS=36']
 SKIPPABLE = range(0x184d2a50, 0x184d2a60)
 
@@ -64,7 +66,12 @@ def sources_hash():
     for f in sorted(os.listdir(os.path.join(DM, 'third_party/astc-encoder'))):
         if f.endswith(('.cpp', '.h')):
             with open(os.path.join(DM, 'third_party/astc-encoder', f), 'rb') as fh: h.update(f.encode() + b'\0' + fh.read())
-    h.update(' '.join(ASTC_FLAGS).encode())
+    zdir = os.path.join(DM, 'third_party/zstd')
+    for root, _, files in sorted(os.walk(zdir)):
+        for f in sorted(files):
+            if f.endswith(('.c', '.h')):
+                with open(os.path.join(root, f), 'rb') as fh: h.update(os.path.relpath(os.path.join(root, f), zdir).encode() + b'\0' + fh.read())
+    h.update(' '.join(ASTC_FLAGS + ZSTD_FLAGS).encode())
     return h.hexdigest()
 
 
@@ -93,6 +100,12 @@ def build_library(work):
         for f in cpp:
             o = os.path.join(work, f'astc-{tag}-{f[:-4]}.o'); objs.append(o)
             if not os.path.exists(o): futs.append(ex.submit(run, ['clang++'] + ASTC_FLAGS + [mac, '-c', os.path.join(astc_dir, f), '-o', o]))
+        zdir = os.path.join(DM, 'third_party/zstd')
+        for root, _, files in sorted(os.walk(zdir)):
+            for f in sorted(files):
+                if not f.endswith('.c'): continue
+                o = os.path.join(work, f'zstd-{tag}-{os.path.basename(root)}-{f[:-2]}.o'); objs.append(o)
+                if not os.path.exists(o): futs.append(ex.submit(run, ['clang'] + ZSTD_FLAGS + [mac, '-I' + zdir, '-c', os.path.join(root, f), '-o', o]))
         for fu in futs: fu.result()
     part = lib + f'.{os.getpid()}.part'
     cmd = ['clang', '-O2', '-g', '-fobjc-arc', '-dynamiclib', mac, '-I' + os.path.join(DM, 'gfx/nvn/include'), '-o', part] + [os.path.join(DM, s) for s in LIB_SOURCES] + objs
