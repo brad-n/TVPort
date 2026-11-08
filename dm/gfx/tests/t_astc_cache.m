@@ -499,7 +499,7 @@ static void block5_contract(NSString *root) {
     CHECK(nvn_bc_astc_format(0x4e, 5, &pf) == 1 && pf == MTLPixelFormatASTC_5x5_sRGB);
     CHECK(nvn_bc_astc_format(0x44, 5, &pf) == 1 && pf == MTLPixelFormatASTC_5x5_LDR);
     CHECK(nvn_bc_astc_format(0x42, 4, &pf) == 1 && pf == MTLPixelFormatASTC_4x4_LDR && nvn_bc_astc_format(0x46, 6, &pf) == 1 && pf == MTLPixelFormatASTC_6x6_sRGB);
-    CHECK(nvn_bc_astc_format(0x42, 3, NULL) == 0 && nvn_bc_astc_format(0x42, 7, NULL) == 0 && nvn_bc_astc_format(0x49, 5, NULL) == 0);
+    CHECK(nvn_bc_astc_format(0x42, 3, NULL) == 0 && nvn_bc_astc_format(0x42, 7, NULL) == 0 && nvn_bc_astc_format(0x4a, 5, NULL) == 0);   // signed BC4: no ASTC form
     // one plane keys differently per block
     enum { W = 40, H = 25 }; size_t bc = (size_t)(W / 4) * ((H + 3) / 4) * 8; uint8_t *plane = malloc(bc);
     for (size_t i = 0; i < bc; i++) plane[i] = (uint8_t)(i * 37 + 11);
