@@ -10,9 +10,12 @@ A plane's "length" for the tag rule is its stored length as the runtime computes
 offset; exactly [offset, offset + length) is overwritten (a plane under 16 bytes is never touched), so [8, length) reads as zeros.
 The levels above the texture cap (the runtime never loads them) are zeroed whole and carry no tag.
 
-Usage: tex_once.py <RomFS.img | build folder> --pack astc-ro.pack --out DIR [--max-dim N] [--block 4|6] [--bc1-block 4|5|6] [--workers N] [--json]
+Usage: tex_once.py <RomFS.img | build folder> --pack astc-ro.pack --out DIR [--max-dim N] [--block 4|6] [--bc1-block 4|5|6] [--compress auto|on|off] [--zlevel N] [--workers N] [--json]
+       tex_once.py <RomFS.img | build folder> --no-pack --out DIR [--zlevel N] [--workers N] [--json]     (docs/texture_once.md 7c: a compressed DMSPARS1 v2 of a game without a texture pack, nothing stripped)
+Lossless compression (--compress, default auto = on): the image is written as DMSPARS1 v2 (zstd blocks of at most 256 KiB, stored raw when they shrink less than 3 %) and the embedded pack as NXASTCPK v2
+(every entry its own zstd frame). --compress off writes today's v1 image and the given pack unchanged.
 Output DIR: romfs.img (DMSPARS1, the pack embedded), report.json. Exit 0 only when the self-check passed (or the inputs are unchanged and nothing was rewritten).
-The self-check re-reads the written file: every byte outside the covered planes equals the original, every tagged plane reads tag + zeros and its tag resolves in the pack (exactly one
+The self-check re-reads the written file (every compressed extent and pack entry is inflated and compared): every byte outside the covered planes equals the original, every tagged plane reads tag + zeros and its tag resolves in the pack (exactly one
 entry of the plane's ASTC size), every container parses, the DMROMFS1 header and index are byte-identical and the embedded pack is the given pack.
 """
 import argparse
@@ -35,7 +38,8 @@ import bntx_astc as B
 import sparse_image as S
 import tex_once_zstd as Z
 
-TOOL_VERSION = 1
+TOOL_VERSION = 2
+DEFAULT_ZLEVEL = 9
 TASK_BYTES = 64 << 20
 ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
 SKIPPABLE_FIRST = 0x184d2a50
@@ -483,8 +487,10 @@ def strip_task(task):
         if r is not None:
             buf[off - lo:off - lo + size] = r
             mods.append((off, size, csz))
-    ext = [] if _W['cfg'].get('manifest') else [(lo + a, bytes(buf[a:b])) for a, b in S.split_zero_runs(buf)]
-    return dict(lo=lo, ext=ext, mods=mods, c=dict(w.c), errors=w.errors[:20], n_errors=len(w.errors), mf=w.mf)
+    zl = _W['cfg'].get('zlevel')
+    parts = S.compress_parts(buf, lo, zl) if zl is not None and not _W['cfg'].get('manifest') else []
+    ext = [] if _W['cfg'].get('manifest') or zl is not None else [(lo + a, bytes(buf[a:b])) for a, b in S.split_zero_runs(buf)]
+    return dict(lo=lo, ext=ext, parts=parts, mods=mods, c=dict(w.c), errors=w.errors[:20], n_errors=len(w.errors), mf=w.mf)
 
 
 def check_task(task):
@@ -492,7 +498,8 @@ def check_task(task):
     lo, hi, items = task['lo'], task['hi'], task['items']
     w.c = collections.Counter()
     o = pread_full(fd, hi - lo, lo)
-    n = sp.read(lo, hi - lo)
+    try: n = sp.read(lo, hi - lo)
+    except S.SparseError as e: return dict(error=f'unreadable: {e}', lo=lo)
     exp = bytearray(o)
     for name, off, size, csz in items:
         a, b = off - lo, off - lo + size
@@ -632,6 +639,30 @@ def split_counters(c):
         textures=dict(seen=c.get('textures', 0), changed=c.get('textures_changed', 0), skipped=skipped_t), containers=cont)
 
 
+def zlevel_of(args):
+    """The zstd level of this run, or None when the image is written uncompressed (--compress off)"""
+    if getattr(args, 'compress', 'auto') == 'off': return None
+    zl = getattr(args, 'zlevel', None)
+    return int(DEFAULT_ZLEVEL if zl is None else zl)
+
+
+def compression_bytes(target, pack_source):
+    """logical / physical byte counts of the compression: bytes of the game image's extents (logical vs stored), and of the pack (source vs embedded)"""
+    with S.SparseImage(target) as sp:
+        ex = sp.extents_ex()
+        return dict(romfs_logical_stored=sum(e[1] for e in ex), compressed_logical=sum(e[1] for e in ex if e[4] == S.ZSTD), compressed_physical=sum(e[3] for e in ex if e[4] == S.ZSTD),
+                    holes=sp.hole_bytes(), pack_source=pack_source, pack_physical=sp.pack_size)
+
+
+def compression_info(target, zl, pack_stats):
+    if zl is None: return dict(enabled=False)
+    with S.SparseImage(target) as sp:
+        ex = sp.extents_ex()
+    info = dict(enabled=True, level=zl, block=S.BLOCK, keep_ratio_percent=S.KEEP_RATIO, extents_zstd=sum(1 for e in ex if e[4] == S.ZSTD), extents_raw=sum(1 for e in ex if e[4] == S.RAW))
+    if pack_stats: info['pack'] = dict(entries=pack_stats['entries'], payloads=pack_stats['payloads'], zstd=pack_stats['zstd'], raw=pack_stats['raw'], logical=pack_stats['logical'], stored=pack_stats['stored'])
+    return info
+
+
 def run(args):
     t0 = time.monotonic()
     romfs = B.find_romfs(args.input)
@@ -641,6 +672,7 @@ def run(args):
     bc1 = int(args.bc1_block or block)
     out = os.path.abspath(args.out); pack = os.path.abspath(args.pack)
     os.makedirs(out, exist_ok=True)
+    zl = zlevel_of(args)
     have = B.read_pack_header(pack)
     if not have: log(f'[RED] {pack} is no complete ASTC pack'); return 2
     fp_args = {} if bc1 == block else {'bc1_block': bc1}      # a pack built without --bc1-block is the pack of today: same fingerprint
@@ -654,7 +686,7 @@ def run(args):
     img = romfs_mod.Image(romfs)
     logical = os.path.getsize(romfs)
     fp = hashlib.sha256(b'tex_once %d\0' % TOOL_VERSION + tool_hash() + b'size %d\0max_dim %d\0block %d\0bc1 %d\0arc %s\0' % (logical, max_dim, block, bc1, args.arc_mode.encode())
-                        + hashlib.sha256(img.index).digest() + have['fingerprint'] + b'%d' % have['bytes']).hexdigest()
+                        + hashlib.sha256(img.index).digest() + have['fingerprint'] + b'%d' % have['bytes'] + (b'zstd %d\0' % zl if zl is not None else b'')).hexdigest()
     target, rep_path = os.path.join(out, 'romfs.img'), os.path.join(out, 'report.json')
     old = read_report(rep_path)
     if old.get('input_fingerprint') == fp and old.get('self_check', {}).get('passed') and not args.force:
@@ -690,8 +722,8 @@ def run(args):
     if arc and arc.table: marks.append((arc.table_off, arc.table_size, None, 'table'))
     marks.sort(key=lambda m: m[0])
     tasks = partition(logical, marks)
-    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs, zstd_work=os.path.join(out, 'lib'))
-    writer = S.SparseWriter(target, logical)
+    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs, zstd_work=os.path.join(out, 'lib'), zlevel=zl)
+    writer = S.SparseWriter(target, logical, version=2 if zl is not None else 1)
     totals = collections.Counter(); errors = []; n_errors = 0
     updates, mods_by_task, table_new = {}, {}, None
     t1 = time.monotonic(); last = t1
@@ -711,10 +743,12 @@ def run(args):
                 if t['kind'] == 'table':
                     orig = bytes(pread_full(fd, t['hi'] - t['lo'], t['lo']))
                     slot, table_new = arc.build_table(orig, updates)
-                    r = dict(ext=[(t['lo'] + a, slot[a:b]) for a, b in S.split_zero_runs(slot)], mods=[], c={'containers_table': 1}, errors=[], n_errors=0)
+                    r = dict(ext=[(t['lo'] + a, slot[a:b]) for a, b in S.split_zero_runs(slot)] if zl is None else [], parts=S.compress_parts(slot, t['lo'], zl) if zl is not None else [],
+                             mods=[], c={'containers_table': 1}, errors=[], n_errors=0)
                     table_slot = slot
                 else: r = fut.result()
                 for off, data in r['ext']: writer.put(off, data)
+                writer.put_parts(r['parts'])
                 totals.update(r['c']); errors += r['errors']; n_errors += r['n_errors']
                 mods_by_task[i] = r['mods']
                 for off, size, csz in r['mods']:
@@ -724,9 +758,20 @@ def run(args):
                 fill()
     except BaseException:
         writer.abort(); raise
-    stats = writer.finish(pack)
     strip_seconds = time.monotonic() - t1
-    log(f'written: {stats["physical"] / 2**30:.2f} GB ({stats["stored"] / 2**30:.2f} GB of RomFS + {stats["pack_size"] / 2**30:.2f} GB pack), {strip_seconds:.0f} s; checking')
+    pack_stats, pack_v2, pack_seconds = None, os.path.join(out, 'pack-v2.tmp'), 0
+    try:
+        if zl is not None:
+            tp = time.monotonic()
+            pack_stats = S.write_pack_v2(pack, pack_v2, zl, args.workers, progress=lambda n, m: n % 20 == 0 and time.monotonic() - tp > 15 and log(f'pack {n}/{m} batches, {time.monotonic() - tp:.0f} s'))
+            pack_seconds = round(time.monotonic() - tp, 1)
+            log(f'pack compressed: {have["bytes"] / 2**30:.2f} -> {pack_stats["size"] / 2**30:.2f} GB, {time.monotonic() - tp:.0f} s')
+        stats = writer.finish(pack_v2 if zl is not None else pack)
+    except BaseException:
+        writer.abort(); raise
+    finally:
+        if os.path.exists(pack_v2): os.unlink(pack_v2)
+    log(f'written: {stats["physical"] / 2**30:.2f} GB ({stats["stored"] / 2**30:.2f} GB of RomFS + {stats["pack_size"] / 2**30:.2f} GB pack), {time.monotonic() - t1:.0f} s; checking')
     # ---- self-check
     t2 = time.monotonic()
     problems = []
@@ -748,7 +793,13 @@ def run(args):
         if sp.read(0, 32) != os.pread(fd, 32, 0): problems.append('DMROMFS1 header differs')
         ioff = struct.unpack_from('<Q', os.pread(fd, 32, 0), 8)[0]
         if sp.read(ioff, len(img.index)) != img.index: problems.append('DMROMFS1 index differs')
-        if sp.pack_offset == 0 or sp.pack_size != have['bytes']: problems.append('embedded pack missing or of another size')
+        if zl is not None:
+            if sp.version != 2 or sp.pack_version != 2 or sp.pack_size != pack_stats['size']: problems.append('embedded pack missing, not v2, or of another size')
+            else:
+                try: sp.inflate_all()
+                except S.SparseError as e: problems.append(str(e))
+                problems += S.verify_pack_v2(target, sp.pack_offset, sp.pack_size, pack, args.workers)
+        elif sp.pack_offset == 0 or sp.pack_size != have['bytes']: problems.append('embedded pack missing or of another size')
         else:
             h = hashlib.sha256()
             for o in range(0, sp.pack_size, 8 << 20): h.update(sp.read_pack(o, 8 << 20))
@@ -777,16 +828,114 @@ def run(args):
     if n_errors: log(f'{n_errors} containers could not be read and were left as they are, first: {errors[:3]}')
     passed = not problems
     rep = dict(tool_version=TOOL_VERSION, input_fingerprint=fp, input=romfs, pack=pack, block=block, bc1_block=bc1, max_dim=max_dim, arc_mode='table' if arc and arc.table else 'pad' if arc else 'none',
-               bytes=dict(logical=logical, physical=stats['physical'], pack=stats['pack_size'], romfs_stored=stats['stored'], extents=stats['extents']),
+               bytes=dict(logical=logical, physical=stats['physical'], pack=stats['pack_size'], romfs_stored=stats['stored'], extents=stats['extents'], **compression_bytes(target, have['bytes'])),
+               compression=compression_info(target, zl, pack_stats),
                errors=dict(containers_unreadable=n_errors, samples=errors[:10]), **split_counters(totals),
                self_check=dict(passed=passed, problems=problems[:20], seconds=round(time.monotonic() - t2, 1)),
-               seconds=dict(strip=round(strip_seconds, 1), total=round(time.monotonic() - t0, 1)))
+               seconds=dict(strip=round(strip_seconds, 1), pack_compress=pack_seconds, total=round(time.monotonic() - t0, 1)))
     os.close(fd)
     if not passed:
         log(f'[RED] self-check failed ({len(problems)} problems): {problems[:3]}')
         os.unlink(target)
     with open(rep_path, 'w') as f: json.dump(tidy(rep), f, indent=1)
     if passed: log(f'self-check passed; {rep["planes"]["tagged"]} planes tagged, {rep["planes"]["zeroed_above_cap"]} zeroed above the cap; {time.monotonic() - t0:.0f} s')
+    if args.json: print(json.dumps(rep, indent=1))
+    return 0 if passed else 1
+
+
+_NP = {}
+
+
+def np_init(romfs, zl, sparse):
+    _NP.update(fd=os.open(romfs, os.O_RDONLY), zl=zl, sparse=S.SparseImage(sparse) if sparse else None)
+
+
+def np_compress_task(span):
+    lo, hi = span
+    return S.compress_parts(pread_full(_NP['fd'], hi - lo, lo), lo, _NP['zl'])
+
+
+def np_check_task(span):
+    lo, hi = span
+    want = pread_full(_NP['fd'], hi - lo, lo)
+    try: got = _NP['sparse'].read(lo, hi - lo)
+    except S.SparseError as e: return f'{lo:#x}: unreadable: {e}'
+    if got != want:
+        i = next(i for i in range(len(want)) if want[i] != got[i])
+        return f'{lo:#x}: bytes differ from the original, first at {lo + i:#x}'
+    return None
+
+
+def run_nopack(args):
+    """--no-pack: the RomFS image as a compressed DMSPARS1 v2 file, nothing stripped, no pack (docs/texture_once.md 7c)"""
+    t0 = time.monotonic()
+    romfs = B.find_romfs(args.input)
+    if not os.path.isfile(romfs): log(f'[RED] {romfs} is a folder: tex_once needs a RomFS image'); return 2
+    if S.is_sparse(romfs): log(f'[RED] {romfs} is already a DMSPARS1 image'); return 2
+    zl = zlevel_of(args)
+    if zl is None: log('[RED] --no-pack writes a compressed image: it cannot go with --compress off'); return 2
+    out = os.path.abspath(args.out)
+    os.makedirs(out, exist_ok=True)
+    import romfs as romfs_mod
+    img = romfs_mod.Image(romfs)
+    logical = os.path.getsize(romfs)
+    fp = hashlib.sha256(b'tex_once nopack %d\0' % TOOL_VERSION + tool_hash() + b'size %d\0zstd %d\0' % (logical, zl) + hashlib.sha256(img.index).digest()).hexdigest()
+    target, rep_path = os.path.join(out, 'romfs.img'), os.path.join(out, 'report.json')
+    old = read_report(rep_path)
+    if old.get('input_fingerprint') == fp and old.get('self_check', {}).get('passed') and not args.force:
+        try:
+            if S.validate(target)['physical'] == old['bytes']['physical']:
+                log('up to date: the inputs are unchanged, nothing rewritten')
+                if args.json: print(json.dumps(old, indent=1))
+                return 0
+        except (OSError, S.SparseError): pass
+    for f in (target, rep_path):
+        if os.path.exists(f): os.unlink(f)
+    spans = [(o, min(o + TASK_BYTES, logical)) for o in range(0, logical, TASK_BYTES)]
+    log(f'{logical / 2**30:.1f} GiB, no pack, zstd level {zl}, {args.workers} workers')
+    writer = S.SparseWriter(target, logical, version=2)
+    t1 = time.monotonic(); last = t1
+    try:
+        with cf.ProcessPoolExecutor(args.workers, initializer=np_init, initargs=(romfs, zl, None)) as ex:
+            pending = collections.deque(); it = iter(spans); done = 0
+            while True:
+                while len(pending) < args.workers * 3:
+                    sp_ = next(it, None)
+                    if sp_ is None: break
+                    pending.append(ex.submit(np_compress_task, sp_))
+                if not pending: break
+                writer.put_parts(pending.popleft().result()); done += 1
+                if time.monotonic() - last > 15: last = time.monotonic(); log(f'compress {done}/{len(spans)} blocks of 64 MiB, {last - t1:.0f} s')
+        stats = writer.finish(None)
+    except BaseException:
+        writer.abort(); raise
+    write_seconds = time.monotonic() - t1
+    log(f'written: {stats["physical"] / 2**30:.2f} GB, {write_seconds:.0f} s; checking')
+    t2 = time.monotonic()
+    problems = []
+    with S.SparseImage(target) as sp:
+        if sp.logical_size != logical or sp.version != 2: problems.append('logical size or version is wrong')
+        if sp.pack_size: problems.append('the image holds a pack')
+        with open(romfs, 'rb') as rf: head32 = rf.read(32)
+        if sp.read(0, 32) != head32: problems.append('DMROMFS1 header differs')
+        ioff = struct.unpack_from('<Q', head32, 8)[0]
+        if sp.read(ioff, len(img.index)) != img.index: problems.append('DMROMFS1 index differs')
+        try: sp.inflate_all()
+        except S.SparseError as e: problems.append(str(e))
+    with cf.ProcessPoolExecutor(args.workers, initializer=np_init, initargs=(romfs, zl, target)) as ex:
+        for bad in ex.map(np_check_task, spans):
+            if bad: problems.append(bad)
+    passed = not problems
+    rep = dict(tool_version=TOOL_VERSION, input_fingerprint=fp, input=romfs, no_pack=True,
+               bytes=dict(logical=logical, physical=stats['physical'], pack=0, romfs_stored=stats['stored'], extents=stats['extents'], **compression_bytes(target, 0)),
+               compression=compression_info(target, zl, None),
+               self_check=dict(passed=passed, problems=problems[:20], seconds=round(time.monotonic() - t2, 1)),
+               seconds=dict(compress=round(write_seconds, 1), total=round(time.monotonic() - t0, 1)))
+    if not passed:
+        log(f'[RED] self-check failed ({len(problems)} problems): {problems[:3]}')
+        os.unlink(target)
+    with open(rep_path, 'w') as f: json.dump(tidy(rep), f, indent=1)
+    if passed: log(f'self-check passed; {logical / 2**30:.2f} -> {stats["physical"] / 2**30:.2f} GB; {time.monotonic() - t0:.0f} s')
     if args.json: print(json.dumps(rep, indent=1))
     return 0 if passed else 1
 
@@ -832,8 +981,11 @@ def run_manifest(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('input', help='RomFS.img, or a build folder (its newest extract/<version>/RomFS.img)')
-    ap.add_argument('--pack', required=True, help='the ASTC pack bntx_astc.py built from this RomFS (same cap and block)')
+    ap.add_argument('--pack', help='the ASTC pack bntx_astc.py built from this RomFS (same cap and block)')
     ap.add_argument('--out', required=True, help='output folder: romfs.img (DMSPARS1), report.json')
+    ap.add_argument('--no-pack', action='store_true', help='no texture pack: write a compressed DMSPARS1 v2 of the RomFS image as it is (nothing stripped)')
+    ap.add_argument('--compress', choices=('auto', 'on', 'off'), default='auto', help='lossless zstd compression of the image and the embedded pack (auto = on)')
+    ap.add_argument('--zlevel', type=int, default=None, help=f'zstd level of --compress (default {DEFAULT_ZLEVEL})')
     ap.add_argument('--max-dim', type=int, default=0, help='the texture cap the pack was built with (0 = none)')
     ap.add_argument('--block', type=int, default=4, choices=(4, 6))
     ap.add_argument('--workers', type=int, default=0, help='processes (default: every core)')
@@ -845,7 +997,10 @@ def main():
     ap.add_argument('--manifest', metavar='FILE', help='write FILE (one line per tagged plane the strip keeps) from the ORIGINAL RomFS image and write nothing else; --out holds only the helper libraries')
     a = ap.parse_args()
     a.workers = a.workers or os.cpu_count() or 4
-    sys.exit(run_manifest(a) if a.manifest else run(a))
+    if a.no_pack and a.pack: ap.error('--no-pack and --pack exclude each other')
+    if not a.no_pack and not a.pack: ap.error('--pack is required (or --no-pack)')
+    if a.zlevel is not None and not -7 <= a.zlevel <= 22: ap.error('--zlevel is a zstd level from -7 to 22')
+    sys.exit(run_manifest(a) if a.manifest else run_nopack(a) if a.no_pack else run(a))
 
 
 if __name__ == '__main__':

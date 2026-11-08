@@ -991,7 +991,56 @@ def texture_once_enabled(args, block: int) -> bool:
     return block > 0 and (getattr(args, 'texture_once', None) or 'auto') != 'off'
 
 
-def store_textures_once(game: Game, pack: Optional[Path], block: int, python: str, texture_cap: int, bc1_block: Optional[int] = None) -> Optional[Path]:
+COMPRESS_CHOICES = ('auto', 'on', 'off')
+
+
+def compress_enabled(args) -> bool:
+    """Compress game data (docs/texture_once.md 7c): Automatic is On. Off keeps today's behaviour: the plain RomFS.img (or the uncompressed stripped image) and astc-ro.pack."""
+    return (getattr(args, 'compress_data', None) or 'auto') != 'off'
+
+
+def link_beside(game: Game, out: Path) -> None:
+    for name in BESIDE_ROMFS:   # the build script finds control.nacp, the icon, html and jit beside the image it is given
+        source, link = game.romfs.parent / name, out / name
+        if source.exists() and not link.exists() and not link.is_symlink():
+            link.symlink_to(source)
+
+
+def embeds_pack(image: Path) -> bool:
+    """Whether a DMSPARS1 image carries the ASTC pack (header: pack size at byte 48); a plain image or an unreadable file does not"""
+    try:
+        with image.open('rb') as file:
+            head = file.read(64)
+    except OSError:
+        return False
+    return len(head) == 64 and head[:8] == b'DMSPARS1' and int.from_bytes(head[48:56], 'little') != 0
+
+
+def compress_game_data(game: Game, python: str) -> Optional[Path]:
+    """Run tex_once.py --no-pack over RomFS.img: a lossless zstd-compressed DMSPARS1 v2 image of the game with nothing stripped. Returns that romfs.img, or None with one warning line: the game then installs as before."""
+    stage('Compressing game data')
+    tool = REPO / 'dm/gfx/tools/tex_once.py'
+    out = game.build / 'tvport-compress'
+    image = out / 'romfs.img'
+    if not game.romfs:
+        emit('log', line='Game data is stored uncompressed: there is no RomFS image.')
+        return None
+    if not tool.is_file():
+        emit('log', line='Game data is stored uncompressed: this engine has no tex_once.py.')
+        return None
+    try:
+        stream([python, '-I', tool, game.romfs, '--no-pack', '--out', out, '--compress', 'on'], cwd=REPO)
+    except Failure as failure:
+        emit('log', line=f'Game data is stored uncompressed: it could not be compressed ({str(failure).splitlines()[-1][:300] if str(failure) else "no reason given"}).')
+        return None
+    if not image.is_file():
+        emit('log', line='Game data is stored uncompressed: the tool finished without an image.')
+        return None
+    link_beside(game, out)
+    return image
+
+
+def store_textures_once(game: Game, pack: Optional[Path], block: int, python: str, texture_cap: int, bc1_block: Optional[int] = None, compress: bool = False) -> Optional[Path]:
     """Run the engine's tex_once.py over RomFS.img and the ASTC pack: every plane the pack covers is zeroed in the game files (the pack holds it) and the result is one sparse image with the pack embedded. Returns that romfs.img, or None when it cannot be made, with one warning line: the feature never fails a build, and the game then goes as before with the plain RomFS.img and astc-ro.pack."""
     stage('Storing textures once')
     tool = REPO / 'dm/gfx/tools/tex_once.py'
@@ -1004,17 +1053,14 @@ def store_textures_once(game: Game, pack: Optional[Path], block: int, python: st
         emit('log', line='Textures are stored twice: this engine has no tex_once.py.')
         return None
     try:
-        stream([python, '-I', tool, game.romfs, '--pack', pack, '--out', out, '--max-dim', str(texture_cap), '--block', str(block), '--bc1-block', str(bc1_block or block)], cwd=REPO)   # tex_once.py must take --bc1-block, as bntx_astc.py does
+        stream([python, '-I', tool, game.romfs, '--pack', pack, '--out', out, '--max-dim', str(texture_cap), '--block', str(block), '--bc1-block', str(bc1_block or block), '--compress', 'on' if compress else 'off'], cwd=REPO)   # tex_once.py must take --bc1-block, as bntx_astc.py does; --compress is Compress game data (docs/texture_once.md 7c)
     except Failure as failure:
         emit('log', line=f'Textures are stored twice: they could not be stored once ({str(failure).splitlines()[-1][:300] if str(failure) else "no reason given"}).')
         return None
     if not image.is_file():
         emit('log', line='Textures are stored twice: the tool finished without an image.')
         return None
-    for name in BESIDE_ROMFS:   # the build script finds control.nacp, the icon, html and jit beside the image it is given
-        source, link = game.romfs.parent / name, out / name
-        if source.exists() and not link.exists() and not link.is_symlink():
-            link.symlink_to(source)
+    link_beside(game, out)
     return image
 
 
@@ -1056,7 +1102,7 @@ def send_file(what: str, source: Path, name: str, device: str, bundle: str) -> N
 
 
 def install(game: Game, device: str, bundle: str, astc_pack: Optional[Path] = None, once: Optional[Path] = None) -> None:
-    """once: the sparse image of Store textures once. It goes as romfs.img and carries the ASTC pack, so astc_pack is not sent and a stale astc-ro.pack is emptied."""
+    """once: the sparse image of Store textures once, or the compressed image of Compress game data. It goes as romfs.img. When it carries the ASTC pack, astc_pack is not sent and a stale astc-ro.pack is emptied; a compressed image without a pack (embeds_pack) goes with astc_pack beside it, as before."""
     stage('Installing on the Apple TV')
     if not game.app or not (game.app / 'embedded.mobileprovision').is_file():
         raise Failure('Build the app first: there is no signed app to install')
@@ -1086,7 +1132,7 @@ def install(game: Game, device: str, bundle: str, astc_pack: Optional[Path] = No
         if stamp:
             stamp.write_text(mine)
         emit('log', line='The game files on the Apple TV match this Mac.')
-    if once:
+    if once and embeds_pack(once):
         empty_stale_pack(once, device, bundle, files.get('astc-ro.pack'))
     elif astc_pack:
         install_astc_pack(astc_pack, device, bundle, files.get('astc-ro.pack'))
@@ -1194,7 +1240,10 @@ def cmd_build(args) -> None:
         emit('log', line={'backed-up': f'{backup["files"]} save files backed up.', 'unchanged': 'The saves on this Mac are already up to date.', 'none': 'No saves on the Apple TV yet.',
                           'unavailable': 'The saves on the Apple TV could not be read, so this build goes ahead without a new backup.',
                           'busy': 'The game kept saving during each copy, so this build goes ahead without a new backup.'}[backup['state']])
-    once = store_textures_once(game, pack, block, python, args.texture_cap, bc1_block) if pack and texture_once_enabled(args, block) else None
+    compress = compress_enabled(args)
+    once = store_textures_once(game, pack, block, python, args.texture_cap, bc1_block, compress) if pack and texture_once_enabled(args, block) else None
+    if once is None and compress:
+        once = compress_game_data(game, python)   # no stripped image: the compressed whole RomFS.img (install sends the ASTC pack beside it when it does not carry one)
     project = generate_project(game, args, team, bundle, python, once)
     bundle_shaders(game, project)
     compile_app(game, project, args.device)
@@ -1614,6 +1663,7 @@ def main() -> int:
     build.add_argument('--pso-mtl4', action='store_true')
     build.add_argument('--guest-file', choices=('on', 'off'))   # unset: the engine's default for the target
     build.add_argument('--astc', choices=ASTC_CHOICES, default='auto')   # Compressed textures: auto is on for the Apple TV
+    build.add_argument('--compress-data', choices=COMPRESS_CHOICES, default='auto')   # Compress game data: auto is on
     build.add_argument('--texture-once', choices=TEXTURE_ONCE_CHOICES, default='auto')   # Store textures once: auto is on whenever Compressed textures is
     build.add_argument('--astc-block', choices=ASTC_BLOCK_CHOICES, default='matched')   # matched to the original (BC1 6x6, the rest 4x4), or 4x4 / 6x6 for every format
     build.add_argument('--gpu', default='')

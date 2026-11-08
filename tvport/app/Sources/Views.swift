@@ -560,6 +560,12 @@ struct SettingsForm: View {
                         }
                         .disabled(library.games.first { $0.id == library.selection }?.compressedTextures == "off")
                         note("Without it, each BC texture is on the Apple TV twice: the game's original and its ASTC copy. On, and Automatic, which is on whenever Compressed textures is, keeps one: the game files are rewritten on this Mac with the original textures cut out (the original game files are not changed), which can save several GB on the Apple TV. If that can't be done the build carries on and stores them twice.")
+                        Picker("Compress game data", selection: compressGameDataBinding) {
+                            Text("Automatic").tag("")
+                            Text("On").tag("on")
+                            Text("Off").tag("off")
+                        }
+                        note("On, and Automatic, which is on, compresses the game files on this Mac while building (lossless: the game reads exactly the same data) and sends them in that form, which can save several GB on the Apple TV. It takes a few minutes more to build. If that can't be done the build carries on and sends the files as they are.")
                         Toggle("Metal 4 pipelines", isOn: flagBinding(\.metal4Pipelines))
                         note("Turns on DM_PSO_MTL4 and keeps the pulling shader libraries in the build. Experimental.")
                         TextField("Pipeline archive GPU", text: textBinding(\.pipelineGPU), prompt: Text("Empty for none, or g18p"))
@@ -616,6 +622,14 @@ struct SettingsForm: View {
         return Binding(get: { library.games.first { $0.id == gameID }?.textureOnce ?? "" }, set: { value in
             guard library.selection == gameID else { return }
             library.update { $0.textureOnce = value.isEmpty ? nil : value }
+        })
+    }
+
+    private var compressGameDataBinding: Binding<String> {
+        let gameID = library.selection
+        return Binding(get: { library.games.first { $0.id == gameID }?.compressGameData ?? "" }, set: { value in
+            guard library.selection == gameID else { return }
+            library.update { $0.compressGameData = value.isEmpty ? nil : value }
         })
     }
 
