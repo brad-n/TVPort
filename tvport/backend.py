@@ -935,6 +935,9 @@ def generate_project(game: Game, args, team: str, bundle: str, python: str, romf
                DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players, args.render_scale, not args.no_thermal_cap, args.fps_target, args.swap_ab_xy, args.swap_ab, args.swap_xy, pso_mtl4, getattr(args, 'extra_env', None), getattr(args, 'guest_file', None), astc_block(args), astc_blocks(args)[1])), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
                DM_XCODE_PROJECT_DIR=str(game.build / 'tvport-xcode'), DM_XCODE_DERIVED_DATA=str(game.build / 'tvport-derived'), FONT_PY=python)
     env.update(artwork_env(args))
+    control = game.extract / 'control.nacp' if game.extract else None
+    if not (control and control.is_file() and nacp_text(control)):
+        env['DM_DISPLAY_NAME'] = game.name()   # a Switch 2 NUP has no control data; build_ipa.sh needs a name
     if pso_mtl4:
         env['IOS_PULL'] = '1'   # keep the pulling vertex libraries (_bp) the Metal 4 pipelines read; without it DM_PSO_MTL4=1 cannot fully enable them
     art = args.art or game.icon or args.shelf_art

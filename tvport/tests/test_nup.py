@@ -25,6 +25,20 @@ class NupGame(unittest.TestCase):
         with patch.object(backend, 'DATA', data), patch.dict(backend.os.environ, {'TVPORT_DEFAULT_BUILD_FOLDER': ''}):
             return backend.Game(folder)
 
+    def test_project_gets_a_display_name_when_the_nup_has_no_control_name(self):
+        # A NUP carries no control.nacp name; build_ipa.sh then stops with "no game name ... set DM_DISPLAY_NAME" (Ocarina, 2026-11-08)
+        from types import SimpleNamespace
+        folder = self.folder(NAME)
+        (folder / '0400486024DEC000_build' / 'extract' / 'v131072').mkdir(parents=True)
+        game = self.game(folder)
+        args = SimpleNamespace(fps=False, mode='handheld', texture_cap=256, players='', render_scale=1, no_thermal_cap=False, fps_target=0, swap_ab_xy=False, swap_ab=None, swap_xy=None, pso_mtl4=False, art=None, shelf_art=None)
+        with patch.object(backend, 'restore_tables'), patch.object(backend, 'profile_env', return_value={}), patch.object(backend, 'write_env', return_value=folder / 'env.txt'), \
+                patch.object(backend, 'artwork_env', return_value={}), patch.object(backend, 'stream') as stream, \
+                patch.object(backend.Game, 'package', 'v131072'), patch.object(backend.Game, 'shaders', None), patch.object(backend.Game, 'icon', None):
+            backend.generate_project(game, args, 'TEAM', 'test.game', sys.executable)
+        self.assertEqual(stream.call_args.kwargs['env'].get('DM_DISPLAY_NAME'), game.name())
+        self.assertTrue(game.name())
+
     def test_nup_is_a_source_and_keyless(self):
         game = self.game(self.folder(NAME, 'extras.rar', 'notes.zip'))
         self.assertEqual(game.sources, [NAME])
