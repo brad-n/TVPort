@@ -95,3 +95,30 @@ self-check and the engine's GPU tests (a tagged plane gives the same ASTC blocks
 Then on the Apple TV (Smash first): `tagged unresolved` = 0, `tagged decoded` = 0, tagged hits > 0 in the counters line, no `[RED] ASTC: tagged`
 lines, and Brad sees no black or wrong textures. Fallback: "Store textures once: Off" and rebuild.
 (Mac gameplay runs with DM_TEST_NO_BC=1 were dropped: they need macOS shader libraries for each game, hours of shader builds.)
+
+## 7. Lossless compression (contract v2, 2026-11-08)
+Goal: shrink what goes to the TV with zstd, losslessly, for every game (with or without a texture pack). Measured on MK8 (zstd -3, 64 KiB
+samples): stored game data keeps 82%, ASTC pack payloads keep 53%. Readers stay compatible with every v1 file.
+
+### 7a. DMSPARS1 version 2: compressed extents
+- Header version = 2. Extent entries become 32 bytes: `{u64 logical offset, u64 length, u64 physical offset, u32 stored length, u32 kind}`;
+  kind 0 = raw (stored length == length), kind 1 = zstd (one zstd frame of exactly `stored length` bytes that inflates to exactly `length`).
+- zstd extents are at most 256 KiB of logical data (the tool's default block); raw extents may be any length. A block that does not shrink
+  below 97% is stored raw. Holes (no extent) still read as zero.
+- The embedded pack stays a separate physical region (16384-aligned, as in v1) and is NOT block-compressed: its index must stay mmap-able
+  raw bytes. Pack payload compression is 7b.
+- Readers: one shared decompressed-block cache (default 16 MiB, `DM_ROMFS_ZCACHE_MB`), safe for concurrent reads; a read spanning blocks
+  decompresses each once; a corrupt frame or a size mismatch is a read error with one `[RED]` line, never silent zeros.
+- Trailer and identity unchanged (identity = logical image).
+
+### 7b. NXASTCPK version 2: compressed entries
+- Header version = 2, index entry size 56: `{32-byte key, u64 offset, u64 stored size, u64 size}`; an entry whose stored size < size is
+  one zstd frame inflating to exactly `size` bytes; stored size == size means raw. `size` is what every size check uses (the tag
+  lookup's "expected ASTC size" compares `size`). Index stays sorted by key and mmap-able; v1 packs (48-byte entries) keep working.
+
+### 7c. Tool and TVPort
+- `tex_once.py ... --compress auto|on|off` (default auto = on) and `--zlevel N`; the pack embedded in the image is re-written as v2 when
+  compressing. `tex_once.py <RomFS.img> --out <dir> --no-pack` writes a compressed DMSPARS1 v2 of a game with no texture pack (nothing
+  stripped). Self-check inflates every compressed extent/entry and compares with the source.
+- TVPort: Advanced "Compress game data" Automatic (= On) / On / Off. On: every game installs a DMSPARS1 v2 romfs.img (stripped + pack
+  when Store textures once applies, else `--no-pack`). Off or any tool failure: today's behaviour.
