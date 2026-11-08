@@ -23,12 +23,14 @@ E_CONTINUE, E_END = 0, 2
 
 _work = None
 _lib = None
+_exact = None
+_exact_cache = {}
 
 
 def configure(work):
     """Where the dylib is built and cached (the tool's lib folder)"""
-    global _work, _lib
-    if work != _work: _lib = None
+    global _work, _lib, _exact
+    if work != _work: _lib = None; _exact = None
     _work = work
 
 
@@ -165,3 +167,88 @@ def forbidden(new, orig=None, skippable_ok=False):
     if f['literals'] - ALLOWED_LITERALS: bad.append(f'literal types {sorted(f["literals"] - ALLOWED_LITERALS)}')
     if f['skippable'] and not skippable_ok and (orig is None or not frame_features(orig)['skippable']): bad.append('a skippable frame')
     return bad
+
+
+# ---- the exact encoder: zstd v1.3.5, streaming, unknown size -------------------------------------------------------------------------------------------------------------------------
+# Super Smash Bros. Ultimate's data.arc frames (entries at level 9, window 2^21; the table at level 22) are what ZSTD_initCStream(level) + ZSTD_compressStream + ZSTD_endStream of v1.3.5 make of
+# their content (no content size in the header). Re-packing with that encoder, at the level that reproduces each original frame, gives frames the game's own decoder reads.
+
+def build_exact(work):
+    """libzstd v1.3.5 (tex_once_zstd135_norlelit.patch), cached in work by its patch's and script's hash. -> path"""
+    h = hashlib.sha256()
+    for f in ('tex_once_zstd135_norlelit.patch', 'tex_once_zstd135_build.sh'):
+        with open(os.path.join(HERE, f), 'rb') as fh: h.update(fh.read())
+    lib = os.path.join(work, f'libzstd135-{h.hexdigest()[:16]}.dylib')
+    if os.path.exists(lib): return lib
+    os.makedirs(work, exist_ok=True)
+    import bntx_astc as B
+    env = dict(os.environ, MACOSX_DEPLOYMENT_TARGET=B.min_os())
+    r = subprocess.run(['sh', os.path.join(HERE, 'tex_once_zstd135_build.sh'), work, lib], capture_output=True, text=True, env=env)
+    if r.returncode: raise RuntimeError(f'building the zstd v1.3.5 encoder failed:\n{r.stderr[-2000:]}')
+    return lib
+
+
+def _open_exact():
+    global _exact
+    if _exact is not None: return _exact
+    work = _work or os.environ.get('TEX_ONCE_ZSTD_WORK') or os.path.join(tempfile.gettempdir(), f'tex_once_zstd-{os.getuid()}')
+    L = ctypes.CDLL(build_exact(work))
+    vp, sz, ui, i = ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint, ctypes.c_int
+    L.ZSTD_createCStream.restype = vp
+    L.ZSTD_initCStream.argtypes = [vp, i]; L.ZSTD_initCStream.restype = sz
+    L.ZSTD_compressBound.argtypes = [sz]; L.ZSTD_compressBound.restype = sz
+    L.ZSTD_isError.argtypes = [sz]; L.ZSTD_isError.restype = ui
+    L.ZSTD_getErrorName.argtypes = [sz]; L.ZSTD_getErrorName.restype = ctypes.c_char_p
+    class In(ctypes.Structure): _fields_ = [('src', vp), ('size', sz), ('pos', sz)]
+    class Out(ctypes.Structure): _fields_ = [('dst', vp), ('size', sz), ('pos', sz)]
+    L.In, L.Out = In, Out
+    L.ZSTD_compressStream.argtypes = [vp, ctypes.POINTER(Out), ctypes.POINTER(In)]; L.ZSTD_compressStream.restype = sz
+    L.ZSTD_endStream.argtypes = [vp, ctypes.POINTER(Out)]; L.ZSTD_endStream.restype = sz
+    L.zcs = L.ZSTD_createCStream()
+    _exact = L
+    return L
+
+
+def exact_compress(data, level):
+    """`data` as one zstd frame the way zstd v1.3.5 streams it with no pledged size: no content size in the header, the window of `level`, no checksum, no dictionary"""
+    L = _open_exact()
+    data = bytes(data)
+    _ok(L, L.ZSTD_initCStream(L.zcs, level), 'init')
+    cap = L.ZSTD_compressBound(len(data)) + 64
+    out = ctypes.create_string_buffer(cap)
+    src = ctypes.create_string_buffer(data, len(data)) if data else None
+    i, o = L.In(ctypes.cast(src, ctypes.c_void_p), len(data), 0), L.Out(ctypes.cast(out, ctypes.c_void_p), cap, 0)
+    while i.pos < i.size: _ok(L, L.ZSTD_compressStream(L.zcs, ctypes.byref(o), ctypes.byref(i)), 'compress')
+    while _ok(L, L.ZSTD_endStream(L.zcs, ctypes.byref(o)), 'end'): pass
+    return out.raw[:o.pos]
+
+
+def level_window(level):
+    """The window descriptor byte exact_compress gives frames of `level`"""
+    if level not in _exact_cache: _exact_cache[level] = exact_compress(b'\0', level)[5]
+    return _exact_cache[level]
+
+
+def tail_ok(tail):
+    """What may follow a frame in its slot: nothing, zeros, or skippable frame(s)"""
+    if not tail or tail.count(0) == len(tail): return True
+    try: f = frame_features(tail)
+    except (ValueError, IndexError): return False
+    return f['frames'] == 0
+
+
+def match_level(orig, dec, big=8 << 20):
+    """The level at which exact_compress(dec) reproduces the zstd frame at the start of `orig` byte for byte (the rest of `orig` being zeros or skippable frames), or None.
+    Only levels with the frame's window descriptor are tried: the one that matched last for that window first, then 9, 22, then the rest (the rest only for content under `big` bytes; stronger levels are slow).
+    A frame with a dictionary or a content size has no match"""
+    orig = bytes(orig)
+    h = frame_header(orig)
+    if h is None or h[1] is None or h[0] != 0: return None
+    cands = [lv for lv in range(1, 23) if level_window(lv) == h[1]]
+    first = [lv for lv in (_exact_cache.get(('last', h[1])), 9, 22) if lv in cands]
+    for lv in dict.fromkeys(first + (cands if len(dec) < big else [])):
+        comp = exact_compress(dec, lv)
+        if orig[:len(comp)] == comp and tail_ok(orig[len(comp):]):
+            _exact_cache[('last', h[1])] = lv
+            return lv
+    return None

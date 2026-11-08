@@ -968,6 +968,111 @@ class NoRleZstdTests(unittest.TestCase):
         self.assertIn('block types', str(cm.exception))
 
 
+class ExactEncoderTests(unittest.TestCase):
+    """The encoder Smash's own frames came from: zstd v1.3.5 streaming, no pledged size, found per frame by recompressing the original's content (tex_once_zstd.match_level)"""
+    @staticmethod
+    def content(seed=1):
+        return random.Random(seed).randbytes(4000) + bytes(150_000) + random.Random(seed + 1).randbytes(900) + bytes(100_000)
+
+    def test_streaming_without_size_has_the_original_header(self):
+        z = B.zstd_module()
+        data = self.content()
+        for level, window in ((9, 0x58), (22, 0x88)):
+            f = tool.Z.exact_compress(data, level)
+            self.assertEqual(tool.zstd_header(f), (0x00, window))         # no content size, no checksum, no dictionary; the level's window
+            self.assertEqual(z.decompress(f), data)
+            self.assertEqual(tool.Z.forbidden(f), [])
+        self.assertEqual(z.decompress(tool.Z.exact_compress(b'', 9)), b'')
+
+    def test_no_rle_blocks_or_literals_in_zeroed_data(self):
+        z = B.zstd_module()
+        for data in (bytes(3 << 20), bytes(100), b'ab' * 40 + bytes(5000), NoRleZstdTests.sparse_data(), b'\x07' * 70_000 + b'\x01' * 300):
+            for level in (1, 9, 19, 22):
+                f = tool.Z.exact_compress(data, level)
+                self.assertEqual(tool.Z.forbidden(f), [], (len(data), level))
+                self.assertEqual(z.decompress(f), data)
+
+    def test_level_detection(self):
+        z = B.zstd_module()
+        data = self.content()
+        for level in (9, 22, 5, 15):
+            f = tool.Z.exact_compress(data, level)
+            lv = tool.Z.match_level(f, data)
+            self.assertEqual(tool.Z.exact_compress(data, lv), f)                                       # the level found reproduces the frame (neighbouring levels may make the same bytes)
+            if level in (9, 22): self.assertEqual(lv, level)
+            level = lv
+            self.assertEqual(tool.Z.match_level(f + bytes(500), data), level)                          # a zero tail (data.arc entry)
+            self.assertEqual(tool.Z.match_level(f + tool.skippable_frame(64), data), level)            # a skippable pad (other zstd files)
+            self.assertIsNone(tool.Z.match_level(f + b'\x01' * 20, data))                              # something else after the frame
+            self.assertIsNone(tool.Z.match_level(f, data[:-1] + b'\x01'))                              # other content
+        self.assertIsNone(tool.Z.match_level(z.compress(data, level=9), data))                         # stock libzstd: content size in the header
+        self.assertIsNone(tool.Z.match_level(b'not a frame', data))
+        P = z.CompressionParameter
+        other = z.compress(data, options={P.compression_level: 3, P.content_size_flag: 0, P.window_log: 17})
+        self.assertIsNone(tool.Z.match_level(other, data))                                              # right header layout, not this encoder
+
+    def walker(self):
+        w = tool.Walker.__new__(tool.Walker)
+        w.dicts, w.zdicts, w.c, w.new_csz = {}, {}, __import__('collections').Counter(), None
+        return w
+
+    def test_walker_repacks_with_the_detected_level_and_falls_back_when_unmatched(self):
+        z = B.zstd_module(); P = z.CompressionParameter
+        dec = self.content(); new = dec[:5000] + bytes(len(dec) - 5000)
+        for level in (9, 22):
+            w = self.walker()
+            orig = tool.Z.exact_compress(dec, level) + bytes(300)                                      # an arc entry: the frame and a zero tail
+            r = w.fit_zstd(new, orig, 'arc', dec)
+            comp = tool.Z.exact_compress(new, level)
+            self.assertEqual(r, comp + bytes(len(orig) - len(comp)))
+            self.assertEqual(w.new_csz, len(comp))
+            self.assertEqual((w.c['encoder_matched'], w.c['encoder_unmatched'], w.c[f'encoder_level:{level}']), (1, 0, 1))
+            w = self.walker()
+            orig = tool.Z.exact_compress(dec, level) + tool.skippable_frame(300)
+            r = w.fit_zstd(new, orig, None, dec)
+            self.assertEqual(len(r), len(orig)); self.assertTrue(r.startswith(comp)); self.assertEqual(z.decompress(r[:len(comp)]), new)
+            self.assertEqual(tool.Z.frame_features(r)['skippable'], 1)
+            w.kind = lambda o, name, hint: 'zstd'
+            inner = w.check; w.check = lambda o, n, name, depth=0, *a, **k: inner(o, n, name, depth, *a, **k) if depth == 0 else None   # the synthetic content holds no texture: only the zstd layer is checked
+            w.check(orig, r, 'x')                                                                      # the self-check's identity proof accepts it
+            self.assertEqual(w.c['encoder_identity_checked'], 1)
+            bad = bytearray(r); bad[len(comp) - 1] ^= 1
+            with self.assertRaises(Exception): w.check(orig, bytes(bad), 'x')
+        # an original from another encoder: the header-copying no-RLE path, counted
+        other = z.compress(dec, options={P.compression_level: 3, P.content_size_flag: 0, P.window_log: 17}); other += bytes(400)
+        w = self.walker()
+        r = w.fit_zstd(new, other, 'arc', dec)
+        self.assertIsNotNone(r); self.assertEqual(w.c['encoder_unmatched'], 1); self.assertEqual(w.c['encoder_matched'], 0)
+        self.assertEqual(tool.zstd_header(r), tool.zstd_header(other)); self.assertEqual(tool.Z.forbidden(r[:w.new_csz], other), [])
+        # a new frame that does not fit the slot falls back too (and is counted)
+        w = self.walker()
+        orig = tool.Z.exact_compress(dec, 9)
+        self.assertIsNone(w.exact_fit(random.Random(9).randbytes(len(dec)), orig, dec, 'arc'))
+        self.assertEqual(w.c['encoder_exact_unusable'], 1)
+
+    def test_table_frame_is_rewritten_with_the_detected_level(self):
+        payloads = [(random.Random(i).randbytes(5000), 5000) for i in range(3)]
+        raw, ents = smash_arc_file(payloads)
+        import smash_arc
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / 'data.arc'; f.write_bytes(raw)
+            T = smash_arc.table(str(f))
+            # replace the table frame by one the exact encoder made (level 22) when it still fits its slot
+            fs = bytes(T['fs']); frame = tool.Z.exact_compress(fs, 22)
+            if len(frame) > T['stored']: self.skipTest('the synthetic table does not fit at level 22')
+            arc = tool.Arc.__new__(tool.Arc)
+            arc.sa = smash_arc; arc.T = T; arc.fd = smash_arc.fd_by_offset(T)
+            arc.table_off = T['fs_off']; arc.table_size = 16 + T['stored']
+            hdr = raw[arc.table_off:arc.table_off + 16]; orig = hdr[:8] + struct.pack('<I', len(frame)) + hdr[12:] + frame + bytes(T['stored'] - len(frame))     # the table slot as the exact encoder left it
+            arc.old_csz = {T['file_off'] + 4 * e[0]: e[1] for e in ents}
+            slot, fs_new = arc.build_table(orig, {})                                                    # nothing changed: the same frame, byte for byte
+            self.assertEqual(arc.encoder, {'level': 22}); self.assertEqual(slot, orig)
+            at = arc.T['file_off'] + 4 * ents[0][0]
+            slot, fs_new = arc.build_table(orig, {at: 123})
+            n = struct.unpack_from('<I', slot, 8)[0]
+            self.assertEqual(slot[16:16 + n], tool.Z.exact_compress(fs_new, 22))
+
+
 class TableSlotTests(unittest.TestCase):
     def test_table_is_one_frame_with_stored_size_of_that_frame(self):
         payloads = [(random.Random(i).randbytes(5000), 5000) for i in range(3)]

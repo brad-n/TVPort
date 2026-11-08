@@ -1,0 +1,15 @@
+diff --git a/lib/compress/zstd_compress.c b/lib/compress/zstd_compress.c
+index c668625..74008e6 100644
+--- a/lib/compress/zstd_compress.c
++++ b/lib/compress/zstd_compress.c
+@@ -1601,8 +1601,9 @@ static size_t ZSTD_compressLiterals (ZSTD_hufCTables_t const* prevHuf,
+         return ZSTD_noCompressLiterals(dst, dstCapacity, src, srcSize);
+     }
+     if (cLitSize==1) {
++        /* TVPort tex_once: no RLE literals (Smash's data.arc has none); a single-symbol literals section is stored raw */
+         memcpy(nextHuf, prevHuf, sizeof(*prevHuf));
+-        return ZSTD_compressRleLiteralsBlock(dst, dstCapacity, src, srcSize);
++        return ZSTD_noCompressLiterals(dst, dstCapacity, src, srcSize);
+     }
+ 
+     if (hType == set_compressed) {
