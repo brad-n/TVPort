@@ -244,6 +244,8 @@ class SparseV2Tests(unittest.TestCase):
             self.assertEqual((off % 16, size), (0, len(pay[i % 40])))
             frame = d[off:off + stored]
             self.assertEqual(S.zdecompress(frame) if stored < size else frame, pay[i % 40])
+            self.assertEqual(S.zdecompress(frame)[:8] if stored < size else frame[:8], b'NXASTC01')   # engine contract: ONE frame over the whole cache-file payload, its 40-byte entry header included; size = that payload
+            self.assertGreater(size, 40)
             self.assertEqual(by_payload.setdefault(i % 40, (off, stored)), (off, stored))   # aliases share the stored bytes
         self.assertTrue(any(stored == size for _, _, stored, size in idx)); self.assertTrue(any(stored < size for _, _, stored, size in idx))
         # embedded in a v2 image (16384-aligned), the pack verifies against its source, and a damaged byte is found
