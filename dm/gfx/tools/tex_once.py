@@ -642,7 +642,8 @@ def split_counters(c):
 def zlevel_of(args):
     """The zstd level of this run, or None when the image is written uncompressed (--compress off)"""
     if getattr(args, 'compress', 'auto') == 'off': return None
-    return int(args.zlevel if args.zlevel is not None else DEFAULT_ZLEVEL)
+    zl = getattr(args, 'zlevel', None)
+    return int(DEFAULT_ZLEVEL if zl is None else zl)
 
 
 def compression_bytes(target, pack_source):

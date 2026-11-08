@@ -107,7 +107,7 @@ class SparseTests(unittest.TestCase):
         bad = bytearray(raw); bad[0] = ord('X')
         (self.root / 'bad.img').write_bytes(bytes(bad))
         with self.assertRaises(S.SparseError): S.SparseImage(str(self.root / 'bad.img'))
-        bad = bytearray(raw); bad[8:12] = struct.pack('<I', 2)   # version
+        bad = bytearray(raw); bad[8:12] = struct.pack('<I', 3)   # version
         (self.root / 'bad.img').write_bytes(bytes(bad))
         with self.assertRaises(S.SparseError): S.SparseImage(str(self.root / 'bad.img'))
 
@@ -137,6 +137,200 @@ class SparseTests(unittest.TestCase):
             f.seek(-5, 2); self.assertEqual(f.read(), data[-5:])
         plain = self.root / 'p.img'; plain.write_bytes(b'hello')
         with S.open_logical(str(plain)) as f: self.assertEqual(f.read(), b'hello')
+
+
+def payload_data():
+    """Logical bytes for the v2 tests: compressible text across block boundaries, random bytes, a hole, a short zero run, a tiny tail"""
+    rng = random.Random(11)
+    text = (b'the quick brown fox jumps over the lazy dog %d ' % 7) * 20000          # ~880 KB: several blocks
+    return text + rng.randbytes(300_000) + bytes(70_000) + text[:123_457] + bytes(100) + rng.randbytes(40) + bytes(5000) + b'end'
+
+
+class SparseV2Tests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
+
+    def tearDown(self): self.tmp.cleanup()
+
+    def write(self, data, name='v2.img', pack=None, level=3):
+        w = S.SparseWriter(str(self.root / name), len(data), version=2)
+        for a in range(0, len(data), 3_000_000): w.put_parts(S.compress_parts(data[a:a + 3_000_000], a, level))      # two tasks' worth, the way the tool feeds it
+        return w.finish(str(pack) if pack else None)
+
+    def test_round_trip_mixed_zstd_raw_and_holes(self):
+        data = payload_data()
+        info = self.write(data)
+        self.assertLess(info['physical'], len(data) * 0.6)
+        with S.SparseImage(str(self.root / 'v2.img')) as s:
+            self.assertEqual((s.version, s.logical_size), (2, len(data)))
+            ex = s.extents_ex()
+            kinds = {e[4] for e in ex}
+            self.assertEqual(kinds, {S.RAW, S.ZSTD})
+            self.assertTrue(all(e[1] <= S.BLOCK for e in ex if e[4] == S.ZSTD))
+            self.assertTrue(all(e[3] < e[1] * S.KEEP_RATIO / 100 for e in ex if e[4] == S.ZSTD))     # raw unless it shrinks below 97 %
+            self.assertTrue(all(e[3] == e[1] for e in ex if e[4] == S.RAW))
+            self.assertTrue(all(e[2] % 16 == 0 for e in ex))
+            self.assertGreater(s.hole_bytes(), 70_000)
+            self.assertEqual(s.read(0, len(data)), data)
+            b = S.BLOCK
+            for off, n in ((0, 1), (b - 1, 2), (b, 1), (b - 5, 10), (2 * b - 1, b + 2), (100, 3 * b), (len(data) - 3, 99), (len(data), 4), (880_000 + 299_999, 70_010)):
+                self.assertEqual(s.read(off, n), data[off:off + n], (off, n))
+            rng = random.Random(5)
+            for _ in range(200):
+                off = rng.randrange(len(data)); n = rng.randrange(1, 400_000)
+                self.assertEqual(s.read(off, n), data[off:off + n])
+            self.assertEqual(s.inflate_all()[0], sum(1 for e in ex if e[4] == S.ZSTD))
+        for f in (S.open_logical(str(self.root / 'v2.img')),):
+            with f: f.seek(500_000); self.assertEqual(f.read(900_000), data[500_000:1_400_000])
+        self.assertEqual(S.validate(str(self.root / 'v2.img'))['version'], 2)
+
+    def test_small_cache_still_reads_the_same_bytes(self):
+        data = payload_data()
+        self.write(data)
+        os.environ['DM_ROMFS_ZCACHE_MB'] = '1'
+        try:
+            with S.SparseImage(str(self.root / 'v2.img')) as s:
+                for off in range(0, len(data), 90_000): self.assertEqual(s.read(off, 200_000), data[off:off + 200_000])
+                self.assertLessEqual(s.cache.size, 1 << 20)
+        finally: del os.environ['DM_ROMFS_ZCACHE_MB']
+
+    def test_truncated_and_damaged_v2_files_are_rejected(self):
+        data = payload_data()
+        self.write(data)
+        raw = (self.root / 'v2.img').read_bytes()
+        for cut in (len(raw) - 1, len(raw) - 32, len(raw) // 2, 64, 10, 0):
+            (self.root / 'cut.img').write_bytes(raw[:cut])
+            with self.assertRaises(S.SparseError, msg=cut): S.SparseImage(str(self.root / 'cut.img'))
+        with S.SparseImage(str(self.root / 'v2.img')) as s: z = next(e for e in s.extents_ex() if e[4] == S.ZSTD); table = s.table_offset
+        bad = bytearray(raw); bad[z[2]] ^= 0x55                                     # a zstd frame's magic (frames carry no checksum: a flipped literal can inflate to other bytes; the tool's self-check compares)
+        (self.root / 'bad.img').write_bytes(bytes(bad))
+        with S.SparseImage(str(self.root / 'bad.img')) as s:                          # opens (structure is fine); the read of that block fails, never zeros
+            with self.assertRaises(S.SparseError): s.read(z[0], z[1])
+            with self.assertRaises(S.SparseError): s.inflate_all()
+        for at, value in ((24, 0), (28, 7)):                                          # table entry 0 (a zstd extent): stored length 0 / kind 7
+            bad = bytearray(raw); struct.pack_into('<I', bad, table + at, value); (self.root / 'bad.img').write_bytes(bytes(bad))
+            with self.assertRaises(S.SparseError): S.SparseImage(str(self.root / 'bad.img'))
+        w = S.SparseWriter(str(self.root / 'w.img'), 1 << 20, version=2)
+        with self.assertRaises(S.SparseError): w.put_zstd(0, S.BLOCK + 1, b'x')       # too long for a zstd extent
+        with self.assertRaises(S.SparseError): w.put_zstd(0, 10, b'x' * 10)           # does not shrink
+        w.abort()
+
+    def test_pack_v2_round_trip(self):
+        rng = random.Random(2)
+        pay = [b'NXASTC01' + bytes(32) + (bytes([i]) * 5000 if i % 2 else rng.randbytes(3000)) for i in range(40)]
+        src = self.root / 'src.pack'
+        keys = sorted(hashlib.sha256(b'k%d' % i).digest() for i in range(52))
+        body, where, pos = bytearray(), [], 80
+        for p in pay:
+            where.append((pos, len(p))); body += p + bytes(-len(p) % 16); pos += len(p) + -len(p) % 16
+        ent = b''.join(k + struct.pack('<QQ', *where[i % 40]) for i, k in enumerate(keys))      # 12 keys alias an earlier payload
+        fp = bytes(range(32))
+        src.write_bytes(b'NXASTCPK' + struct.pack('<IIQQQ', 1, 48, len(keys), pos, pos + len(ent)) + fp + bytes(8) + bytes(body) + ent)
+        dst = self.root / 'dst.pack'
+        st = S.write_pack_v2(str(src), str(dst), 3, workers=2, batch_bytes=20_000)
+        self.assertEqual((st['entries'], st['payloads']), (52, 40))
+        self.assertGreater(st['zstd'], 10); self.assertGreater(st['raw'], 10)
+        d = dst.read_bytes()
+        self.assertEqual(d[:8], b'NXASTCPK')
+        ver, esz, count, ioff, fsize = struct.unpack_from('<IIQQQ', d, 8)
+        self.assertEqual((ver, esz, count, fsize, ioff + 56 * count), (2, 56, 52, len(d), len(d)))
+        self.assertEqual(d[40:80], src.read_bytes()[40:80])
+        self.assertLess(len(d), src.stat().st_size)
+        self.assertEqual(ioff % 16, 0)
+        idx = [struct.unpack_from('<32sQQQ', d, ioff + 56 * i) for i in range(count)]
+        self.assertEqual([e[0] for e in idx], keys)                                    # still sorted
+        by_payload = {}
+        for i, (k, off, stored, size) in enumerate(idx):
+            self.assertEqual((off % 16, size), (0, len(pay[i % 40])))
+            frame = d[off:off + stored]
+            self.assertEqual(S.zdecompress(frame) if stored < size else frame, pay[i % 40])
+            self.assertEqual(by_payload.setdefault(i % 40, (off, stored)), (off, stored))   # aliases share the stored bytes
+        self.assertTrue(any(stored == size for _, _, stored, size in idx)); self.assertTrue(any(stored < size for _, _, stored, size in idx))
+        # embedded in a v2 image (16384-aligned), the pack verifies against its source, and a damaged byte is found
+        data = payload_data()
+        self.write(data, pack=dst)
+        with S.SparseImage(str(self.root / 'v2.img')) as s:
+            self.assertEqual((s.pack_version, s.pack_offset % 16384, s.pack_size), (2, 0, len(d)))
+            self.assertEqual(s.read_pack(0, s.pack_size), d)
+            self.assertEqual(S.verify_pack_v2(str(self.root / 'v2.img'), s.pack_offset, s.pack_size, str(src), workers=2), [])
+            at = s.pack_offset + next(e[1] for e in idx if e[2] < e[3]) + 3
+        raw = bytearray((self.root / 'v2.img').read_bytes()); raw[at] ^= 0x20
+        (self.root / 'bad.img').write_bytes(bytes(raw))
+        with S.SparseImage(str(self.root / 'bad.img')) as s:
+            self.assertTrue(S.verify_pack_v2(str(self.root / 'bad.img'), s.pack_offset, s.pack_size, str(src), workers=2))
+        # a v1 image with a v1 pack (today's files) still reads
+        w = S.SparseWriter(str(self.root / 'v1.img'), len(data)); w.put_scanned(0, data); w.finish(str(src))
+        with S.SparseImage(str(self.root / 'v1.img')) as s: self.assertEqual((s.version, s.pack_version, s.read(0, len(data))), (1, 1, data))
+
+
+class NoPackTests(unittest.TestCase):
+    """tex_once --no-pack: a compressed DMSPARS1 v2 of a game without a texture pack, nothing stripped"""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
+        src = self.root / 'src'; (src / 'sub').mkdir(parents=True)
+        (src / 'sub' / 'text.txt').write_bytes(payload_data())
+        (src / 'rand.bin').write_bytes(random.Random(1).randbytes(500_000))
+        (src / 'zeros.bin').write_bytes(bytes(400_000))
+        (src / 'tiny').write_bytes(b'x')
+        self.img = self.root / 'RomFS.img'
+        romfs_image.pack(str(src), str(self.img))
+
+    def tearDown(self): self.tmp.cleanup()
+
+    def args(self, out, **kw):
+        import argparse
+        ns = argparse.Namespace(input=str(self.img), out=str(out), workers=2, compress='auto', zlevel=3, force=False, json=False)
+        for k, v in kw.items(): setattr(ns, k, v)
+        return ns
+
+    def test_image_equals_the_source_logically_and_is_smaller(self):
+        out = self.root / 'out'
+        self.assertEqual(tool.run_nopack(self.args(out)), 0)
+        rep = json.loads((out / 'report.json').read_text())
+        self.assertTrue(rep['self_check']['passed'])
+        self.assertTrue(rep['no_pack'])
+        b = rep['bytes']
+        self.assertEqual((b['logical'], b['physical'], b['pack']), (self.img.stat().st_size, (out / 'romfs.img').stat().st_size, 0))
+        self.assertLess(b['physical'], b['logical'] * 0.7)
+        self.assertGreater(b['compressed_logical'], b['compressed_physical'] > 0 and b['compressed_physical'])
+        self.assertTrue(rep['compression']['enabled']); self.assertEqual(rep['compression']['level'], 3)
+        self.assertGreater(rep['compression']['extents_zstd'], 3)
+        with S.SparseImage(str(out / 'romfs.img')) as s:
+            self.assertEqual((s.version, s.pack_size), (2, 0))
+            self.assertEqual(s.read(0, s.logical_size), self.img.read_bytes())
+        self.assertEqual(romfs_image.identity(str(out / 'romfs.img'), 't', '1', '2'), romfs_image.identity(str(self.img), 't', '1', '2'))
+        import romfs
+        for n in ('sub/text.txt', 'rand.bin', 'zeros.bin', 'tiny'):
+            self.assertEqual(romfs.Path(str(out / 'romfs.img') + '/' + n).read_bytes(), romfs.Path(str(self.img) + '/' + n).read_bytes())
+
+    def test_skip_fingerprint_covers_the_compression_settings(self):
+        out = self.root / 'out'
+        self.assertEqual(tool.run_nopack(self.args(out)), 0)
+        stamp = (out / 'romfs.img').stat().st_mtime_ns
+        self.assertEqual(tool.run_nopack(self.args(out)), 0)
+        self.assertEqual((out / 'romfs.img').stat().st_mtime_ns, stamp)                # same inputs and settings: skipped
+        self.assertEqual(tool.run_nopack(self.args(out, zlevel=5)), 0)
+        self.assertNotEqual((out / 'romfs.img').stat().st_mtime_ns, stamp)             # another level: rewritten
+        self.assertEqual(json.loads((out / 'report.json').read_text())['compression']['level'], 5)
+        self.assertEqual(tool.run_nopack(self.args(self.root / 'o2', compress='off')), 2)   # nothing to write without compression
+
+    def test_self_check_catches_a_corrupted_compressed_block(self):
+        out = self.root / 'out'
+        orig = S.SparseWriter.put_zstd
+        hit = []
+
+        def damaged(w, offset, length, frame):
+            if not hit:
+                hit.append(offset); frame = bytearray(frame); frame[len(frame) // 2] ^= 0x41; frame = bytes(frame)
+            return orig(w, offset, length, frame)
+        S.SparseWriter.put_zstd = damaged
+        try: code = tool.run_nopack(self.args(out))
+        finally: S.SparseWriter.put_zstd = orig
+        self.assertTrue(hit)
+        self.assertEqual(code, 1)
+        rep = json.loads((out / 'report.json').read_text())
+        self.assertFalse(rep['self_check']['passed']); self.assertTrue(rep['self_check']['problems'])
+        self.assertFalse((out / 'romfs.img').exists())
 
 
 class RomfsViewTests(unittest.TestCase):
@@ -326,6 +520,7 @@ class StripTests(unittest.TestCase):
         (d / 'pack.pack.zs').write_bytes(z.compress(T.sarc([('t.bntx', T.bntx(lib, [ts[5]]))]), level=19))
         (d / 'astc.bntx').write_bytes(T.bntx(lib, [T.Texture(0x2d01, 32, 32, mips=1)]))
         (d / 'data.bin').write_bytes(bytes(1000) + os.urandom(100))
+        (d / 'notes.txt').write_bytes(b'store textures once, compress the rest. ' * 20000)     # compressible data for the zstd blocks
         self.ts = ts
         if arc:
             tex_a = T.Texture(0x1a01, 64, 64, mips=3, seed=5); tex_b = T.Texture(0x2001, 64, 64, mips=3, seed=6); tex_c = T.Texture(0x1c01, 32, 32, mips=2, seed=7)
@@ -357,7 +552,7 @@ class StripTests(unittest.TestCase):
 
     def parse(self, argv):
         import argparse
-        ns = argparse.Namespace(input=argv[0], pack=None, out=None, max_dim=0, block=4, bc1_block=None, workers=2, arc_mode='table', force=False, json=False, no_pack_check=False)
+        ns = argparse.Namespace(input=argv[0], pack=None, out=None, max_dim=0, block=4, bc1_block=None, workers=2, arc_mode='table', force=False, json=False, no_pack_check=False, compress='off', zlevel=None)   # the v1 tests: compression off
         i = 1
         while i < len(argv):
             k = argv[i]
@@ -369,6 +564,8 @@ class StripTests(unittest.TestCase):
             elif k == '--force': ns.force = True; i += 1
             elif k == '--bc1-block': ns.bc1_block = int(argv[i + 1]); i += 2
             elif k == '--no-pack-check': ns.no_pack_check = True; i += 1
+            elif k == '--compress': ns.compress = argv[i + 1]; i += 2
+            elif k == '--zlevel': ns.zlevel = int(argv[i + 1]); i += 2
             else: i += 1
         return ns
 
@@ -511,6 +708,50 @@ class StripTests(unittest.TestCase):
         rep = self.report(out)
         self.assertGreater(rep['planes']['zeroed_above_cap'], 0)
         self.assertTrue(rep['self_check']['passed'])
+
+    def test_compressed_strip_equals_the_uncompressed_strip_and_checks_every_block(self):
+        d, img, pack, out = self.make('tz')
+        self.assertEqual(self.run_tool(img, pack, out), 0)                     # the v1 strip
+        plain = (out / 'romfs.img').read_bytes()
+        with S.SparseImage(str(out / 'romfs.img')) as s: v1 = s.read(0, s.logical_size)
+        out2 = self.root / 'tz_out2'
+        self.assertEqual(self.run_tool(img, pack, out2, 0, '--compress', 'on', '--zlevel', '3'), 0)
+        rep = self.report(out2)
+        self.assertTrue(rep['self_check']['passed'])
+        with S.SparseImage(str(out2 / 'romfs.img')) as s:
+            self.assertEqual((s.version, s.pack_version), (2, 2))
+            self.assertEqual(s.read(0, s.logical_size), v1)                    # the same logical image
+            self.assertEqual(s.pack_offset % 16384, 0)
+            self.assertEqual(S.verify_pack_v2(str(out2 / 'romfs.img'), s.pack_offset, s.pack_size, str(pack), workers=2), [])
+        b = rep['bytes']
+        self.assertEqual((b['logical'], b['physical']), (img.stat().st_size, (out2 / 'romfs.img').stat().st_size))
+        self.assertEqual(b['pack_source'], pack.stat().st_size)
+        self.assertLessEqual(b['pack'], pack.stat().st_size)
+        self.assertGreater(rep['compression']['extents_zstd'], 0)
+        self.assertEqual(rep['compression']['level'], 3)
+        self.assertLess(b['physical'], (out / 'romfs.img').stat().st_size)
+        self.assertEqual(romfs_image.identity(str(out2 / 'romfs.img')), romfs_image.identity(str(img)))
+        # the skip fingerprint holds the settings: same -> skipped; another level -> rewritten
+        stamp = (out2 / 'romfs.img').stat().st_mtime_ns
+        self.assertEqual(self.run_tool(img, pack, out2, 0, '--compress', 'on', '--zlevel', '3'), 0)
+        self.assertEqual((out2 / 'romfs.img').stat().st_mtime_ns, stamp)
+        self.assertEqual(self.run_tool(img, pack, out2, 0, '--compress', 'on', '--zlevel', '4'), 0)
+        self.assertNotEqual((out2 / 'romfs.img').stat().st_mtime_ns, stamp)
+
+    def test_self_check_catches_a_corrupted_compressed_block_in_a_strip(self):
+        d, img, pack, out = self.make('tzc')
+        orig = S.SparseWriter.put_zstd
+        hit = []
+
+        def damaged(w, offset, length, frame):
+            if not hit: hit.append(offset); frame = bytearray(frame); frame[len(frame) // 2] ^= 0x41; frame = bytes(frame)
+            return orig(w, offset, length, frame)
+        S.SparseWriter.put_zstd = damaged
+        try: code = self.run_tool(img, pack, out, 0, '--compress', 'on', '--zlevel', '3')
+        finally: S.SparseWriter.put_zstd = orig
+        self.assertTrue(hit); self.assertEqual(code, 1)
+        self.assertFalse(self.report(out)['self_check']['passed'])
+        self.assertFalse((out / 'romfs.img').exists())
 
     def test_skip_when_inputs_are_unchanged_and_refuse_a_foreign_pack(self):
         d, img, pack, out = self.make('t4')
