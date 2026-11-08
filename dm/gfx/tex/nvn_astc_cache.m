@@ -894,7 +894,7 @@ static void bg_enqueue(uint32_t format, const void *source, size_t size, uint32_
 static int cache_has(const char *root, const char *key, size_t payload) {
     if (!root || !*root) return 0;
     const nvn_pack *pk = pack_for(root);
-    if (pk) { uint64_t off, sz; return pack_find(pk, key, &off, &sz) && sz == payload + 40; }
+    if (pk) { pack_ent e; return pack_find(pk, key, &e) && e.size == payload + 40; }
     @autoreleasepool {
         NSString *path = cache_path(root, key);
         if (atomic_load_explicit(&g_cache_small_ready, memory_order_acquire)) {
