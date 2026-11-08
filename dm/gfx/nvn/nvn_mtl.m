@@ -2536,6 +2536,7 @@ static void embedded_pack_register(void) {
 // The BC bytes are decoded and encoded on the CPU (nvn_astc_cache.m: decode, ASTC FASTEST encode, content-addressed cache in DM_NVN_ASTC_CACHE, read-only prebuilt one in DM_NVN_ASTC_CACHE_RO).
 // BC4/5/6H and 3D textures keep the decoded path. Unset or 0 leaves every code path as it was
 static unsigned g_astc_v1;   // DM_NVN_BC1_ASTC (4|5|6; default DM_NVN_BC_ASTC), 0 = off. Set once by astc_block
+static unsigned g_astc_bc4 = 6, g_astc_bc5 = 4, g_astc_bc6h = 4;   // DM_NVN_BC4_ASTC / DM_NVN_BC5_ASTC / DM_NVN_BC6H_ASTC (4|5|6, 0 = that format keeps its decoded path); BC6H is 0 without ASTC HDR
 static unsigned astc_block(void) {
     static unsigned v;
     static dispatch_once_t once;
@@ -2546,6 +2547,13 @@ static unsigned astc_block(void) {
         g_astc_v1 = v;
         { const char *e1 = getenv("DM_NVN_BC1_ASTC"); unsigned b1 = e1 ? (unsigned)atoi(e1) : 0;
           if (v && e1 && *e1) { if (b1 >= 4 && b1 <= 6) g_astc_v1 = b1; else MLOG("DM_NVN_BC1_ASTC=%s ignored: only 4, 5 and 6 are supported (BC1 uses DM_NVN_BC_ASTC=%u)", e1, v); } }
+        // BC4 (R8 today, 8 bits a texel) takes 6x6 (3.56 bits), BC5 (RG8, 16 bits) 4x4 (8 bits), unsigned BC6H (RG11B10Float, 32 bits) HDR 4x4 (8 bits). The SIGNED formats (BC4S, BC5S, BC6H signed) are never ASTC:
+        // their negative texels have no ASTC LDR / HDR encoding, they keep the decoded path (astc_block_for answers 0)
+        { struct { const char *name; unsigned *slot; } fmts[] = {{"DM_NVN_BC4_ASTC", &g_astc_bc4}, {"DM_NVN_BC5_ASTC", &g_astc_bc5}, {"DM_NVN_BC6H_ASTC", &g_astc_bc6h}};
+          for (int i = 0; i < 3; i++) { const char *ef = getenv(fmts[i].name);
+              if (ef && *ef) { unsigned bf = (unsigned)atoi(ef); if (bf == 0 || (bf >= 4 && bf <= 6)) *fmts[i].slot = bf; else MLOG("%s=%s ignored: only 0 (off), 4, 5 and 6 are supported", fmts[i].name, ef); } }
+          if (g_astc_bc6h && ![g_dev supportsFamily:MTLGPUFamilyApple6]) { MLOG("BC6H stays decoded: this GPU has no ASTC HDR (Metal GPU family Apple6, the A13, and later)"); g_astc_bc6h = 0; }
+          if (!v) g_astc_bc4 = g_astc_bc5 = g_astc_bc6h = 0; }
         { const char *why = stripped_refusal(g_embedded, no_bc(), v); if (why) MDIE("[RED] stripped RomFS image refused: %s", why); }
 #if TARGET_OS_TV
         if (v) {   // the app's data directory (Library/Caches, main.m DM_DATA_DIRECTORY): the writable cache lives there, a prebuilt one is installed beside it
@@ -2563,7 +2571,8 @@ static unsigned astc_block(void) {
             }
         }
 #endif
-        if (v) { MLOG("BC2/3/7 2D textures stored as ASTC %ux%u, BC1 as %ux%u (content-addressed cache: %s, read-only cache: %s); a cache miss %s", v, v, g_astc_v1, g_astc_v1, getenv("DM_NVN_ASTC_CACHE") ?: "none", getenv("DM_NVN_ASTC_CACHE_RO") ?: "none",
+        if (v) { MLOG("BC4 as ASTC %ux%u, BC5 as %ux%u, BC6H as HDR %ux%u (0 = decoded)", g_astc_bc4, g_astc_bc4, g_astc_bc5, g_astc_bc5, g_astc_bc6h, g_astc_bc6h);
+                 MLOG("BC2/3/7 2D textures stored as ASTC %ux%u, BC1 as %ux%u (content-addressed cache: %s, read-only cache: %s); a cache miss %s", v, v, g_astc_v1, g_astc_v1, getenv("DM_NVN_ASTC_CACHE") ?: "none", getenv("DM_NVN_ASTC_CACHE_RO") ?: "none",
                       astc_sync() ? "encodes on the calling thread (DM_NVN_ASTC_MISS=sync, testing only)" : "uploads the texture decoded and encodes in the background for the next run"); nvn_bc_astc_bg_start(); }
         else if (b) MLOG("DM_NVN_BC_ASTC=%u ignored: %s", b, b == 4 || b == 6 ? "this GPU has native BC (set DM_TEST_NO_BC=1 to test)" : "only 4 and 6 are supported");
     });
@@ -2572,7 +2581,15 @@ static unsigned astc_block(void) {
 // The ASTC block of an NVN BC format: BC1 (incl. sRGB: 0x41 0x42 0x45 0x46) has DM_NVN_BC1_ASTC, every other BC format DM_NVN_BC_ASTC. 0 when DM_NVN_BC_ASTC is off
 static unsigned astc_block_for(uint32_t f) {
     unsigned b = astc_block();
-    return b && (f == 0x41 || f == 0x42 || f == 0x45 || f == 0x46) ? g_astc_v1 : b;
+    if (!b) return 0;
+    switch (f) {
+    case 0x41: case 0x42: case 0x45: case 0x46: return g_astc_v1;
+    case 0x49: return g_astc_bc4;
+    case 0x4b: return g_astc_bc5;
+    case 0x50: return g_astc_bc6h;
+    case 0x4a: case 0x4c: case 0x4f: return 0;   // signed: no ASTC encoding of negative texels
+    default: return b;
+    }
 }
 static int astc_eligible(const tex_t *t, uint32_t *pf) {
     unsigned b = astc_block_for(t->d.format);
@@ -2587,7 +2604,15 @@ static int mt_is_astc(id<MTLTexture> mt) { return mt.pixelFormat >= MTLPixelForm
 // Also stands in for a plane of an ASTC texture that has no cache entry (a corrupt file): nothing is encoded on the calling thread
 static void astc_void_block(uint32_t format, uint8_t out[16]) {
     uint8_t zero_bc[16] = {0}, px[4 * 4 * 4] = {0};
-    if (nvn_bc_decode(format, zero_bc, 16, 4, 4, px, 16)) memset(px, 0, sizeof px);
+    if (format == 0x50) {   // HDR void-extent block (bit 9 set) of the decoded colour: R, G, B, A as half floats
+        uint16_t h[4 * 4 * 4] = {0};
+        static const uint8_t hv[8] = {0xfc, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+        if (nvn_bc6h_decode_half(0x50, zero_bc, 16, 4, 4, (uint8_t *)h, 32)) { memset(h, 0, sizeof h); h[3] = 0x3c00; }
+        memcpy(out, hv, 8); memcpy(out + 8, h, 8);
+        return;
+    }
+    if (format == 0x49 || format == 0x4b) { px[3] = 255; }   // R (and G) of an all-zero block are 0; B 0 and A 1 as the sampled R8 / RG8 reads
+    else if (nvn_bc_decode(format, zero_bc, 16, 4, 4, px, 16)) memset(px, 0, sizeof px);
     static const uint8_t v[8] = {0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};   // LDR void-extent block with no extent, then R, G, B, A as 16-bit values
     memcpy(out, v, 8);
     for (int c = 0; c < 4; c++) { out[8 + c * 2] = px[c]; out[9 + c * 2] = px[c]; }   // 0xRR -> 0xRRRR (x * 257)

@@ -21,24 +21,31 @@
 #include <pthread/qos.h>
 #include "../../third_party/zstd/zstd.h"   // decoder only (docs/texture_once.md section 7b)
 
-// BC1/2/3/7 (RGBA8 once decoded) are the formats ASTC LDR can stand in for. This tree's
-// decoder reports the decoded pixel format through nvn_bc_unpacked; the encoded block
-// is 8 bytes for BC1 and 16 for BC2/3/7.
-typedef struct { uint32_t pixel_format; int pixel_bytes, block_bytes; } nvn_bc_format_info;
+// What ASTC stands in for. BC1/2/3/7 decode to RGBA8 (LDR ASTC, sRGB where the format is). The unsigned single- and two-channel formats BC4 (0x49) and BC5 (0x4b) are encoded as LDR ASTC
+// holding (R,0,0,1) and (R,G,0,1): the Metal texture then samples exactly what the R8Unorm / RG8Unorm it replaces does, with no view swizzle. Unsigned BC6H (0x50) is encoded as HDR ASTC from the
+// half-float RGB with alpha 1. The signed formats (BC4 0x4a, BC5 0x4c, BC6H 0x4f) have negative texels ASTC cannot hold and keep their decoded path.
+typedef enum { KIND_RGBA8, KIND_RGBA8_SRGB, KIND_R8, KIND_RG8, KIND_HDR } nvn_bc_kind;
+typedef struct { nvn_bc_kind kind; int pixel_bytes, block_bytes; } nvn_bc_format_info;   // pixel_bytes: of the decoded scratch the encoder reads (RGBA8: 4, HDR half-float RGBA: 8)
 static int nvn_bc_format(uint32_t format, nvn_bc_format_info *info) {
-    uint32_t pf; int bpp;
-    if (!nvn_bc_unpacked(format, &pf, &bpp)) return 0;
-    info->pixel_format = pf; info->pixel_bytes = bpp;
-    info->block_bytes = (format == 0x41 || format == 0x42 || format == 0x45 || format == 0x46 || format == 0x49 || format == 0x4a) ? 8 : 16;
+    switch (format) {
+    case 0x41: case 0x42: case 0x43: case 0x44: case 0x4d: info->kind = KIND_RGBA8; break;
+    case 0x45: case 0x46: case 0x47: case 0x48: case 0x4e: info->kind = KIND_RGBA8_SRGB; break;
+    case 0x49: info->kind = KIND_R8; break;
+    case 0x4b: info->kind = KIND_RG8; break;
+    case 0x50: info->kind = KIND_HDR; break;
+    default: return 0;
+    }
+    info->pixel_bytes = info->kind == KIND_HDR ? 8 : 4;
+    info->block_bytes = (format == 0x41 || format == 0x42 || format == 0x45 || format == 0x46 || format == 0x49) ? 8 : 16;
     return 1;
 }
 int nvn_bc_astc_format(uint32_t format, unsigned block, uint32_t *pixel_format) {
     nvn_bc_format_info info;
-    if (block < 4 || block > 6 || !nvn_bc_format(format, &info) || (info.pixel_format != MTLPixelFormatRGBA8Unorm && info.pixel_format != MTLPixelFormatRGBA8Unorm_sRGB)) return 0;   // RGBA8 only: not BC4/5 nor BC6H (RG11B10Float is 4 bytes too)
-    int srgb = info.pixel_format == MTLPixelFormatRGBA8Unorm_sRGB;
-    if (pixel_format) *pixel_format = block == 4 ? (srgb ? MTLPixelFormatASTC_4x4_sRGB : MTLPixelFormatASTC_4x4_LDR)
-                                    : block == 5 ? (srgb ? MTLPixelFormatASTC_5x5_sRGB : MTLPixelFormatASTC_5x5_LDR)
-                                                 : (srgb ? MTLPixelFormatASTC_6x6_sRGB : MTLPixelFormatASTC_6x6_LDR);
+    if (block < 4 || block > 6 || !nvn_bc_format(format, &info)) return 0;
+    int srgb = info.kind == KIND_RGBA8_SRGB, hdr = info.kind == KIND_HDR;
+    if (pixel_format) *pixel_format = block == 4 ? (hdr ? MTLPixelFormatASTC_4x4_HDR : srgb ? MTLPixelFormatASTC_4x4_sRGB : MTLPixelFormatASTC_4x4_LDR)
+                                    : block == 5 ? (hdr ? MTLPixelFormatASTC_5x5_HDR : srgb ? MTLPixelFormatASTC_5x5_sRGB : MTLPixelFormatASTC_5x5_LDR)
+                                                 : (hdr ? MTLPixelFormatASTC_6x6_HDR : srgb ? MTLPixelFormatASTC_6x6_sRGB : MTLPixelFormatASTC_6x6_LDR);
     return 1;
 }
 
@@ -569,21 +576,37 @@ static int encode_plane(unsigned slot, uint32_t format, const void *source, uint
     size_t astc_pitch = ((size_t)width + block - 1) / block * 16;
     // Every stripe begins on both a BC and an ASTC block boundary. This bounds
     // decoded scratch without adding seams or retaining a second full texture.
-    size_t row = (size_t)width * 4, alignment = block == 6 ? 12 : block == 5 ? 20 : 4;   // lcm(4, block)
+    size_t px = (size_t)info->pixel_bytes, row = (size_t)width * px, alignment = block == 6 ? 12 : block == 5 ? 20 : 4;   // lcm(4, block)
     size_t rows = ((4u << 20) / row / alignment) * alignment;
     if (!rows) rows = alignment;
     if (rows > height) rows = height;
+    int ch = info->kind == KIND_R8 ? 1 : info->kind == KIND_RG8 ? 2 : 0;
     uint8_t *pixels = malloc(rows * row);
-    if (!pixels) return -1;
+    uint8_t *narrow = ch ? malloc(rows * width * ch) : NULL;   // the decoder's R8 / RG8 rows, widened to RGBA8 below
+    if (!pixels || (ch && !narrow)) { free(pixels); free(narrow); return -1; }
     int result = 0;
     for (uint32_t y = 0; y < height && !result; y += rows) {
         uint32_t count = MIN(rows, height - y);
-        size_t offset = (size_t)y / 4 * bc_pitch;
-        result = nvn_bc_decode(format, (const uint8_t *)source + offset, bc_pitch, width, count, pixels, row);
-        if (!result) result = nvn_astc_encode_rgba8_slot(slot, pixels, width, count, info->pixel_format == MTLPixelFormatRGBA8Unorm_sRGB,
-            block, (uint8_t *)output + (size_t)y / block * astc_pitch, astc_pitch * ((count + block - 1) / block));
+        const uint8_t *src = (const uint8_t *)source + (size_t)y / 4 * bc_pitch;
+        uint8_t *out = (uint8_t *)output + (size_t)y / block * astc_pitch;
+        size_t out_size = astc_pitch * ((count + block - 1) / block);
+        if (info->kind == KIND_HDR) {
+            result = nvn_bc6h_decode_half(format, src, bc_pitch, width, count, pixels, row);   // full half precision, whatever DM_BC6H_R11G11B10 says
+            if (!result) result = nvn_astc_encode_slot(slot, NVN_ASTC_HDR16, pixels, width, count, block, out, out_size);
+        } else if (ch) {
+            result = nvn_bc_decode(format, src, bc_pitch, width, count, narrow, (size_t)width * ch);
+            if (!result) {
+                for (size_t i = 0, n = (size_t)width * count; i < n; i++) {
+                    pixels[i * 4] = narrow[i * ch]; pixels[i * 4 + 1] = ch == 2 ? narrow[i * 2 + 1] : 0; pixels[i * 4 + 2] = 0; pixels[i * 4 + 3] = 255;
+                }
+                result = nvn_astc_encode_slot(slot, NVN_ASTC_LDR8, pixels, width, count, block, out, out_size);
+            }
+        } else {
+            result = nvn_bc_decode(format, src, bc_pitch, width, count, pixels, row);
+            if (!result) result = nvn_astc_encode_slot(slot, info->kind == KIND_RGBA8_SRGB ? NVN_ASTC_SRGB8 : NVN_ASTC_LDR8, pixels, width, count, block, out, out_size);
+        }
     }
-    free(pixels);
+    free(pixels); free(narrow);
     return result;
 }
 
