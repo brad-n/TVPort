@@ -86,3 +86,17 @@ int nvn_bc_decode(uint32_t f, const uint8_t *src, size_t pitch, uint32_t w, uint
     else for (size_t by = 0; by < nrows; by++) row(by);
     return 0;
 }
+
+// Unsigned or signed BC6H into RGBA16Float (8 bytes a pixel, alpha 1.0), full half precision: the source of the HDR ASTC encoder (the sampled texture of nvn_bc_decode may be RG11B10Float)
+int nvn_bc6h_decode_half(uint32_t f, const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint8_t *dst, size_t dpitch) {
+    if (f != 0x4f && f != 0x50) return -1;
+    for (uint32_t by = 0; by * 4 < h; by++) for (uint32_t bx = 0; bx * 4 < w; bx++) {
+        uint16_t rgb[16 * 3]; bcdec_bc6h_half(src + (size_t)by * pitch + (size_t)bx * 16, rgb, 4 * 3, f == 0x4f);
+        uint32_t cw = w - bx * 4 < 4 ? w - bx * 4 : 4, ch = h - by * 4 < 4 ? h - by * 4 : 4;
+        for (uint32_t y = 0; y < ch; y++) for (uint32_t x = 0; x < cw; x++) {
+            uint16_t *d = (uint16_t *)(dst + (size_t)(by * 4 + y) * dpitch) + (bx * 4 + x) * 4; const uint16_t *s = rgb + (y * 4 + x) * 3;
+            d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = 0x3c00;
+        }
+    }
+    return 0;
+}

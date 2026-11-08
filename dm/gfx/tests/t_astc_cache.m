@@ -173,7 +173,7 @@ static void background_contract(NSString *root) {
     int hit; CHECK(!nvn_bc_astc_encode(0x4d, plane, bytes, W, H, 4, direct, astc_bytes, b.fileSystemRepresentation, NULL, &hit) && !hit);
     CHECK(!memcmp(fetched, direct, astc_bytes));   // background and synchronous encodes are the same bytes
     CHECK(nvn_bc_astc_learn(0x4d, plane, bytes, 64, 64, 4, NULL) == -1);   // wrong size for the format: invalid, not queued
-    CHECK(nvn_bc_astc_learn(0x49, plane, bytes, W, H, 4, NULL) == -1);    // BC4 has no ASTC form
+    CHECK(nvn_bc_astc_learn(0x49, plane, bytes, W, H, 4, NULL) == -1);    // the wrong size for BC4 (8 bytes a block) is invalid
     // a plane already pending is not queued twice
     NSString *d = [root stringByAppendingPathComponent:@"bg-dup"];
     bg_configure(d, 64u << 20, 1ull << 30, 0, 1);
@@ -499,7 +499,7 @@ static void block5_contract(NSString *root) {
     CHECK(nvn_bc_astc_format(0x4e, 5, &pf) == 1 && pf == MTLPixelFormatASTC_5x5_sRGB);
     CHECK(nvn_bc_astc_format(0x44, 5, &pf) == 1 && pf == MTLPixelFormatASTC_5x5_LDR);
     CHECK(nvn_bc_astc_format(0x42, 4, &pf) == 1 && pf == MTLPixelFormatASTC_4x4_LDR && nvn_bc_astc_format(0x46, 6, &pf) == 1 && pf == MTLPixelFormatASTC_6x6_sRGB);
-    CHECK(nvn_bc_astc_format(0x42, 3, NULL) == 0 && nvn_bc_astc_format(0x42, 7, NULL) == 0 && nvn_bc_astc_format(0x49, 5, NULL) == 0);
+    CHECK(nvn_bc_astc_format(0x42, 3, NULL) == 0 && nvn_bc_astc_format(0x42, 7, NULL) == 0 && nvn_bc_astc_format(0x4a, 5, NULL) == 0);   // signed BC4: no ASTC form
     // one plane keys differently per block
     enum { W = 40, H = 25 }; size_t bc = (size_t)(W / 4) * ((H + 3) / 4) * 8; uint8_t *plane = malloc(bc);
     for (size_t i = 0; i < bc; i++) plane[i] = (uint8_t)(i * 37 + 11);
@@ -526,6 +526,66 @@ static void block5_contract(NSString *root) {
         free(sp);
     }
 }
+
+// BC4 (0x49) / BC5 (0x4b) / unsigned BC6H (0x50): the format mapping (signed ones have none), the keys, the encode, the cache, the background path, and stripes (a plane 16384 texels wide is cut in rows)
+static void bc456_plane(uint8_t *data, size_t size, uint32_t format, unsigned seed) {
+    uint32_t state = seed * 2654435761u + 7;
+    for (size_t i = 0; i < size; i++) { state = state * 1664525u + 1013904223u; data[i] = state >> 24; }
+    if (format == 0x50) for (size_t i = 0; i < size; i += 16) data[i] = (data[i] & ~0x1fu) | 0x03u;   // BC6H mode 11: finite values
+}
+static void bc456_contract(NSString *root) {
+    uint32_t pf;
+    for (unsigned b = 4; b <= 6; b++) {
+        MTLPixelFormat ldr = b == 4 ? MTLPixelFormatASTC_4x4_LDR : b == 5 ? MTLPixelFormatASTC_5x5_LDR : MTLPixelFormatASTC_6x6_LDR, hdr = b == 4 ? MTLPixelFormatASTC_4x4_HDR : b == 5 ? MTLPixelFormatASTC_5x5_HDR : MTLPixelFormatASTC_6x6_HDR;
+        CHECK(nvn_bc_astc_format(0x49, b, &pf) == 1 && pf == ldr);
+        CHECK(nvn_bc_astc_format(0x4b, b, &pf) == 1 && pf == ldr);
+        CHECK(nvn_bc_astc_format(0x50, b, &pf) == 1 && pf == hdr);
+    }
+    CHECK(nvn_bc_astc_format(0x4a, 4, NULL) == 0 && nvn_bc_astc_format(0x4c, 4, NULL) == 0 && nvn_bc_astc_format(0x4f, 4, NULL) == 0);   // signed: negative texels have no ASTC form
+    CHECK(nvn_bc_astc_format(0x49, 3, NULL) == 0 && nvn_bc_astc_format(0x4b, 7, NULL) == 0 && nvn_bc_astc_format(0x50, 0, NULL) == 0);
+    CHECK(nvn_bc_astc_format(0x4d, 4, &pf) == 1 && pf == MTLPixelFormatASTC_4x4_LDR && nvn_bc_astc_format(0x4e, 4, &pf) == 1 && pf == MTLPixelFormatASTC_4x4_sRGB);   // BC7 as before
+    static const struct { uint32_t f; int bb; } fm[] = {{0x49, 8}, {0x4b, 16}, {0x50, 16}};
+    NSString *dir = [root stringByAppendingPathComponent:@"bc456"];
+    nvn_astc_cache_key keys[3][3];
+    for (int i = 0; i < 3; i++) for (unsigned b = 4; b <= 6; b++) {
+        enum { W = 37, H = 21 }; size_t bytes = (size_t)((W + 3) / 4) * ((H + 3) / 4) * fm[i].bb, astc = (size_t)((W + b - 1) / b) * ((H + b - 1) / b) * 16;
+        uint8_t *plane = malloc(bytes), *out = malloc(astc), *again = malloc(astc); bc456_plane(plane, bytes, fm[i].f, 5 + i);
+        int hit = -1; nvn_astc_cache_key saved, plain;
+        CHECK(!nvn_bc_astc_encode_key(fm[i].f, plane, bytes, W, H, b, out, astc, dir.fileSystemRepresentation, NULL, &hit, &saved) && !hit);
+        nvn_bc_astc_plane_key(fm[i].f, W, H, b, plane, bytes, &plain); CHECK(!strcmp(saved.hex, plain.hex));   // the prebuild's key is the runtime's
+        CHECK(!nvn_bc_astc_encode(fm[i].f, plane, bytes, W, H, b, again, astc, dir.fileSystemRepresentation, NULL, &hit) && hit == 1 && !memcmp(out, again, astc));
+        nvn_astc_cache_key rd; memcpy(&rd, &saved, sizeof rd); uint8_t *back = malloc(astc); CHECK(nvn_bc_astc_cache_read(&rd, back, astc, dir.fileSystemRepresentation, NULL) && !memcmp(back, out, astc)); free(back);
+        CHECK(nvn_bc_astc_encode(fm[i].f, plane, bytes + 1, W, H, b, again, astc, NULL, NULL, &hit) == -1);   // a size that is not the format's
+        CHECK(nvn_bc_astc_encode(fm[i].f, plane, bytes, W, H, b, again, astc + 16, NULL, NULL, &hit) == -1);
+        if (b == 4) memcpy(&keys[i][0], &saved, sizeof saved); else if (b == 6) memcpy(&keys[i][2], &saved, sizeof saved);
+        free(plane); free(out); free(again);
+    }
+    for (int i = 0; i < 3; i++) for (int j = i + 1; j < 3; j++) CHECK(strcmp(keys[i][0].hex, keys[j][0].hex) && strcmp(keys[i][2].hex, keys[j][2].hex));   // the format is part of the key
+    // the key of a BC4 plane is not the key of the same bytes as BC5 or BC1, nor at another block
+    CHECK(strcmp(keys[0][0].hex, keys[0][2].hex));
+    // background learn / fetch: the same bytes as the synchronous encode
+    NSString *bg = [root stringByAppendingPathComponent:@"bc456-bg"]; bg_configure(bg, 64u << 20, 1ull << 30, 0, 2);
+    for (int i = 0; i < 3; i++) {
+        enum { W = 64, H = 64 }; unsigned b = i == 0 ? 6 : 4; size_t bytes = (size_t)W / 4 * (H / 4) * fm[i].bb, astc = (size_t)((W + b - 1) / b) * ((H + b - 1) / b) * 16;
+        uint8_t *plane = malloc(bytes), *fetched = malloc(astc), *direct = malloc(astc); bc456_plane(plane, bytes, fm[i].f, 40 + i);
+        CHECK(nvn_bc_astc_learn(fm[i].f, plane, bytes, W, H, b, NULL) == 0); CHECK(nvn_bc_astc_bg_wait(120));
+        CHECK(nvn_bc_astc_learn(fm[i].f, plane, bytes, W, H, b, NULL) == 1 && nvn_bc_astc_fetch(fm[i].f, plane, bytes, W, H, b, fetched, astc) == 1 && nvn_bc_astc_has_plane(fm[i].f, plane, bytes, W, H, b) == 1);
+        CHECK(!nvn_bc_astc_encode(fm[i].f, plane, bytes, W, H, b, direct, astc, [root stringByAppendingPathComponent:@"bc456-direct"].fileSystemRepresentation, NULL, &(int){0}) && !memcmp(fetched, direct, astc));
+        CHECK(nvn_bc_astc_learn(fm[i].f == 0x49 ? 0x4a : fm[i].f == 0x4b ? 0x4c : 0x4f, plane, bytes, W, H, b, NULL) == -1);   // the signed formats are refused
+        free(plane); free(fetched); free(direct);
+    }
+    // stripes: a plane 16384 wide is encoded in bands of rows (BC4: 64 rows rounded down to the block, BC6H: 32); the first rows of a taller plane are the shorter plane's bytes, seams included
+    for (int i = 0; i < 3; i++) for (unsigned b = 4; b <= 6; b++) {
+        enum { W = 16384 }; unsigned H1 = 60, H2 = 100;   // 60 is a multiple of 4, 5 and 12 (a stripe starts on both grids)
+        size_t pitch = (size_t)W / 4 * fm[i].bb, bytes2 = pitch * (H2 / 4), bytes1 = pitch * (H1 / 4), ap = (size_t)((W + b - 1) / b) * 16;
+        size_t astc1 = ap * ((H1 + b - 1) / b), astc2 = ap * ((H2 + b - 1) / b);
+        uint8_t *plane = malloc(bytes2), *o1 = malloc(astc1), *o2 = malloc(astc2); bc456_plane(plane, bytes2, fm[i].f, 90 + i);
+        CHECK(!nvn_bc_astc_encode(fm[i].f, plane, bytes1, W, H1, b, o1, astc1, NULL, NULL, &(int){0}) && !nvn_bc_astc_encode(fm[i].f, plane, bytes2, W, H2, b, o2, astc2, NULL, NULL, &(int){0}));
+        CHECK(!memcmp(o1, o2, ap * (H1 / b)));   // stripes meet without a seam
+        free(plane); free(o1); free(o2);
+    }
+}
+
 int main(int argc, char **argv) { @autoreleasepool {
     size_t budget = argc > 1 && !strcmp(argv[1], "budget") ? 128 : 1u << 20;
     int mapped_mode = argc > 1 && (!strcmp(argv[1], "mapped") || !strcmp(argv[1], "mapped-memcpy"));
@@ -538,6 +598,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     diagnostic_contract(root);
     restore_contract(root);
     block5_contract(root);
+    bc456_contract(root);
     NSString *small = fixture(root, 1, 16);
     fixture(root, 2, 32); fixture(root, 3, 48);
     fixture(root, 4, 64); fixture(root, 5, 65536);

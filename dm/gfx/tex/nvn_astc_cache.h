@@ -5,7 +5,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-// BC1/2/3/7 can use LDR ASTC. BC4/5 and HDR BC6 retain their decoded formats.
+// BC1/2/3/7 and unsigned BC4 (0x49) / BC5 (0x4b) use LDR ASTC, unsigned BC6H (0x50) HDR ASTC (the caller decides whether the GPU has it). The signed formats keep their decoded path: 0 for them.
 int nvn_bc_astc_format(uint32_t format, unsigned block, uint32_t *pixel_format);
 // Prepare verified immutable snapshots before gameplay. The first budget bounds
 // heap payload bytes; the second bounds a private file snapshot whose read-only

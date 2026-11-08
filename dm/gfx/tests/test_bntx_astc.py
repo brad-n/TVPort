@@ -24,8 +24,8 @@ tool = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = tool
 spec.loader.exec_module(tool)
 
-NVN = {0x1a01: 0x42, 0x1a06: 0x46, 0x1b01: 0x43, 0x1c01: 0x44, 0x2001: 0x4d, 0x2006: 0x4e}
-BYTES_PER_BLOCK = {0x42: 8, 0x46: 8, 0x43: 16, 0x44: 16, 0x4d: 16, 0x4e: 16}
+NVN = {0x1a01: 0x42, 0x1a06: 0x46, 0x1b01: 0x43, 0x1c01: 0x44, 0x2001: 0x4d, 0x2006: 0x4e, 0x1d01: 0x49, 0x1e01: 0x4b, 0x1f0a: 0x50}   # BC4 / BC5 / BC6H unsigned
+BYTES_PER_BLOCK = {0x42: 8, 0x46: 8, 0x43: 16, 0x44: 16, 0x4d: 16, 0x4e: 16, 0x49: 8, 0x4b: 16, 0x50: 16}
 
 
 def blocks(rng, nvn, w, h):
@@ -35,6 +35,8 @@ def blocks(rng, nvn, w, h):
     out = bytearray(rng.randbytes(n * bpb))
     if nvn in (0x4d, 0x4e):
         for i in range(0, len(out), 16): out[i] = (out[i] & ~0x7f) | 0x40
+    if nvn == 0x50:   # BC6H mode 11 (one subset, 10-bit endpoints): finite values
+        for i in range(0, len(out), 16): out[i] = (out[i] & ~0x1f) | 0x03
     return bytes(out)
 
 
@@ -57,7 +59,7 @@ class Texture:
         return buf.raw
 
 
-def bntx(lib, textures, prefix=b''):
+def bntx(lib, textures, prefix=b'', platform=b'NX  '):
     """A BNTX file with the fields tool.bntx_textures reads (and the usual places for the rest)"""
     n = len(textures)
     info_at = 0x50
@@ -79,7 +81,7 @@ def bntx(lib, textures, prefix=b''):
     out[0:8] = b'BNTX\0\0\0\0'
     struct.pack_into('<IHBB', out, 8, 0x00040001, 0xfeff, 0x0c, 0x40)
     struct.pack_into('<I', out, 0x1c, len(out))
-    out[0x20:0x24] = b'NX  '
+    out[0x20:0x24] = platform   # b'NX  ' on the Switch, b'Ounc' on the Switch 2
     struct.pack_into('<IQQ', out, 0x24, n, info_at, data_at)
     mo = offs_at
     for i, t in enumerate(textures):
@@ -190,7 +192,7 @@ class PrebuildTests(unittest.TestCase):
         (d / 'data.bin').write_bytes(bytes(1000))
         return d, ts
 
-    def runtime_finds(self, ts, pack, cap=0, absent=None, block=4, bc1_block=None):
+    def runtime_finds(self, ts, pack, cap=0, absent=None, block=4, bc1_block=None, fmt_blocks=(6, 4, 4)):
         """Every plane of every texture, as the RUNTIME enumerates and looks it up (nvn_astc_walk_planes + nvn_bc_astc_learn / fetch with the pack as the read-only cache).
         cap is DM_BC_MAX_DIM: the runtime skips nvn_bc_skip_levels(d, cap) levels (its bc_skip calls that function); the walk here starts there. Every plane of a skipped level is appended to `absent` when the pack lacks it"""
         L = self.lib
@@ -216,7 +218,8 @@ class PrebuildTests(unittest.TestCase):
                 def cb(_, level, layer, w, h, bc, size):
                     plane = ctypes.string_at(bc, size)
                     seen.append((level, layer, plane == t.planes[(level, layer)]))   # deswizzle(swizzle(x)) == x: the runtime's walk sees the texture's planes
-                    blk = (bc1_block or block) if fmt in (0x41, 0x42, 0x45, 0x46) else block   # the runtime's astc_block_for(format)
+                    blk = (bc1_block or block) if fmt in (0x41, 0x42, 0x45, 0x46) else dict(zip((0x49, 0x4b, 0x50), fmt_blocks)).get(fmt, block)   # the runtime's astc_block_for(format)
+                    if not blk: return 0   # the pack was built without the format
                     ok = L.nvn_bc_astc_learn(fmt, bc, size, w, h, blk, None) == 1
                     astc = ((w + blk - 1) // blk) * 16 * ((h + blk - 1) // blk)
                     got, want = ctypes.create_string_buffer(astc), ctypes.create_string_buffer(astc)
@@ -237,6 +240,76 @@ class PrebuildTests(unittest.TestCase):
                             plane = t.planes[(level, layer)]
                             absent.append(L.nvn_bc_astc_fetch(fmt, plane, len(plane), w, h, 4, ctypes.create_string_buffer(((w + 3) // 4) * 16 * ((h + 3) // 4)), ((w + 3) // 4) * 16 * ((h + 3) // 4)) != 1)
         return found
+
+    # ---- BC4 / BC5 / BC6H, Switch 2 BNTX (platform tag Ounc) and dictionary zstd (Pack/ZsDic.pack.zs) ----
+    def textures456(self):
+        return [Texture(0x1d01, 64, 40, mips=4, pkg=2), Texture(0x1e01, 37, 21, mips=3, pkg=0), Texture(0x1f0a, 32, 32, mips=3, pkg=1), Texture(0x1e01, 16, 16, mips=2, layers=3, dim=5, pkg=1),
+                Texture(0x1d02, 16, 16, mips=1), Texture(0x1e02, 16, 16, mips=1), Texture(0x1f05, 16, 16, mips=1)]   # the last three are BC4 / BC5 / BC6H signed: never in the pack
+
+    def zsdic_tree(self, name, ts):
+        """Switch 2 layout: the textures in .bntx.zs files whose platform tag is Ounc, one compressed with a dictionary from Pack/ZsDic.pack.zs"""
+        z = tool.zstd_module()
+        if z is None or not hasattr(z, 'train_dict'): self.skipTest('this Python has no zstd module with dictionary training')
+        samples = [b'BNTX\0\0\0\0Ounc' + random.Random(i).randbytes(40) + (b'tex_%d_albedo.bntx ' % i) * 6 + bytes(300) for i in range(600)]
+        zd = z.ZstdDict(z.train_dict(samples, 4096).dict_content)
+        self.assertNotEqual(zd.dict_id, 0)
+        d = self.root / name
+        (d / 'Pack').mkdir(parents=True)
+        (d / 'Pack' / 'ZsDic.pack.zs').write_bytes(zstd_compress(sarc([('pack.zsdic', zd.dict_content)])))
+        with_dict = z.compress(bntx(self.lib, ts[:3], platform=b'Ounc'), zstd_dict=zd)
+        self.assertEqual(tool.zstd_dict_id(with_dict), zd.dict_id)   # the frame names the dictionary
+        (d / 'a.bntx.zs').write_bytes(with_dict)
+        (d / 'b.bntx.zs').write_bytes(zstd_compress(bntx(self.lib, ts[3:], platform=b'Ounc')))   # no dictionary
+        (d / 'c.bntx').write_bytes(bntx(self.lib, ts[:1], platform=b'NX  '))
+        return d
+
+    def test_bntx_platform_tag_ounc_is_accepted(self):
+        b = bntx(self.lib, [Texture(0x1d01, 16, 16)], platform=b'Ounc')
+        self.assertTrue(tool.bntx_ok(b, 0))
+        self.assertTrue(tool.bntx_ok(bntx(self.lib, [Texture(0x1d01, 16, 16)]), 0))
+        self.assertFalse(tool.bntx_ok(bntx(self.lib, [Texture(0x1d01, 16, 16)], platform=b'XXXX'), 0))
+
+    def test_bc4_bc5_bc6h_are_prebuilt_and_looked_up_by_the_runtime(self):
+        ts = self.textures456()
+        d = self.zsdic_tree('tree456', ts)
+        want_planes = {}
+        for t in ts[:4]:
+            want_planes[t.fmt] = want_planes.get(t.fmt, 0) + t.mips * t.layers
+        for fb in ((6, 4, 4), (4, 6, 5), (5, 5, 6)):
+            out = self.root / ('out456_%d%d%d' % fb)
+            rep = tool.prebuild(str(d), str(out), 4, workers=2, log=lambda *_: None, fmt_blocks=fb)
+            self.assertEqual(rep['fmt_blocks'], dict(bc4=fb[0], bc5=fb[1], bc6h=fb[2]))
+            self.assertEqual(rep['plane_errors'], 0)
+            self.assertEqual(rep['layout_differs'], 0)
+            self.assertEqual(rep['container_errors'], 0)
+            # the four eligible textures of a.bntx.zs (dictionary) + b.bntx.zs (Ounc, no dictionary); c.bntx repeats the first one
+            cf = rep['converted_by_format']   # c.bntx repeats the first texture; it is only seen as a repeat when the same worker reads both files
+            self.assertEqual((cf['BC5U'], cf['BC6HU'], cf['BC4U'] + rep['repeated_textures']), (2, 1, 2))
+            self.assertEqual(rep['unique_planes'], sum(want_planes.values()))
+            found = self.runtime_finds(ts[:4], out / 'astc-ro.pack', fmt_blocks=fb)
+            self.assertEqual(len(found), sum(want_planes.values()))
+            self.assertTrue(all(found), fb)
+            # the signed forms are not covered, and looked up at another block the planes are absent
+            if fb != (6, 4, 4):
+                self.assertFalse(any(self.runtime_finds(ts[:4], out / 'astc-ro.pack', fmt_blocks=(6, 4, 4))[:3]) and all(self.runtime_finds(ts[:4], out / 'astc-ro.pack', fmt_blocks=(6, 4, 4))))
+        # decoded bytes of the planes (R8, RG8, RG11B10) are what the report names as covered
+        self.assertGreater(rep['decoded_bytes_covered'], 0)
+        self.assertLess(rep['decoded_bytes_covered'], rep['decoded_rgba_bytes_covered'])
+        # the blocks are part of the pack's fingerprint
+        a = tool.prebuild(str(d), str(self.root / 'out456_644'), 4, workers=2, log=lambda *_: None)
+        self.assertTrue(a['up_to_date'])
+        b = tool.prebuild(str(d), str(self.root / 'out456_644'), 4, workers=2, log=lambda *_: None, fmt_blocks=(4, None, None))
+        self.assertFalse(b['up_to_date'])
+        with self.assertRaises(SystemExit): tool.prebuild(str(d), str(self.root / 'out456_bad'), 4, workers=2, log=lambda *_: None, fmt_blocks=(3, None, None))
+
+    def test_a_format_can_be_left_out_of_the_pack(self):
+        ts = self.textures456()
+        d = self.zsdic_tree('tree456_off', ts)
+        out = self.root / 'out456_off'
+        rep = tool.prebuild(str(d), str(out), 4, workers=2, log=lambda *_: None, fmt_blocks=(0, 4, 0))
+        self.assertEqual(rep['converted_by_format'], {'BC5U': 2})
+        found = self.runtime_finds([t for t in ts[:4] if t.fmt == 0x1e01], out / 'astc-ro.pack', fmt_blocks=(0, 4, 0))
+        self.assertTrue(found and all(found))
 
     def test_flags_match_the_host_makefile(self):
         mk = (DM / 'host/Makefile').read_text()

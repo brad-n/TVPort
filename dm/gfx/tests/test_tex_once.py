@@ -566,6 +566,7 @@ class StripTests(unittest.TestCase):
             elif k == '--force': ns.force = True; i += 1
             elif k == '--bc1-block': ns.bc1_block = int(argv[i + 1]); i += 2
             elif k == '--no-pack-check': ns.no_pack_check = True; i += 1
+            elif k in ('--bc4-block', '--bc5-block', '--bc6h-block'): setattr(ns, k[2:].replace('-', '_'), int(argv[i + 1])); i += 2
             elif k == '--compress': ns.compress = argv[i + 1]; i += 2
             elif k == '--zlevel': ns.zlevel = int(argv[i + 1]); i += 2
             else: i += 1
@@ -686,7 +687,7 @@ class StripTests(unittest.TestCase):
         for name, blk in (('a.bntx', 6), ('b.bntx', 4)):
             job = B.Job(self.libpath, blk, str(cache), True, {}, 0)
             job.blob((d / name).read_bytes(), name)
-            for key, key2, w_, h_, astc, hit in job.planes:
+            for key, key2, w_, h_, astc, hit, _bpp in job.planes:
                 keys[key] = key
                 if key2: keys[key2] = key
         pack = work / 'astc-ro.pack'
@@ -703,6 +704,36 @@ class StripTests(unittest.TestCase):
         self.assertNotEqual(rep['input_fingerprint'], rep4['input_fingerprint'])
         # a real pack's check: a bc1 block that the pack was not built for is refused
         self.assertEqual(self.run_tool(img, pack, work / 'out5', 0, '--bc1-block', '6'), 2)
+
+    def test_bc4_bc5_bc6h_planes_are_tagged_like_bc1_to_bc7(self):
+        """Unsigned BC4 / BC5 / BC6H planes of an NX and an Ounc (Switch 2) BNTX are tagged and checked; the signed forms are left alone; a pack made without a format leaves its planes untouched"""
+        lib = self.lib
+        ts = [T.Texture(0x1d01, 64, 64, mips=3, pkg=1), T.Texture(0x1e01, 64, 32, mips=3, pkg=2), T.Texture(0x1f0a, 32, 32, mips=3, pkg=1), T.Texture(0x1d02, 16, 16, mips=1), T.Texture(0x1e02, 16, 16, mips=1),
+              T.Texture(0x1f05, 16, 16, mips=1), T.Texture(0x2001, 32, 32, mips=2, pkg=1)]
+        d = self.root / 'bc456tree'; d.mkdir()
+        (d / 'a.bntx').write_bytes(T.bntx(lib, ts[:2] + ts[3:5]))
+        (d / 'b.bntx').write_bytes(T.bntx(lib, [ts[2]] + ts[5:], platform=b'Ounc'))
+        planes = sum(t.mips for t in ts if t.fmt in T.NVN)
+        for name, fb, tagged in (('all', (6, 4, 4), planes), ('noBC4', (0, 4, 4), planes - 3), ('b455', (4, 5, 5), planes)):
+            work = self.root / ('bc456work_' + name); work.mkdir()
+            img = work / 'RomFS.img'; romfs_image.pack(str(d), str(img))
+            cache = work / 'cache'; cache.mkdir()
+            keys = {}
+            for nm in ('a.bntx', 'b.bntx'):
+                job = B.Job(self.libpath, 4, str(cache), True, {}, 0, 0, fb)
+                job.blob((d / nm).read_bytes(), nm)
+                for key, key2, w_, h_, astc, hit, _bpp in job.planes:
+                    keys[key] = key
+            pack = work / 'astc-ro.pack'
+            B.write_pack(str(pack), str(cache), keys, B.fingerprint(str(img), 4, 0, 0, fb))
+            out = work / 'out'
+            extra = [] if fb == (6, 4, 4) else ['--bc4-block', str(fb[0]), '--bc5-block', str(fb[1]), '--bc6h-block', str(fb[2])]
+            self.assertEqual(self.run_tool(img, pack, out, 0, *extra), 0, name)
+            rep = self.report(out)
+            self.assertEqual((rep['planes']['tagged'], rep['planes']['skipped']), (tagged, {}), name)
+            self.assertTrue(rep['self_check']['passed'])
+        # a pack made for other blocks is refused
+        self.assertEqual(self.run_tool(img, pack, self.root / 'bc456_refused', 0), 2)
 
     def test_texture_cap_zeroes_the_levels_the_runtime_never_loads(self):
         d, img, pack, out = self.make('t3', cap=64)

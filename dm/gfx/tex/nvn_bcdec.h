@@ -11,3 +11,5 @@ void nvn_bc6h_r11g11b10_set(int on);
 int nvn_bc_unpacked(uint32_t nvn_fmt, uint32_t *mtl_pf, int *bpp);
 // Decode a w×h pixel region: src is laid out by block rows (pitch bytes per block row), dst has dpitch bytes per pixel row. Returns 0 on success
 int nvn_bc_decode(uint32_t nvn_fmt, const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint8_t *dst, size_t dpitch);
+// BC6H (0x50 unsigned, 0x4f signed) into RGBA16Float, 8 bytes a pixel, alpha 1.0, always at full half precision (nvn_bc_decode may write RG11B10Float)
+int nvn_bc6h_decode_half(uint32_t nvn_fmt, const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint8_t *dst, size_t dpitch);
