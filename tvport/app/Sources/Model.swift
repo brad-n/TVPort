@@ -57,6 +57,7 @@ struct Game: Codable, Identifiable, Hashable {
     var compressedTextures: String?   // "on" / "off"; nil = Automatic (on for Apple TV builds). A tri-state and a block size, not tvOS flags, so other targets can share them
     var compressedTextureBlock: Int?  // ASTC block of the compressed textures: nil = Matched to the original (BC1 6x6, every other format 4x4; the default), 4 = 4x4 and 6 = 6x6 for every format. An older library.json holds 6, or nothing
     var textureOnce: String?          // "on" / "off"; nil = Automatic (on whenever Compressed textures is on). Store textures once: the textures live in the game files only, not also in a second ASTC copy
+    var trimShaders: String?          // "on" / "off"; nil = Automatic (on when the game has a list of at least 1,000 used shaders). Trim shaders: the app carries the used shaders compiled and the rest as compressed source
     var pipelineGPU: String?          // GPU architectures for the pipeline archive (build script --gpu); empty = none
     var extraEnvironment: String?     // KEY=VALUE lines for the app's env file
     var addons: [GameAddon]?
@@ -72,6 +73,7 @@ struct Game: Codable, Identifiable, Hashable {
         if let choice = compressedTextures, choice == "on" || choice == "off" { arguments += ["--astc", choice] }
         if compressedTextureBlock == 4 || compressedTextureBlock == 6 { arguments += ["--astc-block", String(compressedTextureBlock ?? 4)] }   // Matched is the build script's default
         if let choice = textureOnce, choice == "on" || choice == "off" { arguments += ["--texture-once", choice] }
+        if let choice = trimShaders, choice == "on" || choice == "off" { arguments += ["--trim-shaders", choice] }
         let gpu = (pipelineGPU ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if !gpu.isEmpty { arguments += ["--gpu", gpu] }
         for line in (extraEnvironment ?? "").split(whereSeparator: \.isNewline) {

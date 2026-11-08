@@ -25,5 +25,7 @@ NSData *trim_json(NSString *key);          // the shader's reflection json, infl
 NSData *trim_inflate(NSData *frame, int json);   // a zstd entry with the msl (json = 0) or json dictionary
 void trim_note_skip(NSString *key);        // a draw was skipped for this shader: counted, logged once per shader
 trim_stats_t trim_stats(void);
+void trim_test_hold(int on);               // tests only: while on, the compile threads leave the queue alone, so a shader stays pending as long as the test wants
+
 // The options a source is compiled with, as close as MTLCompileOptions gets to the build's `metal -c -O1 -mios-version-min=18.0 -fmetal-math-mode=relaxed -fpreserve-invariance -fbracket-depth=1024`
 MTLCompileOptions *trim_compile_options(void);

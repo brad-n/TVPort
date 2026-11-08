@@ -560,6 +560,12 @@ struct SettingsForm: View {
                         }
                         .disabled(library.games.first { $0.id == library.selection }?.compressedTextures == "off")
                         note("Without it, each BC texture is on the Apple TV twice: the game's original and its ASTC copy. On, and Automatic, which is on whenever Compressed textures is, keeps one: the game files are rewritten on this Mac with the original textures cut out (the original game files are not changed), which can save several GB on the Apple TV. If that can't be done the build carries on and stores them twice.")
+                        Picker("Trim shaders", selection: trimShadersBinding) {
+                            Text("Automatic").tag("")
+                            Text("On").tag("on")
+                            Text("Off").tag("off")
+                        }
+                        note("Makes the app much smaller: the shaders this game has used on your Apple TV go in compiled, the rest as compressed source that the Apple TV compiles the first time a scene needs it (the picture may lack those objects for a moment). Automatic is on once the game has a list of 1,000 used shaders.")
                         Toggle("Metal 4 pipelines", isOn: flagBinding(\.metal4Pipelines))
                         note("Turns on DM_PSO_MTL4 and keeps the pulling shader libraries in the build. Experimental.")
                         TextField("Pipeline archive GPU", text: textBinding(\.pipelineGPU), prompt: Text("Empty for none, or g18p"))
@@ -616,6 +622,14 @@ struct SettingsForm: View {
         return Binding(get: { library.games.first { $0.id == gameID }?.textureOnce ?? "" }, set: { value in
             guard library.selection == gameID else { return }
             library.update { $0.textureOnce = value.isEmpty ? nil : value }
+        })
+    }
+
+    private var trimShadersBinding: Binding<String> {
+        let gameID = library.selection
+        return Binding(get: { library.games.first { $0.id == gameID }?.trimShaders ?? "" }, set: { value in
+            guard library.selection == gameID else { return }
+            library.update { $0.trimShaders = value.isEmpty ? nil : value }
         })
     }
 

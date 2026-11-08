@@ -13,6 +13,7 @@ static NSMutableDictionary<NSString *, TrimShader *> *g_sh;
 static NSMutableSet<NSString *> *g_src;
 static NSMutableArray<NSString *> *g_q;
 static id<MTLDevice> g_dev; static trim_read_fn g_rd; static trim_log_fn g_log; static int g_workers;
+static int g_hold;   // tests: the compile threads take nothing from the queue (trim_test_hold)
 static _Atomic uint64_t c_compiled, c_failed, c_ns, c_libs, c_skip, c_skip_sh, c_inflated;
 static ZSTD_DDict *g_dd[2]; static pthread_mutex_t g_dd_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread ZSTD_DCtx *t_dctx;
@@ -77,7 +78,7 @@ static void *worker(void *arg) {
     (void)arg; pthread_setname_np("shader-trim"); pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
     for (;;) {
         @autoreleasepool {
-            [g_cv lock]; while (!g_q.count) [g_cv wait];
+            [g_cv lock]; while (!g_q.count || g_hold) [g_cv wait];
             NSString *key = g_q.firstObject; [g_q removeObjectAtIndex:0]; [g_cv unlock];
             compile_key(key);
         }
@@ -133,3 +134,4 @@ trim_stats_t trim_stats(void) {
     if (g_cv) { [g_cv lock]; t.source_keys = g_src.count; [g_cv unlock]; }
     return t;
 }
+void trim_test_hold(int on) { [g_cv lock]; g_hold = on; [g_cv broadcast]; [g_cv unlock]; }

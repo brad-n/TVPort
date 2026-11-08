@@ -889,12 +889,17 @@ def generate_project(game: Game, args, team: str, bundle: str, python: str, romf
                DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players, args.render_scale, not args.no_thermal_cap, args.fps_target, args.swap_ab_xy, args.swap_ab, args.swap_xy, pso_mtl4, getattr(args, 'extra_env', None), getattr(args, 'guest_file', None), astc_block(args), astc_blocks(args)[1])), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
                DM_XCODE_PROJECT_DIR=str(game.build / 'tvport-xcode'), DM_XCODE_DERIVED_DATA=str(game.build / 'tvport-derived'), FONT_PY=python)
     env.update(artwork_env(args))
+    trim = getattr(args, 'shader_trim_dir', None)
+    if trim:   # Trim shaders (trim_shaders): the app image and map come from there
+        env['MSL_IOS'] = str(trim)
     if pso_mtl4:
         env['IOS_PULL'] = '1'   # keep the pulling vertex libraries (_bp) the Metal 4 pipelines read; without it DM_PSO_MTL4=1 cannot fully enable them
     art = args.art or game.icon or args.shelf_art
     if art:
         env['DM_ICON'] = str(art)
     stream(['bash', REPO / 'dm/ios/tools/build_ipa.sh', '--prepare-xcode'], env=env, cwd=REPO)
+    if trim:
+        install_trimmed_map(trim, game.build / 'tvport-xcode')
     return game.build / 'tvport-xcode'
 
 
@@ -924,6 +929,89 @@ def bundle_shaders(game: Game, project: Path) -> None:
         rows = merged_rows(saved.read_text())
         manifest.write_text(known.rstrip('\n') + '\n' + '\n'.join(row for row in rows if row not in set(merged_rows(known))) + '\n')
         emit('log', line=f'{len(rows)} known shaders and pipelines go into the app.')
+
+
+TRIM_CHOICES = ('auto', 'on', 'off')
+TRIM_AUTO_MIN = 1000   # Automatic trims a game whose used-shader list (the Apple TV's plus the profile's) names at least this many shaders
+TRIM_DIR = 'tvport-shadertrim'
+
+
+def trim_enabled(choice: Optional[str], used: int) -> bool:
+    """Trim shaders (docs/shader_trimming.md): Off is today's full set; On trims whatever the lists name; Automatic needs a list of TRIM_AUTO_MIN shaders, as a game never played has nothing to say what it uses."""
+    choice = choice or 'auto'
+    return choice == 'on' or (choice == 'auto' and used >= TRIM_AUTO_MIN)
+
+
+def trim_inputs(game: Game) -> Optional[dict]:
+    """The files dm/gfx/tools/shader_trim.py splits, or None when this build has not got them (a shader library that is a folder, or a cache the Mac build pruned)."""
+    name = f'b-{chain()}.img'
+    compiled, sources = game.build / 'shader/ios' / name, game.build / 'shader/cache' / name
+    profile = game.profile_root / game.title_id
+    if not (profile / 'shader_map.tsv').is_file():
+        profile = REPO / 'dm/games' / game.title_id
+    lists = [path for path in (game.build / SHADER_LIST, profile / 'pso_manifest.tsv') if path.is_file()]   # the Apple TV's recorded list, and the profile's prewarm list
+    if not (compiled.is_file() and sources.is_file() and (profile / 'shader_map.tsv').is_file()):
+        return None
+    return {'compiled': compiled, 'sources': sources, 'map': profile / 'shader_map.tsv', 'lists': lists, 'bf_want': profile / 'bf_want.tsv'}
+
+
+def trim_fingerprint(tool: Path, inputs: dict) -> str:
+    h = hashlib.sha256()
+    for path in (inputs['compiled'], inputs['sources']):
+        st = path.stat()
+        h.update(f'{path.name}:{st.st_size}:{st.st_mtime_ns}\n'.encode())
+    for path in (tool, inputs['map'], inputs['bf_want'], *inputs['lists']):
+        if path.is_file():
+            h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def trim_shaders(game: Game, args, python: str) -> Optional[Path]:
+    """Trim shaders: a folder with the app's shader image (the shaders the game has used compiled, every other vertex and pixel shader as compressed source) and its shader map, or None for the full
+    set (Off, a game below the Automatic threshold, or a failure: the build goes on as it always did)."""
+    choice = getattr(args, 'trim_shaders', None) or 'auto'
+    if choice == 'off':
+        return None
+    tool = REPO / 'dm/gfx/tools/shader_trim.py'
+    inputs = trim_inputs(game) if tool.is_file() else None
+    if not inputs:
+        if choice == 'on':
+            emit('log', line='Trim shaders needs the Mac shader build, which this build folder does not have: the app carries every shader compiled.')
+        return None
+    try:
+        count = run([python, '-I', tool, 'count', *[a for p in inputs['lists'] for a in ('--used', p)]]).stdout.strip()
+        used = int(count or 0)
+    except (subprocess.CalledProcessError, ValueError, OSError):
+        used = 0
+    if not trim_enabled(choice, used):
+        emit('log', line=f'Trim shaders: Automatic stays off, the list of used shaders has {used} (it needs {TRIM_AUTO_MIN}).')
+        return None
+    out = game.build / TRIM_DIR
+    key = trim_fingerprint(tool, inputs)
+    if (out / 'trim.key').is_file() and (out / 'trim.key').read_text() == key and (out / inputs['compiled'].name).is_file() and (out / 'shader_map.tsv').is_file():
+        emit('log', line='Trim shaders: the trimmed shader image from the last build still fits.')
+        return out
+    stage('Trimming shaders')
+    shutil.rmtree(out, ignore_errors=True)
+    command = [python, '-I', tool, 'split', '--compiled', inputs['compiled'], '--sources', inputs['sources'], '--map', inputs['map'], '--out', out, '--jobs', '3']
+    for path in inputs['lists']:
+        command += ['--used', path]
+    if inputs['bf_want'].is_file():
+        command += ['--bf-want', inputs['bf_want']]
+    try:
+        stream(command, cwd=REPO)
+        (out / 'trim.key').write_text(key)
+    except (Failure, OSError) as error:
+        shutil.rmtree(out, ignore_errors=True)
+        emit('log', line=f'Trim shaders did not work ({error}): the app carries every shader compiled.')
+        return None
+    emit('log', line=f'Trim shaders: {used} used shaders go in compiled, the rest as compressed source ({(out / inputs["compiled"].name).stat().st_size // 2**20} MB of shaders instead of {inputs["compiled"].stat().st_size // 2**20} MB).')
+    return out
+
+
+def install_trimmed_map(trim: Path, project: Path) -> None:
+    """The app's shader map says which shaders are source (column 6): the trimmed one replaces the profile's copy build_ipa.sh put in the project."""
+    shutil.copy2(trim / 'shader_map.tsv', project / 'Gen/dm/shader_map.tsv')
 
 
 def compile_app(game: Game, project: Path, device: Optional[str]) -> None:
@@ -1195,6 +1283,7 @@ def cmd_build(args) -> None:
                           'unavailable': 'The saves on the Apple TV could not be read, so this build goes ahead without a new backup.',
                           'busy': 'The game kept saving during each copy, so this build goes ahead without a new backup.'}[backup['state']])
     once = store_textures_once(game, pack, block, python, args.texture_cap, bc1_block) if pack and texture_once_enabled(args, block) else None
+    args.shader_trim_dir = trim_shaders(game, args, python)   # Trim shaders: None keeps the full set
     project = generate_project(game, args, team, bundle, python, once)
     bundle_shaders(game, project)
     compile_app(game, project, args.device)
@@ -1616,6 +1705,7 @@ def main() -> int:
     build.add_argument('--astc', choices=ASTC_CHOICES, default='auto')   # Compressed textures: auto is on for the Apple TV
     build.add_argument('--texture-once', choices=TEXTURE_ONCE_CHOICES, default='auto')   # Store textures once: auto is on whenever Compressed textures is
     build.add_argument('--astc-block', choices=ASTC_BLOCK_CHOICES, default='matched')   # matched to the original (BC1 6x6, the rest 4x4), or 4x4 / 6x6 for every format
+    build.add_argument('--trim-shaders', choices=TRIM_CHOICES, default='auto')   # Trim shaders: used shaders compiled, the rest compressed source; auto needs a list of 1,000 used shaders
     build.add_argument('--gpu', default='')
     build.add_argument('--extra-env', action='append', default=[])   # KEY=VALUE
     build.add_argument('--players', default='')

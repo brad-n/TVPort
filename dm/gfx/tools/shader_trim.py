@@ -13,7 +13,8 @@
 # regenerated from the same MSL by the same functions dmsh_build.py calls (dmsh_pull.variant, dmsh_vin.variant, dmsh_side.unit, dmsh_fetch.fold), kept only where the shader's reflection says
 # the build made them.
 # Usage: shader_trim.py split --compiled <ios b-chain.img> --sources <mac cache b-chain.img> --map <shader_map.tsv> --used <list.tsv>... --out <dir> [--level 19] [--jobs 4]
-#        shader_trim.py check <out dir>             the image against the map: every key has the form the map says
+#        shader_trim.py count --used <list.tsv>...  the number of shaders the lists name
+#        shader_trim.py check <out dir>             the trimmed image against its map: every key has the form the map says, and every source entry inflates
 import argparse, collections, concurrent.futures as cf, ctypes, ctypes.util, json, os, random, re, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -70,6 +71,14 @@ class Zstd:
         out = ctypes.create_string_buffer(size)
         self.err(self.L.ZSTD_decompress_usingDDict(dctx, out, size, frame, len(frame), dd), 'decompress')
         return out.raw
+
+
+def make_dict(z, samples, size):
+    """A trained dictionary, or for a game with few shaders (the trainer needs many samples) the samples themselves as a raw-content dictionary"""
+    if len(samples) >= 64:
+        try: return z.train(samples, size)
+        except RuntimeError: pass
+    return b''.join(samples)[-size:] or b'shader_trim'
 
 
 # ---------------------------------------------------------------- the used list
@@ -132,7 +141,7 @@ def split(compiled, sources, map_path, used_paths, out_dir, level=19, jobs=4, sa
     used, rows = read_used(used_paths)
     cimg, simg = romfs.Path(compiled), romfs.Path(sources)
     cnames = {e.name for e in cimg.iterdir()}
-    lines = open(map_path, 'r', errors='replace').read().split('\n')
+    with open(map_path, 'r', errors='replace') as f: lines = f.read().split('\n')
     stage_of = {}
     for ln in lines:
         c = ln.split('\t')
@@ -151,12 +160,11 @@ def split(compiled, sources, map_path, used_paths, out_dir, level=19, jobs=4, sa
         except OSError: continue
         if total + len(s) > TRAIN_BYTES: break
         samples.append(s); total += len(s); jsamples.append((cimg / f'{k}_b.json').read_bytes())
-    d_msl = z.train(samples) if len(samples) >= 8 else b''
-    d_json = z.train(jsamples, 32768) if len(jsamples) >= 8 else b''
+    d_msl, d_json = make_dict(z, samples, DICT_BYTES), make_dict(z, jsamples, 32768)
     say(f'dictionaries: msl {len(d_msl)} bytes from {len(samples)} sources ({total >> 20} MB), json {len(d_json)} bytes ({time.time() - t0:.0f} s)')
     import threading
     local = threading.local()
-    cds = (z.cdict(d_msl, level), z.cdict(d_json, level)) if d_msl and d_json else (None, None)
+    cds = (z.cdict(d_msl, level), z.cdict(d_json, level))
 
     def cctx():
         if not hasattr(local, 'c'): local.c = z.L.ZSTD_createCCtx()
@@ -195,14 +203,41 @@ def split(compiled, sources, map_path, used_paths, out_dir, level=19, jobs=4, sa
         elif len(c) > 3: outmap.append('\t'.join(c[:5] + [''] * (5 - len(c[:5])) + ['src' if c[3] in src_keys else 'lib']))
         else: outmap.append(ln)
     outmap.insert(1, '# form (column 6): lib = a compiled library in the image, src = zstd MSL source the device compiles at first use (dm/gfx/tools/shader_trim.py)')
-    open(os.path.join(out_dir, 'shader_map.tsv'), 'w').write('\n'.join(outmap))
+    with open(os.path.join(out_dir, 'shader_map.tsv'), 'w') as f: f.write('\n'.join(outmap))
     csize = os.path.getsize(compiled); isize = os.path.getsize(img)
     rep = {'keys': len(keys), 'used': len(used & set(keys)), 'source_keys': len(src_keys), 'no_source': len(skipped), 'compiled_image_bytes': csize, 'trimmed_image_bytes': isize,
            'dict_bytes': [len(d_msl), len(d_json)], 'msl_entries': sum(1 for n in files if n.endswith(MSL)), 'seconds': round(time.time() - t0)}
-    json.dump(rep, open(os.path.join(out_dir, 'trim_report.json'), 'w'), indent=1)
+    with open(os.path.join(out_dir, 'trim_report.json'), 'w') as f: json.dump(rep, f, indent=1)
     say(f'trimmed image {isize >> 20} MB from {csize >> 20} MB, {len(src_keys)} shaders in source form ({len(skipped)} without a source stay compiled... see report)')
     return rep
 
+
+
+def check(out_dir, say=print):
+    """The image in out_dir against its shader_map.tsv: a src key has its _b.msl and _b.jsonz and no compiled _b files, a lib key has its _b.metallib, every source entry inflates. → the list of problems"""
+    z = Zstd(); bad = []
+    img = next(p for p in sorted(os.listdir(out_dir)) if p.endswith('.img'))
+    im = romfs.Path(os.path.join(out_dir, img)); names = {e.name for e in im.iterdir()}
+    dd, dj, dctx = z.ddict((im / DICT_MSL).read_bytes()), z.ddict((im / DICT_JSON).read_bytes()), z.L.ZSTD_createDCtx()
+    nsrc = nlib = 0
+    with open(os.path.join(out_dir, 'shader_map.tsv')) as f: map_lines = f.read().split('\n')
+    for ln in map_lines:
+        c = ln.split('\t')
+        if ln.startswith('#') or c[0] == 'package' or len(c) < 6: continue
+        k, form = c[3], c[5]
+        if form == 'src':
+            nsrc += 1
+            for n in (f'{k}_b{MSL}', f'{k}_b{JSONZ}'):
+                if n not in names: bad.append(f'{k}: {n} is not in the image')
+            if f'{k}_b.metallib' in names or f'{k}_b.json' in names: bad.append(f'{k}: both forms are in the image')
+            for n in (x for x in names if x.startswith(k) and x.endswith(MSL)):
+                try: z.decompress((im / n).read_bytes(), dd, dctx)
+                except (RuntimeError, ValueError, OSError) as e: bad.append(f'{n}: {e}')
+            try: json.loads(z.decompress((im / f'{k}_b{JSONZ}').read_bytes(), dj, dctx))
+            except (RuntimeError, ValueError, OSError, KeyError) as e: bad.append(f'{k}: json: {e}')
+        elif f'{k}_b.metallib' in names: nlib += 1
+    say(f'{nsrc} source, {nlib} compiled, {len(bad)} problems')
+    return bad
 
 
 def main():
@@ -213,10 +248,14 @@ def main():
     s.add_argument('--used', action='append', default=[]); s.add_argument('--out', required=True)
     s.add_argument('--level', type=int, default=19); s.add_argument('--jobs', type=int, default=4); s.add_argument('--limit', type=int)
     s.add_argument('--bf-want')
+    c = sub.add_parser('check'); c.add_argument('out')
+    n = sub.add_parser('count'); n.add_argument('--used', action='append', default=[])   # the number of shaders the lists name (TVPort's Automatic)
     a = ap.parse_args()
+    if a.cmd == 'check': return 1 if check(a.out) else 0
+    if a.cmd == 'count': print(len(read_used(a.used)[0])); return 0
     bf = frozenset()
     if a.bf_want and os.path.exists(a.bf_want):
-        bf = frozenset(ln.strip() for ln in open(a.bf_want) if ln.strip() and not ln.lstrip().startswith('#'))
+        with open(a.bf_want) as f: bf = frozenset(ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith('#'))
     split(a.compiled, a.sources, a.map, a.used, a.out, a.level, a.jobs, limit=a.limit, bf_want=bf)
     return 0
 

@@ -27,7 +27,7 @@ import romfs
 
 ALIGN = 16   # of each file's data: the file is mapped by pages, so its first byte's alignment is its offset's in the image
 STAMP = 'inputs.tsv'   # dmsh_chain.py STAMP
-APP_SUFFIXES = ('.metallib', '.json', '.tsv')   # what the host reads (not the Mac build's .metal sources)
+APP_SUFFIXES = ('.metallib', '.json', '.tsv', '.msl', '.jsonz', '.dict')   # what the host reads (not the Mac build's .metal sources); .msl, .jsonz and .dict: shaders in source form (dm/gfx/tools/shader_trim.py)
 APP_LEAVE_OUT = ('_b_build.json',)   # dmsh_build.py's report, for the tools
 PULLING, PULLING_LEFT_OUT = '_bp.metallib', '_bp_left_out'   # dmsh_pull.py's libraries (build_ipa.sh decides who wants them), and the marker of an image without them
 
