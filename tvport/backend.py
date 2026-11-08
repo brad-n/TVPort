@@ -944,9 +944,12 @@ def trim_enabled(choice: Optional[str], used: int) -> bool:
 
 def trim_inputs(game: Game) -> Optional[dict]:
     """The files dm/gfx/tools/shader_trim.py splits, or None when this build has not got them (a shader library that is a folder, or a cache the Mac build pruned)."""
-    name = f'b-{chain()}.img'
-    compiled, sources = game.build / 'shader/ios' / name, game.build / 'shader/cache' / name
-    profile = game.profile_root / game.title_id
+    try:
+        name = f'b-{chain()}.img'
+        compiled, sources = game.build / 'shader/ios' / name, game.build / 'shader/cache' / name
+        profile = game.profile_root / game.title_id
+    except (AttributeError, TypeError):   # a game that is not a build folder (no profile)
+        return None
     if not (profile / 'shader_map.tsv').is_file():
         profile = REPO / 'dm/games' / game.title_id
     lists = [path for path in (game.build / SHADER_LIST, profile / 'pso_manifest.tsv') if path.is_file()]   # the Apple TV's recorded list, and the profile's prewarm list

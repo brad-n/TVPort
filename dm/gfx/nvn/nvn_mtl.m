@@ -5526,7 +5526,8 @@ static const img_ent *msl_image_file(NSString *path, romfs_img **img) {
 }
 // Shader trimming: the shader map marks some keys `src` (column 6): their libraries are compressed MSL in the image, compiled on the device in the background (nvn_shader_trim.m). A request for
 // such a shader that is not compiled yet makes shader_load return nil with t_trim_pending set, and the draw that needs it is skipped; t_trim_sync (the prewarm's threads) waits for it instead
-static __thread int t_trim_sync, t_trim_pending;
+static __thread int t_trim_sync, t_trim_bg, t_trim_pending;   // t_trim_bg: the prefetch (ahead of need: queued behind what a draw is waiting for)
+static inline int trim_mode(void) { return t_trim_sync ? TRIM_WAIT : t_trim_bg ? TRIM_BACKGROUND : TRIM_URGENT; }
 static int g_trim_any;
 static NSData *msl_data(NSString *path) {   // a file of the library, nil when it has none
     NSData *d = [NSData dataWithContentsOfFile:path];
@@ -5757,7 +5758,7 @@ static id<MTLLibrary> lib_from_file(NSString *path, NSError **err) {
     if (g_trim_any) {   // a shader in source form: its library is made by nvn_shader_trim.m (ready, or not yet: nil, and t_trim_pending says to try again later)
         NSString *n = path.lastPathComponent;
         if ([n hasSuffix:@".metallib"] && n.length >= 27 && trim_is_source([n substringToIndex:16])) {
-            NSString *name = [n substringToIndex:n.length - 9]; int st = trim_ensure([n substringToIndex:16], t_trim_sync), layer = 0;
+            NSString *name = [n substringToIndex:n.length - 9]; int st = trim_ensure([n substringToIndex:16], trim_mode()), layer = 0;
             id<MTLLibrary> lib = st == TRIM_READY ? trim_library(name, &layer) : nil;
             if (lib) t_lib_layer = layer;
             else { if (st == TRIM_PENDING) t_trim_pending = 1;
@@ -5859,7 +5860,7 @@ static id<MTLComputePipelineState> cps_new(id<MTLFunction> f, NSError **e);   //
 // layer: a vertex shader's layer entry points (entry_layer / entry_layer_z, which also write the layer) instead of main0 / main0_z, for a program whose geometry shader is a slice writer (prog_fold_gs)
 static NvShader *shader_load(NSString *pc, int stage, int layer) {
     NSError *e = nil;
-    if (g_trim_any && pc.length == 18 && [pc hasSuffix:@"_b"] && trim_ensure([pc substringToIndex:16], t_trim_sync) == TRIM_PENDING) { t_trim_pending = 1; return nil; }   // compiling from source: not an error
+    if (g_trim_any && pc.length == 18 && [pc hasSuffix:@"_b"] && trim_ensure([pc substringToIndex:16], trim_mode()) == TRIM_PENDING) { t_trim_pending = 1; return nil; }   // compiling from source: not an error
     NSData *jd = msl_data([NSString stringWithFormat:@"%@/%@.json", g_msl_dir, pc]);
     NSDictionary *j = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
     if (j && stage == 2 && [j[@"gs_slice"] isKindOfClass:[NSDictionary class]] && [j[@"chain"] isEqual:@DMSH_CHAIN]) {   // a slice-writing geometry shader has no library: a stub prog_fold_gs replaces
@@ -8988,6 +8989,8 @@ static void warm_finish(void) {
     if (g_comp4) MLOG("pipeline bases so far: %llu compiled, %llu from the archive, %llu reused (%.1f ms for the bases); %llu specializations (their descriptors %s), %llu pipelines without a base (MTLDevice)",
                       (unsigned long long)g_pb_built, (unsigned long long)g_pb_archived, (unsigned long long)g_pb_reused, g_pb_base_ns / 1e6, (unsigned long long)g_pb_spec,
                       (const char *[]){"not asked for yet", "returned retained", "returned autoreleased"}[atomic_load(&g_spec_own) % 3], (unsigned long long)g_pb_legacy);
+    if (g_trim_any) { trim_stats_t ts = trim_stats(); MLOG("shader trimming so far: %llu of %llu source shaders compiled on the device (%llu libraries, %.1f ms of compiling, %llu failed), %llu draws skipped while compiling (%llu shaders)",
+                                                      (unsigned long long)ts.compiled, (unsigned long long)ts.source_keys, (unsigned long long)ts.libs, ts.compile_ns / 1e6, (unsigned long long)ts.failed, (unsigned long long)ts.skipped_draws, (unsigned long long)ts.skipped_shaders); }
     if (g_arch_bundle || g_arch_cap) MLOG("compute pipelines so far: %llu from the archive bundled with the app, %llu from this device's archive, %llu built (%.1f ms looking up, %.1f ms building)",
                                          (unsigned long long)g_cps_arch, (unsigned long long)g_cps_run, (unsigned long long)g_cps_built, g_cps_look_ns / 1e6, g_cps_build_ns / 1e6);
     // All warm tasks have joined. WarmItems retain published shaders until the submit thread claims them.
@@ -10592,7 +10595,7 @@ static void shader_prefetch_rest(void) {
     uint64_t t0 = bp_now(); int hy = hybrid_on();
     NSMutableArray *res = [NSMutableArray arrayWithCapacity:n]; for (NSUInteger i = 0; i < n; i++) [res addObject:NSNull.null];
     dispatch_apply(n, DISPATCH_APPLY_AUTO, ^(size_t i) { @autoreleasepool {
-        NvShader *o = shader_load(keys[i], stages[i].intValue, 0);
+        t_trim_bg = 1; NvShader *o = shader_load(keys[i], stages[i].intValue, 0); t_trim_bg = 0;
         if (o && hy && o->stage == 0 && o->has_pull && !o->layer_out) pull_load(o);
         os_unfair_lock_lock(&g_pf_lock); if (o) res[i] = o; os_unfair_lock_unlock(&g_pf_lock);
     } });
@@ -13117,7 +13120,7 @@ void mtl_prog_prefetch(const prog_t *cp) {
         NSString *pc = [k stringByAppendingString:@"_b"];
         if (!progpf_first(pc)) continue;
         dispatch_async(pp_bg_queue(), ^{ @autoreleasepool {
-            NvShader *sh = shader_load(pc, st, 0);
+            t_trim_bg = 1; NvShader *sh = shader_load(pc, st, 0); t_trim_bg = 0;
             if (sh && st == 0 && sh->has_pull && !sh->layer_out && hybrid_on()) pull_load(sh);   // its pulling entry too, as the prewarm does (warm_shader)
             if (!sh) return;
             WarmItem *item = [WarmItem new]; item->kind = 0; item->record = 1; item->key = pc; item->shader = sh; warm_enqueue(item);

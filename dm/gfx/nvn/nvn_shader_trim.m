@@ -107,7 +107,11 @@ int trim_ensure(NSString *key, int wait) {
     if (![g_src containsObject:key]) { [g_cv unlock]; return TRIM_NONE; }
     TrimShader *s = g_sh[key];
     if (!s) { s = [TrimShader new]; s->state = TRIM_PENDING; g_sh[key] = s; if (wait) [g_q insertObject:key atIndex:0]; else [g_q addObject:key]; [g_cv broadcast]; }
-    while (wait && s->state == TRIM_PENDING) [g_cv wait];
+    else if (wait && s->state == TRIM_PENDING) {   // a draw (or the prewarm) needs what the prefetch queued behind others: it goes first
+        NSUInteger at = [g_q indexOfObject:key];
+        if (at != NSNotFound && at > 0) { [g_q removeObjectAtIndex:at]; [g_q insertObject:key atIndex:0]; }
+    }
+    while (wait == TRIM_WAIT && s->state == TRIM_PENDING) [g_cv wait];
     int r = s->state; [g_cv unlock]; return r;
 }
 id<MTLLibrary> trim_library(NSString *name, int *layer) {
