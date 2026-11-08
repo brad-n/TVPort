@@ -33,6 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import bntx_astc as B
 import sparse_image as S
+import tex_once_zstd as Z
 
 TOOL_VERSION = 1
 TASK_BYTES = 64 << 20
@@ -82,58 +83,47 @@ def skippable_frame(n):
     return struct.pack('<II', SKIPPABLE_FIRST, n - 8) + bytes(n - 8)
 
 
+def has_skippable(f):
+    try: return bool(Z.frame_features(f)['skippable'])
+    except (ValueError, IndexError): return False
+
+
 def zstd_header(f):
     """The layout of a zstd frame's header: (frame header descriptor byte, window descriptor byte or None), or None for no frame"""
-    if len(f) < 5 or f[:4] != ZSTD_MAGIC: return None
-    return f[4], (None if (f[4] >> 5) & 1 else (f[5] if len(f) > 5 else None))
+    return Z.frame_header(f)
 
 
-def zstd_options(z, level, like):
-    """Compression options that give the new frame the header layout of `like`, the original frame it replaces.
-    Smash's own zstd decoder takes only the layout the game shipped with (every frame in its data.arc, table included: descriptor 0 = no content
-    size, a window descriptor, no checksum, no dictionary ID). Frames with a content size / single segment (zstd's defaults) hung it at boot
-    (2026-11-08), so the new frame copies the original's flags and its window."""
-    P = z.CompressionParameter
-    opts = {P.compression_level: level}
-    h = zstd_header(like) if like else None
-    if h is None: return opts
-    fhd, wd = h
-    opts[P.checksum_flag] = (fhd >> 2) & 1
-    opts[P.dict_id_flag] = 1 if fhd & 3 else 0
-    opts[P.content_size_flag] = 1 if (fhd >> 6) or ((fhd >> 5) & 1) else 0
-    if wd is not None:
-        opts[P.window_log] = max(10, 10 + (wd >> 3) + (1 if wd & 7 else 0))   # the power of two covering the original's window
-    return opts
-
-
-def zstd_compress(z, data, level, zd=None, like=None):
-    opts = zstd_options(z, level, like)
-    h = zstd_header(like) if like else None
-    if h is not None and h[1] is not None and not (h[0] >> 6):
-        # The original declares no content size: compress as a stream of unknown size, so zstd keeps the window it is given
-        # (a one-shot compress knows the size and shrinks the window, which changes the window descriptor)
-        c = z.ZstdCompressor(options=opts, zstd_dict=zd) if zd else z.ZstdCompressor(options=opts)
-        return c.compress(data, mode=c.CONTINUE) + c.flush(mode=c.FLUSH_FRAME)
-    return z.compress(data, options=opts, zstd_dict=zd) if zd else z.compress(data, options=opts)
+def zstd_compress(data, level, zd=None, like=None):
+    """One zstd frame of `data` from the encoder without RLE blocks / RLE literals (tex_once_zstd), with the header layout of `like`, the original frame it replaces.
+    Smash's own zstd decoder takes only the layout the game shipped with (every frame in its data.arc, table included: descriptor 0 = no content size, a window descriptor,
+    no checksum, no dictionary ID) and hung at boot on frames with RLE blocks, so the new frame copies the original's flags and its window and uses no RLE."""
+    return Z.compress(data, level, zd.dict_content if zd else None, like)
 
 
 def zstd_stream(data, slot, zd=None, like=None):
     """`data` as one zstd frame of at most `slot` bytes (tries stronger levels when the first does not fit), or None. like: the original frame, whose header layout the new one copies"""
-    z = B.zstd_module()
     for level in ZSTD_LEVELS[:2 if len(data) > (32 << 20) else 3]:
-        comp = zstd_compress(z, data, level, zd, like)
+        comp = zstd_compress(data, level, zd, like)
         if len(comp) <= slot: return comp
     return None
 
 
-def zstd_slot(data, slot, zd=None, min_tail=0, levels=None, like=None):
-    """`data` compressed into exactly `slot` bytes: the stream, then one skippable frame of zeros to the slot's end. None when it does not fit, or leaves a tail of 1..7 bytes (no room for the frame's header)"""
-    z = B.zstd_module()
+def zstd_slot(data, slot, zd=None, min_tail=0, levels=None, like=None, skippable=True):
+    """`data` compressed into exactly `slot` bytes: the stream, then one skippable frame of zeros to the slot's end. None when it does not fit, or leaves a tail of 1..7 bytes (no room for the frame's header),
+    or leaves a tail with skippable off (the original has no skippable frame, so the new file has none either)"""
     for level in levels or ZSTD_LEVELS[:2 if len(data) > (32 << 20) else 3]:
-        comp = zstd_compress(z, data, level, zd, like)
+        comp = zstd_compress(data, level, zd, like)
         tail = slot - len(comp)
         if tail == 0 and not min_tail: return comp
-        if tail >= max(8, min_tail): return comp + skippable_frame(tail)
+        if skippable and tail >= max(8, min_tail): return comp + skippable_frame(tail)
+    return None
+
+
+def zstd_table_frame(fs, stored, like):
+    """The data.arc table `fs` as exactly one frame (no padding, no skippable frame) of at most `stored` bytes with the header layout of `like`, the original frame, or None"""
+    for level in TABLE_LEVELS:
+        comp = zstd_compress(fs, level, None, like)
+        if len(comp) <= stored: return comp
     return None
 
 
@@ -346,7 +336,7 @@ class Walker:
             if comp is None: return None
             self.new_csz = len(comp)
             return comp + bytes(len(orig) - len(comp))
-        return zstd_slot(data, len(orig), self.zdict(orig), like=orig)
+        return zstd_slot(data, len(orig), self.zdict(orig), like=orig, skippable=has_skippable(orig))
 
     def sub(self, d, name, depth, hint, top=None):
         """strip() with its own counters: -> (new bytes or None, the counters it made); an error leaves the container as it is"""
@@ -434,6 +424,10 @@ class Walker:
                 if n[top_csz:].count(0) != len(n) - top_csz: raise Mismatch(f'{name}: bytes after the new stream are not zero')
                 nn = n[:top_csz]
             if nn[:4] != ZSTD_MAGIC and not (len(nn) >= 4 and struct.unpack('<I', nn[:4])[0] in B.SKIPPABLE): raise Mismatch(f'{name}: no zstd frame')
+            if o != n:
+                try: bad = Z.forbidden(nn, o)
+                except (ValueError, IndexError) as e: raise Mismatch(f'{name}: the new zstd data is not a readable frame run ({e})')
+                if bad: raise Mismatch(f'{name}: the new zstd frame uses {bad}, which the original does not; the game decodes only the original archive\'s features')
             ho, hn = zstd_header(o), zstd_header(nn)
             if ho is not None and hn is not None and o != n and ho != hn:
                 raise Mismatch(f'{name}: zstd frame header changed ({ho} -> {hn}); the game decodes only the original layout')
@@ -468,6 +462,7 @@ _W = {}
 
 
 def worker_init(cfg):
+    if cfg.get('zstd_work'): Z.configure(cfg['zstd_work'])
     pack = PackIndex(cfg['pack'])
     _W.update(cfg=cfg, w=Walker(cfg['lib'], cfg['native'], cfg['block'], cfg['max_dim'], pack, cfg['dicts'], cfg.get('bc1_block')), fd=os.open(cfg['romfs'], os.O_RDONLY))
     if cfg.get('sparse'): _W['sparse'] = S.SparseImage(cfg['sparse'])
@@ -580,7 +575,7 @@ class Arc:
         self.table = False
         if want_table:
             fs = bytes(self.T['fs'])
-            fits = zstd_slot(fs, self.T['stored'], min_tail=64, levels=TABLE_LEVELS) is not None   # with room to spare: the rewritten table compresses a little differently
+            fits = zstd_table_frame(fs, self.T['stored'], None) is not None
             self.table = fits and self.table_off + self.table_size <= self.base + self.size
 
     def usable(self, entries):
@@ -596,10 +591,15 @@ class Arc:
             for fdi in self.fd.get(at, ()):
                 p = T['FD'] + 16 * fdi + 4
                 if struct.unpack_from('<I', fs, p)[0] == old[at]: struct.pack_into('<I', fs, p, new); n += 1
-        slot = zstd_slot(bytes(fs), T['stored'], levels=TABLE_LEVELS, like=orig[16:])
-        if slot is None: raise RuntimeError('the rewritten data.arc table does not fit its slot')
-        if zstd_header(slot) != zstd_header(orig[16:]): raise RuntimeError(f'the rewritten data.arc table frame has header {zstd_header(slot)}, the original {zstd_header(orig[16:])}: the game decodes only the original layout')
-        return orig[:16] + slot, bytes(fs)
+        frame = zstd_table_frame(bytes(fs), T['stored'], orig[16:16 + T['stored']])
+        if frame is None: raise RuntimeError('the rewritten data.arc table does not fit its slot')
+        ho = zstd_header(orig[16:])
+        if zstd_header(frame) != ho: raise Mismatch(f'the rewritten data.arc table frame has header {zstd_header(frame)}, the original {ho}: the game decodes only the original layout')
+        bad = Z.forbidden(frame, orig[16:16 + T['stored']])
+        if bad: raise Mismatch(f'the rewritten data.arc table frame uses {bad}, which the original table does not')
+        # like the original: the table is one frame, its header's stored size is the frame's length (not the slot's), zeros after it, the section size unchanged
+        hdr = orig[:8] + struct.pack('<I', len(frame)) + orig[12:16]
+        return hdr + frame + bytes(T['stored'] - len(frame)), bytes(fs)
 
 
 # ---- run ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -608,7 +608,7 @@ def log(msg): print('tex_once: ' + msg, file=sys.stderr, flush=True)
 
 def tool_hash():
     h = hashlib.sha256()
-    for f in ('tex_once.py', 'sparse_image.py', 'tex_once_native.c'):
+    for f in ('tex_once.py', 'sparse_image.py', 'tex_once_native.c', 'tex_once_zstd.py', 'tex_once_zstd.patch' if False else 'tex_once_zstd_norle.patch', 'tex_once_zstd_build.sh'):
         with open(os.path.join(HERE, f), 'rb') as fh: h.update(fh.read())
     return h.digest()
 
@@ -674,6 +674,7 @@ def run(args):
         if os.path.exists(f): os.unlink(f)
     lib = find_astc_lib(pack, out)
     native = build_native(os.path.join(out, 'lib'))
+    Z.configure(os.path.join(out, 'lib')); Z.build(os.path.join(out, 'lib'))
     files = B.image_files(romfs)
     dicts = B.zs_dicts(romfs, files, lib)
     arc = None
@@ -695,7 +696,7 @@ def run(args):
     if arc and arc.table: marks.append((arc.table_off, arc.table_size, None, 'table'))
     marks.sort(key=lambda m: m[0])
     tasks = partition(logical, marks)
-    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs)
+    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs, zstd_work=os.path.join(out, 'lib'))
     writer = S.SparseWriter(target, logical)
     totals = collections.Counter(); errors = []; n_errors = 0
     updates, mods_by_task, table_new = {}, {}, None
@@ -763,11 +764,19 @@ def run(args):
         if table_new is not None:
             T = arc.T
             slot = sp.read(arc.table_off, arc.table_size)
-            if slot[:16] != os.pread(fd, 16, arc.table_off): problems.append('data.arc table header changed')
-            elif bytes(B.unzstd(slot[16:], {})) != table_new: problems.append('data.arc table does not inflate to the expected table')
+            oh = os.pread(fd, 16, arc.table_off)
+            stored_new = struct.unpack_from('<I', slot, 8)[0]
+            frame = slot[16:16 + stored_new]
+            if slot[:8] != oh[:8] or slot[12:16] != oh[12:16]: problems.append('data.arc table header changed beyond its stored size')
+            elif slot[16 + stored_new:].count(0) != len(slot) - 16 - stored_new: problems.append('data.arc table: bytes after its frame are not zero')
+            elif bytes(B.unzstd(frame, {})) != table_new: problems.append('data.arc table does not inflate to the expected table')
+            elif len(table_new) != len(T['fs']): problems.append('data.arc table size changed')
             else:
-                got = bytearray(B.unzstd(slot[16:], {}))
-                if len(got) != len(T['fs']): problems.append('data.arc table size changed')
+                try:
+                    bad = Z.forbidden(frame, os.pread(fd, T['stored'], arc.table_off + 16))
+                    if bad or Z.frame_features(frame)['frames'] != 1: problems.append(f'data.arc table frame: {bad or "not exactly one frame"}')
+                    if zstd_header(frame) != zstd_header(os.pread(fd, 8, arc.table_off + 16)): problems.append('data.arc table frame header differs from the original')
+                except ValueError as e: problems.append(f'data.arc table frame unreadable: {e}')
     writer_c = collections.Counter({k: totals[k] for k in ('planes_tagged', 'planes_zeroed_cap', 'textures_changed')})
     for k in writer_c:
         if writer_c[k] != vtotals.get(k, 0): problems.append(f'{k}: the strip counted {writer_c[k]}, the check found {vtotals.get(k, 0)}')
@@ -801,6 +810,7 @@ def run_manifest(args):
     if not B.read_pack_header(pack): log(f'[RED] {pack} is no complete ASTC pack'); return 2
     lib = find_astc_lib(pack, out)
     native = build_native(os.path.join(out, 'lib'))
+    Z.configure(os.path.join(out, 'lib')); Z.build(os.path.join(out, 'lib'))
     files = B.image_files(romfs)
     dicts = B.zs_dicts(romfs, files, lib)
     arc = None
@@ -812,7 +822,7 @@ def run_manifest(args):
     fd = os.open(romfs, os.O_RDONLY)
     marks = [(off, size, (name, off, size, bool(arc and arc.table and name.startswith('/data.arc#'))), 'item') for name, off, size in items if candidate(fd, name, off, size)]
     tasks = [t for t in partition(os.path.getsize(romfs), sorted(marks, key=lambda m: m[0])) if t['kind'] != 'table']
-    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs, manifest=True)
+    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs, manifest=True, zstd_work=os.path.join(out, 'lib'))
     n = 0
     with cf.ProcessPoolExecutor(args.workers, initializer=worker_init, initargs=(cfg,)) as ex, open(args.manifest + '.part', 'w') as f:
         for i, r in enumerate(ex.map(strip_task, tasks)):
