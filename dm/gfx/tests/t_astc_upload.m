@@ -35,6 +35,11 @@ static void run_bc456_sync(void);
 static void run_bc456_background(const char *dir);
 static void run_bc456_tagged(const char *dir);
 static void fill_blocks(uint8_t *data, size_t size, uint32_t format, unsigned seed) {
+    if (format >= 0x79 && format <= 0x94) {   // native ASTC (any block size): void-extent blocks of pseudo-random colours, valid for every block size, so a decode is exact and a level mix-up shows
+        uint32_t st = seed * 2654435761u + 12345u; static const uint8_t hdr[8] = {0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+        for (size_t i = 0; i + 16 <= size; i += 16) { memcpy(data + i, hdr, 8); for (int c = 0; c < 8; c += 2) { st = st * 1664525u + 1013904223u; data[i + 8 + c] = st >> 16; data[i + 9 + c] = st >> 24; } }
+        return;
+    }
     if (format == 0x49 || format == 0x4b || format == 0x50) { fill_bc456(data, size, format, seed); return; }
     int bb = (format == 0x41 || format == 0x42 || format == 0x45 || format == 0x46 || format == 0x49 || format == 0x4a) ? 8 : 16;
     uint32_t state = seed + 1;
@@ -937,6 +942,87 @@ static void run_bc456_tagged(const char *dir) {
     g_embedded = 0; g_smooth = 0; CHECK(nvn_bc_astc_bg_wait(120), "drains");
 }
 
+
+// ---- Native ASTC under DM_ASTC_MAX_DIM (T_ASTC_MODE=astcnative): the finest levels of a texture that is ASTC in the file are left out, as BC's are ----
+static float *read_lv(id<MTLTexture> mt, unsigned level, unsigned layer, uint32_t w, uint32_t h) {
+    id<MTLBuffer> out = [g_dev newBufferWithLength:(size_t)w * h * 16 options:MTLResourceStorageModeShared]; uint32_t sel[2] = {level, layer};
+    id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:sampler_pipeline(mt.textureType == MTLTextureType2DArray)]; [e setTexture:mt atIndex:0]; [e setBuffer:out offset:0 atIndex:0]; [e setBytes:sel length:sizeof sel atIndex:1];
+    [e dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(MIN(w, 8u), MIN(h, 8u), 1)]; [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    float *r = malloc((size_t)w * h * 16); memcpy(r, out.contents, (size_t)w * h * 16); return r;
+}
+// Metal level ml of `a` samples the same texels as level nl of `b`
+static int same_level(id<MTLTexture> a, unsigned ml, id<MTLTexture> b, unsigned nl, unsigned layer, uint32_t w, uint32_t h) {
+    float *x = read_lv(a, ml, layer, w, h), *y = read_lv(b, nl, layer, w, h); int eq = !memcmp(x, y, (size_t)w * h * 16); int nonblack = 0;
+    for (size_t i = 0; i < (size_t)w * h * 4; i++) if (x[i] != 0) { nonblack = 1; break; }
+    free(x); free(y); return eq && nonblack;
+}
+static void run_astc_native(void) {
+    static const struct { uint32_t fmt; unsigned w, h, levels, target, layers; int cap; unsigned skip; int sh; const char *name; } C[] = {
+        {0x79, 512, 256, 10, 1, 1, 128, 2, 0, "4x4 512x256"},   {0x7b, 300, 150, 9, 1, 1, 64, 3, 0, "5x5 300x150 (odd)"}, {0x7d, 1024, 1024, 11, 1, 1, 256, 2, 0, "6x6 1024"},
+        {0x7f, 640, 360, 10, 1, 1, 100, 3, 0, "8x6 640x360"},   {0x80, 256, 256, 9, 1, 1, 64, 2, 0, "8x8 256"},       {0x86, 512, 512, 10, 1, 1, 128, 2, 0, "12x12 512"},
+        {0x8b, 512, 512, 10, 1, 1, 256, 1, 0, "6x6 sRGB 512"},  {0x7d, 256, 256, 9, 4, 3, 64, 2, 0, "6x6 array of 3"},
+        {0x7d, 1024, 1024, 1, 1, 1, 256, 0, 1, "no mip chain: left whole"}, {0x7d, 512, 512, 2, 1, 1, 16, 1, 1, "chain with no level that fits: last level"},
+        {0x7d, 128, 128, 8, 1, 1, 256, 0, 0, "under the cap"},   {0x7d, 256, 256, 9, 8, 1, 64, 0, 0, "cube: not cut"},
+    };
+    int ncase = (int)(sizeof C / sizeof *C);
+    for (int c = 0; c < ncase; c++) {
+        if (C[c].target == 8) continue;   // cube: only the skip function (below)
+        nvn_texdesc d = {.target = C[c].target, .format = C[c].fmt, .width = C[c].w, .height = C[c].h, .depth = C[c].layers, .levels = C[c].levels, .samples = 1};
+        int sh = 0; unsigned sk = nvn_astc_skip_levels(&d, C[c].cap, &sh);
+        CHECK(sk == C[c].skip && sh == C[c].sh, "%s: nvn_astc_skip_levels = %u (short %d), want %u (%d)", C[c].name, sk, sh, C[c].skip, C[c].sh);
+        void *m1, *m2; g_astc_capdim = 0; tex_t t1 = fixture(d, &m1); id<MTLTexture> ref = upload(&t1);
+        g_astc_capdim = C[c].cap; tex_t t2 = fixture(d, &m2); CHECK(bc_skip(&t2) == sk, "%s: bc_skip follows the cap", C[c].name); id<MTLTexture> cap = upload(&t2);
+        CHECK(ref && cap && ref.mipmapLevelCount == C[c].levels && ref.width == C[c].w, "%s: uncapped keeps all levels", C[c].name);
+        CHECK(cap && cap.pixelFormat == ref.pixelFormat && mt_is_astc(cap), "%s: still native ASTC", C[c].name);
+        CHECK(cap && cap.width == MAX(C[c].w >> sk, 1u) && cap.height == MAX(C[c].h >> sk, 1u) && cap.mipmapLevelCount == C[c].levels - sk && cap.arrayLength == ref.arrayLength && cap.textureType == ref.textureType,
+              "%s: capped size %lux%lu levels %lu (skip %u)", C[c].name, cap ? (unsigned long)cap.width : 0ul, cap ? (unsigned long)cap.height : 0ul, cap ? (unsigned long)cap.mipmapLevelCount : 0ul, sk);
+        if (sk) CHECK(cap.allocatedSize < ref.allocatedSize, "%s: capped allocates less (%lu < %lu)", C[c].name, (unsigned long)cap.allocatedSize, (unsigned long)ref.allocatedSize);
+        for (unsigned l = sk; cap && l < C[c].levels; l++) for (unsigned y = 0; y < (C[c].target == 4 ? C[c].layers : 1u); y++)
+            CHECK(same_level(cap, l - sk, ref, l, y, MAX(C[c].w >> l, 1u), MAX(C[c].h >> l, 1u)), "%s: kept NVN level %u layer %u samples like the uncapped texture's", C[c].name, l, y);
+        if (sk && cap) {   // a view names NVN levels: levels sk+1.. of the capped texture is Metal level 1..; a view that starts in a dropped level starts at Metal level 0
+            view_t v = {0}; v.set_levels = 1; v.base_level = sk + 1; v.nlevels = 1; mtl_reg_tex(97300 + c * 2, &t2, &v);
+            view_t v2 = {0}; v2.set_levels = 1; v2.base_level = 0; v2.nlevels = sk + 2; mtl_reg_tex(97301 + c * 2, &t2, &v2);
+            os_unfair_lock_lock(&g_rmu); id<MTLTexture> w1 = tex_by_id(97300 + c * 2), w2 = tex_by_id(97301 + c * 2); os_unfair_lock_unlock(&g_rmu);
+            if (sk + 1 < C[c].levels) CHECK(w1 && w1.mipmapLevelCount == 1 && w1.width == MAX(C[c].w >> (sk + 1), 1u), "%s: a view of NVN level %u is Metal level 1", C[c].name, sk + 1);
+            CHECK(w2 && w2.mipmapLevelCount == MIN(2u, C[c].levels - sk) && w2.width == cap.width, "%s: a view from level 0 over %u levels starts at the first kept level (levels %lu)", C[c].name, sk + 2, w2 ? (unsigned long)w2.mipmapLevelCount : 0ul);
+        }
+        if (sk && C[c].target == 1) {   // buffer-to-texture copies: a dropped level takes none; a kept level lands in its Metal level
+            int bw, bh, bpb = nvn_fmt_bpb(d.format, &bw, &bh); void *tmem; tex_t t3 = empty_texture(d, &tmem, 5 + c); mtl_tex_init(&t3);
+            for (unsigned l = 0; l < C[c].levels; l++) {
+                uint32_t w = MAX(C[c].w >> l, 1u), h = MAX(C[c].h >> l, 1u); size_t row = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh, bytes = row * rows;
+                void *src; if (posix_memalign(&src, getpagesize(), (bytes + 16383) & ~(size_t)16383)) abort(); mtl_pool_add(src, (bytes + 16383) & ~(size_t)16383);
+                fill_blocks(src, bytes, d.format, l + g_seed_base);
+                p_copy_b2t cp = {.src = (uint64_t)(uintptr_t)src, .tex = &t3, .r = {0, 0, 0, (int)w, (int)h, 1}, .has_view = 1}; cp.view.set_levels = 1; cp.view.base_level = l;
+                mtl_sub_begin(); copy_b2t(&cp, sizeof cp); CHECK(mtl_wait(mtl_sub_commit(), 20000000000ull), "%s: copy into NVN level %u completes", C[c].name, l);
+                mtl_pool_del(src); mtl_drain(); free(src);
+            }
+            id<MTLTexture> m3 = tex_mtl(&t3);
+            CHECK(m3 && m3.mipmapLevelCount == C[c].levels - sk && m3.width == cap.width, "%s: a texture made by copies has the capped size", C[c].name);
+            for (unsigned l = sk; m3 && l < C[c].levels; l++) CHECK(same_level(m3, l - sk, ref, l, 0, MAX(C[c].w >> l, 1u), MAX(C[c].h >> l, 1u)), "%s: copy into NVN level %u lands in Metal level %u", C[c].name, l, l - sk);
+            // texture-to-texture: the capped texture's level into a second capped texture
+            void *tmem2; tex_t t4 = empty_texture(d, &tmem2, 40 + c); mtl_tex_init(&t4); unsigned kl = sk + (C[c].levels - sk > 1 ? 1 : 0); uint32_t kw = MAX(C[c].w >> kl, 1u), kh = MAX(C[c].h >> kl, 1u);
+            p_copy_t2t ct = {.src = &t2, .dst = &t4, .has_sv = 1, .has_dv = 1, .sr = {0, 0, 0, (int)kw, (int)kh, 1}, .dr = {0, 0, 0, (int)kw, (int)kh, 1}}; ct.sv.set_levels = 1; ct.sv.base_level = kl; ct.dv.set_levels = 1; ct.dv.base_level = kl;
+            mtl_sub_begin(); copy_t2t(&ct); CHECK(mtl_wait(mtl_sub_commit(), 20000000000ull), "%s: texture copy completes", C[c].name);
+            ct.sv.base_level = 0; ct.dv.base_level = 0; ct.sr.width = ct.dr.width = (int)C[c].w; ct.sr.height = ct.dr.height = (int)C[c].h;
+            mtl_sub_begin(); copy_t2t(&ct); CHECK(mtl_wait(mtl_sub_commit(), 20000000000ull), "%s: a copy of a dropped level is skipped without a fault", C[c].name);
+            id<MTLTexture> m4 = tex_mtl(&t4);
+            CHECK(m4 && m4.mipmapLevelCount == C[c].levels - sk && same_level(m4, kl - sk, ref, kl, 0, kw, kh), "%s: texture-to-texture copy of NVN level %u", C[c].name, kl);
+            defer_obj_release(m3); defer_obj_release(m4); release_fixture(tmem); release_fixture(tmem2);
+        }
+        defer_obj_release(ref); defer_obj_release(cap); release_fixture(m1); release_fixture(m2);
+    }
+    { nvn_texdesc cube = {.target = 8, .format = 0x7d, .width = 256, .height = 256, .depth = 1, .levels = 9, .samples = 1}; CHECK(nvn_astc_skip_levels(&cube, 64, NULL) == 0, "a cube is not cut");
+      nvn_texdesc a3 = cube; a3.target = NVN_TEXTURE_TARGET_3D; CHECK(nvn_astc_skip_levels(&a3, 64, NULL) == 0, "a 3D texture is not cut");
+      nvn_texdesc bc = cube; bc.target = 1; bc.format = 0x4d; CHECK(nvn_astc_skip_levels(&bc, 64, NULL) == 0 && nvn_bc_skip_levels(&bc, 64) == 2, "BC stays with nvn_bc_skip_levels");
+      nvn_texdesc nb = bc; nb.format = 0x7d; CHECK(nvn_bc_skip_levels(&nb, 64) == 0, "nvn_bc_skip_levels does not touch ASTC (the prebuild's planes are unchanged)"); }
+    // the switches: DM_ASTC_MAX_DIM wins, else DM_BC_MAX_DIM on a GPU without BC (DM_TEST_NO_BC here), else off
+    unsetenv("DM_ASTC_MAX_DIM"); setenv("DM_BC_MAX_DIM", "128", 1); g_astc_capdim = -1; CHECK(astc_cap() == 128, "DM_BC_MAX_DIM alone caps ASTC without BC");
+    setenv("DM_ASTC_MAX_DIM", "32", 1); g_astc_capdim = -1; CHECK(astc_cap() == 32, "DM_ASTC_MAX_DIM is separate");
+    setenv("DM_ASTC_MAX_DIM", "0", 1); g_astc_capdim = -1; CHECK(astc_cap() == 0, "DM_ASTC_MAX_DIM=0 turns ASTC capping off");
+    unsetenv("DM_ASTC_MAX_DIM"); unsetenv("DM_BC_MAX_DIM"); g_astc_capdim = -1; CHECK(astc_cap() == 0, "no switch: no cap");
+    setenv("DM_ASTC_MAX_DIM", "64", 1); g_astc_capdim = -1; CHECK(astc_cap() == 64, "DM_ASTC_MAX_DIM alone caps (a Mac with native BC)");
+}
 int main(int argc, char **argv) { @autoreleasepool {
     (void)argc; (void)argv;
     char dir[] = "/tmp/t_astc_upload.XXXXXX";
@@ -946,6 +1032,12 @@ int main(int argc, char **argv) { @autoreleasepool {
     CHECK(astc_block() == (six ? 6u : 4u), "DM_NVN_BC_ASTC is on (with DM_TEST_NO_BC)");
     CHECK(astc_block_for(0x42) == g_bc1_blk && astc_block_for(0x46) == g_bc1_blk && astc_block_for(0x41) == g_bc1_blk && astc_block_for(0x45) == g_bc1_blk, "BC1 (and sRGB) uses DM_NVN_BC1_ASTC");
     CHECK(astc_block_for(0x43) == g_blk && astc_block_for(0x44) == g_blk && astc_block_for(0x4d) == g_blk && astc_block_for(0x4e) == g_blk, "BC2/3/7 use DM_NVN_BC_ASTC");
+    if (mode && !strcmp(mode, "astcnative")) {
+        run_astc_native(); mtl_drain();
+        { char cmd[128]; snprintf(cmd, sizeof cmd, "rm -rf %s", dir); system(cmd); }
+        printf("ASTC upload (native ASTC cap): %d checks, %d failures\n", checks, failed);
+        return failed ? 1 : 0;
+    }
     if (maxdim) {
         run_maxdim(dir);
         mtl_drain();

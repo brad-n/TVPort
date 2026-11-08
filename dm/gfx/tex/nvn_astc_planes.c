@@ -47,10 +47,21 @@ int nvn_astc_walk_planes_raw(const nvn_texdesc *d, const void *storage, unsigned
 int nvn_astc_walk_planes(const nvn_texdesc *d, const void *storage, unsigned skip, nvn_astc_plane_fn fn, void *ctx) {
     return nvn_astc_walk_planes_raw(d, storage, skip, NULL, fn, ctx);
 }
+static unsigned skip_levels_to(const nvn_texdesc *d, int cap) {
+    unsigned s = 0, n = d->levels ? d->levels : 1;
+    while (s + 1 < n && (d->width >> s > d->height >> s ? d->width >> s : d->height >> s) > (unsigned)cap) s++;
+    return s;
+}
 unsigned nvn_bc_skip_levels(const nvn_texdesc *d, int cap) {
     uint32_t pf; int bpp;
     if (cap <= 0 || (d->target != 1 && d->target != 4) || !nvn_bc_unpacked(d->format, &pf, &bpp)) return 0;
-    unsigned s = 0, n = d->levels ? d->levels : 1;
-    while (s + 1 < n && (d->width >> s > d->height >> s ? d->width >> s : d->height >> s) > (unsigned)cap) s++;
+    return skip_levels_to(d, cap);
+}
+int nvn_fmt_astc_native(uint32_t f) { return f >= 0x79 && f <= 0x94; }
+unsigned nvn_astc_skip_levels(const nvn_texdesc *d, int cap, int *short_chain) {
+    if (short_chain) *short_chain = 0;
+    if (cap <= 0 || (d->target != 1 && d->target != 4) || !nvn_fmt_astc_native(d->format)) return 0;
+    unsigned s = skip_levels_to(d, cap);
+    if (short_chain) *short_chain = (d->width > (uint32_t)cap || d->height > (uint32_t)cap) && s + 1 >= (d->levels ? d->levels : 1);   // over the cap, but no level of the chain fits: the last level is kept
     return s;
 }

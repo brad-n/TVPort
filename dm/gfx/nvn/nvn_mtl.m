@@ -2619,9 +2619,38 @@ static void astc_void_block(uint32_t format, uint8_t out[16]) {
 }
 // DM_BC_MAX_DIM=<pixels>: a decompressed BC texture costs 4 to 8 times its Switch size, so a 2D or 2D array texture with a mip chain drops its finest levels until its longest side fits.
 // The Metal texture then starts at NVN level bc_skip: uploads, views and copies shift by it. Normalized sampling still reads the right picture; 0 or unset keeps every level
+static _Atomic uint64_t g_astc_cap_cut, g_astc_cap_short, g_astc_cap_saved;   // native ASTC textures made under DM_ASTC_MAX_DIM: cut, over the cap with no level that fits, bytes of the dropped levels
+int nvn_sparse_pool(const void *pool);
+static int g_astc_capdim = -1;   // the cap, read once (a test sets it)
+static int astc_cap(void) {   // DM_ASTC_MAX_DIM when set (0 = off), else DM_BC_MAX_DIM on a GPU without BC (the A15 path); a Mac with no DM_ASTC_MAX_DIM keeps its native ASTC textures whole
+    int cap = g_astc_capdim;
+    if (cap < 0) {
+        const char *e = getenv("DM_ASTC_MAX_DIM"), *b = getenv("DM_BC_MAX_DIM");
+        cap = e && *e ? atoi(e) : b && no_bc() ? atoi(b) : 0; if (cap < 0) cap = 0; g_astc_capdim = cap;
+        if (cap > 0) MLOG("ASTC textures: finest levels dropped down to %d pixels (%s)", cap, e && *e ? "DM_ASTC_MAX_DIM" : "DM_BC_MAX_DIM");
+    }
+    return cap;
+}
 static unsigned bc_skip(const tex_t *t) {
     static int cap = -1; if (cap < 0) { const char *e = getenv("DM_BC_MAX_DIM"); cap = e ? atoi(e) : 0; if (cap > 0) MLOG("BC textures: finest levels dropped down to %d pixels (DM_BC_MAX_DIM)", cap); }
+    if (nvn_fmt_astc_native(t->d.format)) {   // native ASTC: the same cut by its own cap; not a sparse placement texture (its tiles and mip tail are laid out for the whole chain)
+        int c = astc_cap();
+        return c > 0 && !(t->pool && nvn_sparse_pool(t->pool)) ? nvn_astc_skip_levels(&t->d, c, NULL) : 0;
+    }
     return cap > 0 && no_bc() ? nvn_bc_skip_levels(&t->d, cap) : 0;   // the one computation the offline prebuild shares (tex/nvn_astc_planes.c)
+}
+// Counted when a native ASTC texture's Metal texture is described (tex_desc): cut, or over the cap with nothing to cut
+static void astc_cap_note(const tex_t *t, unsigned sk) {
+    int sh = 0, c = astc_cap(); if (c <= 0) return;
+    nvn_astc_skip_levels(&t->d, c, &sh);
+    if (!sk && !sh) return;
+    uint64_t n = sk ? atomic_fetch_add(&g_astc_cap_cut, 1) + 1 : atomic_fetch_add(&g_astc_cap_short, 1) + 1;
+    if (sk) { int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh); uint64_t sv = 0; unsigned L = t->d.levels ? t->d.levels : 1;
+        for (unsigned l = 0; l < sk && l < L; l++) sv += (uint64_t)((MAX(t->d.width >> l, 1u) + bw - 1) / bw) * ((MAX(t->d.height >> l, 1u) + bh - 1) / bh) * bpb * ((t->d.target == 4) ? t->d.depth : 1);
+        atomic_fetch_add(&g_astc_cap_saved, sv); }
+    if (n <= 3 || !(n & (n - 1)))   // the first few and every power of two after
+        MLOG("ASTC cap: %llu textures cut (%llu MB dropped), %llu over the cap with no level that fits; ser=%llu %ux%u format %#x levels %u -> skip %u", (unsigned long long)atomic_load(&g_astc_cap_cut),
+             (unsigned long long)(atomic_load(&g_astc_cap_saved) >> 20), (unsigned long long)atomic_load(&g_astc_cap_short), (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels, sk);
 }
 // DM_NVN_ASTC_MISS=background: the per-texture decision, by serial, kept for the texture's lifetime (flags: 1 decided, 2 ASTC, 4 its planes were looked up in the cache and the misses queued)
 typedef struct { uint64_t serial; uint8_t flags; } astc_dec;
@@ -2629,14 +2658,14 @@ static pthread_mutex_t g_astc_mu = PTHREAD_MUTEX_INITIALIZER; static astc_dec *g
 static _Atomic uint64_t g_astc_n_astc, g_astc_n_decoded;
 static _Atomic uint64_t g_astc_copy_first, g_astc_copy_astc, g_astc_copy_partial, g_astc_copy_ns, g_astc_copy_bytes;   // textures created empty and filled by copy (astc_first_copy)
 static astc_dec *astc_slot(uint64_t serial, int add) {   // g_astc_mu held; the pointer is good until the next add
-    if (add && (g_astc_n + 1) * 2 > g_astc_cap) {
-        size_t ncap = g_astc_cap ? g_astc_cap * 2 : 4096; astc_dec *nt = calloc(ncap, sizeof *nt); if (!nt) MDIE("ASTC decision table of %zu entries", ncap);
-        for (size_t i = 0; i < g_astc_cap; i++) if (g_astc_tab[i].serial) { size_t j = (g_astc_tab[i].serial * 0x9E3779B97F4A7C15ull >> 32) & (ncap - 1); while (nt[j].serial) j = (j + 1) & (ncap - 1); nt[j] = g_astc_tab[i]; }
-        free(g_astc_tab); g_astc_tab = nt; g_astc_cap = ncap;
+    if (add && (g_astc_n + 1) * 2 > g_astc_capdim) {
+        size_t ncap = g_astc_capdim ? g_astc_capdim * 2 : 4096; astc_dec *nt = calloc(ncap, sizeof *nt); if (!nt) MDIE("ASTC decision table of %zu entries", ncap);
+        for (size_t i = 0; i < g_astc_capdim; i++) if (g_astc_tab[i].serial) { size_t j = (g_astc_tab[i].serial * 0x9E3779B97F4A7C15ull >> 32) & (ncap - 1); while (nt[j].serial) j = (j + 1) & (ncap - 1); nt[j] = g_astc_tab[i]; }
+        free(g_astc_tab); g_astc_tab = nt; g_astc_capdim = ncap;
     }
-    if (!g_astc_cap) return NULL;
-    size_t j = (serial * 0x9E3779B97F4A7C15ull >> 32) & (g_astc_cap - 1);
-    while (g_astc_tab[j].serial) { if (g_astc_tab[j].serial == serial) return &g_astc_tab[j]; j = (j + 1) & (g_astc_cap - 1); }
+    if (!g_astc_capdim) return NULL;
+    size_t j = (serial * 0x9E3779B97F4A7C15ull >> 32) & (g_astc_capdim - 1);
+    while (g_astc_tab[j].serial) { if (g_astc_tab[j].serial == serial) return &g_astc_tab[j]; j = (j + 1) & (g_astc_capdim - 1); }
     if (!add) return NULL;
     g_astc_tab[j].serial = serial; g_astc_n++; return &g_astc_tab[j];
 }
@@ -2717,7 +2746,7 @@ static int tex_atomic_alias(id<MTLTexture> base) {
 static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     uint32_t pf = 0; uint8_t swz[4];
     if (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf) { RED_ONCE(0, "texture format %#x has no Metal equivalent (first case)", t->d.format); return nil; }
-    int unp = 0; unsigned sk = bc_skip(t); { uint32_t upf; int ubpp; if (bc_unpack(t->d.format, &upf, &ubpp)) { pf = upf; unp = 1; } }
+    int unp = 0; unsigned sk = bc_skip(t); if (nvn_fmt_astc_native(t->d.format)) astc_cap_note(t, sk); { uint32_t upf; int ubpp; if (bc_unpack(t->d.format, &upf, &ubpp)) { pf = upf; unp = 1; } }
     int astc = 0; { uint32_t apf; if (bc_astc(t, &apf)) { pf = apf; unp = 0; astc = 1; } }   // DM_NVN_BC_ASTC: ASTC instead of the decoded format; no GPU decoding writes it
     // Metal's limits: 16384 in 2D, 2048 in 3D, 2048 array layers; beyond them Metal aborts the process on an assertion, so they are caught here with a red line
     if (t->d.width > 16384 || t->d.height > 16384 || t->d.depth > 2048) { RED_ONCE(71, "texture size exceeds Metal limits: %u×%u×%u levels %u format %#x target %d (first case ser=%llu)", t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.format, t->d.target, (unsigned long long)t->serial); return nil; }
@@ -3251,7 +3280,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     if (!astc) astc_learn_late(t);   // DM_NVN_ASTC_MISS=background: a decoded BC texture's planes go to the background encoder, once
     unsigned sk = bc_skip(t);   // NVN level of Metal level 0 (DM_BC_MAX_DIM)
     int linear = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0;   // linear storage no view could take (linear_fit): its rows are copied on the CPU
-    int direct = !unp && !astc && !linear && !rb_shift && stamp && direct_upload_on() && g_nvn_deswz_gpu && !(t->pool && nvn_sparse_pool(t->pool)) && nvn_deswz_gpu_direct_supported(&t->d);
+    int direct = !unp && !astc && !linear && !rb_shift && !sk && stamp && direct_upload_on() && g_nvn_deswz_gpu && !(t->pool && nvn_sparse_pool(t->pool)) && nvn_deswz_gpu_direct_supported(&t->d);
     if (direct) d.usage |= MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
     id<MTLTexture> mt = reuse && reuse.pixelFormat == d.pixelFormat && reuse.width == d.width && reuse.height == d.height && reuse.mipmapLevelCount == d.mipmapLevelCount && reuse.textureType == d.textureType
                         && (reuse.usage & d.usage) == d.usage
@@ -3400,7 +3429,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
                 size_t srow = t->L.layer_size / (t->d.height ? t->d.height : 1);
                 if (l || y || z != 1 || srow < pitch || srow * rows > t->L.size) { RED_ONCE(153, "linear texture upload: %ux%u format %#x target %d levels %u is not one 2D level of rows (stride %zu)", t->d.width, t->d.height, t->d.format, t->d.target, t->d.levels, srow); break; }
                 for (size_t r = 0; r < rows; r++) memcpy((uint8_t *)stg.contents + off + r * pitch, src + r * srow, pitch);
-            } else if (nvn_deswizzle(&t->d, l, y, src, (uint8_t *)stg.contents + off, pitch)) { RED_ONCE(9, "deswizzle failed format %#x target %d", t->d.format, t->d.target); break; }
+            } else if (nvn_deswizzle(&t->d, l + sk, y, src, (uint8_t *)stg.contents + off, pitch)) { RED_ONCE(9, "deswizzle failed format %#x target %d", t->d.format, t->d.target); break; }
             if (rb_shift) rb_swap_rows((uint8_t *)stg.contents + off, pitch, rows, z, pitch, pitch * rows, rb_shift);
             if (zb && l < 16) { const uint64_t *q = (const uint64_t *)((const uint8_t *)stg.contents + off); size_t nb = pitch * rows * z / 16;
                 for (size_t i = 0; i < nb; i++) g_zb[l] += !(q[2 * i] | q[2 * i + 1]);
