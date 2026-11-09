@@ -16,7 +16,7 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: TVPort
-        CFBundleShortVersionString: "1.2.3"
+        CFBundleShortVersionString: "1.3.0"
         CFBundleVersion: "44"
         CFBundleURLTypes:
           - CFBundleURLName: dev.tvport.mac.build

@@ -78,6 +78,16 @@ def uv_files(uv_arg) -> tuple:
     return uv, run([uv, '--version']).split()[1], licenses
 
 
+def build_number(repo: Path = REPO) -> str:
+    """The app's build number: how many commits the checkout's history holds, so every packaged change counts up (About shows Version 1.3.0 (1329))"""
+    return run(['git', '-C', repo, 'rev-list', '--count', 'HEAD']).strip()
+
+
+def stamp_version(values: dict, build: str) -> None:
+    """Put the build number into the packaged app's Info.plist values; the version itself comes from tvport/app/project.yml"""
+    values['CFBundleVersion'] = build
+
+
 def build_app(work: Path) -> Path:
     """The app built from tvport/app/project.yml in a project of its own, so the checkout's TVPort.xcodeproj and build folder stay as they are."""
     run(['xcodegen', 'generate', '-q', '--spec', REPO / 'tvport/app/project.yml', '--project', work])
@@ -136,6 +146,7 @@ def main() -> int:
         (helpers / 'uv').chmod(0o755)
         plist = app / 'Contents/Info.plist'
         values = plistlib.loads(plist.read_bytes())
+        stamp_version(values, build_number())
         values.pop('TVPortRoot', None)   # the checkout the app was built from: this one carries its engine instead
         plist.write_bytes(plistlib.dumps(values))
         run(['codesign', '--force', '--sign', '-', helpers / 'uv'])

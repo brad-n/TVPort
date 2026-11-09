@@ -4,7 +4,7 @@
 
 ## What this fork adds (brad-n/TVPort)
 
-Changes in this fork that the TVPort and nxnative releases don't have yet, in plain terms. Upstream fixes we brought in early are listed with their pull request numbers, so they're easy to drop once upstream accepts them.
+Changes in this fork that the TVPort and nxnative releases don't have yet, in plain terms. This fork's TVPort shows **Version 1.3.0** in About, with a build number that goes up with every change, so you can tell which build you're running. Upstream fixes we brought in early are listed with their pull request numbers, so they're easy to drop once upstream accepts them.
 
 **Smaller games on the Apple TV**
 - **Store textures once:** the game's textures are kept once, in the Apple TV's own format, instead of twice (original plus converted copy). Mario Kart 8 Deluxe went from 21.5 GB to 13.6 GB.
