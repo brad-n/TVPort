@@ -1504,10 +1504,11 @@ static void spin_sub_begin(void);
 void mtl_prepare(void) {
     if (!g_warm_started && prepare_on()) { mtl_init(); shmap_load(); }
 }
+static void pu_step(void);   // DM_NVN_TEX_PURGE: purgeable reloadable textures
 static void sub_cut_begin(void); static void ts_sub_begin(void), ts_boundary(void); static int ts_on(void);
 static void gmem_commit_patch(void);   // the raw pool table words of the arguments encoded so far follow the pools (gmem_slot_note)
 void mtl_sub_begin(void) {
-    mtl_init(); g_sub_serial++; spin_sub_begin(); pool_age(); res_budget_step(); g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL;
+    mtl_init(); g_sub_serial++; spin_sub_begin(); pool_age(); res_budget_step(); pu_step(); g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL;
     sub_cut_begin();
     defer_drain();
     rh_trim();
@@ -2797,7 +2798,7 @@ static void tex_put(uint64_t k, id o) {   // serials from 2^62 up are external t
 // Host record of a packaged texture: the current MTLTexture, the upload stamp, and the global write generation at the last check
 // spare: the texture the last re-upload replaced, kept resident and written by the next re-upload once the GPU has passed spare_fence (a texture the CPU rewrites every frame, a movie frame,
 // alternates between two textures instead of allocating one per frame: Link's Awakening's title movie made and freed an 8 MB texture a frame)
-@interface NvPkg : NSObject { @public id<MTLTexture> tex, spare, view; uint64_t stamp, seen, hash, spare_fence, vgen, vseen, sub; const void *span; int sparse, vbase; uint8_t *edge[2]; uint32_t edge_n[2]; id ps; } @end   // hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK; span: its tracked range (nvn_dirty_span, NULL = untracked);
+@interface NvPkg : NSObject { @public id<MTLTexture> tex, spare, view; uint64_t stamp, seen, hash, spare_fence, vgen, vseen, sub; const void *span; int sparse, vbase; uint8_t *edge[2]; uint32_t edge_n[2]; id ps, pu; } @end   // hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK; span: its tracked range (nvn_dirty_span, NULL = untracked);
 // sparse: in a sparse virtual pool, read through its page table (hle_nvn.c nvn_sparse_*), vgen the page table's generation at the upload and vseen at the last look; view: what it is bound as (sparse_view)
 // ps: its placement sparse texture (NvSparse, sparse_make), which tex is: mapped and uploaded tile by tile (sparse_sync)
 // edge: the uploaded bytes of the storage's first and last host pages where other data shares them (pkg_edges_take)
@@ -4835,6 +4836,91 @@ static void cpu_unc_drop(void) {
 }
 static id<MTLTexture> tex_mtl_(const tex_t *ct);
 static id<MTLTexture> tex_mtl(const tex_t *ct) { AP_B; id<MTLTexture> r = tex_mtl_(ct); AP_E(4); return r; }
+// ---------- Purgeable reloadable textures (DM_NVN_TEX_PURGE) ----------
+// A packaged texture (uploaded from the guest's bytes, tracked by dirty pages, never written by the GPU) can be rebuilt from guest memory (or the ASTC cache the upload reads) at any time, so
+// when memory is short the ones nothing has read for a while give their GPU copy back: after PU_IDLE frames unused they leave the residency set and become Volatile (the system takes them at
+// its next need; footprint accounting leaves volatile memory out), and when the process is also close to its limit (os_proc_available_memory under DM_NVN_TEX_PURGE_LOW_MB, back above
+// DM_NVN_TEX_PURGE_HIGH_MB) those idle for PU_IDLE_EMPTY frames go Empty at once. A use sets the texture NonVolatile and back into the residency set, and uploads it again in place when the system
+// (or Empty) took its contents. Idea and retention policy are yuchanns/nxnative-tvos' (fa2d8256, MIT: dm/gfx/tex/LICENSE.nxnative-tvos); the use tracking is this tree's, as shaders reach
+// textures through the pool tables here: a table walk is not a use (a purged texture reads the dummy there), the shaders' own read bit is (pool_seen_scan clears the bitmap each submission, so
+// a set bit means "read since the last look"), and a direct bind (tex_mtl_ outside a walk) is.
+// Never purged: sparse or placement textures, views, heaps, buffers, multisample, render targets or shader-written textures, storage the GPU wrote (gws_owned), a texture a serial entry holds
+// by itself (a takeover), and with DM_TEX_RELEASE on the anonymous guest (the released pages are zeros, the guest copy is gone)
+@interface NvPurge : NSObject { @public __weak NvPkg *pkg; uint64_t uframe, ufence, bfence; uintptr_t lo, hi; int state; } @end
+@implementation NvPurge @end
+enum { PU_LIVE = 0, PU_PENDING, PU_VOLATILE, PU_EMPTY };   // pending: the pool tables show the dummy, the texture is still resident until the submissions that may have read it have completed
+int dm_guest_in_files(void);
+static struct { int on; unsigned idle, idle_empty, every; uint64_t low, high, keep, min_bytes; } g_pu;
+static int64_t g_pu_fake_mb = -1;   // DM_NVN_TEX_PURGE_FAKE_AVAIL_MB: what os_proc_available_memory says (tests; the Mac has no such call)
+static pthread_mutex_t g_pu_mu = PTHREAD_MUTEX_INITIALIZER; static NSMutableArray<NvPurge *> *g_pu_list;
+static int g_pu_pressure, g_pu_walk;   // a pool table walk is resolving textures (g_rmu held): a purged texture reads the dummy there and stays purged
+static uint64_t g_pu_vol_n, g_pu_vol_b, g_pu_empty_n, g_pu_empty_b, g_pu_back_n, g_pu_back_b, g_pu_reload_n, g_pu_cancel_n;
+static unsigned pu_env(const char *n, unsigned d) { const char *e = getenv(n); return e && *e ? (unsigned)atoi(e) : d; }
+static int pu_on(void) {
+    static int v = -1;
+    if (v >= 0) return v;
+    const char *e = getenv("DM_NVN_TEX_PURGE"); v = e && atoi(e) != 0;
+    if (v && rel_mode() > 0 && !dm_guest_in_files()) { MLOG("DM_NVN_TEX_PURGE is off: DM_TEX_RELEASE gives the anonymous guest copy back, which a purged texture is rebuilt from"); v = 0; }
+    if (!v) return 0;
+    g_pu.idle = pu_env("DM_NVN_TEX_PURGE_IDLE", 60); g_pu.idle_empty = pu_env("DM_NVN_TEX_PURGE_EMPTY_IDLE", 240); g_pu.every = pu_env("DM_NVN_TEX_PURGE_EVERY", 30);
+    g_pu.low = (uint64_t)pu_env("DM_NVN_TEX_PURGE_LOW_MB", 896); g_pu.high = (uint64_t)pu_env("DM_NVN_TEX_PURGE_HIGH_MB", 1024); if (g_pu.high < g_pu.low) g_pu.high = g_pu.low;
+    g_pu.keep = (uint64_t)pu_env("DM_NVN_TEX_PURGE_KEEP_MB", 64) << 20; g_pu.min_bytes = (uint64_t)pu_env("DM_NVN_TEX_PURGE_MIN_KB", 256) << 10;
+    const char *f = getenv("DM_NVN_TEX_PURGE_FAKE_AVAIL_MB"); if (f && *f) g_pu_fake_mb = atoll(f);
+    g_pu.on = 1;
+    MLOG("purgeable reloadable textures (DM_NVN_TEX_PURGE): idle %u frames -> volatile, %u -> empty, only below %llu MB available (back off above %llu MB), keeping %llu MB of the most recent",
+         g_pu.idle, g_pu.idle_empty, (unsigned long long)g_pu.low, (unsigned long long)g_pu.high, (unsigned long long)(g_pu.keep >> 20));
+    return 1;
+}
+static uint64_t pu_avail_mb(void) {
+    if (g_pu_fake_mb >= 0) return (uint64_t)g_pu_fake_mb;
+#if TARGET_OS_IPHONE
+    return os_proc_available_memory() >> 20;
+#else
+    return UINT64_MAX;   // no such call on the Mac: no pressure
+#endif
+}
+static void pu_adopt(NvPkg *pk, const tex_t *t) {   // a new package
+    if (!pu_on() || pk->sparse || !t->mem || !t->L.size) return;
+    NvPurge *p = [NvPurge new]; p->pkg = pk; p->uframe = atomic_load(&g_cur_frame); p->ufence = atomic_load(&g_fence) + 1; p->lo = (uintptr_t)t->mem; p->hi = p->lo + t->L.size;
+    pk->pu = p;
+    pthread_mutex_lock(&g_pu_mu); if (!g_pu_list) g_pu_list = [NSMutableArray new]; [g_pu_list addObject:p];
+    static unsigned adds; if (!(++adds & 2047)) for (NSUInteger i = 0; i < g_pu_list.count;) { if (g_pu_list[i]->pkg) i++; else [g_pu_list removeObjectAtIndex:i]; }   // finished packages (the sweep prunes too, but only under pressure)
+    pthread_mutex_unlock(&g_pu_mu);
+}
+static int tex_storage_live(const tex_t *t);
+// A purged texture is used (or its shaders read it): resident and filled again. 1 = done; 0 = cannot (the storage is gone): the caller reads the dummy
+static int pu_restore(NvPkg *pk, NvPurge *p, const tex_t *t) {
+    pthread_mutex_lock(&g_pu_mu); int st = p->state; p->state = PU_LIVE; pthread_mutex_unlock(&g_pu_mu);
+    if (st == PU_LIVE) return 1;
+    if (st == PU_PENDING) { g_pu_cancel_n++; atomic_fetch_add(&g_ser_gen, 1); return 1; }   // still resident; the tables that showed the dummy are rebuilt
+    if (!t->mem || !tex_storage_live(t)) { pthread_mutex_lock(&g_pu_mu); p->state = st; pthread_mutex_unlock(&g_pu_mu); return 0; }
+    id<MTLTexture> mt = pk->tex;
+    MTLPurgeableState prior = [mt setPurgeableState:MTLPurgeableStateNonVolatile];
+    res_add(mt);
+    g_pu_back_n++; g_pu_back_b += mt.allocatedSize;
+    if (prior == MTLPurgeableStateEmpty) {   // the contents are gone: the guest's bytes (or the ASTC cache) again, into the same texture, so cached resource IDs stay valid
+        uint64_t stamp = 0; id<MTLTexture> nt = pkg_upload(t, &stamp, mt, mt.usage);
+        if (!nt) {
+            MLOG("[RED] purged texture ser=%llu could not be uploaded again: it reads the dummy", (unsigned long long)t->serial);
+            res_remove(mt); [mt setPurgeableState:MTLPurgeableStateEmpty]; pthread_mutex_lock(&g_pu_mu); p->state = PU_EMPTY; pthread_mutex_unlock(&g_pu_mu); return 0;
+        }
+        if (nt != mt) { pk->tex = nt; defer_obj_release(mt); }
+        pk->stamp = stamp; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = stamp; pkg_edges_take(pk, t); if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size);
+        g_pu_reload_n++;
+        static unsigned n; if (n++ < 8 || !(n % 256)) MLOG("purged texture restored: ser=%llu %ux%u format %#x re-uploaded (%llu re-uploads, %llu restored in all)", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, (unsigned long long)g_pu_reload_n, (unsigned long long)g_pu_back_n);
+    }
+    p->uframe = atomic_load(&g_cur_frame); p->ufence = atomic_load(&g_fence) + 1;
+    atomic_fetch_add(&g_ser_gen, 1);   // the pool tables and the cached views take the texture again
+    return 1;
+}
+// tex_mtl_ found the package: 0 = go on; -1 = purged and this is only a table walk (the dummy). Otherwise a use: stamps it and brings it back
+static int pu_use(NvPkg *pk, const tex_t *t) {
+    NvPurge *p = (NvPurge *)pk->pu; if (!p) return 0;
+    if (g_pu_walk) return p->state ? -1 : 0;
+    p->uframe = atomic_load(&g_cur_frame); p->ufence = atomic_load(&g_fence) + 1;
+    if (p->state && !pu_restore(pk, p, t)) return -1;
+    return 0;
+}
 // A sparse texture is bound from its first level whose pages, and those of every smaller level, are all mapped: a view of levels [r, n) samples as with a minimum LOD of r.
 // The translator drops TEX's LOD clamp and residency predicate, so Monster Hunter Rise's streamed textures were sampled at levels it had not mapped yet; those read 0, which ASTC
 // decodes as its error colour (magenta clothes on the title screen). Single-layer 2D textures only; the view follows each upload, as the mappings change only with one
@@ -4963,6 +5049,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         if (pk && pk->ps) { sparse_look(pk->ps, t); return pk->tex; }   // a placement sparse texture: its tiles follow the game's mappings
         if (!pk) { id<MTLTexture> made = nil; NvSparse *ps = sparse_make(t, 0, &made);
             if (ps) { pk = [NvPkg new]; pk->ps = ps; pk->tex = made; pk->sparse = 1; sparse_sync(ps, t, 1); tex_put(t->serial, pk); return pk->tex; } }
+        if (pk && pk->pu && pu_use(pk, t) < 0) return nil;   // purged, and only a pool table walk asks: the dummy (DM_NVN_TEX_PURGE)
         if (pk) {   // Already uploaded: check the covered pages only if there has been a guest write since the last check
             if (g_nabs) pkg_absorb_take(pk, t);
             if (g_nabsp && pkg_absorb_waits(t->serial)) return pk->view ? pk->view : pk->tex;
@@ -4997,6 +5084,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         pk->sparse = t->pool && nvn_sparse_pool(t->pool); pk->vgen = pk->vseen = nvn_sparse_gen();
         pk->tex = pkg_upload(t, &pk->stamp, nil, 0);
         if (!pk->tex) return nil;
+        pu_adopt(pk, t);
         pk->span = nvn_dirty_span(t->mem, t->L.size);
         pk->seen = pk->stamp; g_pkg_uploads++; if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size);   // "nothing written since" starts at the stamp: a write that faulted during the upload moved "now" past it
         pkg_edges_take(pk, t);
@@ -7328,6 +7416,97 @@ static inline __attribute__((always_inline)) uint64_t tex_fast_rid(int tid, void
     if (t && tid > 0 && tid < g_ntreg && (__bridge void *)t == g_treg[tid].view) return g_treg[tid].view_rid;   // the view tex_by_id kept: its resource ID without a message per ID (pool_gpu)
     return t ? t.gpuResourceID._impl : 0;
 }
+// ---------- Purgeable reloadable textures, the sweep (see pu_use) ----------
+#include "nvn_asset_retention.h"
+static int pu_eligible(NvPkg *pk, NvPurge *p) {   // g_rmu held
+    id<MTLTexture> t = pk->tex;
+    if (!t || pk->ps || pk->sparse || pk->view || !pk->span) return 0;
+    if (t.heap || t.buffer || t.parentTexture || t.sampleCount != 1) return 0;
+    if (t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DArray && t.textureType != MTLTextureTypeCube) return 0;
+    if (t.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) return 0;
+    if (gws_owned(p->lo, p->hi)) return 0;
+    pthread_mutex_lock(&g_smu); int held = entry_holds((__bridge void *)t); pthread_mutex_unlock(&g_smu);   // a takeover: serial entries draw with it by themselves
+    return !held;
+}
+// Phase 2: the tables that showed the dummy are done with (every submission up to the decision has completed): out of the residency set, then Volatile (Empty when the process is still short
+// of memory and the texture has been idle long). Caller holds g_rmu
+static void pu_finish(uint64_t frame, uint64_t done, int pressure) {
+    NSMutableArray<NvPurge *> *fin = [NSMutableArray new]; uint64_t left = 0;
+    pthread_mutex_lock(&g_pu_mu);
+    for (NvPurge *p in g_pu_list) if (p->state == PU_PENDING) { if (p->pkg && p->bfence <= done) [fin addObject:p]; else left++; }
+    pthread_mutex_unlock(&g_pu_mu);
+    if (!fin.count) return;
+    uint64_t nv = 0, bv = 0, ne = 0, be = 0; NSMutableArray<id<MTLTexture>> *vol = [NSMutableArray new], *emp = [NSMutableArray new];
+    for (NvPurge *p in fin) {
+        NvPkg *pk = p->pkg; if (!pk) continue;
+        pthread_mutex_lock(&g_pu_mu); int still = p->state == PU_PENDING; if (still) p->state = (pressure && g_pu.idle_empty && frame >= p->uframe + g_pu.idle_empty) ? PU_EMPTY : PU_VOLATILE; int empty = p->state == PU_EMPTY; pthread_mutex_unlock(&g_pu_mu);
+        if (!still) continue;
+        if (pk->spare && pk->spare_fence <= done) { pthread_mutex_lock(&g_smu); int held = entry_holds((__bridge void *)pk->spare); pthread_mutex_unlock(&g_smu); if (!held) { defer_obj_release(pk->spare); pk->spare = nil; } }
+        res_remove(pk->tex);
+        uint64_t z = pk->tex.allocatedSize;
+        if (empty) { [emp addObject:pk->tex]; ne++; be += z; } else { [vol addObject:pk->tex]; nv++; bv += z; }
+    }
+    res_commit();   // out of the set before the system may take the memory
+    for (id<MTLTexture> t in emp) [t setPurgeableState:MTLPurgeableStateEmpty];
+    for (id<MTLTexture> t in vol) [t setPurgeableState:MTLPurgeableStateVolatile];
+    g_pu_vol_n += nv; g_pu_vol_b += bv; g_pu_empty_n += ne; g_pu_empty_b += be;
+    static unsigned n; if (nv + ne && (n++ < 20 || !(n % 50)))
+        MLOG("texture purge at frame %llu: %llu made volatile (%llu MB), %llu empty (%llu MB); in all volatile %llu MB, empty %llu MB, restored %llu MB (%llu re-uploaded, %llu cancelled while pending), %llu still pending, available %llu MB",
+             (unsigned long long)frame, (unsigned long long)nv, (unsigned long long)(bv >> 20), (unsigned long long)ne, (unsigned long long)(be >> 20), (unsigned long long)(g_pu_vol_b >> 20), (unsigned long long)(g_pu_empty_b >> 20),
+             (unsigned long long)(g_pu_back_b >> 20), (unsigned long long)g_pu_reload_n, (unsigned long long)g_pu_cancel_n, (unsigned long long)left, (unsigned long long)pu_avail_mb());
+}
+// The submit thread, at a submission's start (after res_budget_step). Phase 1, every PU_EVERY frames while the process is short of memory: the textures nothing has used for PU_IDLE frames, but the
+// most recent ones that fit DM_NVN_TEX_PURGE_KEEP_MB, are marked pending and the pool tables go back to the dummy for them (an epoch bump). Phase 2 is pu_finish
+static void pu_step(void) {
+    static uint64_t last_frame;
+    uint64_t frame = atomic_load(&g_cur_frame), done = atomic_load(&g_done), fence = atomic_load(&g_fence);
+    if (frame == last_frame) return;
+    last_frame = frame;
+    os_unfair_lock_lock(&g_rmu);
+    pu_finish(frame, done, g_pu_pressure);
+    if (frame % MAX(g_pu.every, 1u)) { os_unfair_lock_unlock(&g_rmu); return; }
+    uint64_t avail = pu_avail_mb();
+    if (g_pu_pressure) { if (avail >= g_pu.high) g_pu_pressure = 0; } else if (avail < g_pu.low) g_pu_pressure = 1;
+    if (!g_pu_pressure) { os_unfair_lock_unlock(&g_rmu); return; }
+    NSMutableArray<NvPurge *> *list = [NSMutableArray new];
+    pthread_mutex_lock(&g_pu_mu);
+    for (NSUInteger i = 0; i < g_pu_list.count;) {   // finished packages leave the list
+        NvPurge *p = g_pu_list[i];
+        if (!p->pkg) { [g_pu_list removeObjectAtIndex:i]; continue; }
+        i++; if (p->state == PU_LIVE) [list addObject:p];
+    }
+    pthread_mutex_unlock(&g_pu_mu);
+    nvn_asset_retention_item *it = list.count ? calloc(list.count, sizeof *it) : NULL; size_t n = 0;
+    for (NSUInteger k = 0; k < list.count; k++) {
+        NvPurge *p = list[k]; NvPkg *pk = p->pkg;
+        if (!pk || frame < p->uframe + g_pu.idle || p->ufence > done) continue;
+        uint64_t z = pk->tex ? pk->tex.allocatedSize : 0;
+        if (z < g_pu.min_bytes || !pu_eligible(pk, p)) continue;
+        it[n++] = (nvn_asset_retention_item){p->uframe, z, k, 0};
+    }
+    uint64_t kept = 0, picked = 0, picked_b = 0;
+    if (n) {
+        kept = nvn_asset_retention_select(it, n, frame, 2ull * g_pu.idle, g_pu.keep);
+        for (size_t i = 0; i < n; i++) {
+            if (it[i].keep) continue;
+            NvPurge *p = list[it[i].index];
+            pthread_mutex_lock(&g_pu_mu); if (p->state == PU_LIVE) { p->state = PU_PENDING; p->bfence = fence; picked++; picked_b += it[i].bytes; } pthread_mutex_unlock(&g_pu_mu);
+        }
+    }
+    free(it);
+    if (picked) { atomic_fetch_add(&g_ser_gen, 1); static unsigned q; if (q++ < 10 || !(q % 100)) MLOG("texture purge at frame %llu: %llu textures (%llu MB) idle, tables show the dummy until the GPU is done; %llu KB kept as recent; available %llu MB", (unsigned long long)frame, (unsigned long long)picked, (unsigned long long)(picked_b >> 20), (unsigned long long)(kept >> 10), (unsigned long long)avail); }
+    os_unfair_lock_unlock(&g_rmu);
+}
+// A shader read texture ID id_ since the last look (pool_seen_scan; g_rmu held)
+static void pu_seen(int id_) {
+    if (id_ <= 0 || id_ >= g_ntreg || !g_treg[id_].ok || g_treg[id_].gone) return;
+    __unsafe_unretained id o = tex_get(g_treg[id_].t.serial);
+    NvPkg *pk = [o isKindOfClass:[NvPkg class]] ? o : (o ? nil : pkg_shared(&g_treg[id_].t));
+    NvPurge *p = pk ? (NvPurge *)pk->pu : nil; if (!p) return;
+    p->uframe = atomic_load(&g_cur_frame); p->ufence = atomic_load(&g_fence) + 1;
+    if (p->state) pu_restore(pk, p, &g_treg[id_].t);
+}
+static uint64_t pu_walk_rid(int id_, void **tv) { g_pu_walk = 1; uint64_t r = tex_fast_rid(id_, tv); g_pu_walk = 0; return r; }   // a table walk: not a use
 static MTLSamplerAddressMode wrapm(int w) {
     switch (w) { case 0: case 7: return MTLSamplerAddressModeClampToEdge; case 1: return MTLSamplerAddressModeRepeat;
         case 3: case 2: return MTLSamplerAddressModeMirrorClampToEdge; case 5: case 4: return MTLSamplerAddressModeClampToBorderColor;
@@ -10118,13 +10297,16 @@ static void pool_seen_scan(void) {
     for (unsigned i = 0; i < words; i++) {
         uint32_t fresh = w[i] & ~g_seen_done[i];
         if (fresh) { g_seen_done[i] |= fresh; g_seen_todo[i] |= fresh; for (uint32_t bits = fresh; bits; bits &= bits - 1) pool_ds_note((int)i * 32 + __builtin_ctz(bits)); }
+        if (g_pu.on && w[i]) {   // DM_NVN_TEX_PURGE: the bits mean "read since the last look": noted as uses, then cleared for the next submission
+            uint32_t cur = w[i]; for (uint32_t bits = cur; bits; bits &= bits - 1) pu_seen((int)i * 32 + __builtin_ctz(bits));
+            atomic_fetch_and((_Atomic uint32_t *)(uintptr_t)&w[i], ~cur); }
         for (uint32_t bits = g_seen_todo[i]; bits; bits &= bits - 1) {
             int b = __builtin_ctz(bits), id_ = (int)i * 32 + b;
             if (id_ <= 0 || id_ >= g_ntreg || !g_treg[id_].ok || g_treg[id_].gone || (!g_treg[id_].view && !tex_storage_live(&g_treg[id_].t))) { g_seen_todo[i] &= ~(1u << b); continue; } // NOLINT(clang-analyzer-core.BitwiseShift): bits is nonzero, so ctz returns 0..31
             if (!g_treg[id_].view && pool_unwritten_target(&g_treg[id_].t)) { g_seen_todo[i] &= ~(1u << b); continue; }
             if (!g_treg[id_].view && !pkg_shared(&g_treg[id_].t) && !tex_get(g_treg[id_].t.serial)) { if (g_walk_req >= POOL_REQ_BYTES) return; g_walk_req += pool_tex_size(&g_treg[id_].t); }
             g_seen_todo[i] &= ~(1u << b);
-            void *tv = NULL; uint64_t tr = tex_fast_rid(id_, &tv); if (!tv || !tr) continue;
+            void *tv = NULL; uint64_t tr = pu_walk_rid(id_, &tv); if (!tv || !tr) continue;
             MTLTextureType tt = ((__bridge id<MTLTexture>)tv).textureType; int trans = g_treg[id_].retired && g_treg[id_].transient_sub == g_sub_serial;
             for (int k = 0; k < POOL_SNAPS; k++) { pool_snap *q = &g_psnap[k]; int at = id_ - q->base;
                 if (!q->buf || q->samp || at < 0 || (uint32_t)at >= *(uint32_t *)q->buf.contents || (MTLTextureType)q->dtt != tt) continue;
@@ -10166,7 +10348,7 @@ static uint64_t pool_entry(int samp, int dtt, int id_, uint64_t limit, int *gone
     if (!r->view && pool_tex_size(&r->t) > limit && !pkg_shared(&r->t) && !tex_get(r->t.serial) && !(pool_seen(id_) && g_walk_req < POOL_REQ_BYTES)) { ++*left; *left_req += pool_seen(id_); return 0; }   // a texture a shader read is made whatever the budget, so it reads the dummy for a few frames at most
     if (r->tt1 && r->tt1 - 1 != dtt) return 0;   // an ID of another texture type, seen before (the table holds only its own type): nothing to look up or charge (the idea is from PR 1428)
     if (!r->view && !pkg_shared(&r->t)) { g_walk_spent += pool_tex_size(&r->t); if (pool_seen(id_)) g_walk_req += pool_tex_size(&r->t); }
-    void *tv = NULL; uint64_t tr = tex_fast_rid(id_, &tv);
+    void *tv = NULL; uint64_t tr = pu_walk_rid(id_, &tv);
     if (!tv) return 0;
     MTLTextureType got = ((__bridge id<MTLTexture>)tv).textureType; g_treg[id_].tt1 = (uint8_t)got + 1;
     if (got != (MTLTextureType)dtt) return 0;
