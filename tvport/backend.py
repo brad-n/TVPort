@@ -924,6 +924,16 @@ def prepare_game(game: Game, keys: Optional[Path], team: str, python: str, args=
     return game
 
 
+def store_artwork(game: Game) -> Optional[Path]:
+    """The Nintendo store's art for a game that has none else (a Switch 2 game: no icon in its NUP, no entry in titledb), kept in the artwork cache. None offline."""
+    import nintendo_store
+    try:
+        return nintendo_store.fallback_artwork(DATA, switchtv_cache(), game.artwork_title_id, log=lambda line: emit('log', line=line))
+    except Exception as error:   # the fallback must never fail a build
+        emit('log', line=f'Nintendo store artwork skipped ({error})')
+        return None
+
+
 def generate_project(game: Game, args, team: str, bundle: str, python: str, romfs: Optional[Path] = None) -> Path:
     """romfs: the image the app is built against when it is not game.romfs (the sparse image of Store textures once)"""
     stage('Generating the Apple TV project')
@@ -940,7 +950,7 @@ def generate_project(game: Game, args, team: str, bundle: str, python: str, romf
         env['DM_DISPLAY_NAME'] = game.name()   # a Switch 2 NUP has no control data; build_ipa.sh needs a name
     if pso_mtl4:
         env['IOS_PULL'] = '1'   # keep the pulling vertex libraries (_bp) the Metal 4 pipelines read; without it DM_PSO_MTL4=1 cannot fully enable them
-    art = args.art or game.icon or args.shelf_art
+    art = args.art or game.icon or args.shelf_art or store_artwork(game)
     if art:
         env['DM_ICON'] = str(art)
     stream(['bash', REPO / 'dm/ios/tools/build_ipa.sh', '--prepare-xcode'], env=env, cwd=REPO)
@@ -1558,13 +1568,16 @@ def switchtv_icons(source: Path, work: Path) -> Path:
 
 def prepare_switchtv(team: str) -> tuple:
     """The SwitchTV project in the cache folder, with its catalogue; returns (project folder, catalogue, fingerprint). Nothing is built yet."""
+    import nintendo_store
     import switchtv_catalog as sc
     source, cache = REPO / 'tvport/switchtv', switchtv_cache()
     if not (source / 'project.yml').is_file():
         raise Failure('This TVPort has no SwitchTV app (tvport/switchtv)')
     stage('Making the SwitchTV catalogue')
     catalog_out = cache / 'catalog'
-    catalog = sc.build_catalog(read_library(), DATA, cache, catalog_out, lambda item: game_bundle_id(item, team), log=lambda line: emit('log', line=line))
+    log = lambda line: emit('log', line=line)
+    catalog = sc.build_catalog(read_library(), DATA, cache, catalog_out, lambda item: game_bundle_id(item, team), log=log,
+                               store=lambda title_id: nintendo_store.load_product(cache, title_id, log=log))
     emit('log', line=f'SwitchTV lists {len(catalog["games"])} games.')
     for name, missing in sc.field_report(catalog).items():
         emit('log', line=f'{name}: {"no " + ", ".join(missing) if missing else "all fields found"}')

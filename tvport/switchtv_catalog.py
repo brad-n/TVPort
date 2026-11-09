@@ -15,6 +15,8 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
+import nintendo_store
+
 TITLEDB_URL = 'https://raw.githubusercontent.com/blawar/titledb/master/US.en.json'
 TITLEDB_MAX_AGE_S = 24 * 3600   # a list that lacks a library game is fetched again after this
 NOT_GENRES = {'Other', 'Multiplayer'}   # titledb's `category` mixes genres with these two
@@ -124,8 +126,10 @@ def load_titledb(cache: Path, wanted: set, fetch: Callable[[str, Path], None] = 
 
 
 def build_catalog(library: list, data: Path, cache: Path, out: Path, bundle_for: Callable[[dict], str], *, fetch: Callable[[str, Path], None] = download,
-                  scale: Callable[[Path, Path, int], None] = sips_scale, now: Callable[[], float] = time.time, log: Callable[[str], None] = lambda _: None) -> dict:
-    """Write out/catalog.json and out/images/ for the library's built games; return the catalogue (also a summary of which fields each game has: 'fields')."""
+                  scale: Callable[[Path, Path, int], None] = sips_scale, now: Callable[[], float] = time.time, log: Callable[[str], None] = lambda _: None,
+                  store: Optional[Callable[[str], Optional[dict]]] = None) -> dict:
+    """Write out/catalog.json and out/images/ for the library's built games; return the catalogue (also a summary of which fields each game has: 'fields').
+    store: title ID -> Nintendo store product (nintendo_store.load_product), asked only for a game titledb has no banner for (a Switch 2 game); None leaves the store out."""
     games = library_games(library)
     ids = {g['titleID'].upper() for g in games}
     titledb = load_titledb(cache, ids, fetch, now, log)
@@ -139,6 +143,8 @@ def build_catalog(library: list, data: Path, cache: Path, out: Path, bundle_for:
     for item in sorted(games, key=lambda g: g['titleID'].upper()):
         title_id = item['titleID'].upper()
         entry = pick_entry(titledb, title_id, sources.get(title_id, ''))
+        if store and not entry.get('bannerUrl'):
+            entry = nintendo_store.merge_entry(entry, store(title_id))
         art = data / 'artwork' / f'{title_id}.jpg'
         if not art.is_file() and entry.get('bannerUrl'):
             art = cache / 'banners' / f'{title_id}.jpg'
