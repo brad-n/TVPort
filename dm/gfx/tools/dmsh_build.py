@@ -25,6 +25,7 @@ GAME = dmsh_chain.load_game()   # the current game profile (DM_GAME): the tables
 if f'"{CHAIN}"' not in open(dmsh_chain.HEADER).read(): sys.exit(f'[RED] {dmsh_chain.HEADER} does not hold the current translation chain version {CHAIN}: run dmsh_chain.py --header first and commit it (otherwise the host cannot find these libraries)')
 INPUTS = dmsh_chain.inputs(GAME)   # the digest of the profile's inputs, which a full build stamps on its libraries (b-<V>/inputs.tsv)
 RAW_READ_LOG = GAME.get('shader_raw_read_log', '0') == '1'   # raw global loads log the pool table entry they read (the job's raw_read_log): the host keeps resident what they read (nvn_mtl.m gmem_map, DM_NVN_GMEM_MODE=learned)
+BORDER_EMU = GAME.get('shader_border_emu', '1') == '1'   # 0: border_emu leaves every sample alone (no twin samplers, no border block, no dm_bs): for a game whose samplers never need a border colour Metal lacks (Ocarina of Time). The profile's shader_* keys are in each shader's cache key and the library stamp, so changing it rebuilds
 XLATE = os.environ.get('XLATE', os.path.join(dmsh_chain.XLATE_DIR, 'dmsh_xlate'))
 SPIRV_CROSS = dmsh_chain.SPIRV_CROSS   # the in-repo build the lock records
 FACTS = dmsh_facts.load()
@@ -347,10 +348,11 @@ template<typename V, typename T, typename... A> static inline __attribute__((alw
     return r;
 }}
 '''
-def border_emu(msl):
+def border_emu(msl, enabled=True):
     """The samples of the argument buffer's textures through its sampler members, T.sample(S, args) → dm_bs(T.sample(S, args), block, bit, T, S_w, args) (see BORDER_HELPERS);
     the source unchanged when it samples through none. Only samples of float textures: an integer texture is not filtered, and its border colour is Maxwell's integer one, which
-    the host does not correct (it keeps Metal's nearest)"""
+    the host does not correct (it keeps Metal's nearest). With enabled false (the profile's shader_border_emu 0) the source unchanged, whatever it samples"""
+    if not enabled: return msl
     body = re.search(r'struct spvDescriptorSetBuffer0\s*\{(.*?)\};', msl, re.S)
     if not body: return msl
     # members with attributes after their id too (see reflect): the twins' ids go after every one of them
@@ -1691,7 +1693,7 @@ def finish(key, w, j, c1):
     try: src = pool_arrays(src)   # handles traced to no slot read the pools the replay keeps (see pool_arrays)
     except ValueError as e: return 'pool rewrite failed', str(e)[:160], None
     src = dmsh_wide.wide_loads(src)   # storage words the translator split, read whole again (see dmsh_wide.py)
-    src = border_emu(src)   # border colours Metal lacks (see border_emu)
+    src = border_emu(src, BORDER_EMU)   # border colours Metal lacks (see border_emu)
     if j['stage'] == 'ps': src = finite_rg11(frag_z_snap(src)[0])   # gl_FragCoord.z against a depth of its own surface (see frag_z_snap); a non-finite colour output of an R11G11B10F target (see finite_rg11)
     open(msl, 'w').write(src)
     first, spill = [], 0

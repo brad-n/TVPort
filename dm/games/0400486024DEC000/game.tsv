@@ -37,6 +37,8 @@ shader_groups	/Shader/=shader /Effect/=effect /Lib/=lib /UI/=layout
 shader_note	Ocarina of Time shaders
 # Raw global loads log the pool table entry they read (docs/reference/shaders.md, Raw global memory: the read log), which DM_NVN_GMEM_MODE=learned needs to wire only the pools the shaders read
 shader_raw_read_log	1
+# Border colours Metal lacks are corrected in the shaders through twin samplers (docs: dm/games/README.md shader_border_emu). Ocarina of Time never needed one in seven Apple TV runs (the host logs "which Metal lacks" zero times), so the ~86k dm_bs sites in its shaders are compiled out
+shader_border_emu	0
 
 # ---- Frame rate ----
 # The game steps its time by a frame ratio, its base rate / its frame rate, whatever the frame took: frames longer than a vsync played in slow motion. The ratio takes the host's

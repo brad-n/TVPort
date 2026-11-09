@@ -1,6 +1,7 @@
 """Border colours Metal has no sampler state for (dmsh_build.py border_emu): the rewrite of a shader's samples, the reflection of the twins and the block, the readable-tile variant
 of a rewritten shader, the compile on both platforms, and with DM_TEST_BORDER (the t_border executable) the samples on the GPU."""
 import ast
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -23,6 +24,8 @@ selected = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name i
 scope = {'re': re, 'abi': abi, 'dmsh_geometry': dmsh_geometry}
 exec(compile(ast.Module(body=selected, type_ignores=[]), str(TOOLS / 'dmsh_build.py'), 'exec'), scope)
 border_emu, reflect = scope['border_emu'], scope['reflect']
+GAMES = Path(__file__).resolve().parents[2] / 'games'
+BUILD_SRC = (TOOLS / 'dmsh_build.py').read_text()
 
 HEAD = '#include <metal_stdlib>\n#include <simd/simd.h>\n\nusing namespace metal;\n\n'
 # Tears of the Kingdom's ff9def5b3c418851 as spirv-cross writes it, cut down: a uniform segment, the bend map and its sampler
@@ -173,6 +176,111 @@ class Rewrite(unittest.TestCase):
             path = Path(directory) / 'kernel.metal'; path.write_text(out)
             r = subprocess.run([os.environ['DM_TEST_BORDER'], str(path)], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+
+# border_emu as it was before the profile key shader_border_emu: the first 16 digits of the sha256 of its output for these three shaders
+GOLDEN = {'GRASS': '012df75c8740d7b0', 'KERNEL': 'c0297a275bef153d', 'INTEGER': '1aa0c9b68612f3d4'}
+TWIN_OR_BLOCK = re.compile(r'dm_bs|dm_bmix|dm_border|' + re.escape(abi.BORDER_TWIN) + r'\b')
+
+
+class KeyOn(unittest.TestCase):
+    """shader_border_emu 1 (the default) is the old behaviour, byte for byte"""
+    def test_output_unchanged(self):
+        for name, src in (('GRASS', GRASS), ('KERNEL', KERNEL), ('INTEGER', INTEGER)):
+            with self.subTest(shader=name):
+                self.assertEqual(hashlib.sha256(border_emu(src).encode()).hexdigest()[:16], GOLDEN[name])
+                self.assertEqual(border_emu(src, True), border_emu(src))
+
+    def test_build_reads_the_key_with_default_one(self):
+        self.assertRegex(BUILD_SRC, r"(?m)^BORDER_EMU = GAME\.get\('shader_border_emu', '1'\) == '1'")
+        self.assertIn('src = border_emu(src, BORDER_EMU)', BUILD_SRC)
+
+
+class KeyOff(unittest.TestCase):
+    """shader_border_emu 0: no twin members, no block member, no dm_bs"""
+    def test_source_untouched(self):
+        for name, src in (('GRASS', GRASS), ('KERNEL', KERNEL), ('INTEGER', INTEGER)):
+            with self.subTest(shader=name):
+                out = border_emu(src, False)
+                self.assertEqual(out, src)
+                self.assertIsNone(TWIN_OR_BLOCK.search(out))
+
+    def test_reflection_has_no_twin_or_block(self):
+        refl = reflect('k', 'ps', border_emu(GRASS, False), {'sbufs': []})
+        self.assertEqual([e['msl_name'] for e in refl if 'border_bit' in e or e.get('kind') == abi.KIND_BORDER], [])
+        self.assertEqual([e['msl_name'] for e in refl], ['fp_c1', 'fp_t_tcb_8', 'fp_t_tcb_8Smplr', 'fp_t2d_cb14_0', 'fp_t2d_cb14_0Smplr'])
+
+    def test_readable_tile_variant_without_the_wrap(self):
+        plain = re.sub(r'    float4 _50 = .*\n', '    float4 _50 = float4(0.0);\n', GRASS.replace(', center_no_perspective', ''))
+        src = border_emu(plain, False)
+        fv, meta = dmsh_fetch.fold(src, reflect('k', 'ps', src, {'sbufs': []}))
+        self.assertIsNotNone(fv, meta)
+        self.assertNotIn('dm_bs', fv)
+
+    @unittest.skipUnless(shutil.which('xcrun'), 'requires Metal compilers')
+    def test_compiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, src in (('grass', GRASS), ('kernel', KERNEL), ('integer', INTEGER)):
+                msl = root / (name + '.metal'); msl.write_text(border_emu(src, False))
+                for sdk in ('macosx', 'iphoneos'):
+                    with self.subTest(shader=name, sdk=sdk):
+                        r = subprocess.run(['xcrun', '-sdk', sdk, 'metal', '-c', '-fmodules-cache-path=' + str(root / sdk), str(msl), '-o', str(root / f'{name}_{sdk}.air')], capture_output=True, text=True)
+                        self.assertEqual(r.returncode, 0, r.stderr)
+
+    @unittest.skipUnless(os.environ.get('DM_TEST_BORDER'), 'set DM_TEST_BORDER to the native t_border executable')
+    def test_gpu_with_a_metal_border(self):
+        out = border_emu(KERNEL, False)
+        self.assertEqual([n for _, n, _ in members(out)], ['cp_t_tcb_8', 'cp_t_tcb_8Smplr'], 't_border --plain fills these two')
+        with tempfile.TemporaryDirectory(prefix='border_') as directory:
+            path = Path(directory) / 'kernel.metal'; path.write_text(out)
+            r = subprocess.run([os.environ['DM_TEST_BORDER'], '--plain', str(path)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn('plain cases', r.stdout)
+
+
+class Profile(unittest.TestCase):
+    """the key in a game profile: validated, a define for the host, and part of what a shader library is keyed by"""
+    def profile(self, root, value):
+        d = root / '0400486024DEC000'
+        d.mkdir(parents=True, exist_ok=True)
+        rows = [l for l in (GAMES / '0400486024DEC000' / 'game.tsv').read_text().splitlines() if not l.startswith('shader_border_emu')]
+        if value is not None: rows.append(f'shader_border_emu\t{value}')
+        (d / 'game.tsv').write_text('\n'.join(rows) + '\n')
+        return d
+
+    def header(self, root, value):
+        self.profile(root, value); h = root / 'out.h'
+        env = dict(os.environ, DM_GAMES_DIR=str(root), DM_GAMES_FIRST='1')
+        r = subprocess.run([sys.executable, str(GAMES / 'game.py'), 'header', '0400486024DEC000', str(h)], capture_output=True, text=True, env=env)
+        return r, (h.read_text() if h.exists() else '')
+
+    def test_define(self):
+        for value, want in ((None, 1), ('1', 1), ('0', 0)):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as t:
+                r, text = self.header(Path(t), value)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn(f'#define DM_GAME_SHADER_BORDER_EMU {want}\n', text)
+
+    def test_bad_value_refused(self):
+        with tempfile.TemporaryDirectory() as t:
+            r, _ = self.header(Path(t), '2')
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('shader_border_emu must be 0 or 1', r.stdout + r.stderr)
+
+    def test_ocarina_turns_it_off(self):
+        self.assertRegex((GAMES / '0400486024DEC000' / 'game.tsv').read_text(), r'(?m)^shader_border_emu\t0$')
+
+    def test_key_changes_the_cache_keys(self):
+        sys.path.insert(0, str(GAMES)); sys.path.insert(0, str(TOOLS))
+        import game; import dmsh_chain
+        with tempfile.TemporaryDirectory() as t:
+            got = {}
+            for value in ('0', '1'):
+                root = Path(t) / value
+                g = game.Game(self.profile(root, value)); got[value] = (dmsh_chain.profile_rows(g), dmsh_chain.inputs(g))
+            self.assertNotEqual(got['0'][0], got['1'][0], 'the per-shader cache key (PROFILE_ROWS)')
+            self.assertNotEqual(got['0'][1], got['1'][1], 'the library stamp (b-<V>/inputs.tsv)')
 
 
 if __name__ == '__main__':
