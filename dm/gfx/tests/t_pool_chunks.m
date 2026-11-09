@@ -137,7 +137,7 @@ int main(void) { @autoreleasepool {
     // The write log: one bit an entry, and the host learns the range of the entry the bit names, from the table the shader used
     {
         id<MTLBuffer> map = gmem_map();
-        mtl_sub_begin(); uint64_t log = gml_take(map); CHECK("a log", log != 0);
+        mtl_sub_begin(); uint64_t log = gml_take(map, 1); CHECK("a log", log != 0);
         id<MTLBuffer> lb = g_gml_free.lastObject; (void)lb;
         const uint8_t *t = (const uint8_t *)map.contents; int n0 = g_gml_n, want = -1;
         for (int k = 1; k < DMSH_GMEM_MAP_ENTRIES && want < 0; k++) { uint64_t r[2]; memcpy(r, t + (size_t)k * DMSH_GMEM_MAP_ENTRY, sizeof r); if (r[0] <= base + 900 * MB && base + 900 * MB < r[1]) want = k; }

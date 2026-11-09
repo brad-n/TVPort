@@ -223,6 +223,8 @@ def header_one(g):
     if mml not in ('on', 'off'): sys.exit(f'{g.id}: mem_map_limit must be on or off: {mml}')
     mvs = movie_keys(g)   # the movie library's enhancement networks (DM_MOVIE_NETWORK)
     ups = upscaler_keys(g)   # the game's own upscaler shaders, which DM_UPSCALER=metalfx (the launcher's Game's upscaler) replaces with MetalFX's spatial scaler (nvn_mtl.m up_mfx_encode)
+    rrl = g.get('shader_raw_read_log', '0')   # raw global loads log the pool table entry they read (dmsh_build.py raw_read_log): nvn_mtl.m DM_NVN_GMEM_MODE=learned needs it
+    if rrl not in ('0', '1'): sys.exit(f'{g.id}: shader_raw_read_log must be 0 or 1: {rrl}')
     dbr = g.get('draw_barriers', 'full')   # how draw passes are ordered (nvn_mtl.m barrier_game): full = each waits for all earlier GPU work, game = by the game's own barriers, so vertex work overlaps the previous pass's fragments
     if dbr not in ('full', 'game'): sys.exit(f'{g.id}: draw_barriers must be full or game: {dbr}')
     gts = g.get('gpu_timestamps', 'submission')   # counter timestamps (nvn_mtl.m rep_ticks): submission = one time per submission, segment = the GPU start / end of the segment holding the report
@@ -282,6 +284,7 @@ def header_one(g):
          f'#define DM_GAME_TEX_DYN_SLOTS {int(tds == "on")}',
          f'#define DM_GAME_GPU_TS_SEGMENT {int(gts == "segment")}',
          f'#define DM_GAME_DRAW_BARRIERS_GAME {int(dbr == "game")}',
+         f'#define DM_GAME_SHADER_RAW_READ_LOG {int(rrl == "1")}',
          f'#define DM_GAME_UPSCALER_KEYS {q(",".join(ups))}', f'#define DM_GAME_UPSCALER_N {len(ups)}',
          f'#define DM_GAME_MOVIE_KEYS {q(",".join(mvs))}', f'#define DM_GAME_MOVIE_N {len(mvs)}',
          f'#define DM_GAME_VCONV_RANGE {int(vcr == "on")}',
