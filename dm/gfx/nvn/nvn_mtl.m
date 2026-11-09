@@ -150,6 +150,7 @@ static int g_cut_copy;                          // a buffer → texture copy was
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t g_done;                 // GPU complete and all CPU-visible effects through this fence published
+enum { FENCE_NS = 16384 }; static uint64_t g_fence_ns[FENCE_NS];   // when the submission of each recent fence began (mtl_sub_begin): how long ago a fence g_alias_seen holds was (the ledger, alias_sweep)
 static uint64_t g_arena_made;
 static uint64_t g_cm_mdraws;
 static uint64_t g_sub_enc0;   // g_cm_enc when the submission began (an empty one is not committed with DM_NVN_EMPTY_SUB)
@@ -290,6 +291,13 @@ static NSHashTable *g_res_objects;
 // Residency budget accounting (DM_NVN_RESIDENCY_BUDGET_MB, see res_evict_to_budget): bytes the set holds, in all and by kind (0 texture, 1 heap, 2 shared buffer, 3 private buffer); under g_res_mu
 static uint64_t g_res_bytes, g_res_kb[4];
 static int res_kind(id o) { return [o conformsToProtocol:@protocol(MTLTexture)] ? 0 : [o conformsToProtocol:@protocol(MTLHeap)] ? 1 : ((id<MTLBuffer>)o).storageMode == MTLStorageModeShared ? 2 : 3; }
+// The memory an object of the residency set holds of its own. A texture made over a buffer (tex_linear, buffer textures) or a view of another texture reports its buffer's or its parent's
+// allocatedSize: Ocarina of Time's UI text textures (256x46 R8 over an 8 MB pool buffer) said 8 MB each, 56 MB for seven at the title, in the ledger's render targets and in the budget's
+// count, while that pool buffer was counted already. Such an object counts 0 here (the ledger counts a buffer the set does not hold once, lg_dump)
+static uint64_t res_size(id o) {
+    if ([o conformsToProtocol:@protocol(MTLTexture)]) { id<MTLTexture> t = o; if (t.buffer || t.parentTexture) return 0; }
+    return ((id<MTLAllocation>)o).allocatedSize;
+}
 static NSMapTable *g_res_line; static NSHashTable *g_retired;   // DM_NVN_ALLOCPROF: each resident object's res_add line; objects taken out of the set (weak: only the live ones stay)
 static _Atomic unsigned g_image_heap_n, g_big_n;   // g_big_n: large pools in chunks, whose buffers overlap (BIG_MIN)
 // DM_NVN_VIS_ALIAS=0 (diagnostic; the picture may be wrong): the encoders' start barriers flush to the device only, without the resource-alias flush (measures what the flush costs the GPU)
@@ -327,7 +335,7 @@ static void res_add_at(id<MTLAllocation> allocation, int line) { @autoreleasepoo
     { int k = 0; while (k < RS_SITES - 1 && g_rs_site[k].line && g_rs_site[k].line != line) k++; g_rs_site[k].line = line; g_rs_site[k].n++; g_rs_site[k].bytes += r.allocatedSize; }
     [g_res addAllocation:(id<MTLAllocation>)r];
     [g_res_objects addObject:r];
-    { uint64_t z = r.allocatedSize; g_res_bytes += z; g_res_kb[res_kind(r)] += z; }
+    { uint64_t z = res_size(r); g_res_bytes += z; g_res_kb[res_kind(r)] += z; }
     if (allocprof_on()) { if (!g_res_line) g_res_line = [NSMapTable weakToStrongObjectsMapTable]; [g_res_line setObject:@(line) forKey:r]; }   // where it became resident, for the retired-but-alive report (mtl_mem_stat)
     g_res_dirty = 1;
     pthread_mutex_unlock(&g_res_mu);
@@ -339,7 +347,7 @@ static void res_remove(id<MTLAllocation> r) { @autoreleasepool {
     if (![g_res_objects containsObject:r]) { pthread_mutex_unlock(&g_res_mu); return; }
     [g_res removeAllocation:(id<MTLAllocation>)r];
     [g_res_objects removeObject:r];
-    { uint64_t z = r.allocatedSize; int k = res_kind(r); g_res_bytes -= MIN(z, g_res_bytes); g_res_kb[k] -= MIN(z, g_res_kb[k]); }
+    { uint64_t z = res_size(r); int k = res_kind(r); g_res_bytes -= MIN(z, g_res_bytes); g_res_kb[k] -= MIN(z, g_res_kb[k]); }
     if (allocprof_on()) { if (!g_retired) g_retired = [NSHashTable weakObjectsHashTable]; [g_retired addObject:r]; }   // still listed while something keeps it alive
     g_res_dirty = 1; g_rs_rm++;
     pthread_mutex_unlock(&g_res_mu);
@@ -402,7 +410,8 @@ static id<MTLHeap> rh_take(MTLTextureDescriptor *d, int *reused) {
     if (got) { *reused = 1; return CFBridgingRelease(got); }
     MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypePlacement; hd.size = need.size;
     hd.storageMode = d.storageMode; hd.cpuCacheMode = d.cpuCacheMode; hd.hazardTrackingMode = d.hazardTrackingMode;
-    *reused = 0; return [g_dev newHeapWithDescriptor:hd];
+    *reused = 0; id<MTLHeap> h = [g_dev newHeapWithDescriptor:hd]; h.label = @"dm.rt";   // the label says which kind a heap of the residency set is (lg_dump)
+    return h;
 }
 // A shared render target in a GPU-only pool (tex_mtl_), in recycled memory: written by the GPU alone, so its bytes never come from the CPU's view of the pool
 static id<MTLTexture> rh_texture(const tex_t *t, MTLTextureDescriptor *d) {
@@ -1102,7 +1111,7 @@ static uint64_t res_budget(void) {
 static uint64_t res_bytes_now(void) { pthread_mutex_lock(&g_res_mu); uint64_t b = g_res_bytes; pthread_mutex_unlock(&g_res_mu); return b; }
 static void res_recount(void) { @autoreleasepool {   // objects that died without a res_remove would leave the running totals high: count the set again
     pthread_mutex_lock(&g_res_mu); uint64_t tot = 0, kb[4] = {0};
-    for (id<MTLAllocation> o in g_res_objects.allObjects) { uint64_t z = o.allocatedSize; tot += z; kb[res_kind(o)] += z; }
+    for (id<MTLAllocation> o in g_res_objects.allObjects) { uint64_t z = res_size(o); tot += z; kb[res_kind(o)] += z; }
     g_res_bytes = tot; memcpy(g_res_kb, kb, sizeof kb);
     pthread_mutex_unlock(&g_res_mu);
 } }
@@ -1565,12 +1574,15 @@ static void gmem_commit_patch(void);   // the raw pool table words of the argume
 static uint64_t g_so_queue; static unsigned g_so_idx, g_so_prev;
 void mtl_sub_origin(uint64_t queue, unsigned idx, unsigned prev_kind) { g_so_queue = queue; g_so_idx = idx; g_so_prev = prev_kind; }
 static void sub_origin_pd(void);
+static void alias_sweep(void);   // the sharing table's unreferenced textures past DM_NVN_ALIAS_SWEEP_MB (below alias_take_over)
 void mtl_sub_begin(void) {
     mtl_init(); g_sub_serial++; spin_sub_begin(); pool_age(); res_budget_step(); pu_step(); g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL;
+    g_fence_ns[(g_fence + 1) % FENCE_NS] = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     gpc_sub_begin();
     sub_cut_begin();
     defer_drain();
     rh_trim();
+    alias_sweep();
     defer_reset();
     mtl_prepare();   // done by then in the submit entry; the replay tool (nvn_replay) reaches it here
     warm_claim();
@@ -2874,6 +2886,7 @@ void mtl_alias_drop_pool(const void *pool) {
 // every texture ID down the slow path and made the next walk build the 33,025-entry table whole. Caller holds g_smu
 enum { ALIAS_IDLE = 16 };
 static uint64_t g_alias_taken;   // shared textures evicted when another texture took over their storage (for the memory report)
+static uint64_t g_alias_swept, g_alias_swept_b;   // unreferenced shared textures alias_sweep let go, and their memory (the memory report, the ledger)
 static void alias_take_over(const alias_key *nk) {
     nvn_texlayout L; nvn_tex_layout(&nk->d, &L);
     if (!L.size) return;
@@ -2898,6 +2911,98 @@ static void alias_take_over(const alias_key *nk) {
     }
     if (n) { ser_note(0); g_alias_taken += n; }
 }
+// DM_NVN_ALIAS_SWEEP_MB=<n> (0 = off): the sharing table's unreferenced textures beyond n MB go, the longest unused first. A memory workaround, on by default where memory is tight:
+// 64 on iOS and tvOS (a fixed footprint limit ends the app) and on a Mac whose Metal working set is under 16 GB (8 and 16 GB Macs); off on larger Macs (alias_sweep_default_mb). An entry nothing
+// refers to (no live texture object, no finalized one in the ghost ring, no pin, no live view of it) used to stay until another texture took over its storage or its pool went, and a
+// scene load leaves hundreds: Ocarina of Time's balcony save makes about 800 render targets for its new scene, most at new places in its target pool (the dynamic resolution's
+// 480x270 to 960x540 colour and depth targets), and finalizes them within seconds. 502 of them, 304 MB, then waited unreferenced for about 30 s, until the game's next targets
+// happened to cover their storage: the graphics ledger held 2.27 GB through that window, and peaked at 2.40 GB as the load began it (Mac mini, the TV's settings). An Apple TV ends
+// the app near 2.07 GB. A swept texture's memory goes as takeover's does: out of the table now, released once the submissions up to this one complete (defer_obj_release), its
+// placement heap then waiting for the next target it fits (rh_take) or freed (rh_trim). Only entries no lookup found for ALIAS_SWEEP_IDLE submissions and ALIAS_SWEEP_MS go: an
+// engine that finalizes a target before it submits and makes it again the next frame keeps finding it (alias_take_over's ALIAS_IDLE), and a game submits several times a frame.
+// On NVN those bytes would still be there: a texture made again over the same storage with the same description now starts from zeros or its initial fill, which an engine only
+// notices if it reads before it draws; each one is counted and the first ones logged ("made again over the same storage"). Every texture ID's cached view is checked again after a sweep (a generation bump with no note), so none keeps a swept texture
+enum { ALIAS_SWEEP_IDLE = 64, ALIAS_SWEEP_EVERY = 8, ALIAS_SWEEP_MS = 1000 };
+static int64_t g_alias_sweep_cap = -1;   // bytes; 0 off
+static nvn_hmap g_alias_swept_keys = {.klen = sizeof(alias_key)};   // key -> when it was swept (ns + 1): a texture made again over it is counted (alias_swept_again). Under g_smu
+static uint64_t g_alias_again;
+static long long alias_sweep_default_mb(int iphone, uint64_t working_set) { return iphone || working_set < (16ull << 30) ? 64 : 0; }   // the default cap: where memory is tight
+static uint64_t alias_sweep_cap(void) {
+    if (g_alias_sweep_cap < 0) { const char *e = getenv("DM_NVN_ALIAS_SWEEP_MB"); long long v = e && *e ? atoll(e) : alias_sweep_default_mb(TARGET_OS_IPHONE, g_dev.recommendedMaxWorkingSetSize);
+        g_alias_sweep_cap = v > 0 ? (int64_t)v << 20 : 0;
+        if (g_alias_sweep_cap) MLOG("unreferenced shared textures past %lld MB go, the longest unused first (DM_NVN_ALIAS_SWEEP_MB%s; Metal's working set %llu MB)", v, e && *e ? "" : ", the default where memory is tight",
+                                    (unsigned long long)(g_dev.recommendedMaxWorkingSetSize >> 20)); }
+    return (uint64_t)g_alias_sweep_cap;
+}
+typedef struct { alias_key k; uint64_t seen, bytes; void *o; } sweep_cand;
+static int sweep_cmp(const void *a, const void *b) { const sweep_cand *x = a, *y = b; return x->seen < y->seen ? -1 : x->seen > y->seen; }
+// A texture whose (pool, offset, description) was swept is made again: on NVN the bytes would still be there. Caller holds g_smu
+static void alias_swept_again(const alias_key *k, id<MTLTexture> mt) {
+    if (!g_alias_swept_keys.n) return;
+    void *v = nvn_hm_del(&g_alias_swept_keys, k); if (!v) return;
+    g_alias_again++;
+    if (g_alias_again <= 8 || !(g_alias_again % 500)) MLOG("a shared texture swept %.1f s ago is made again over the same storage (%lux%lu format %lu): it starts from zeros or its initial fill, where NVN would still hold the old bytes (%llu so far)",
+        (clock_gettime_nsec_np(CLOCK_MONOTONIC) - ((uint64_t)(uintptr_t)v - 1)) / 1e9, (unsigned long)mt.width, (unsigned long)mt.height, (unsigned long)mt.pixelFormat, (unsigned long long)g_alias_again);
+}
+static uint64_t alias_own_bytes(id o, CFMutableSetRef heaps) {   // the memory a shared texture holds of its own: its placement heap's once (an image family shares one), else res_size
+    if (![o conformsToProtocol:@protocol(MTLTexture)]) return 0;
+    id<MTLHeap> h = ((id<MTLTexture>)o).heap;
+    if (h) { if (CFSetContainsValue(heaps, (__bridge const void *)h)) return 0; CFSetAddValue(heaps, (__bridge const void *)h); return h.allocatedSize; }
+    return res_size(o);
+}
+static void alias_parents_of(nvn_hmap *m, CFMutableSetRef out) {   // the base textures of the views a holder table counts (a live sRGB / linear twin's serial holds a view of the shared texture)
+    for (uint32_t i = 0; i < m->cap; i++) { if (!m->vals[i]) continue; uintptr_t a; memcpy(&a, m->keys + (size_t)i * m->klen, sizeof a);
+        id o = (__bridge id)(void *)a; if (![o conformsToProtocol:@protocol(MTLTexture)]) continue;
+        for (id<MTLTexture> t = ((id<MTLTexture>)o).parentTexture; t; t = t.parentTexture) CFSetAddValue(out, (__bridge const void *)t); }
+}
+// The submit thread, when a submission begins (mtl_sub_begin), every ALIAS_SWEEP_EVERY submissions; g_smu only tried, as tex_mtl_'s takeover holds it on the same path
+static void alias_sweep(void) { @autoreleasepool {
+    uint64_t cap = alias_sweep_cap(); if (!cap) return;
+    static uint64_t next; uint64_t f = atomic_load(&g_fence); if (f < next) return; next = f + ALIAS_SWEEP_EVERY;
+    if (pthread_mutex_trylock(&g_smu)) return;
+    sweep_cand *c = NULL; uint32_t nc = 0, cc = 0; uint64_t unref = 0;   // c: every unreferenced entry
+    CFMutableSetRef heaps = CFSetCreateMutable(NULL, 0, NULL), parents = NULL;
+    for (uint32_t i = 0; i < g_alias.cap; i++) {
+        void *v = g_alias.vals[i]; if (!v) continue;
+        uintptr_t a = (uintptr_t)v; id o = (__bridge id)v;
+        if (serial_table_holds(v) || (g_ghost_held.n && nvn_hm_get(&g_ghost_held, &a)) || tex_object_pinned(o)) continue;
+        uint64_t z = alias_own_bytes(o, heaps); unref += z;
+        alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
+        if (nc == cc) { cc = cc ? 2 * cc : 256; c = realloc_or_die(c, cc * sizeof *c, "the sharing table sweep"); }
+        c[nc++] = (sweep_cand){k, (uint64_t)(uintptr_t)nvn_hm_get(&g_alias_seen, &k), z, v};
+    }
+    uint64_t n = 0, b = 0;
+    if (unref > cap) {   // only then the views' bases are looked for (a walk of every object a serial holds): they are not unreferenced, nor are their bytes
+        parents = CFSetCreateMutable(NULL, 0, NULL); alias_parents_of(&g_by_serial_held, parents); alias_parents_of(&g_ghost_held, parents);
+        uint32_t m = 0; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+        for (uint32_t j = 0; j < nc; j++) {
+            if (CFSetContainsValue(parents, c[j].o)) { unref -= MIN(unref, c[j].bytes); continue; }
+            uint64_t ago = f + 1 - c[j].seen;   // submissions since a lookup found it; when it was (g_fence_ns), while the ring still holds it
+            if (c[j].seen && (ago < ALIAS_SWEEP_IDLE || (ago < FENCE_NS && now - MIN(now, g_fence_ns[c[j].seen % FENCE_NS]) < ALIAS_SWEEP_MS * 1000000ull))) continue;   // found lately: it stays, and counts
+            c[m++] = c[j];
+        }
+        nc = m;
+        qsort(c, nc, sizeof *c, sweep_cmp);   // the longest unused first
+        for (uint32_t j = 0; j < nc && unref > cap; j++) {
+            void *old = nvn_hm_del(&g_alias, &c[j].k);
+            if (!old) continue;
+            nvn_hm_del(&g_alias_seen, &c[j].k);
+            id o = CFBridgingRelease(old);
+            if (g_alias_set) CFSetRemoveValue(g_alias_set, (__bridge const void *)o);
+            defer_obj_release(o);
+            if (g_alias_swept_keys.n > 8192) nvn_hm_clear(&g_alias_swept_keys, NULL);
+            nvn_hm_put(&g_alias_swept_keys, &c[j].k, (void *)(uintptr_t)(now + 1));
+            unref -= MIN(unref, c[j].bytes); n++; b += c[j].bytes;
+        }
+    }
+    if (n) { g_alias_swept += n; g_alias_swept_b += b; g_ser_gen++; }   // no note: every texture ID's cached view is checked again (ser_sync)
+    else if (parents) next = f + ALIAS_SWEEP_IDLE;   // over the cap with nothing to let go (all found lately, or views' bases): the walk waits longer
+    pthread_mutex_unlock(&g_smu);
+    if (parents) CFRelease(parents);
+    CFRelease(heaps); free(c);
+    if (n) { static int lines; if (lines++ < 40 || !(lines % 100)) MLOG("sharing table sweep: %llu unreferenced shared textures unused for %d+ submissions and %d+ ms let go, %llu MB; %llu MB unreferenced left (cap %llu MB); %llu, %llu MB, so far",
+        (unsigned long long)n, ALIAS_SWEEP_IDLE, ALIAS_SWEEP_MS, (unsigned long long)(b >> 20), (unsigned long long)(unref >> 20), (unsigned long long)(cap >> 20), (unsigned long long)g_alias_swept, (unsigned long long)(g_alias_swept_b >> 20)); }
+} }
 static __unsafe_unretained id serial_get(uint64_t k) { pthread_mutex_lock(&g_smu); __unsafe_unretained id o = hm_get_id(&g_by_serial, &k); pthread_mutex_unlock(&g_smu); return o; }
 static void serial_put(uint64_t k, id o) { pthread_mutex_lock(&g_smu); id old = hm_get_id(&g_by_serial, &k); if (old) { held_add((__bridge void *)old, -1); if (alias_has(old)) defer_obj_unref(old); else defer_obj_release(old); } hm_put_id(&g_by_serial, &k, o); held_add((__bridge void *)o, 1); ser_note(k); pthread_mutex_unlock(&g_smu); }
 static void serial_del(uint64_t k) { pthread_mutex_lock(&g_smu); id old = hm_get_id(&g_by_serial, &k); if (old) { held_add((__bridge void *)old, -1); if (alias_has(old)) defer_obj_unref(old); else defer_obj_release(old); hm_del_id(&g_by_serial, &k); ser_note(k); } pthread_mutex_unlock(&g_smu); }   // nothing to drop: the texture ID caches stay valid
@@ -4198,6 +4303,7 @@ static int sp_slot(uint32_t *out) {   // caller holds g_sp_mu
         hd.type = MTLHeapTypePlacement; hd.storageMode = MTLStorageModePrivate; hd.size = (NSUInteger)SP_HEAP_TILES * SP_TILE; hd.maxCompatiblePlacementSparsePageSize = MTLSparsePageSize64;
         id<MTLHeap> h = [g_dev newHeapWithDescriptor:hd];
         if (!h) { RED_ONCE(144, "cannot make a 256 MB placement heap for sparse tiles (%llu tiles mapped)", (unsigned long long)g_sp_live); return 0; }
+        h.label = @"dm.sparse";
         if (!g_sp_heaps) g_sp_heaps = [NSMutableArray array];
         uint32_t base = (uint32_t)g_sp_heaps.count * SP_HEAP_TILES; [g_sp_heaps addObject:h]; res_add(h);
         if (g_sp_freecap < g_sp_nfree + SP_HEAP_TILES) { g_sp_freecap = g_sp_nfree + SP_HEAP_TILES; g_sp_free = realloc_or_die(g_sp_free, g_sp_freecap * sizeof *g_sp_free, "the sparse tile list"); }
@@ -5155,6 +5261,7 @@ static id<MTLTexture> image_texture(const tex_t *t, MTLTextureDescriptor *d) {
         MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypePlacement; hd.size = capacity;
         hd.storageMode = d.storageMode; hd.cpuCacheMode = d.cpuCacheMode; hd.hazardTrackingMode = d.hazardTrackingMode;
         id<MTLHeap> heap = [g_dev newHeapWithDescriptor:hd]; if (!heap) return nil;
+        heap.label = @"dm.image";
         owner = [NvImageHeap new]; owner->heap = heap; atomic_fetch_add(&g_image_heap_n, 1);
     }
     id<MTLTexture> mt = [owner->heap newTextureWithDescriptor:d offset:0]; if (!mt) return nil;
@@ -5351,6 +5458,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     pthread_mutex_lock(&g_smu);
     if (!g_alias_set) g_alias_set = CFSetCreateMutable(NULL, 0, NULL);
     alias_take_over(&ak);
+    alias_swept_again(&ak, mt);
     hm_put_id(&g_alias, &ak, mt); CFSetAddValue(g_alias_set, (__bridge const void *)mt); nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1));
     pthread_mutex_unlock(&g_smu);
     tex_put(t->serial, mt);
@@ -5419,7 +5527,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
         enum { NB = 24 }; struct { uint32_t key, n; uint64_t bytes; } bk[NB]; int nb = 0; uint64_t rbytes = 0; unsigned robjs = 0;
         pthread_mutex_lock(&g_res_mu); NSArray *live = g_res_objects.allObjects; pthread_mutex_unlock(&g_res_mu);
         for (id a in live) {
-            uint64_t sz = ((id<MTLAllocation>)a).allocatedSize; uint32_t key = 3u << 28;   // kind in the top bits: 1 texture (storage, render target, type, pixel format), 2 buffer (storage), 3 heap
+            uint64_t sz = res_size(a); uint32_t key = 3u << 28;   // kind in the top bits: 1 texture (storage, render target, type, pixel format), 2 buffer (storage), 3 heap
             if ([a conformsToProtocol:@protocol(MTLTexture)]) { id<MTLTexture> t = a; key = 1u << 28 | (uint32_t)t.storageMode << 24 | (t.usage & MTLTextureUsageRenderTarget ? 1u << 20 : 0) | ((uint32_t)t.textureType & 0xf) << 16 | ((uint32_t)t.pixelFormat & 0xffff); }
             else if ([a conformsToProtocol:@protocol(MTLBuffer)]) key = 2u << 28 | (uint32_t)((id<MTLBuffer>)a).storageMode << 24;
             rbytes += sz; robjs++;
@@ -6507,7 +6615,7 @@ static void shmap_read(void) {
 }
 
 @interface NvShader : NSObject { @public id<MTLFunction> fn, tf_fn, discard_fn, fn_u, fn_m, fn_d, geo_fn; int nf_ok; NSMutableDictionary<NSNumber *, id<MTLFunction>> *nffn;   /* nf_ok: the library's entry points carry the non-finite colour output rewrite (dmsh_build.py finite_rg11, function constant DMSH_FINITE_FC); nffn: their specializations (nf_fn) */ uint8_t mask_m;   // fn_u: the integer-output entry point (dmsh_build.py fs_uint), for pipelines whose colour attachments are all unsigned integer (pso_desc); fn_m: the mixed one, its outputs in mask_m unsigned integer; fn_d: the dual-source one (dmsh_build.py fs_dual)
-    uint16_t tf_stride[4]; uint32_t cb_ext[16], sb_ro; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, layer_out; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
+    uint16_t tf_stride[4]; uint32_t cb_ext[16], sb_ro; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, layer_out; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off; int c1_ready;
     uint32_t geo_vertices, geo_invocations, geo_output, geo_stride, geo_index_stride;
     uint8_t mesh_kind, mesh_notask; uint16_t mesh_threads, mesh_payload;   // an NVN2 task (1) or mesh (2) shader, a mesh shader with no task, its workgroup's threads, its payload's bytes (dmsh_meshstage.py)
     id<MTLFunction> mesh_obj;   // a mesh shader with no task: the object function that launches its workgroups in blocks of DMSH_MESH_GRID (dmsh_meshstage.py main0_o)
@@ -6562,11 +6670,18 @@ static id<MTLBuffer> c1_bank(size_t room) {
     return g_c1_banks.lastObject;
 }
 
+// DM_NVN_C1_LAZY (on by default; 0 = when the shader loads, as before): a shader's c1 goes into a bank at its first use (the argument block that binds it, c1_slot), not when it loads.
+// The prewarm loads thousands of shaders the game never draws (Ocarina of Time: about 5,800 by its title screen), and every shader a valid c1_full.tsv does not clear takes 64 KiB:
+// without the table (a partial library, or a stale one) that was 117 banks, 468 MB, in Link's house, a quarter of what the Apple TV lets the app have. Made lazily, a missing table costs
+// the shaders drawn, and each first use a lock and one copy
+static int c1_lazy(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_C1_LAZY"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_C1_LAZY=0: shaders' c1 slices made when they load"); } return v; }
 static void c1_store(NvShader *o) {
+    if (__atomic_load_n(&o->c1_ready, __ATOMIC_ACQUIRE)) return;
     size_t len = o->rf.c1_len;
     NSString *guardKey = [NSString stringWithUTF8String:o->key];
     if ([guardKey hasSuffix:@"_b"]) guardKey = [guardKey substringToIndex:guardKey.length - 2];
-    os_unfair_lock_lock(&g_c1_lock);   // Both the warm-up thread and the submit thread load shaders
+    os_unfair_lock_lock(&g_c1_lock);   // The warm-up thread and the submit thread load shaders, and the submit and encode threads bind them (c1_slot)
+    if (o->c1_ready) { os_unfair_lock_unlock(&g_c1_lock); return; }
     // A dedicated c1 is 64 KiB of its own, zero past its data: a slice of a bank (zeroed when made), not an MTLBuffer of its own. Without c1_full.tsv (a partial library) every
     // shader gets one, and one buffer each put about 10,000 allocations into the queue's residency set on Hyrule Warriors: Age of Imprisonment's way to its first field; every
     // commit then spent its time in the kernel (the Metal 4 submission queue busy about 75% of the time, almost all system time), command allocators stayed in flight while the
@@ -6583,7 +6698,14 @@ static void c1_store(NvShader *o) {
     o->c1buf = b;
     o->c1_gpu = b.gpuAddress;
     o->c1off = off;
+    __atomic_store_n(&o->c1_ready, 1, __ATOMIC_RELEASE);   // a thread that sees it ready reads the three above without the lock (c1_slot)
     os_unfair_lock_unlock(&g_c1_lock);
+}
+// The bank and GPU address of a shader's c1 for its argument block, made at this first use (c1_lazy); nil with a c1 of length 0 (the caller binds the zero bank)
+static id<MTLBuffer> c1_slot(NvShader *o, uint64_t *gpu) {
+    if (!o->rf.has_c1) return nil;
+    if (!__atomic_load_n(&o->c1_ready, __ATOMIC_ACQUIRE)) c1_store(o);
+    *gpu = o->c1_gpu + o->c1off; return o->c1buf;
 }
 
 static NSMutableArray<WarmItem *> *g_warm_items;
@@ -6831,7 +6953,7 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
         if (o->arg_len != (NSUInteger)(8 * (max_aid + 1)) || (o->arg_len & 7) || max_aid >= NVN_REFL_MAXARG)
             MDIE("shader %s has an unexpected argument buffer layout: encodedLength=%lu maxAid=%d", o->key, (unsigned long)o->arg_len, max_aid);
     }
-    if (o->rf.has_c1) c1_store(o);
+    if (o->rf.has_c1 && !c1_lazy()) c1_store(o);
     NSString *ext = g_cb_ext[[pc hasSuffix:@"_b"] ? [pc substringToIndex:pc.length - 2] : pc];   // bytes each uniform slot can read (cb_len), storage slots never written (sb_ro)
     for (NSString *f in [ext componentsSeparatedByString:@" "]) { int r = 0, n = 0;
         if (sscanf(f.UTF8String, "%d:%d", &r, &n) == 2 && r >= 0 && r < 16 && n > 0) o->cb_ext[r] = (uint32_t)n;
@@ -11560,8 +11682,9 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
             if (bl) PD("B %llu st%d sbufu reg%d+%#x addr=%#llx %s", g_stat_pass, nvn_stage, reg, b->off, (unsigned long long)addr, b->rw ? "rw" : "ro");
         } else if (b->kind == NVN_RB_C1) {      // B: the shader's own constant segment, built when the shader is fetched
-            id<MTLBuffer> cb = sh->c1buf ? sh->c1buf : zero_bank();   // c1 has length 0 (600 of them in the whole library) yet the shader still declares it: reads 0
-            slots[aid] = (sh->c1buf ? sh->c1_gpu : zero_bank_gpu()) + (sh->c1buf ? sh->c1off : 0);
+            uint64_t c1g = 0; id<MTLBuffer> cb = c1_slot(sh, &c1g);   // made at this first use (c1_lazy)
+            if (!cb) { cb = zero_bank(); c1g = zero_bank_gpu(); }   // c1 has length 0 (600 of them in the whole library) yet the shader still declares it: reads 0
+            slots[aid] = c1g;
             USE(cb, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_GMEM || b->kind == NVN_RB_GMEML) {   // B: the memory pool table for addresses traced to no storage buffer (gmem_map), and the write log of those stores (gml_take)
             if (!raw_map) raw_map = gmem_map();   // the log and the shader use the same table even if a pool comes in during the encode

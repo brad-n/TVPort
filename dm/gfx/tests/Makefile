@@ -540,6 +540,19 @@ t_image_alias: t_image_alias.m $(MTL_T_DEP)
 check_t_image_alias: t_image_alias
 	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_image_alias
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_image_alias
+t_c1_lazy: t_c1_lazy.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_c1_lazy.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_c1_lazy
+check_t_c1_lazy: t_c1_lazy
+	./t_c1_lazy
+	DM_NVN_C1_LAZY=0 ./t_c1_lazy
+t_alias_sweep: t_alias_sweep.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_alias_sweep.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_alias_sweep
+check_t_alias_sweep: t_alias_sweep
+	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_alias_sweep
+	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_alias_sweep
+	DM_NVN_ALIAS_SWEEP_MB=0 MTL_DEBUG_LAYER=1 ./t_alias_sweep
 t_rt_recycle: t_rt_recycle.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_rt_recycle.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_rt_recycle
