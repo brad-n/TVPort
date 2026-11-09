@@ -44,6 +44,8 @@ def frame_step(ctx):
     dynamic_resolution(ctx)
     render_scale(ctx)
     shadow_map(ctx)
+    probe_interval(ctx)
+    ground_mist(ctx)
 
 def render_scale(ctx):   # fork: v131072's own addresses (every site asserts its bytes); a rule's function at another offset (another build) gets none
     if ctx.base != 0x6e6be0: return
@@ -114,6 +116,65 @@ def shadow_map(ctx):   # fork: v131072's own addresses (every site asserts its b
         ctx.put(site, [B(site, start)], 'static shadow map size = the host size (0 = the game\'s 12288)')
 
 
+# Reflection probe interval (state +0xa8, u32 written by the loader: DM_REFLECTION_INTERVAL, 0 or 1 = the game's): a quality trade for slower GPUs. The scene's cube map
+# scheduler (main+0x33d6a0 on v131072; its draw main+0x268d10) keeps per probe slot (0x1c0 bytes, at [+0xef0], [+0xee8] of them) the faces done (s8 +0x1b8) and the faces to have
+# done after this frame (s8 +0x1b9). Once a frame it hands out a budget of faces, [+0x268] in all and at most the byte [+0xb] per slot (1; 7 for a few frames after a scene
+# change, main+0x334390): target = min(done + min([+0xb], budget left), 7). The draw renders faces done..target-1 (each a 128x128 scene render of about 220 draws); at 7 it runs
+# the filter chain (main+0x84e790: 7 mips, two 6-target passes each) and the slot is released two calls later. On the balcony: a face on each of 6 frames, the filter on the 7th,
+# one idle frame. The stub replaces the budget load: on frames whose number (state +0xac, the host's present count) is not a multiple of the interval the budget is 0, so no
+# slot moves (target = done: no face, no filter). The cycle stretches to about 7 x interval frames; what a probe shows lags its surroundings that much longer. w9 is dead at the
+# site (its next instruction loads it); x16 / x17 appear nowhere in the function
+def probe_interval(ctx):
+    base = ctx.others.get('probe scheduler')
+    if base is None: return   # not found in this build (a red line from the locator): the game's own schedule
+    here, emit = ctx.here, ctx.emit
+    site = base + 0x90
+    ctx.site(site, '6a6a42b9')   # ldr w10,[x19,#0x268]
+    start = here()
+    emit(0xb9426a6a)   # ldr w10,[x19,#0x268]   the original: the frame's face budget
+    emit(ADRP(16, here(), ctx.state))
+    emit(0xb940aa11)   # ldr w17,[x16,#0xa8]    the interval
+    back = here() + 4 * 8
+    emit(cbz_w(here(), back, 17))   # 0: the game's own
+    emit(0x7100063f)   # cmp w17,#1
+    emit(BEQ(here(), back))   # 1: every frame
+    emit(0xb940ae10)   # ldr w16,[x16,#0xac]    frames presented
+    emit(0x1ad10a09)   # udiv w9,w16,w17
+    emit(0x1b11c129)   # msub w9,w9,w17,w16     frame % interval
+    emit(cbz_w(here(), back, 9))   # the interval's frame: the game's budget
+    emit(0x5280000a)   # mov w10,#0             other frames: no face
+    assert here() == back
+    emit(B(here(), site + 4))
+    ctx.put(site, [B(site, start)], 'reflection probe faces only on every Nth frame (state +0xa8, DM_REFLECTION_INTERVAL; 0 or 1 = every frame, the game\'s)')
+    ctx.capabilities.add('REFLECTION_INTERVAL')
+
+
+# Ground mist (state +0xa4, u32 written by the loader: DM_GROUND_MIST=off, 1; 0 = the game's): a quality trade for slower GPUs. The mist over Kokiri Forest's floor is a fluid
+# volume: agl's eularian_fluid_simulation computes it (about 80 dispatches a frame, 0.24 ms on a Mac mini M2 Pro) and its drawer (main+0x26b110 on v131072, called from the
+# scene's draw at main+0x642ee0 with [scene+0xb80]) draws its own half-size depth (three passes), then ray-marches the volume in one task / mesh draw (fragment shader
+# 5ad65c0eefd09c7f, 1.8 ms at 480x270 on the Mini) into the half-size translucent effects targets, which the effects pass cleared and the next draws add to; the drawer off saves
+# about 2.2 ms a frame there. It returns at once unless its byte +0x18 is 1; the stub makes it read 0 when the mist is off. The simulation still runs: Foliage, Model and FoliageShader shaders sample its velocity (cFluidSimulationVelocity), so grass keeps moving with it.
+# The draw adds into targets that are cleared and shared every frame, so it cannot run at half rate or a lower resolution on its own: off is the one level. x16 / x17
+# appear nowhere in the function
+def ground_mist(ctx):
+    base = ctx.others.get('fluid draw')
+    if base is None: return   # not found in this build: the game's mist
+    here, emit = ctx.here, ctx.emit
+    site = base + 0x24
+    ctx.site(site, '08604039')   # ldrb w8,[x0,#0x18]
+    start = here()
+    emit(0x39406008)   # ldrb w8,[x0,#0x18]     the original: the drawer's enabled byte
+    emit(ADRP(16, here(), ctx.state))
+    emit(0xb940a611)   # ldr w17,[x16,#0xa4]    1 = off
+    back = here() + 4 * 2
+    emit(cbz_w(here(), back, 17))
+    emit(0x52800008)   # mov w8,#0              off: the drawer reads as disabled
+    assert here() == back
+    emit(B(here(), site + 4))
+    ctx.put(site, [B(site, start)], 'fluid volume draw (ground mist) skipped (state +0xa4, DM_GROUND_MIST=off; 0 = the game\'s)')
+    ctx.capabilities.add('GROUND_MIST')
+
+
 # The game's dynamic resolution (game__gfx__DynamicResolutionParam: LoadThreshold, ReduceCounterMax, IncreaseCounterMax and a list of levels, each a ResolutionReduceScale and a
 # Priority; on v131072 levels 0..9 at 0.75..0.333 of 2048x1152, 1536x864 to 683x384). Its update (main+0x805aa0) reads the frame's GPU load (about 0.2 ms a unit) into +0x8, subtracts
 # its small model of the fixed costs and divides the rest by the square of the current scale: it takes the rest of the frame's cost to grow with the pixel count, as on the Switch 2
@@ -155,7 +216,9 @@ def dynamic_resolution(ctx):
 MATCH_FRAME_STEP = {'main': [
     {'name': 'frame ratio from the host\'s step', 'size': 0x9b4, 'fingerprints': ['6ae2aff5344d14568e4dbaf93455e2d8278384bf892ed6c6eca87fef98fbcd1d'], 'stub': frame_step,   # v131072 main+0x6e6be0
      'others': {'dynamic resolution': {'size': 0x294, 'fingerprints': ['7af6ceb0aedf8e0c17dc08ce17fcd6a7cba6d394a0d09e3b504c6d668dc418e7']},   # v131072 main+0x8065e0
-                'dynamic resolution update': {'size': 0xb24, 'fingerprints': ['5a423697838976baf286cffa5e2ceef0d4e037abbcd9d371e90e9e702d61b3d4']}}},   # main+0x805aa0
+                'dynamic resolution update': {'size': 0xb24, 'fingerprints': ['5a423697838976baf286cffa5e2ceef0d4e037abbcd9d371e90e9e702d61b3d4']},   # main+0x805aa0
+                'probe scheduler': {'size': 0xa84, 'fingerprints': ['1cf03d90dce3429a92cc48b83ac150ef3dbe9cd4b00a4c494d1eb6a69086df6b']},   # main+0x33d6a0
+                'fluid draw': {'size': 0x13f8, 'fingerprints': ['c7b343dde31d4f1d1c315bdbb0db303d16282868356312ec51b2a83a83e6b3f8']}}},   # main+0x26b110
 ]}
 
 BINDING = [
@@ -165,6 +228,12 @@ BINDING = [
     {'what': 'dynamic resolution: full size, or a climb on the load measured at each level', 'now': 'game', 'goal': 'game', 'purpose': 'rendering',
      'why': "the game's own dynamic-resolution level function and update, found by their functions' fingerprints on any build that keeps both; switchable (DM_DYNAMIC_RESOLUTION)",
      'checked': 'v131072 main: one function with each fingerprint (the level function a leaf, x2..x11 / x16 / x17 / s0..s2 free), its callers, the update and the controller fields read by disassembly, the fields read in play (2026-11-08); the climb run natively against a model of the update and in play to full size (2026-11-09)'},
+    {'what': 'reflection probe faces only on every Nth frame (DM_REFLECTION_INTERVAL)', 'now': 'game', 'goal': 'game', 'purpose': 'rendering',
+     'why': "the face budget load of the game's cube map scheduler, found by the scheduler function's fingerprint on any build that keeps it; switchable, off by default",
+     'checked': 'v131072 main: one function with this fingerprint; its slots, budget and the draw read by disassembly, the call paths of the probe passes traced in play (2026-11-09)'},
+    {'what': 'ground mist off: the fluid volume draw skipped (DM_GROUND_MIST)', 'now': 'game', 'goal': 'game', 'purpose': 'rendering',
+     'why': "the enabled byte of the game's fluid volume drawer, found by its function's fingerprint on any build that keeps it; switchable, off by default",
+     'checked': 'v131072 main: one function with this fingerprint; the mist draw and the simulation dispatches traced to it in play (2026-11-09)'},
     {'what': 'view scale = the host render scale (DM_RENDER_SCALE)', 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
      'why': "the 3D views' scale store and the dynamic-resolution status in the graphics module's frame update, at v131072's offsets (the match rule's function is at main+0x6e6be0 there)",
      'blocked': 'no function-matched form yet; sits beside the frame ratio stub, which is matched'},

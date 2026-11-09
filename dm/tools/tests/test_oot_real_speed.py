@@ -1,4 +1,4 @@
-"""Execute Ocarina's render scale and static shadow map size stubs (the 3D views' scale and the literal 12288 of the shadow texture from the host). The frame step is upstream's function-matched stub (MATCH_FRAME_STEP), which calls them; the real-speed stub it replaced is gone."""
+"""Execute Ocarina's render scale, static shadow map size, reflection probe interval and ground mist stubs (the 3D views' scale and the literal 12288 of the shadow texture from the host). The frame step is upstream's function-matched stub (MATCH_FRAME_STEP), which calls them; the real-speed stub it replaced is gone."""
 import importlib
 import importlib.util
 from pathlib import Path
@@ -178,6 +178,103 @@ class ShadowMapSize(unittest.TestCase):
         self.assertEqual(shadow_size(0xc30c24, 6144)[0], shadow_size(0xc30c2c, 6144)[0])
 
 
+PROBE_SCHEDULER, FLUID_DRAW = 0x33d6a0, 0x26b110   # v131072: the cube map scheduler and the fluid volumes' draw (others of the frame step rule)
+PROBE_SITE, MIST_SITE = PROBE_SCHEDULER + 0x90, FLUID_DRAW + 0x24
+SCHEDULER, FLUID_DRAWER = 0x3300000, 0x3380000   # stand for x19 (the scheduler) and x0 (the fluid drawer)
+
+
+def quality_ctx(machine):
+    ctx = Ctx(machine)
+    ctx.others, ctx.capabilities = {'probe scheduler': PROBE_SCHEDULER, 'fluid draw': FLUID_DRAW}, set()
+    return ctx
+
+
+def probe_budget(interval, frame, budget=3, canary=0x5a5a5a5a5a5a5a5a):
+    """Run the reflection probe stub from its site to the instruction after it: the face budget it leaves in w10 for this frame, whether the registers it may not touch kept
+    their values, and where it goes on"""
+    assert unicorn is not None and arm is not None
+    machine = unicorn.Uc(unicorn.UC_ARCH_ARM64, unicorn.UC_MODE_ARM)
+    machine.mem_map(BASE, 0x3400000)
+    ctx = quality_ctx(machine)
+    profile.probe_interval(ctx)
+    machine.mem_write(BASE + STATE + 0xa8, struct.pack('<I', interval))
+    machine.mem_write(BASE + STATE + 0xac, struct.pack('<I', frame))
+    machine.mem_write(BASE + SCHEDULER + 0x268, struct.pack('<I', budget))
+    kept = [r for r in range(29) if r not in (9, 10, 16, 17, 19)]   # w9 is dead at the site (the next instruction loads it), w10 is the result, x16 / x17 are free in the function
+    for r in kept: machine.reg_write(arm.UC_ARM64_REG_X0 + r, canary + r)
+    machine.reg_write(arm.UC_ARM64_REG_X19, BASE + SCHEDULER)
+    machine.emu_start(BASE + PROBE_SITE, BASE + PROBE_SITE + 4, count=32)
+    ok = all(machine.reg_read(arm.UC_ARM64_REG_X0 + r) == canary + r for r in kept)
+    return machine.reg_read(arm.UC_ARM64_REG_X10), ok, ctx, machine.reg_read(arm.UC_ARM64_REG_PC)
+
+
+@unittest.skipIf(unicorn is None, 'optional ARM64 execution dependency: unicorn')
+class ReflectionInterval(unittest.TestCase):
+    def test_the_site_is_the_schedulers_face_budget(self):
+        ctx = probe_budget(0, 0)[2]
+        self.assertEqual(ctx.sites[PROBE_SITE], '6a6a42b9')   # ldr w10,[x19,#0x268]
+        self.assertIn('REFLECTION_INTERVAL', ctx.capabilities)
+
+    def test_unset_and_one_keep_the_games_budget_every_frame(self):
+        for interval in (0, 1):
+            for frame in range(6):
+                with self.subTest(interval=interval, frame=frame):
+                    budget, ok, _, pc = probe_budget(interval, frame)
+                    self.assertEqual(budget, 3)
+                    self.assertTrue(ok)
+                    self.assertEqual(pc, BASE + PROBE_SITE + 4)
+
+    def test_an_interval_gives_the_budget_on_every_nth_frame_only(self):
+        for interval in (2, 3, 4, 8):
+            for frame in list(range(2 * interval + 1)) + [0xffffffff, 0xfffffff8]:
+                with self.subTest(interval=interval, frame=frame):
+                    budget, ok, _, pc = probe_budget(interval, frame)
+                    self.assertEqual(budget, 3 if frame % interval == 0 else 0)
+                    self.assertTrue(ok)
+                    self.assertEqual(pc, BASE + PROBE_SITE + 4)
+
+
+def mist_enabled(setting, enabled=1, canary=0x5a5a5a5a5a5a5a5a):
+    """Run the ground mist stub from its site to the instruction after it: the enabled byte it leaves in w8 (the draw function returns at once unless it is 1)"""
+    assert unicorn is not None and arm is not None
+    machine = unicorn.Uc(unicorn.UC_ARCH_ARM64, unicorn.UC_MODE_ARM)
+    machine.mem_map(BASE, 0x3400000)
+    ctx = quality_ctx(machine)
+    profile.ground_mist(ctx)
+    machine.mem_write(BASE + STATE + 0xa4, struct.pack('<I', setting))
+    machine.mem_write(BASE + FLUID_DRAWER + 0x18, bytes([enabled]))
+    kept = [r for r in range(1, 29) if r not in (8, 16, 17)]
+    for r in kept: machine.reg_write(arm.UC_ARM64_REG_X0 + r, canary + r)
+    machine.reg_write(arm.UC_ARM64_REG_X0, BASE + FLUID_DRAWER)
+    machine.emu_start(BASE + MIST_SITE, BASE + MIST_SITE + 4, count=16)
+    ok = all(machine.reg_read(arm.UC_ARM64_REG_X0 + r) == canary + r for r in kept) and machine.reg_read(arm.UC_ARM64_REG_X0) == BASE + FLUID_DRAWER
+    return machine.reg_read(arm.UC_ARM64_REG_X8), ok, ctx, machine.reg_read(arm.UC_ARM64_REG_PC)
+
+
+@unittest.skipIf(unicorn is None, 'optional ARM64 execution dependency: unicorn')
+class GroundMist(unittest.TestCase):
+    def test_the_site_is_the_fluid_drawers_enabled_byte(self):
+        ctx = mist_enabled(0)[2]
+        self.assertEqual(ctx.sites[MIST_SITE], '08604039')   # ldrb w8,[x0,#0x18]
+        self.assertIn('GROUND_MIST', ctx.capabilities)
+
+    def test_unset_keeps_the_drawers_own_state(self):
+        for enabled in (0, 1):
+            with self.subTest(enabled=enabled):
+                got, ok, _, pc = mist_enabled(0, enabled)
+                self.assertEqual(got, enabled)
+                self.assertTrue(ok)
+                self.assertEqual(pc, BASE + MIST_SITE + 4)
+
+    def test_off_reads_as_disabled(self):
+        for enabled in (0, 1):
+            with self.subTest(enabled=enabled):
+                got, ok, _, pc = mist_enabled(1, enabled)
+                self.assertEqual(got, 0)
+                self.assertTrue(ok)
+                self.assertEqual(pc, BASE + MIST_SITE + 4)
+
+
 class MatchedFrameStep(unittest.TestCase):
     def test_render_scale_is_part_of_the_matched_stub_and_only_at_v131072_offsets(self):
         ctx = Ctx(None)
@@ -188,6 +285,19 @@ class MatchedFrameStep(unittest.TestCase):
         ctx.base = 0x1000
         profile.shadow_map(ctx)
         self.assertEqual(ctx.sites, {})
+
+    def test_the_quality_stubs_need_their_functions(self):
+        for stub in (profile.probe_interval, profile.ground_mist):
+            with self.subTest(stub=stub.__name__):
+                ctx = Ctx(None)
+                ctx.others, ctx.capabilities = {'probe scheduler': None, 'fluid draw': None}, set()
+                stub(ctx)
+                self.assertEqual((ctx.sites, ctx.capabilities), ({}, set()))
+
+    def test_the_quality_stubs_functions_are_others_of_the_rule(self):
+        others = profile.MATCH_FRAME_STEP['main'][0]['others']
+        self.assertEqual(others['probe scheduler']['size'], 0xa84)
+        self.assertEqual(others['fluid draw']['size'], 0x13f8)
 
     def test_the_frame_step_is_matched_not_build_bound(self):
         self.assertFalse(hasattr(profile, 'FRAME_STEP'))
