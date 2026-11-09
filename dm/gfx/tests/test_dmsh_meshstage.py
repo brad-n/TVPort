@@ -107,7 +107,8 @@ class Stage(unittest.TestCase):
         self.assertIn('[[object]] void main0(', src)
         self.assertIn(f'set_threadgroups_per_grid(uint3(min(_23[{out + 1}], {ms.METAL_MAX_GRID}u), 1u, 1u))', src)
         self.assertIn(f'dm_payload.w[i] = _23[{out}u + i]', src)
-        self.assertIn(f'[[buffer({abi.MESH_FIRST_SLOT})]]', src)
+        self.assertIn(f'[[buffer({abi.MESH_DRAW_SLOT})]]', src)
+        self.assertIn('_23[0] = dm_draw[1] + dm_tg;', src)   # the draw's {count, first}: its first task + this threadgroup
 
     def test_body_returns_to_the_wrapper(self):   # an early return must not skip handing the outputs over
         src, _ = self.task()
@@ -135,12 +136,20 @@ class Stage(unittest.TestCase):
         self.assertIn(f'uint at = {prim + 4}u + n;', src)
 
     def test_mesh_with_a_task_reads_its_number_from_the_payload(self):
-        self.assertIn('_23[4] = dm_tg;', self.mesh(task=True)[0])
+        src = self.mesh(task=True)[0]
+        self.assertIn('_23[4] = dm_tg;', src)
+        self.assertNotIn('main0_o', src)
 
-    def test_mesh_without_a_task_counts_from_the_draws_first(self):
+    def test_mesh_without_a_task_counts_from_its_blocks_first(self):   # Metal's mesh grid holds at most METAL_MAX_GRID threadgroups: an object function launches the draw in blocks
         src = self.mesh()[0]
-        self.assertIn('_23[0] = dm_first[0] + dm_tg;', src)
-        self.assertNotIn('[[payload]]', src)
+        self.assertEqual(ms.METAL_MAX_GRID, abi.MESH_GRID)
+        self.assertIn('_23[0] = dm_block.first + dm_tg;', src)
+        self.assertIn('const object_data dm_block_t& dm_block [[payload]]', src)
+        self.assertIn('[[object]] void main0_o(object_data dm_block_t& dm_block [[payload]]', src)
+        self.assertIn(f'[[buffer({abi.MESH_DRAW_SLOT})]]', src)
+        self.assertIn(f'uint b = dm_otg * {ms.METAL_MAX_GRID}u;', src)
+        self.assertIn('dm_block.first = dm_draw[1] + b;', src)
+        self.assertIn(f'dm_grid.set_threadgroups_per_grid(uint3(min(dm_draw[0] - b, {ms.METAL_MAX_GRID}u), 1u, 1u));', src)
 
     def test_per_primitive_outputs(self):   # four blocks of 6 vertex components (36 + 4 * 192 = 804 words), then the per-primitive blocks of 1 component (stride 32)
         src = self.mesh(primitive=True)[0]
@@ -202,6 +211,9 @@ class Stage(unittest.TestCase):
         i = ms.info(control(6), bytes(0x80))
         src = (KERNEL % (ms.memory(i)[1] // 4, ms.memory(i)[0][2] // 4 + 1)).replace('main0(', 'main0(uint (&a)[4], ')
         with self.assertRaises(ValueError): ms.to_stage(src, i)
+
+    def test_position_is_invariant(self):   # two mesh shaders of one geometry must agree: a pre-pass and a colour pass testing depth for equality
+        self.assertIn('float4 position [[position, invariant]];', self.mesh()[0])
 
     @unittest.skipUnless(shutil.which('xcrun') and subprocess.run(['xcrun', '-sdk', 'macosx', '-f', 'metal'], capture_output=True).returncode == 0, 'no Metal compiler')
     def test_compiles(self):
