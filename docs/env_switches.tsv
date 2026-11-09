@@ -165,6 +165,7 @@ DM_NVN_END_ALIAS	diagnostic	`1` puts the resource-alias flush back on every enco
 DM_NVN_FAST_WAKE	switch	`0` makes the game's `SyncWait`s wake on the commit feedback handler instead of the GPU's own signal of the fence (on by default)
 DM_NVN_FB_SNAP	switch	Draws that sample a colour attachment of their own render pass: unset, those that write it (or follow a write in the pass) read a snapshot, reused until the game's next barrier; `0` none; `all` a fresh snapshot for every draw that samples one (slow, diagnostic, no tile reads)
 DM_NVN_FB_TILE	switch	`0` makes such draws that sample the attachment at their own pixel (a projective sample at the vertex shader's screen varying) read a snapshot too, instead of the tile
+DM_NVN_FINITE_RG11	switch	`0` leaves pixel shaders' non-finite colour outputs as they are (default on): a pipeline with an R11G11B10F colour attachment takes the entry point that stores 0 for a NaN or infinity in that output, as Maxwell does, where Metal stores 65024 and the bloom spreads it (Ocarina of Time's ground mist, issue #1839)
 DM_NVN_FLUSH_FILL	switch	`0` starts a new GPU texture in a CPU-writable pool as zeros; by default one whose storage the game flushed before its first use is filled from that storage once
 DM_NVN_FRAMES	diagnostic	`=<N>` prints the NVN call table frame by frame for the first N frames (default 3)
 DM_NVN_FUSE_CHECK	diagnostic	`=1` checks pass merging in the same frame: renders the merged passes again apart and logs the comparison of the attachments every time
@@ -182,11 +183,13 @@ DM_NVN_GEO_MESH_RUN	switch	`0` dispatches every mesh geometry draw on its own; b
 DM_NVN_GMEM_BUDGET_MB	switch	`=<n>` or `auto` (0 / unset: off) limits the raw pool table's wired pools (the table the shaders' raw global loads read) to that many MB, leaving out the least recently addressed pools over it; for a device with a hard memory limit (Apple TV). Fork-only
 DM_NVN_GPUPROF	diagnostic	`=<f>`, `<f1>-<f2>` or `every:<n>`: logs the GPU start and duration of every encoder of those frames (`[gpuprof]` lines from Metal 4 counter heap timestamps)
 DM_NVN_GPU_TS	switch	`segment` or `submission`: what timestamp reports record (GPU start / end of the segment holding each report, or one time for the whole submission), instead of the profile's `gpu_timestamps`
+DM_NVN_GWS_PAGES	switch	`0` rounds a GPU-written storage span's protected pages inward per split again (default on: a split keeps the pages of the span it came from, so a remnant under a page can still report a later CPU write; PR #1876)
 DM_NVN_HILITE	diagnostic	`=<fragment shader key>,…`: those draws use a solid colour instead (magenta, green, cyan, yellow, blue, white in order), to tell wrong geometry from wrong shading
 DM_NVN_INDLOG	diagnostic	`=<n>`: the first n indirect draws (and those of pass-dumped frames) log their arguments at encode and as the GPU left them once the submission completed, with the first indices
 DM_NVN_IXCLOG	diagnostic	`=<n>` logs the first n indirect draw and dispatch conversions (record to arguments) once the GPU has run them
 DM_NVN_KEYDUMP	diagnostic	`=<fs key>[:n[:every]]`: for up to n draws of that fragment shader (default 6), logs the pass dump binding lines plus vertex formats, vertex streams and uniform values; meant for devices
 DM_NVN_LAZY_CLEAR	switch	`0` makes clears with no draw after them open a pass of their own, as before; by default they wait to become the load action of the next pass on that target
+DM_NVN_LEDGER	diagnostic	`=<seconds>`: every that many seconds a `[ledger]` block in the log: GPU allocated against the residency set, render targets by size and format, sampled textures (ASTC, BC, other, by format), resident pool buffers, heaps, recycled heaps waiting (RH), kept upload staging and pool buffers freed but alive. Off by default
 DM_NVN_LOADPROBE	diagnostic	`=1`, `2` or `3`: attachments whose load is skipped are cleared to a sentinel colour (`3` NaN; `1` NaN for float formats) and the sentinel pixels left at pass end are counted (should be 0)
 DM_NVN_LOG	diagnostic	`=1` logs the creation of NVN objects
 DM_NVN_MAGSCAN	diagnostic	`=<fs key>[:every[:phase]]`: device self-check that reads each pass's colour attachments every `every` frames (default 30) and logs `[mag]` lines for solid magenta 16×16 blocks or non-finite pixels

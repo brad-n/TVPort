@@ -4424,7 +4424,10 @@ static size_t gws_find(uintptr_t a) {   // the first span that ends after a; g_g
     }
     return l;
 }
+// DM_NVN_GWS_PAGES=0 (upstream PR #1876 off): a span's protected pages are those whole inside its current [lo, hi), so a split's remnant under a page keeps none and can never report a CPU write
+static int gws_pages_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_GWS_PAGES"); on = !(e && *e && atoi(e) == 0); if (!on) MLOG("GPU-written storage spans: protected pages rounded inward per split (DM_NVN_GWS_PAGES=0)"); } return on; }
 static void gws_reprotect(gws_span *s) {   // preserve a split span's original protected pages
+    if (!gws_pages_on()) whole_pages(s->lo, s->hi, &s->page_lo, &s->page_hi);
     s->stamp = s->seen = nvn_dirty_now();
     s->rg = s->page_hi > s->page_lo ? nvn_dirty_span((const void *)s->page_lo, s->page_hi - s->page_lo) : NULL;
     if (s->rg) {
@@ -4443,9 +4446,12 @@ static int gws_cpu_since(gws_span *s, uintptr_t lo, uintptr_t hi) {
     // Keep that page's write history, but only when the queried texture covers
     // the whole page: writes to a neighbouring texture still do not count.
     uintptr_t pg = (uintptr_t)getpagesize();
-    whole_pages(lo, hi, &a, &e);
-    a = MAX(a, MAX(s->page_lo, s->lo & ~(pg - 1)));
-    e = MIN(e, MIN(s->page_hi, (s->hi + pg - 1) & ~(pg - 1)));
+    if (!gws_pages_on()) whole_pages(MAX(lo, s->lo), MIN(hi, s->hi), &a, &e);
+    else {
+        whole_pages(lo, hi, &a, &e);
+        a = MAX(a, MAX(s->page_lo, s->lo & ~(pg - 1)));
+        e = MIN(e, MIN(s->page_hi, (s->hi + pg - 1) & ~(pg - 1)));
+    }
     if (e <= a || !s->rg) {
         return 0;
     }
@@ -4458,6 +4464,7 @@ static void gws_rewritten(gws_span *s) {   // the GPU writes a span again: a CPU
     }
 
     s->seen = now;
+    if (!gws_pages_on()) whole_pages(s->lo, s->hi, &s->page_lo, &s->page_hi);
     if (!gws_cpu_since(s, s->page_lo, s->page_hi)) {
         return;
     }
@@ -4548,6 +4555,7 @@ static id<MTLBuffer> pool_buf(uintptr_t a, uintptr_t b) {
     pthread_mutex_lock(&g_gws_mu);
     size_t i0 = gws_find(a);
     for (size_t i = i0; i < g_ngws && g_gws[i].lo < b; i++) {
+        if (!gws_pages_on()) whole_pages(g_gws[i].lo, g_gws[i].hi, &g_gws[i].page_lo, &g_gws[i].page_hi);
         g_gws[i].gpu = !gws_cpu_since(&g_gws[i], g_gws[i].page_lo, g_gws[i].page_hi);
     }
     nvn_dirty_hold((void *)a, b - a);
@@ -4968,7 +4976,9 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
 // Memory readout line (always on, low frequency, capped): resident memory, GPU allocated, deferred-release queue, residency set object count, registered memory pools / peak / tracking table capacity, cumulative texture re-uploads.
 // Purpose: pin down "crashes with no log". The system gives no notice before killing a process for memory, so only readouts left beforehand can show which number kept climbing.
 // Called by the frame hook every 300 frames; printed only when resident or GPU allocated changed by ≥ 64 MB since the last line, otherwise one line every 3000 frames; capped at 400 lines per game. All integers (the frame hook runs on the guest thread's small stack, so no floating-point formatting)
+static void ledger_poke(void);   // nvn_ledger.inc
 void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
+    ledger_poke();
     static unsigned long long last_rss, last_gpu, last_frame; static int lines; unsigned long long gpu = (unsigned long long)(g_dev.currentAllocatedSize >> 20);
     unsigned long long dr = rss_mb > last_rss ? rss_mb - last_rss : last_rss - rss_mb, dg = gpu > last_gpu ? gpu - last_gpu : last_gpu - gpu;
     if (lines >= 400 || (lines && dr < 64 && dg < 64 && frame - last_frame < 3000)) return; lines++; last_rss = rss_mb; last_gpu = gpu; last_frame = frame;
@@ -16862,5 +16872,6 @@ void mem_census(const char *why) { @autoreleasepool {
            (unsigned long long)nb[0], (unsigned long long)(bb[0] >> 20), (unsigned long long)nb[1], (unsigned long long)(bb[1] >> 20), (unsigned long long)nb[3], (unsigned long long)(bb[3] >> 20), (unsigned long long)nb[2], (unsigned long long)(bb[2] >> 20)); }
     #undef CN_ADD
 } }
+#include "nvn_ledger.inc"   // DM_NVN_LEDGER=<seconds>: where the graphics ledger goes, logged periodically
 #include "nvn_capture.inc"   // DM_NVN_CAPTURE (one frame for dm/gfx/tests/nvn_replay)
 #pragma clang attribute pop
