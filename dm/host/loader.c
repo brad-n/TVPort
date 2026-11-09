@@ -334,6 +334,16 @@ void dm_fps_state_apply(void) {
     const char *ss = getenv("DM_SHADOW_MAP_SIZE"); uint32_t sz = 0;
     if (ss && *ss) { char *end; unsigned long v = strtoul(ss, &end, 10); if (end == ss || *end || (v != 0 && (v < 4096 || v > 12288 || v % 1024))) LOG("[RED] DM_SHADOW_MAP_SIZE=%s: 4096 to 12288 in multiples of 1024; keeping the game's size", ss); else if (v != 12288) { sz = (uint32_t)v; if (sz) LOG("%s: static shadow map %ux%u instead of the game's 12288x12288 (DM_SHADOW_MAP_SIZE)", g_fps_mod, sz, sz); } }
     memcpy(dm_fps_state + 0xa0, &sz, sizeof sz);
+    // Quality trades for slower GPUs, both off by default (Ocarina of Time's stubs; builds without them ignore the fields). Reflection probes, u32 at +0xa8: DM_REFLECTION_INTERVAL=2 to 8
+    // lets the game's cube map scheduler hand out probe faces only on every Nth frame, by the present count the host keeps at +0xac (hle_nvn.c); 1 or unset keeps its face a frame.
+    // Ground mist, u32 at +0xa4: DM_GROUND_MIST=off skips the fluid volume's draw (its simulation still runs); on or unset keeps it
+    const char *ri = getenv("DM_REFLECTION_INTERVAL"); uint32_t rn = 0;
+    if (ri && *ri) { char *end; unsigned long v = strtoul(ri, &end, 10); if (end == ri || *end || v < 1 || v > 8) LOG("[RED] DM_REFLECTION_INTERVAL=%s: 1 to 8; keeping the game's probe updates", ri); else if (v > 1) { rn = (uint32_t)v; LOG("%s: reflection probes refreshed at 1/%u of the game's rate (DM_REFLECTION_INTERVAL; builds with the stub)", g_fps_mod, rn); } }
+    memcpy(dm_fps_state + 0xa8, &rn, sizeof rn);
+    const char *gm = getenv("DM_GROUND_MIST"); uint32_t moff = gm && !strcmp(gm, "off");
+    if (gm && *gm && strcmp(gm, "on") && strcmp(gm, "off")) LOG("[RED] DM_GROUND_MIST=%s: on or off; keeping the mist", gm);
+    if (moff) LOG("%s: ground mist off (DM_GROUND_MIST; builds with the stub)", g_fps_mod);
+    memcpy(dm_fps_state + 0xa4, &moff, sizeof moff);
     // Screen shape: DM_SCREEN_ASPECT, the screen's width / height between 1.3 and 1.77, makes the builds with screen-shape stubs
     // (Breath of the Wild 1.9.0's patches.py) render that shape: the output keeps its width (1920) and takes the height that gives the ratio, a multiple of 48 so the
     // 2/3-size layout space (1280 wide) stays whole: 1.43 → 1920x1344 and 1280x896. State +0x48 u32 output height, +0x4c u32 layout height, +0x50 its float; 0 = 16:9
