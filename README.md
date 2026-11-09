@@ -81,6 +81,7 @@ This fork builds on [the original TVPort](https://github.com/68hctmzzjf-svg/TVPo
 - **Mac interface improvements:** a fixed-width sidebar, clearer setup status, revised buttons and spacing, game versions in save-manager headings, File-menu access to Settings and Manage Saves, and clearer Last Run Stats and Show Log actions. Removing the last library game no longer leaves the detail view referencing a deleted entry.
 - **Safer automatic save recovery:** installation checks for both working and persistent saves before restoring a backup, and skips recovery when it cannot verify that saves are absent.
 - **Ocarina of Time render scale:** a 3D resolution setting for The Legend of Zelda: Ocarina of Time, the same one Tears of the Kingdom and Breath of the Wild have. It fixes the game's 3D view at a fraction of its size (for example 75%) and turns off the game's changing resolution, which asks the Apple TV for less graphics memory when the world loads.
+- **Ocarina of Time shadow map size:** a switch (`DM_SHADOW_MAP_SIZE`) for The Legend of Zelda: Ocarina of Time that makes the game's huge fixed-shadow picture smaller (for example 6144 instead of 12288 pixels a side, about 220 MB less graphics memory), which helps the Apple TV keep the game inside its memory limit. Its fixed (static) shadows get blurrier.
 
 These fork-specific features are included in 1.2.3. The original project’s release downloads do not include them.
 

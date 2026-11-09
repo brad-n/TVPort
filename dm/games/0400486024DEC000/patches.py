@@ -8,6 +8,10 @@ def CBZ_W(frm, to, rt):
     return 0x34000000 | (((off >> 2) & 0x7FFFF) << 5) | rt
 
 
+def CBNZ_W(frm, to, rt):
+    return CBZ_W(frm, to, rt) | 0x01000000
+
+
 # Real-time speed. The frame loop (main+0x6e6be0) computes each frame's step as a constant over its target frame rate and never reads the clock: s1 is 60, or 30 in one mode of the game
 # (the fcsel at main+0x6e6cc0), s0 the target, so one frame is one step however long it took and everything runs slowly below the target. Found by gunvalk (zortos293/Lichii PR #216).
 # The stub keeps that division and takes the larger of it and s1 x the measured frame time (state +0x38, float seconds, hle_nvn.c): 0 there leaves the game's own step, and the step is
@@ -70,6 +74,21 @@ def real_speed(ctx):
     emit(B(here(), 0x31d3f3c))
     ctx.put(0x31d3f38, [B(0x31d3f38, start)], 'view scale = the host render scale (1.0 = the game\'s dynamic resolution)')
     ctx.render_scale = 1
+    # Static shadow map size (state +0xa0, u32 pixels written by the loader: DM_SHADOW_MAP_SIZE, 0 = the game's). The game keeps two depth textures (format 0x5a, Depth16) for its static
+    # depth shadows, the samplers cSamplerFineStaticDepthShadow / cSamplerCoarseStaticDepthShadow: a fine one of 12288x12288 (296 MB of the graphics memory on tvOS) and a coarse one of
+    # 4096x4096. Both sizes are literals, not the StaticSdwWidth parameter (4096 in Main.gsys__ModelSceneConfigParam, read into the config at +0x548). The fine one is made at
+    # main+0xc30c24 / main+0xc30c2c (width and height of the texture info of the function at main+0xc30870) and once more at main+0x344d78 (the call main+0xc2f3f0, which makes a render
+    # target of one size for both sides); the stubs put the host's size in place of the literal, so the game itself allocates the smaller texture and sizes its viewports from it. Each
+    # stub clobbers only the register the displaced mov wrote. No other 0x3000 / 12288.0 / 1/12288 literal belongs to the map (searched in the whole of main's code)
+    for site, rd in ((0xc30c24, 3), (0xc30c2c, 4), (0x344d78, 3)):
+        ctx.site(site, (0x52860000 | rd).to_bytes(4, 'little').hex())   # mov wN,#0x3000
+        start = here()
+        emit(ADRP(rd, here(), ctx.state))
+        emit(0xb940a000 | (rd << 5) | rd)   # ldr wN,[xN,#0xa0]     the host's size
+        emit(CBNZ_W(here(), here() + 8, rd))   # set: keep it
+        emit(0x52860000 | rd)   # mov wN,#0x3000        the game's own
+        emit(B(here(), site + 4))
+        ctx.put(site, [B(site, start)], 'static shadow map size = the host size (0 = the game\'s 12288)')
 
 
 FRAME_STEP = {'e0f3ccfaf50065ae4ea01eb5aeb13b1a': real_speed}   # 1.1.1 (v131072), the main of v0 too
