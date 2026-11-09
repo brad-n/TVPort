@@ -177,6 +177,8 @@ static class SwshXlate
         public bool QueryHostRawSearchLoop() => _job["raw_loop"] is JsonNode n && (bool)n;
         // Job raw_regs = true (a profile's shader_raw_regs): a raw lookup keeps its last entry's start, end and delta in private words (GlobalToStorage)
         public bool QueryHostRawRangeRegisters() => _job["raw_regs"] is JsonNode n && (bool)n;
+        // Job raw_ptable = true (a profile's shader_raw_ptable): a raw lookup reads the host's page table first and searches only for the pages it leaves to the search (GlobalToStorage)
+        public bool QueryHostRawPageTable() => _job["raw_ptable"] is JsonNode n && (bool)n;
         // Job no_rescale = true (a profile's shader_no_rescale): the host's render scales are all 1.0 (nvn_mtl.m support_buf), so the translator writes no rescale (InstEmitAttribute.EmitIpa, TexturePass)
         public bool QueryHostRenderScaleOne() => _job["no_rescale"] is JsonNode n && (bool)n;
         // Job softfloat64 = true: the host has no FP64, so Ryujinx's DoubleToFloat pass lowers double operations to float (Metal has no double type). Set only on the retry of a

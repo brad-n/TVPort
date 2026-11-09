@@ -213,6 +213,15 @@ t_gmem_survive: t_gmem_survive.m $(MTL_T_DEP)
 .PHONY: check_t_gmem_survive
 check_t_gmem_survive: t_gmem_survive
 	DM_NVN_POOL_UNWIRE=0 DM_NVN_GMEM_MODE='learned!' MTL_DEBUG_LAYER=1 ./t_gmem_survive
+t_gmem_pt: t_gmem_pt.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_gmem_pt.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_gmem_pt
+check_t_gmem_pt: t_gmem_pt
+	DM_NVN_GMEM_PT=1 MTL_DEBUG_LAYER=1 ./t_gmem_pt
+	DM_NVN_GMEM_PT=1 DM_NVN_GMEM_MODE='learned!' MTL_DEBUG_LAYER=1 ./t_gmem_pt
+	DM_NVN_GMEM_PT=1 DM_NVN_GMEM_PT_SHARED=0 MTL_DEBUG_LAYER=1 ./t_gmem_pt
+	DM_NVN_GMEM_PT=1 DM_NVN_GMEM_PT_SHARED=0 DM_NVN_GMEM_MODE='learned!' MTL_DEBUG_LAYER=1 ./t_gmem_pt
+	DM_NVN_GMEM_PT=0 MTL_DEBUG_LAYER=1 ./t_gmem_pt
 t_gmem_words: t_gmem_words.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_gmem_words.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_gmem_words

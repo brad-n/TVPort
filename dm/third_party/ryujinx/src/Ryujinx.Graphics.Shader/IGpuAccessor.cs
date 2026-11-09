@@ -269,6 +269,16 @@ namespace Ryujinx.Graphics.Shader
         }
 
         /// <summary>
+        /// nxnative: queries whether a raw global memory lookup reads the page table the host appends to the pool table first, one load per 16 KiB guest page, and searches only for the pages it
+        /// leaves to the search (a profile's shader_raw_ptable, GlobalToStorage).
+        /// </summary>
+        /// <returns>True for the page table, false for the hint and the search</returns>
+        bool QueryHostRawPageTable()
+        {
+            return false;
+        }
+
+        /// <summary>
         /// nxnative: queries whether every render scale the support buffer holds is 1.0, so gl_FragCoord.xy, texel fetches and size queries need no rescale (a profile's shader_no_rescale).
         /// </summary>
         /// <returns>True to leave the rescale out, false for Ryujinx's resolution scaling code</returns>

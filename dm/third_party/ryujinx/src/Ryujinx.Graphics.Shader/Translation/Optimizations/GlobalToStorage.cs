@@ -902,6 +902,15 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
         // for the next table, so the residency of raw memory follows what the shaders read, not every pool the game has
         private const int GmemReadLogWords = (1 << GmemMapLog2) / 32;
 
+        // nxnative: the page table the host appends to the pool table (dmsh_abi.h DMSH_GMEM_PT_*) for a game whose profile sets shader_raw_ptable (IGpuAccessor.QueryHostRawPageTable): right after the
+        // entries, a header {first page, page count n, 0, 0}, then n + 1 64-bit entries, one per 16 KiB guest page from the first: the Metal GPU address of that page in the buffer of the pool table entry
+        // that holds the whole page, ORed with that entry's index (1 to 8,191) in the low 14 bits; 0 for a page no single entry holds (a page two pools share, a pool's first or last page, a page in no
+        // pool) and for entry n, where an address outside the table lands. A lookup is one load; a 0 takes the search, which decides those pages exactly as before
+        private const int GmemPtWord = (1 << GmemMapLog2) * GmemMapEntryWords;
+        private const int GmemPtHeadWords = 4;
+        private const int GmemPtShift = 14;
+        private const int GmemPtSlotMask = (1 << GmemPtShift) - 1;
+
         // nxnative: a global memory access whose address the search traced to no storage buffer, an address the shader loaded from memory (Donkey Kong Bananza: gsys's vertex
         // shader that resets the terrain's indirect draw records reads each record's address from a storage buffer). Ryujinx drops such an access (a load reads 0). Here it
         // goes to the address itself: a tagged hint for its 2 MiB chunk, else a branchless binary search, finds the host's pool holding it, the address moves by that pool's delta (its Metal GPU address minus its
@@ -981,6 +990,9 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             Operand lblFound = Label();
             Operand lblChosen = Label();
 
+            // nxnative (the profile key shader_raw_ptable, IGpuAccessor.QueryHostRawPageTable): the page table first, the search only for the pages it leaves to it
+            bool pageTable = gpuAccessor.QueryHostRawPageTable();
+
             // The entry this helper chose last in this invocation, if it holds the address: a shader reads a structure word after word from one pool, so all but the first access of a run
             // choose the entry the first one chose (Ocarina of Time's foliage mesh shader 73dc0b90c4082e43, 135 reads, took 10.9 ms of a 683x384 frame). The table's ranges are disjoint
             // (nvn_mtl.m gmem_map), so the search below would choose the same entry, and the host binds one table for a whole draw or dispatch. The word starts at 0, the empty entry
@@ -999,25 +1011,89 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 return rangeRegs ? context.Load(StorageKind.LocalMemory, rangeBinding, Const(word)) : MapWord(lastEntry, word);
             }
 
-            Operand lastHolds = context.BitwiseAnd(AtOrBelow(LastWord(1), LastWord(0)), Below(LastWord(3), LastWord(2)));
-            context.Copy(selected, last);
-            context.BranchIfTrue(lblChosen, lastHolds);
+            // A small integer is read or written in its 32-bit word (computed here with the page table: both of its ways use it)
+            Operand wordLow = pageTable ? (isSmall ? context.BitwiseAnd(addrLow, Const(~3)) : addrLow) : null;
 
-            // The hint of the address's 2 MiB chunk names an entry holding the whole chunk (dmsh_abi.h DMSH_GMEM_HINT_SHIFT). An address too high for the tag searches
-            Operand chunk = context.BitwiseOr(context.ShiftLeft(addrHigh, Const(32 - GmemHintShift)), context.ShiftRightU32(addrLow, Const(GmemHintShift)));
-            Operand indexMask = Const((1 << GmemMapLog2) - 1);
-            Operand hint = MapWord(context.IMultiply(context.BitwiseAnd(chunk, indexMask), Const(GmemMapEntryWords)), 6);
-            Operand hintIndex = context.BitwiseAnd(hint, indexMask);
-            Operand hintFits = context.BitwiseAnd(
-                context.BitwiseAnd(context.ICompareNotEqual(hintIndex, Const(0)), context.ICompareEqual(context.ShiftRightU32(hint, Const(GmemMapLog2)), chunk)),
-                context.ICompareLessUnsigned(addrHigh, Const(1 << (GmemHintShift - GmemMapLog2))));
-            context.Copy(selected, hintIndex);
-            context.BranchIfTrue(lblFound, hintFits);
+            // Without the range words, the page table's one load is cheaper than the last entry's four table words, so it goes first
+            if (rangeRegs || !pageTable)
+            {
+                Operand lastHolds = context.BitwiseAnd(AtOrBelow(LastWord(1), LastWord(0)), Below(LastWord(3), LastWord(2)));
+                context.Copy(selected, last);
+                context.BranchIfTrue(lblChosen, lastHolds);
+            }
+
+            Operand hostLowPt = null;
+            Operand hostHighPt = null;
+            Operand lblAccess = null;
+
+            if (pageTable)
+            {
+                hostLowPt = Local();
+                hostHighPt = Local();
+                lblAccess = Label();
+                Operand lblSearch = Label();
+
+                // The address's page in the table: (address >> 14) - first page, at most n (entry n is 0), and n for an address at or above 2^46, whose page number the 32 bits do not hold
+                Operand page = context.BitwiseOr(context.ShiftLeft(addrHigh, Const(32 - GmemPtShift)), context.ShiftRightU32(addrLow, Const(GmemPtShift)));
+                Operand ptCount = MapWord(Const(GmemPtWord), 1);
+                Operand pageIndex = context.IMinimumU32(context.ISubtract(page, MapWord(Const(GmemPtWord), 0)), ptCount);
+                pageIndex = context.ConditionalSelect(context.ICompareLessUnsigned(addrHigh, Const(1 << GmemPtShift)), pageIndex, ptCount);
+                Operand pageWord = context.IAdd(context.ShiftLeft(pageIndex, Const(1)), Const(GmemPtWord + GmemPtHeadWords));
+                Operand pageLow = MapWord(pageWord, 0);
+                context.BranchIfTrue(lblSearch, context.ICompareEqual(pageLow, Const(0)));
+
+                Operand slot = context.BitwiseAnd(pageLow, Const(GmemPtSlotMask));
+                context.Copy(selected, slot);
+
+                if (readLog)
+                {
+                    // As the search's choice below: the entry's bit when it is not the entry this helper chose last in this invocation
+                    Operand rword = context.IAdd(context.ShiftRightU32(slot, Const(5)), Const(GmemReadLogWords));
+                    Operand rbit = context.ShiftLeft(Const(1), context.BitwiseAnd(slot, Const(31)));
+                    Operand lblRead = Label();
+
+                    context.BranchIfTrue(lblRead, context.ICompareEqual(slot, last));
+                    context.BranchIfTrue(lblRead, context.ICompareNotEqual(context.BitwiseAnd(context.Load(StorageKind.StorageBuffer, logBinding, Const(0), rword), rbit), Const(0)));
+                    context.AtomicOr(StorageKind.StorageBuffer, logBinding, Const(0), rword, rbit);
+                    context.MarkLabel(lblRead);
+                }
+
+                context.Store(StorageKind.LocalMemory, lastBinding, slot);
+
+                if (rangeRegs)
+                {
+                    Operand slotEntry = context.IMultiply(slot, Const(GmemMapEntryWords));
+
+                    for (int word = 0; word < 6; word++)
+                    {
+                        context.Store(StorageKind.LocalMemory, rangeBinding, Const(word), MapWord(slotEntry, word));
+                    }
+                }
+
+                // The page's GPU address and the address's offset in it: the entry is 16 KiB aligned, so no carry
+                context.Copy(hostLowPt, context.BitwiseOr(context.BitwiseAnd(pageLow, Const(~GmemPtSlotMask)), context.BitwiseAnd(wordLow, Const(GmemPtSlotMask))));
+                context.Copy(hostHighPt, MapWord(pageWord, 1));
+                context.Branch(lblAccess);
+                context.MarkLabel(lblSearch);
+            }
+            else
+            {
+                // The hint of the address's 2 MiB chunk names an entry holding the whole chunk (dmsh_abi.h DMSH_GMEM_HINT_SHIFT). An address too high for the tag searches
+                Operand chunk = context.BitwiseOr(context.ShiftLeft(addrHigh, Const(32 - GmemHintShift)), context.ShiftRightU32(addrLow, Const(GmemHintShift)));
+                Operand indexMask = Const((1 << GmemMapLog2) - 1);
+                Operand hint = MapWord(context.IMultiply(context.BitwiseAnd(chunk, indexMask), Const(GmemMapEntryWords)), 6);
+                Operand hintIndex = context.BitwiseAnd(hint, indexMask);
+                Operand hintFits = context.BitwiseAnd(
+                    context.BitwiseAnd(context.ICompareNotEqual(hintIndex, Const(0)), context.ICompareEqual(context.ShiftRightU32(hint, Const(GmemMapLog2)), chunk)),
+                    context.ICompareLessUnsigned(addrHigh, Const(1 << (GmemHintShift - GmemMapLog2))));
+                context.Copy(selected, hintIndex);
+                context.BranchIfTrue(lblFound, hintFits);
+            }
 
             // The last entry whose start is at or below the address (entry 0 starts at 0, so there always is one)
             Operand index = Const(0);
 
-            if (gpuAccessor.QueryHostRawSearchLoop())
+            if (gpuAccessor.QueryHostRawSearchLoop() || pageTable)   // with the page table the search is rare: its compact form
             {
                 // nxnative (the profile key shader_raw_loop, IGpuAccessor.QueryHostRawSearchLoop): the same 13 steps as a loop. Unrolled, each of a shader's lookups carried its own copy of
                 // the search (Ocarina of Time's ground mist: 43 lookups, two thirds of its main function's 36,212 LLVM instructions), though a lookup searches only when the hint misses
@@ -1077,7 +1153,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             context.MarkLabel(lblChosen);
             found = context.IMultiply(selected, Const(GmemMapEntryWords));
 
-            if (writes)
+            void WriteLog()
             {
                 Operand word = context.ShiftRightU32(selected, Const(5));
                 Operand bit = context.ShiftLeft(Const(1), context.BitwiseAnd(selected, Const(31)));
@@ -1088,11 +1164,32 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 context.MarkLabel(lblLogged);
             }
 
+            if (writes && !pageTable)
+            {
+                WriteLog();
+            }
+
             // A small integer is read or written in its 32-bit word
-            Operand wordLow = isSmall ? context.BitwiseAnd(addrLow, Const(~3)) : addrLow;
+            wordLow ??= isSmall ? context.BitwiseAnd(addrLow, Const(~3)) : addrLow;
             Operand hostLow = context.IAdd(wordLow, rangeRegs ? LastWord(4) : MapWord(found, 4));   // with shader_raw_regs the chosen entry's words are the private ones by now
             Operand carry = context.ConditionalSelect(context.ICompareLessUnsigned(hostLow, wordLow), Const(1), Const(0));
             Operand hostHigh = context.IAdd(context.IAdd(addrHigh, rangeRegs ? LastWord(5) : MapWord(found, 5)), carry);
+
+            if (pageTable)
+            {
+                // Both ways meet here: the page table's address or the entry's delta added; a store or atomic sets the chosen entry's bit in the write log either way
+                context.Copy(hostLowPt, hostLow);
+                context.Copy(hostHighPt, hostHigh);
+                context.MarkLabel(lblAccess);
+
+                if (writes)
+                {
+                    WriteLog();
+                }
+
+                hostLow = hostLowPt;
+                hostHigh = hostHighPt;
+            }
 
             Operand resultValue = null;
 

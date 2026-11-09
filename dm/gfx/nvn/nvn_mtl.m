@@ -5577,6 +5577,9 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     }
     { void mtl_gmem_words(uint64_t *, uint64_t *, uint64_t *); uint64_t gw, go, gb; mtl_gmem_words(&gw, &go, &gb);
       if (gw) MLOG("raw pool table words at commit: %llu, of them %llu held an older table than the current one and %llu the current one behind the pools", (unsigned long long)gw, (unsigned long long)go, (unsigned long long)gb); }
+    { void mtl_gmem_pt_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *); uint64_t nb, ns, mx, pns, pmx, pb; mtl_gmem_pt_stats(&nb, &ns, &mx, &pns, &pmx, &pb);
+      if (nb) MLOG("raw pool table builds: %llu, %.1f ms in all (%.3f ms average, %.3f ms most), of it the page table %.1f ms (%.3f ms most, %llu KB now)", (unsigned long long)nb, ns / 1e6, ns / 1e6 / (double)nb, mx / 1e6,
+          pns / 1e6, pmx / 1e6, (unsigned long long)(pb >> 10)); }
 }
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_uploads; *reuploads = g_pkg_reuploads; }
 uint64_t mtl_pkg_edge_skips(void) { return g_pkg_edge_skips; }
@@ -11172,13 +11175,84 @@ static int gmem_learned_entries(uint8_t *t, const uint8_t *keep, int *over, int 
     free(R); free(S); free(F);
     return n;
 }
+// The page table (dmsh_abi.h DMSH_GMEM_PT_*, read by shaders built with the profile key shader_raw_ptable): appended to each pool table, so a submission keeps the version it was encoded and patched
+// with (gmem_commit_patch, deferred release) and the read and write logs keep naming entries of that table. One 64-bit entry per 16 KiB guest page from the first page of the entries: the page's
+// GPU address in the buffer of the entry that holds the whole page, ORed with the entry's index; 0 where no entry holds the whole page (a page two pools share, a pool's partial first or last page,
+// a page in no pool) or the page's GPU address is not 16 KiB aligned, and for entry n, where the shader clamps an address outside the table: those lookups search, so every address resolves to the
+// entry the search chooses. A stub's pages point into the page of zeros (at most GMEM_STUB from its start, as the search's delta does; distinct addresses of a stub keep distinct words). Covers the entries' whole span up to DM_NVN_GMEM_PT_MAX_MB of table (default 32 MB: 64 GB of guest addresses); a wider span
+// takes the window holding the most pool bytes, and addresses outside it search (pools far outside the main block, Unreal's malloc zones). Rebuilt with the pool table, whenever a pool comes or goes.
+// DM_NVN_GMEM_PT=0|1 (default: the profile key shader_raw_ptable): 0 leaves the page table empty (n = 0, every lookup searches), which shaders built with the key read correctly, only slower
+static int gmem_pt_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_NVN_GMEM_PT"); v = e && *e ? atoi(e) != 0 : DM_GAME_SHADER_RAW_PTABLE;
+        if (v || (e && *e)) MLOG("raw global memory: page table %s (DM_NVN_GMEM_PT%s)", v ? "on" : "off", e && *e ? "" : ", the profile's shader_raw_ptable"); }
+    return v;
+}
+// DM_NVN_GMEM_PT_SHARED=1: a page no single entry holds whole (a page two pools share, a pool's partial first or last page) takes the page table too: the buffer of an entry that touches it (a
+// resident one before a stub), which covers the whole host page as every pool's buffer does, so any address in the page reads the guest's bytes. The search then decides only pages no entry touches.
+// The page's entry index is that entry's: a store into the other pool's part sets its bit in the write log, so the ranges the stores are learned to write (gml_read) are widened to whole pages; an
+// address in the gap of a partial page reads the guest's memory instead of 0, and a store there lands in it. 0: those pages search (the search's exact choice)
+static int gmem_pt_shared(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_GMEM_PT_SHARED"); v = e && *e ? atoi(e) != 0 : 1; if (gmem_pt_on()) MLOG("raw global memory: page table pages two pools share %s (DM_NVN_GMEM_PT_SHARED)", v ? "point into one of their buffers" : "search"); } return v; }
+static uint64_t gmem_pt_max_pages(void) { static uint64_t v; if (!v) { const char *e = getenv("DM_NVN_GMEM_PT_MAX_MB"); uint64_t mb = e && atoi(e) > 0 ? (uint64_t)atoi(e) : 32; v = (mb << 20) / 8; } return v; }
+enum { GMEM_PT_SHIFT = DMSH_GMEM_PT_SHIFT, GMEM_PT_MASK = (1 << DMSH_GMEM_PT_SHIFT) - 1 };
+_Static_assert(DMSH_GMEM_PT_OFF == DMSH_GMEM_MAP_ENTRIES * DMSH_GMEM_MAP_ENTRY && DMSH_GMEM_MAP_ENTRIES <= (1 << DMSH_GMEM_PT_SHIFT), "the page table follows the entries, and an entry's index fits its low bits");
+typedef struct { uint64_t fast, shared, misaligned, outside; } gmem_pt_info;   // pages: one entry's (fast), held by no one entry (shared / partial / gap, within the span), not 16 KiB aligned, of entries outside the window
+// The pages the table covers, from the n entries of t (entry 0 empty, sorted, disjoint): all of them if they fit max_pages, else the window of max_pages holding the most entry bytes. Only pages below
+// 2^32 (guest addresses below 2^46: the shader's page number is 32 bits). count 0: no page table
+static void gmem_pt_span(const uint8_t *t, int n, uint64_t max_pages, uint32_t *first, uint32_t *count) {
+    *first = 0; *count = 0;
+    int m = 1; while (m < n) { uint64_t hi; memcpy(&hi, t + (size_t)m * DMSH_GMEM_MAP_ENTRY + 8, 8); if (((hi + GMEM_PT_MASK) >> GMEM_PT_SHIFT) > UINT32_MAX) break; m++; }   // entries below 2^46
+    if (m <= 1 || !max_pages) return;
+    uint64_t e0[2], e1[2]; memcpy(e0, t + DMSH_GMEM_MAP_ENTRY, 16); memcpy(e1, t + (size_t)(m - 1) * DMSH_GMEM_MAP_ENTRY, 16);
+    uint64_t p0 = e0[0] >> GMEM_PT_SHIFT, p1 = (e1[1] + GMEM_PT_MASK) >> GMEM_PT_SHIFT;
+    if (p1 - p0 <= max_pages) { *first = (uint32_t)p0; *count = (uint32_t)(p1 - p0); return; }
+    uint64_t best = 0, best_p = p0, sum = 0; int j = 1;
+    for (int i = 1; i < m; i++) {   // windows starting at each entry's first page: the entries wholly inside count
+        uint64_t a[2]; memcpy(a, t + (size_t)i * DMSH_GMEM_MAP_ENTRY, 16); uint64_t ws = a[0] >> GMEM_PT_SHIFT;
+        if (j < i) { j = i; sum = 0; }
+        while (j < m) { uint64_t b[2]; memcpy(b, t + (size_t)j * DMSH_GMEM_MAP_ENTRY, 16); if (((b[1] + GMEM_PT_MASK) >> GMEM_PT_SHIFT) - ws > max_pages) break; sum += b[1] - b[0]; j++; }
+        if (sum > best) { best = sum; best_p = ws; }
+        if (j > i) sum -= a[1] - a[0];
+    }
+    *first = (uint32_t)best_p; *count = (uint32_t)MIN(max_pages, (uint64_t)UINT32_MAX - best_p);
+}
+// Fills pt[0 .. count) (zeroed by the caller; pt[count] stays 0) from the n entries of t. zgpu: the page of zeros' GPU address, for stub entries (last word 1)
+// shared: also the pages an entry only touches (DM_NVN_GMEM_PT_SHARED), the first entry's unless it is a stub and a later one is not
+static void gmem_pt_fill(uint64_t *pt, const uint8_t *t, int n, uint32_t first, uint32_t count, uint64_t zgpu, int shared, gmem_pt_info *info) {
+    memset(info, 0, sizeof *info);
+    uint64_t lo_p = first, hi_p = (uint64_t)first + count, prev_end = 0;
+    for (int k = 1; k < n; k++) {
+        const uint8_t *ent = t + (size_t)k * DMSH_GMEM_MAP_ENTRY; uint64_t e[3]; uint32_t stub; memcpy(e, ent, sizeof e); memcpy(&stub, ent + 28, 4);
+        uint64_t p0 = (e[0] + GMEM_PT_MASK) >> GMEM_PT_SHIFT, p1 = e[1] >> GMEM_PT_SHIFT;   // the pages wholly inside [start, end)
+        uint64_t q0 = e[0] >> GMEM_PT_SHIFT, q1 = (e[1] + GMEM_PT_MASK) >> GMEM_PT_SHIFT;   // the pages it touches
+        if (q1 <= lo_p || q0 >= hi_p) { info->outside += q1 - q0; continue; }
+        info->shared += (p0 > q0 && q0 >= prev_end) + (q1 > p1 && p1 >= p0);   // its partial first and last pages (counted once when two entries share one)
+        prev_end = q1;
+        uint64_t a = shared ? q0 : p0, b = shared ? q1 : p1;
+        for (uint64_t p = MAX(a, lo_p); p < MIN(b, hi_p); p++) {
+            uint64_t g = stub ? zgpu + (((p << GMEM_PT_SHIFT) - (e[0] & ~(uint64_t)GMEM_PT_MASK)) & (GMEM_STUB - 1)) : (p << GMEM_PT_SHIFT) + e[2];   // a stub: the same word for an address as the search gives it, up to the in-page shift
+            if (g & GMEM_PT_MASK) { info->misaligned++; continue; }
+            uint64_t *slot = &pt[p - first];
+            if (*slot) {   // a page an earlier entry touches too: keep it unless it is a stub's and this entry is not
+                uint32_t was; memcpy(&was, t + (size_t)(*slot & GMEM_PT_MASK) * DMSH_GMEM_MAP_ENTRY + 28, 4);
+                if (!was || stub) continue;
+                info->fast--;
+            }
+            *slot = g | (uint64_t)k; info->fast++;
+        }
+    }
+}
+static uint64_t g_gmem_builds, g_gmem_build_ns, g_gmem_build_max_ns, g_gmem_pt_ns, g_gmem_pt_max_ns, g_gmem_pt_bytes; static gmem_pt_info g_gmem_pt_last;
+void mtl_gmem_pt_stats(uint64_t *builds, uint64_t *build_ns, uint64_t *build_max_ns, uint64_t *pt_ns, uint64_t *pt_max_ns, uint64_t *pt_bytes) {
+    *builds = g_gmem_builds; *build_ns = g_gmem_build_ns; *build_max_ns = g_gmem_build_max_ns; *pt_ns = g_gmem_pt_ns; *pt_max_ns = g_gmem_pt_max_ns; *pt_bytes = g_gmem_pt_bytes;
+}
 static int gml_snapshot(uint64_t **lo, uint64_t **hi);   // below: the ranges the raw stores have been seen to write (a copy; the caller frees both)
 static id<MTLBuffer> gmem_map(void) {
     uint64_t gen = atomic_load(&g_pool_gen), budget = gmem_budget(), stale = atomic_load(&g_gmem_stale); int learned = gmem_learned(), cap = budget != 0 || learned;
     if (g_gmem_buf && g_gmem_gen == gen && (!cap || g_gmem_stale_seen == stale)) return g_gmem_buf;
+    uint64_t t_start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t *glo = NULL, *ghi = NULL; int ng = cap ? gml_snapshot(&glo, &ghi) : 0;   // before g_mu: gml_read holds the log's lock while it takes g_mu
-    id<MTLBuffer> b = [g_dev newBufferWithLength:DMSH_GMEM_MAP_ENTRIES * DMSH_GMEM_MAP_ENTRY options:MTLResourceStorageModeShared];
-    uint8_t *t = (uint8_t *)b.contents; memset(t, 0, b.length);
+    uint8_t *t = calloc(1, DMSH_GMEM_PT_OFF); if (!t) MDIE("raw pool table: out of memory");   // the entries, copied into the buffer once the page table's size is known
     for (int k = 1; k < DMSH_GMEM_MAP_ENTRIES; k++) memset(t + (size_t)k * DMSH_GMEM_MAP_ENTRY, 0xff, 8);
     int n = 1, over = 0; uint64_t end = 0;
     pthread_mutex_lock(&g_mu);
@@ -11225,6 +11299,22 @@ static id<MTLBuffer> gmem_map(void) {
         }
     }
     if (over) RED_ONCE(140, "raw global memory: %d more memory pools than the %d entries of the pool table; addresses in them are not reached", over, DMSH_GMEM_MAP_ENTRIES - 1);
+    uint64_t t_pt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint32_t pt_first = 0, pt_n = 0; if (gmem_pt_on()) gmem_pt_span(t, n, gmem_pt_max_pages(), &pt_first, &pt_n);
+    size_t pt_len = ((size_t)pt_n + 1) * 8;   // entry n (0) is there with no page table too: the shader clamps every address to it
+    id<MTLBuffer> b = [g_dev newBufferWithLength:DMSH_GMEM_PT_OFF + DMSH_GMEM_PT_HEAD + pt_len options:MTLResourceStorageModeShared];
+    { uint8_t *bt = (uint8_t *)b.contents; memcpy(bt, t, DMSH_GMEM_PT_OFF); uint32_t head[4] = {pt_first, pt_n, 0, 0}; memcpy(bt + DMSH_GMEM_PT_OFF, head, sizeof head);
+      uint64_t *pt = (uint64_t *)(bt + DMSH_GMEM_PT_OFF + DMSH_GMEM_PT_HEAD); memset(pt, 0, pt_len);
+      if (pt_n) {
+          uint64_t zgpu = 0; if (learned) { pthread_mutex_lock(&g_mu); zgpu = gmem_zero().gpuAddress; pthread_mutex_unlock(&g_mu); }
+          gmem_pt_fill(pt, t, n, pt_first, pt_n, zgpu ? zgpu : 1, gmem_pt_shared(), &g_gmem_pt_last); } }   // without stubs no entry needs the page of zeros (1: misaligned, never used)
+    free(t);
+    uint64_t t_end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), d_all = t_end - t_start, d_pt = t_end - t_pt;
+    g_gmem_builds++; g_gmem_build_ns += d_all; if (d_all > g_gmem_build_max_ns) g_gmem_build_max_ns = d_all; g_gmem_pt_ns += d_pt; if (d_pt > g_gmem_pt_max_ns) g_gmem_pt_max_ns = d_pt; g_gmem_pt_bytes = pt_len;
+    if (pt_n) { static int said; if (said++ < 20 || !(said % 200)) MLOG("raw global memory: page table of %u pages (%llu KB) from guest %#llx, %llu pages one entry's, %llu partial / shared, %llu not 16 KiB aligned, %llu outside it; "
+        "table build %.3f ms (page table %.3f ms), %llu builds so far, %.3f ms average, %.3f ms most", pt_n, (unsigned long long)(pt_len >> 10), (unsigned long long)pt_first << GMEM_PT_SHIFT,
+        (unsigned long long)g_gmem_pt_last.fast, (unsigned long long)g_gmem_pt_last.shared, (unsigned long long)g_gmem_pt_last.misaligned, (unsigned long long)g_gmem_pt_last.outside,
+        d_all / 1e6, d_pt / 1e6, (unsigned long long)g_gmem_builds, g_gmem_build_ns / 1e6 / (double)g_gmem_builds, g_gmem_build_max_ns / 1e6); }
     res_add(b); res_commit();
     if (g_gmem_buf) defer_obj_release(g_gmem_buf);
     g_gmem_buf = b; g_gmem_gen = gen; g_gmem_stale_seen = stale;
@@ -11290,8 +11380,11 @@ static void gml_read(id<MTLBuffer> b, id<MTLBuffer> map, int predicted, uint64_t
         pthread_mutex_unlock(&g_gsr_mu); }
     pthread_mutex_lock(&g_gml_mu);
     g_gml_logs++;
+    uint32_t pt_n = 0; if (map.length > DMSH_GMEM_PT_OFF) memcpy(&pt_n, t + DMSH_GMEM_PT_OFF + 4, 4);
+    int widen = pt_n && gmem_pt_shared();   // a store into a page two pools share sets the bit of the entry the page table names: the learned range covers its whole pages
     for (int i = 0; i < GML_WORDS && !g_gml_over; i++) for (uint32_t bits = w[i]; bits && !g_gml_over; bits &= bits - 1) {
         uint64_t e[2]; memcpy(e, t + (size_t)(i * 32 + __builtin_ctz(bits)) * DMSH_GMEM_MAP_ENTRY, sizeof e);
+        if (widen) { e[0] &= ~(uint64_t)GMEM_PT_MASK; e[1] = (e[1] + GMEM_PT_MASK) & ~(uint64_t)GMEM_PT_MASK; }
         int known = 0;
         for (int k = 0; k < g_gml_n && !known; k++) known = e[0] >= g_gml_lo[k] && e[1] <= g_gml_hi[k];
         { uint32_t sf; memcpy(&sf, t + (size_t)(i * 32 + __builtin_ctz(bits)) * DMSH_GMEM_MAP_ENTRY + 28, 4); if (sf) stub_wrote = 1; }   // a store into a stub landed in the page of zeros (learned mode)

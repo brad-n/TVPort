@@ -32,8 +32,9 @@ BORDER_EMU = GAME.get('shader_border_emu', '1') == '1'   # 0: border_emu leaves 
 #   shader_unord_cmp: an unordered float comparison is the negation of the ordered opposite, one comparison instead of three and two ORs (InstEmit.GetFPComparison)
 #   shader_raw_loop: a raw global memory lookup's binary search over the pool table is a loop, not 13 unrolled steps at each lookup (GlobalToStorage)
 #   shader_raw_regs: a raw lookup keeps its last entry's start, end and delta in private words, so a hit reads no table word (GlobalToStorage)
+#   shader_raw_ptable: a raw lookup reads the page table the host appends to the pool table (one load per 16 KiB guest page) and searches only for the pages it leaves to the search (GlobalToStorage)
 #   shader_no_rescale: no division of gl_FragCoord.xy and no texel-fetch or size rescale by the support buffer's render scale, which the host always fills with 1.0 (InstEmitAttribute.EmitIpa, TexturePass)
-XLATE_KEYS = {'shader_fragw_fold': 'fragw_fold', 'shader_ftz_cmp': 'ftz_cmp', 'shader_unord_cmp': 'unord_cmp', 'shader_raw_loop': 'raw_loop', 'shader_raw_regs': 'raw_regs', 'shader_no_rescale': 'no_rescale'}
+XLATE_KEYS = {'shader_fragw_fold': 'fragw_fold', 'shader_ftz_cmp': 'ftz_cmp', 'shader_unord_cmp': 'unord_cmp', 'shader_raw_loop': 'raw_loop', 'shader_raw_regs': 'raw_regs', 'shader_raw_ptable': 'raw_ptable', 'shader_no_rescale': 'no_rescale'}
 XLATE_OPTS = {opt: True for key, opt in XLATE_KEYS.items() if GAME.get(key, '0') == '1'}
 WIDE_DEVICE = GAME.get('shader_wide_device', '0') == '1'   # 1: wide_loads also merges the words of device storage buffers the shader never writes (dmsh_wide.py unwritten)
 XLATE = os.environ.get('XLATE', os.path.join(dmsh_chain.XLATE_DIR, 'dmsh_xlate'))

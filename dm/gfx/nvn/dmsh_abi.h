@@ -89,6 +89,14 @@
 // bit of the entry it chose (by the hint or the search, not when it reuses the entry it chose last) -- shaders with loads only get the log binding too. In nvn_mtl.m's DM_NVN_GMEM_MODE=learned an
 // entry whose last 4 bytes (the table entry's padding) are 1 is a stub: memory the host has not made resident, whose delta points into a page of zeros; the read bit says a shader wants it
 #define DMSH_GMEM_LOG_CB_OFFSET 1
+// Page table (a game whose profile sets shader_raw_ptable, GlobalToStorage GmemPtWord): the table buffer goes on past the entries. At DMSH_GMEM_PT_OFF a 16-byte header {first page (guest address >> DMSH_GMEM_PT_SHIFT,
+// 32 bits), page count n (32 bits), 0, 0}, then n + 1 64-bit entries, one per 16 KiB guest page from the first: the Metal GPU address of that page in the buffer of the table entry that holds the whole page
+// (16 KiB aligned), ORed with that entry's index (1 to 8,191) in the low DMSH_GMEM_PT_SHIFT bits. 0 sends the lookup to the search: a page no single entry holds (shared by two pools, a pool's first or last
+// partial page, in no pool), a page whose GPU address is not 16 KiB aligned, and entry n, where the shader clamps an address outside the table. A stub's pages point at the page of zeros. Every table
+// has the header (n = 0 when the host fills no page table: every lookup searches), so shaders built with the key read the same memory on any host of this chain
+#define DMSH_GMEM_PT_OFF 262144          // bytes before the header: DMSH_GMEM_MAP_ENTRIES * DMSH_GMEM_MAP_ENTRY (word 65,536 of the table buffer)
+#define DMSH_GMEM_PT_HEAD 16             // bytes of the header, before entry 0
+#define DMSH_GMEM_PT_SHIFT 14            // 16 KiB pages; the low 14 bits of an entry hold the table entry's index
 
 // A pool binding points at a buffer the host keeps (nvn_mtl.m pool_gpu): a 32-bit bound n (the highest index the shader may read), then from DMSH_POOL_HEAD one 8-byte resource ID per ID
 #define DMSH_POOL_HEAD 16                // bytes before element 0 of a pool buffer: the bound n, 4 bytes of padding, and the 64-bit GPU address of the read bitmap: bit i in 32-bit word i / 32 is set by a shader that reads texture ID i (dmsh_build.py pool_arrays, nvn_mtl.m pool_seen_scan); 0 in a table of a uniform buffer's handles (htab_gpu), whose reads are not marked
