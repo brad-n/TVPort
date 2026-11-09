@@ -188,9 +188,10 @@ else t "no app icon ($ICON not found): the home-screen icon stays blank"; fi
 # The unsigned IPA carries the same request in its executable's ad-hoc signature below; the install tool replaces that signature.
 if [ "$PREPARE_XCODE" = YES ] && [ -n "${DM_ENTITLEMENTS-default}" ]; then
   if [ -n "${DM_ENTITLEMENTS:-}" ]; then cp "$DM_ENTITLEMENTS" Gen/DmIOS.entitlements || die "copy DM_ENTITLEMENTS"
-  else GROUP_ENT=; [ -z "$DM_SWITCHTV_GROUP" ] || GROUP_ENT="<key>keychain-access-groups</key><array><string>$DM_SWITCHTV_GROUP</string></array>"
+  else EVA_ENT=; RES=$(gp mem_reserve 2>/dev/null || true); [ -z "$RES" ] || [ $((RES)) -le $((0x180000000)) ] || EVA_ENT='<key>com.apple.developer.kernel.extended-virtual-addressing</key><true/>'   # a guest address space over 6 GB (Switch 2 profiles: 12.5 GB) is one reservation tvOS and iOS refuse without Extended Virtual Addressing
+    GROUP_ENT=; [ -z "${DM_SWITCHTV_GROUP:-}" ] || GROUP_ENT="<key>keychain-access-groups</key><array><string>$DM_SWITCHTV_GROUP</string></array>"
     printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
-    "<plist version=\"1.0\"><dict><key>com.apple.developer.kernel.increased-memory-limit</key><true/>$GROUP_ENT</dict></plist>" > Gen/DmIOS.entitlements || die "entitlements"; fi
+    "<plist version=\"1.0\"><dict><key>com.apple.developer.kernel.increased-memory-limit</key><true/>$EVA_ENT$GROUP_ENT</dict></plist>" > Gen/DmIOS.entitlements || die "entitlements"; fi
   echo "CODE_SIGN_ENTITLEMENTS = Gen/DmIOS.entitlements" >> Gen/dm.xcconfig
   t "entitlements: $(plutil -convert json -o - Gen/DmIOS.entitlements)"
 fi
@@ -240,8 +241,9 @@ rm -rf "$APP/msl" "$O/Payload"   # Payload/: what the copy-and-zip packing left 
 if [ -n "${DM_ENTITLEMENTS-default}" ]; then
   ENT=$O/DmIOS.entitlements
   if [ -n "${DM_ENTITLEMENTS:-}" ]; then cp "$DM_ENTITLEMENTS" "$ENT" || die "copy DM_ENTITLEMENTS"
-  else printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
-    '<plist version="1.0"><dict><key>com.apple.developer.kernel.increased-memory-limit</key><true/></dict></plist>' > "$ENT" || die "entitlements"; fi
+  else EVA_ENT=; RES=$(gp mem_reserve 2>/dev/null || true); [ -z "$RES" ] || [ $((RES)) -le $((0x180000000)) ] || EVA_ENT='<key>com.apple.developer.kernel.extended-virtual-addressing</key><true/>'   # a guest address space over 6 GB (Switch 2 profiles: 12.5 GB) is one reservation tvOS and iOS refuse without Extended Virtual Addressing
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+    "<plist version=\"1.0\"><dict><key>com.apple.developer.kernel.increased-memory-limit</key><true/>$EVA_ENT</dict></plist>" > "$ENT" || die "entitlements"; fi
   EXE=$APP/DmIOS; [ ! -f "$APP/Info.plist" ] || EXE=$APP/$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist") || die "CFBundleExecutable of $APP"
   xattr -cr "$EXE" 2> /dev/null   # codesign refuses a file with a resource fork, Finder information or quarantine attributes
   codesign --force --sign - --entitlements "$ENT" "$EXE" || die "ad-hoc signature with the entitlements"

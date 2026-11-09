@@ -18,6 +18,8 @@ import romfs_image
 GAME = '010015100B514000'
 SCRIPT = (REPO / 'dm/ios/tools/build_ipa.sh').read_text()
 SIGNING = SCRIPT[SCRIPT.index('# The entitlements of an unsigned IPA'):SCRIPT.index('\nP=Payload/DmIOS.app\n')]
+XCODE_ENTITLEMENTS = SCRIPT[SCRIPT.index('# A prepared Xcode project is signed in Xcode'):SCRIPT.index('# DM_COPY_ROMFS=NO also for the prepared project')]
+EVA = 'com.apple.developer.kernel.extended-virtual-addressing'
 PACKING = SCRIPT[SCRIPT.index('\nP=Payload/DmIOS.app\n'):]
 PREAMBLE = 'set -u\nt() { :; }; die() { echo "$*" >&2; exit 1; }\ngp() { python3 "$PROFILE_TOOL" "$GAME" "$1"; }\n'
 CAN_SIGN = sys.platform == 'darwin' and shutil.which('codesign') and shutil.which('cc')
@@ -25,7 +27,7 @@ CAN_SIGN = sys.platform == 'darwin' and shutil.which('codesign') and shutil.whic
 
 def run_step(script, root, **extra):
     env = {k: v for k, v in os.environ.items() if not k.startswith('DM_') and k not in ('IOS_PULL', 'AOC', 'PSO')}
-    env.update(GAME=GAME, DM=str(root / 'dm'), PROFILE_TOOL=str(REPO / 'dm/games/game.py'), **extra)
+    env.update(dict(GAME=GAME, DM=str(root / 'dm'), PROFILE_TOOL=str(REPO / 'dm/games/game.py')), **extra)
     return subprocess.run(['/bin/bash', '-c', PREAMBLE + script], cwd=root, env=env, capture_output=True, text=True)
 
 
@@ -96,6 +98,31 @@ class UnsignedIpaTests(unittest.TestCase):
                 shown = subprocess.run(['codesign', '-d', '--entitlements', '-', str(root / 'DmIOS.app/DmIOS')], capture_output=True, text=True)
                 self.assertEqual('com.apple.developer.kernel.increased-memory-limit' in shown.stdout + shown.stderr, expected)
 
+
+    @unittest.skipUnless(CAN_SIGN, 'needs macOS codesign and a C compiler')
+    def test_a_big_address_space_asks_for_extended_virtual_addressing(self):
+        # Ocarina (Switch 2) reserves 12.5 GB of guest address space; tvOS refuses one reservation over about 6 GB without the entitlement ("FATAL reserve guest AS", 2026-11-08)
+        for game_id, expected in (('0400486024DEC000', True), ('010015100B514000', False)):
+            with self.subTest(game=game_id), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / 'DmIOS.app').mkdir(); (root / 'pkg').mkdir()
+                (root / 'main.c').write_text('int main(void) { return 0; }\n')
+                subprocess.run(['cc', '-o', str(root / 'DmIOS.app/DmIOS'), str(root / 'main.c')], check=True)
+                result = run_step(SIGNING, root, GAME=game_id, APP=str(root / 'DmIOS.app'), O=str(root / 'pkg'))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                shown = subprocess.run(['codesign', '-d', '--entitlements', '-', str(root / 'DmIOS.app/DmIOS')], capture_output=True, text=True)
+                self.assertEqual(EVA in shown.stdout + shown.stderr, expected)
+                self.assertIn('com.apple.developer.kernel.increased-memory-limit', shown.stdout + shown.stderr)
+
+    def test_the_xcode_project_asks_for_extended_virtual_addressing_for_a_big_address_space(self):
+        for game_id, expected in (('0400486024DEC000', True), ('010015100B514000', False)):
+            with self.subTest(game=game_id), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary); (root / 'Gen').mkdir(); (root / 'Gen/dm.xcconfig').write_text('')
+                result = run_step(XCODE_ENTITLEMENTS, root, GAME=game_id, PREPARE_XCODE='YES', DM_SWITCHTV_GROUP='')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                plist = (root / 'Gen/DmIOS.entitlements').read_text()
+                self.assertEqual(EVA in plist, expected)
+                self.assertIn('com.apple.developer.kernel.increased-memory-limit', plist)
 
 if __name__ == '__main__':
     unittest.main()
