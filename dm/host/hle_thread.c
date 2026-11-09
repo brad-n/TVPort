@@ -645,11 +645,48 @@ int thr_find_by_name(const char *name, pthread_t *out) {
 }
 // State dump (called from crash.c on watchdog / crash; read-only, takes no lock): what each guest thread is waiting on and where its most recent SVC was issued from
 // During a state dump, take the backtrace of other guest threads: suspend → read registers → walk the frame pointer chain (both guest code and gate blocks keep the x29 chain) → resume; only main / sdk frames are printed
+// Host-side backtraces for the stall dump. A guest thread that is not waiting in an SVC, or is stuck inside a host call (the NVN layer on Metal, Core Audio, the OS), has its pc in host code, where the
+// guest backtrace below shows nothing. Between the suspend and the resume only mach calls and memory reads run (hbt_grab: no malloc, no stdio, no dladdr: the suspended thread may hold their locks);
+// the symbols are looked up by hbt_format after the thread runs again. System libraries on tvOS / iOS / Apple silicon sign their saved return addresses (pointer authentication), stripped here.
+// Frames: the pc, the lr (a leaf such as a syscall stub has no frame of its own: its caller's return address is only in the lr) and the frame-pointer chain
+enum { HBT_MAX = 24 };
+typedef struct { int n; uint64_t pc[HBT_MAX]; } hbt_t;
+static uint64_t hbt_strip(uint64_t p) {
+#if defined(__aarch64__)
+    uint64_t o; __asm__ volatile("mov x30, %1\n\thint #7\n\tmov %0, x30" : "=r"(o) : "r"(p) : "x30");   // xpaclri
+    return o;
+#else
+    return p;
+#endif
+}
+static void hbt_grab(const arm_thread_state64_t *st, hbt_t *b) {
+    uint64_t fp = __darwin_arm_thread_state64_get_fp(*st);
+    b->n = 0; b->pc[b->n++] = hbt_strip(__darwin_arm_thread_state64_get_pc(*st)); b->pc[b->n++] = hbt_strip(__darwin_arm_thread_state64_get_lr(*st));
+    while (fp && b->n < HBT_MAX) {
+        uint64_t fr[2]; vm_size_t g = 0;
+        if (vm_read_overwrite(mach_task_self(), fp, 16, (vm_address_t)fr, &g) || g != 16 || fr[0] <= fp) break;
+        uint64_t r = hbt_strip(fr[1]); if (r != b->pc[b->n - 1]) b->pc[b->n++] = r;   // a function with a frame: the lr register is its saved lr
+        fp = fr[0];
+    }
+}
+// Appends " name+off" per frame to out: a guest module's name, else the nearest exported symbol (dladdr), else image+off, else the address
+static void hbt_format(char *out, size_t n, const hbt_t *b) {
+    size_t q = strlen(out);
+    for (int k = 0; k < b->n && q + 120 < n; k++) {
+        uint64_t a = b->pc[k]; Dl_info di; module_t *m = module_of((void *)a);
+        if (!a) continue;
+        if (m) q += (size_t)snprintf(out + q, n - q, " %s+%#llx", m->name, (unsigned long long)(a - (uint64_t)m->base));
+        else if (dladdr((void *)a, &di) && di.dli_sname) q += (size_t)snprintf(out + q, n - q, " %s+%#lx", di.dli_sname, (unsigned long)(a - (uint64_t)di.dli_saddr));
+        else if (di.dli_fname && di.dli_fbase) { const char *f = strrchr(di.dli_fname, '/'); q += (size_t)snprintf(out + q, n - q, " %s+%#lx", f ? f + 1 : di.dli_fname, (unsigned long)(a - (uint64_t)di.dli_fbase)); }
+        else q += (size_t)snprintf(out + q, n - q, " %#llx", (unsigned long long)a);
+    }
+}
 static void thr_bt(thr_t *t) {
     if (!t->mport || t->exited || t->mport == mach_thread_self()) return;
     if (thread_suspend(t->mport) != KERN_SUCCESS) return;
-    arm_thread_state64_t st; mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
+    arm_thread_state64_t st; mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT; hbt_t hb; hb.n = 0;
     if (thread_get_state(t->mport, ARM_THREAD_STATE64, (thread_state_t)&st, &n) == KERN_SUCCESS) {
+        if (!module_of((void *)__darwin_arm_thread_state64_get_pc(st))) hbt_grab(&st, &hb);   // in host code (running, or inside a host call): the host frames are printed after the resume
         // Threads not waiting in a system call (running guest code, possibly spinning on a condition): print the callee-saved registers x19–x28, plus 128 bytes of the memory pointed to by each of x19 / x20.
         // A thread spinning on a condition is told apart by its callee-saved registers (often the object it waits on) and the memory they point to
         if (t->wkind == 0) { char rl[400]; int q = snprintf(rl, sizeof rl, "[dm]   %#x registers pc=", t->handle); uint64_t pc = __darwin_arm_thread_state64_get_pc(st); module_t *pm = module_of((void *)pc);
@@ -678,6 +715,7 @@ static void thr_bt(thr_t *t) {
         fprintf(stderr, "%s\n", line);
     }
     thread_resume(t->mport);
+    if (hb.n) { char hl[2400]; snprintf(hl, sizeof hl, "[dm]   %#x host backtrace:", t->handle); hbt_format(hl, sizeof hl, &hb); fprintf(stderr, "%s\n", hl); }
 }
 void svc_thread_dump(void) {
     static const char *kinds[] = {"running/not waiting", "mutex", "condvar", "address", "sync object"};
@@ -730,21 +768,10 @@ void svc_thread_dump(void) {
             int guest = 0; for (thr_t *t = g_all; t; t = t->all) if (t->mport == ths[i]) { guest = 1; break; }
             if (!guest && ths[i] != mach_thread_self() && thread_suspend(ths[i]) == KERN_SUCCESS) {
                 arm_thread_state64_t st; mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
-                if (thread_get_state(ths[i], ARM_THREAD_STATE64, (thread_state_t)&st, &n) == KERN_SUCCESS) {
-                    char line[1200]; int p = snprintf(line, sizeof line, "[dm] host thread %#x:", ths[i]);
-                    uint64_t fp = __darwin_arm_thread_state64_get_fp(st), pc = __darwin_arm_thread_state64_get_pc(st);
-                    for (int k = 0; k < 12 && p < (int)sizeof line - 80; k++) {
-                        Dl_info di; module_t *m = module_of((void *)pc);
-                        if (m) p += snprintf(line + p, sizeof line - p, " %s+%#llx", m->name, pc - (uint64_t)m->base);
-                        else if (dladdr((void *)pc, &di) && di.dli_sname) p += snprintf(line + p, sizeof line - p, " %s+%#lx", di.dli_sname, (unsigned long)(pc - (uint64_t)di.dli_saddr));
-                        else p += snprintf(line + p, sizeof line - p, " %#llx", pc);
-                        uint64_t fr[2]; vm_size_t g2 = 0;
-                        if (!fp || vm_read_overwrite(mach_task_self(), fp, 16, (vm_address_t)fr, &g2) || g2 != 16 || fr[0] <= fp) break;
-                        fp = fr[0]; pc = fr[1];
-                    }
-                    fprintf(stderr, "%s\n", line);
-                }
+                hbt_t hb; hb.n = 0;
+                if (thread_get_state(ths[i], ARM_THREAD_STATE64, (thread_state_t)&st, &n) == KERN_SUCCESS) hbt_grab(&st, &hb);
                 thread_resume(ths[i]);
+                if (hb.n) { char line[2400]; snprintf(line, sizeof line, "[dm] host thread %#x:", ths[i]); hbt_format(line, sizeof line, &hb); fprintf(stderr, "%s\n", line); }
             }
             mach_port_deallocate(mach_task_self(), ths[i]);
         }
