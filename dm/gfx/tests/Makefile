@@ -36,8 +36,8 @@ MTL_T_SRC=../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_s
 # target: ./t_x by default, with the environment its RUN_ENV gives it (check_t_x: RUN_ENV = MTL_DEBUG_LAYER=1, beside its build rule), or a check_t_x recipe of its own when it
 # runs several ways. A new test needs its source and its build rule; no list to add it to. NOT_RUN: helpers linked into other tests (t_host_stubs, t_present_rescue_focus, t_gpu_lost_front),
 # a fixture test_image_atomic_bounds.py builds itself (t_atomic_return), t_geometry_primitive_id (the GPU half of test_dmsh_geometry.py, which gives it the directory of
-# its translated fixtures), and t_gpuprof, which CI's CPU subset runs (.github/workflows/tests.yml)
-NOT_RUN = t_host_stubs t_present_rescue_focus t_gpu_lost_front t_atomic_return t_geometry_primitive_id t_gpuprof
+# its translated fixtures), t_gpuprof, which CI's CPU subset runs (.github/workflows/tests.yml), and t_flatva_bench, a benchmark that prints numbers
+NOT_RUN = t_host_stubs t_present_rescue_focus t_gpu_lost_front t_atomic_return t_geometry_primitive_id t_gpuprof t_flatva_bench
 RUN_TESTS = $(filter-out $(NOT_RUN),$(basename $(sort $(wildcard t_*.c t_*.m))))
 check_t_%: t_%
 	$(RUN_ENV) ./$<
@@ -63,6 +63,11 @@ t_astc_cache: t_astc_cache.m ../tex/nvn_astc_cache.m ../tex/nvn_astc_cache.h ../
 # Encode throughput of the transcoder (prints numbers, not a test; no sanitizers): make t_astc_bench && ./t_astc_bench
 t_astc_bench: t_astc_bench.m ../tex/nvn_astc_cache.m ../tex/nvn_astc_cache.h ../tex/nvn_astc.mm ../tex/nvn_astc.h ../tex/nvn_bcdec.c ../tex/nvn_bcdec.h $(ASTC_LIB) $(ZSTD_LIB)
 	clang -O2 -g -Wall -Wno-unused-function -I../nvn/include -fobjc-arc -o $@ t_astc_bench.m ../tex/nvn_bcdec.c ../tex/nvn_astc.mm $(ASTC_LIB) $(ZSTD_LIB) -lc++ -framework Foundation -framework Metal
+# Flat guest GPU address space spike (branch tv-all-flatva-spike): Metal's limits for one flat range (placement sparse buffers, GPU addresses, residency), and pointer chases through
+# zero-copy pools translated by the raw pool table against a page table and an add. Prints numbers, not a test (NOT_RUN); GPU runs on a shared Mac go through the bench lock:
+# make t_flatva_bench && ./t_flatva_bench limits && ./t_flatva_bench chase
+t_flatva_bench: t_flatva_bench.m
+	clang -O2 -g -Wall -fobjc-arc -o $@ t_flatva_bench.m -framework Metal -framework Foundation
 # DM_NVN_BC_ASTC on the GPU: uploads of BC1/2/3/7 as ASTC against the CPU decode (DM_TEST_NO_BC and the variable are set by the test)
 t_astc_upload: t_astc_upload.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_astc_upload.m $(MTL_T_SRC) $(FW)
