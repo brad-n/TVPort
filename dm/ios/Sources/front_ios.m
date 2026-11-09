@@ -18,6 +18,7 @@
 
 void dm_gamepad_active(void);
 #import "DmLayout.h"
+#include "DmDisplayCap.h"
 #import "DmGameMenu.h"
 
 void front_ios_boot(void);
@@ -46,6 +47,9 @@ static UILabel *front_ios_fps_label(void);
         CAMetalLayer *l = (CAMetalLayer *)self.layer;
         l.device = MTLCreateSystemDefaultDevice(); l.pixelFormat = MTLPixelFormatBGRA8Unorm;
         l.contentsScale = MAX(self.traitCollection.displayScale, 1); l.framebufferOnly = NO; l.opaque = YES;
+#if TARGET_OS_TV
+        self.maxPixelWidth = dm_tv_max_width(getenv("DM_TV_MAX_WIDTH"));   // at most 1920 across by default: the game's picture is 1080p at most here, and the TV scales the layer (DmDisplayCap.h)
+#endif
         self.backgroundColor = UIColor.blackColor;
     }
     return self;
@@ -59,6 +63,8 @@ static UILabel *front_ios_fps_label(void);
     if (self.maxPixelWidth > 0) scale = MIN(scale, self.maxPixelWidth / MAX(self.bounds.size.width, 1));
     l.contentsScale = scale;
     l.drawableSize = CGSizeMake(self.bounds.size.width * l.contentsScale, self.bounds.size.height * l.contentsScale);
+    static CGSize logged; if (!CGSizeEqualToSize(logged, l.drawableSize)) { logged = l.drawableSize;
+        LOG("front end: drawable %.0fx%.0f (screen scale %.2f, at most %.0f across; DM_TV_MAX_WIDTH on the Apple TV)", l.drawableSize.width, l.drawableSize.height, screen ? screen.nativeScale : 0, self.maxPixelWidth); }
 }
 @end
 static void tv_attach(void);
@@ -402,7 +408,11 @@ void *front_metal_layer(void) { return (__bridge void *)g_layer; }
 int front_display_pixels(int *w, int *h) {   // the screen in pixels, landscape (nativeBounds is portrait); UIScreen's sizes may be read from any thread
     CGRect b = UIScreen.mainScreen.nativeBounds; int a = (int)b.size.width, c = (int)b.size.height;
     if (a <= 0 || c <= 0) return 0;
-    *w = a > c ? a : c; *h = a > c ? c : a; return 1;
+    *w = a > c ? a : c; *h = a > c ? c : a;
+#if TARGET_OS_TV
+    dm_cap_display(w, h, dm_tv_max_width(getenv("DM_TV_MAX_WIDTH")));   // the size the picture is drawn at (DmGameView maxPixelWidth), so a docked Switch 2 game renders for it, not for 4K
+#endif
+    return 1;
 }
 // Offline HTML pages (web_apple.m): the page's view goes over the game view and under the gamepad, which lets touches on no control through to it while the page is
 // shown (DmGamepad.m hitTest); the page takes them as a click on what they land on, and the gamepad and controllers drive it as on the Switch
