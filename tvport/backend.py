@@ -883,6 +883,46 @@ def extractor_options(args) -> list:
     return out
 
 
+def profile_signature(game: Game) -> str:
+    """The game's own profile in the engine (dm/games/<title id>/game.tsv and pso_manifest.tsv): what the rewriter and the shader step read besides the code patches."""
+    title_id = getattr(game, 'title_id', '')
+    folder = REPO / 'dm/games' / title_id
+    parts = {name: hashlib.sha256((folder / name).read_bytes()).hexdigest() for name in ('game.tsv', 'pso_manifest.tsv') if title_id and (folder / name).is_file()}
+    return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()
+
+
+def engine_change(game: Game) -> Optional[str]:
+    """Why a prepared game's rewritten code is out of date with this engine, or None. The rewriter (dm/tools/patch_nso.py) writes build_src.sha256 into patched_<version>/:
+    the sha256 and the path (from dm/tools) of itself and every patch file it read. Entries for other games' patches.py are ignored; this game's own, the shared ones and
+    a missing record all count. A changed game.tsv / pso_manifest.tsv counts when the last prepare recorded them (a game prepared before that has nothing to compare)."""
+    package = getattr(game, 'package', None)
+    if not game.build or not package:
+        return None
+    record = game.build / f'patched_{package}' / 'build_src.sha256'
+    try:
+        lines = record.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return 'the record of what its code was rewritten from is missing'
+    tools = REPO / 'dm/tools'
+    own = f'../games/{getattr(game, "title_id", "")}/'
+    for line in lines:
+        digest, _, relative = line.partition('  ')
+        if not digest or not relative:
+            continue
+        if relative.startswith('../games/') and not relative.startswith(own):
+            continue
+        try:
+            current = hashlib.sha256((tools / relative).read_bytes()).hexdigest()
+        except OSError:
+            return f'{relative} is gone from the engine'
+        if current != digest:
+            return f'{Path(relative).name} changed' if not relative.startswith('..') else f'{relative.removeprefix("../")} changed'
+    recorded = game.state().get('profile_signature')
+    if recorded and recorded != profile_signature(game):
+        return "the game's profile (game.tsv or pso_manifest.tsv) changed"
+    return None
+
+
 def prepare_game(game: Game, keys: Optional[Path], team: str, python: str, args=None) -> Game:
     stage('Extracting the game, rewriting its code and building shaders')
     emit('log', line='This can take 30 to 60 minutes the first time, and again when the game version changes.')
@@ -920,7 +960,7 @@ def prepare_game(game: Game, keys: Optional[Path], team: str, python: str, args=
         raise Failure('The engine finished without shaders or game files for this game. See the log above.')
     profile = profile or 'profile'
     profiles[signature] = profile
-    game.save_state(source_signature=signature, profile_root=profile, profiles_by_source=profiles)
+    game.save_state(source_signature=signature, profile_root=profile, profiles_by_source=profiles, profile_signature=profile_signature(game))
     return game
 
 
@@ -1289,6 +1329,15 @@ def cmd_build(args) -> None:
     previous_signature = game.state().get('source_signature')
     if not game.prepared or ((previous_signature or game.addons) and previous_signature != signature):
         game = prepare_game(game, args.keys, team, python, args)
+    else:
+        why = engine_change(game)
+        if why:
+            # build_ipa_from_nsp.py reuses the extract, the shaders and every rewritten module whose inputs are unchanged, so this redoes only the rewrite
+            if getattr(game, 'keyless', False) or (args.keys and Path(args.keys).is_file()) or find_keys(game):
+                emit('log', line=f"The engine's patches for this game changed ({why}): rewriting the game's code again.")
+                game = prepare_game(game, args.keys, team, python, args)
+            else:
+                emit('log', line=f"The engine's patches for this game changed ({why}), but prod.keys was not found, so the game's code is not rewritten again this time.")
     bundle = game.bundle_id(team)
     block, bc1_block = astc_blocks(args)
     pack = prebuild_astc(game, block, python, args.texture_cap, bc1_block) if block else None   # the game's files are extracted: encode its BC textures once, here
@@ -1309,7 +1358,7 @@ def cmd_build(args) -> None:
     project = generate_project(game, args, team, bundle, python, None)
     bundle_shaders(game, project)
     compile_app(game, project, args.device)
-    game.save_state(bundle_id=bundle, art=str(args.art) if args.art else None, mode=args.mode, texture_cap=args.texture_cap, render_scale=args.render_scale, source_signature=signature)
+    game.save_state(bundle_id=bundle, art=str(args.art) if args.art else None, mode=args.mode, texture_cap=args.texture_cap, render_scale=args.render_scale, source_signature=signature, profile_signature=profile_signature(game))
     if args.device:
         install(game, args.device, bundle, pack, once)
         restored = restore_saves(game, args.device, bundle)
