@@ -674,7 +674,6 @@ static inline const pc_ent *pc_get(uint64_t addr, uint64_t len) {
     pc_ent *c = &t_pc.e[pc_slot(addr)];
     if (addr >= c->lo && addr < c->hi && addr + (len > 1 ? len : c->unk) <= c->end) { t_pc.last = *c; return c; }
     for (unsigned k = 0; k < PC_RECENT; k++) { const pc_ent *x = &t_pc.r[k]; if (addr >= x->lo && addr < x->hi && addr + (len > 1 ? len : x->unk) <= x->end) { *c = *x; t_pc.last = *x; return c; } }
-
     return NULL;
 }
 static void pc_put(int i, uint64_t addr) {   // caller holds g_mu, pool i is resident and holds addr

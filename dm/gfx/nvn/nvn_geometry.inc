@@ -616,7 +616,6 @@ static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
     });
     return nil;
 }
-}
 static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
     id<MTL4RenderCommandEncoder> en = (id<MTL4RenderCommandEncoder>)en_; NvShader *ts = g_mtk.ts, *ms = g_mtk.ms;
     [en setArgumentTable:g_vt atStages:MTLRenderStageMesh];

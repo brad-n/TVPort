@@ -300,7 +300,9 @@ static void native_mesh(NSString *dir) {
         EXPECT("different depth entry is not claimed", count, g_pso_mtk.n);
         g_mtk.ms = other_depth;
         id<MTLRenderPipelineState> alternate = mtk_pso(raster);
-        EXPECT("different depth entry builds its own pipeline", before + 1, g_bp_pso_n);
+        EXPECT("a miss is built in the background: the first demand leaves the draw out", 1, alternate == nil);
+        for (int w = 0; w < 400 && !alternate; w++) { usleep(25000); alternate = mtk_pso(raster); }   // this tree builds a miss in the background (the PR built it on the spot)
+        EXPECT("different depth entry builds its own pipeline", 1, alternate != nil);
         EXPECT("different depth entry is not the warmed pipeline", 1, alternate && alternate != warmed);
         if (alternate) { uint8_t pixel[4]; pixels(alternate, 1, pixel); EXPECT("alternate entry preserves the clear color", 1, pixel[0] == 255 && pixel[1] == 0 && pixel[2] == 0 && pixel[3] == 255); }
     }
