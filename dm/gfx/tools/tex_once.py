@@ -51,6 +51,15 @@ BC1_FORMATS = (0x1a01, 0x1a06)
 NATIVE_SOURCE = os.path.join(HERE, 'tex_once_native.c')
 
 
+def debug_mode():
+    """Hidden bisect switch TEX_ONCE_DEBUG (Smash boot hang, 2026-11-08); empty = the normal tool.
+    repack-only: every container the normal run touches is re-packed the same way, but its planes are left as they are (the decompressed contents equal the original; no pack is embedded).
+    zero-only: planes are tagged + zeroed only in containers that need no re-compression (raw NUTEXB / BNTX / SARC, uncompressed data.arc entries); every zstd / Yaz0 container and the data.arc table stay byte-identical."""
+    m = os.environ.get('TEX_ONCE_DEBUG', '')
+    if m not in ('', 'repack-only', 'zero-only'): raise SystemExit(f'TEX_ONCE_DEBUG={m!r}: expected repack-only or zero-only')
+    return m
+
+
 class Mismatch(Exception):
     """The self-check found a difference the strip must not make"""
 
@@ -196,6 +205,7 @@ class Walker:
         self.c = collections.Counter(); self.errors = []; self.new_csz = None
         self.mf = []; self.meta = {}; self.item = ''   # --manifest: one record per tagged plane the strip keeps (meta: the planes of the texture being planned, by offset)
         self.zdicts = {}
+        self.debug = debug_mode()
 
     # -- textures
     def plan(self, d, t):
@@ -272,6 +282,7 @@ class Walker:
             if conflict:
                 c['textures_skipped:overlap'] += 1; c['planes_skipped:overlap'] += len(mods); continue
             if buf is None: buf = bytearray(d)
+            if self.debug == 'repack-only': continue     # the container counts as touched (it is re-packed by the caller) but its planes stay
             for off, span, tag, astc in mods:
                 if tag is None: buf[off:off + span] = bytes(span)
                 else: buf[off:off + 8] = tag; buf[off + 8:off + span] = bytes(span - 8)
@@ -328,9 +339,43 @@ class Walker:
             return self.zdicts[did]
         return None
 
-    def fit_zstd(self, data, orig, top):
+    def pad_exact(self, comp, slot, top):
+        """The exact encoder's frame `comp` as the slot's new bytes: a data.arc entry gets a zero tail, any other zstd file a skippable frame of zeros (or nothing, when it fills the slot). None when it does not fit"""
+        if len(comp) > slot: return None
+        tail = slot - len(comp)
+        if top == 'arc' or tail == 0: return comp + bytes(tail)
+        return comp + skippable_frame(tail) if tail >= 8 else None
+
+    def exact_slot(self, data, orig, dec, top, level=None):
+        """`data` re-packed with the encoder the game's own frames came from (zstd v1.3.5 streaming) into the slot of `orig`, whose content is `dec`: -> (the slot's new bytes, the level used, the level
+        that reproduces `orig`), or (None, None, level or None) when the original frame is not reproducible or no level with its window (so its header) gives a frame that fits. The matched level first,
+        then stronger levels of the same window: a texture with small planes can compress a few bytes worse after the strip"""
+        lv = level if level is not None else Z.match_level(orig, dec)
+        if lv is None: return None, None, None
+        for use in Z.same_window_levels(lv) if len(data) < (8 << 20) else [lv]:
+            comp = Z.exact_compress(data, use)
+            new = self.pad_exact(comp, len(orig), top)
+            if new is not None and not Z.forbidden(comp, rle_literals=True):
+                if top == 'arc': self.new_csz = len(comp)
+                return new, use, lv
+        return None, None, lv
+
+    def exact_fit(self, data, orig, dec, top):
+        """exact_slot() with the counters; None when the caller must fall back to the header-copying no-RLE encoder"""
+        new, used, lv = self.exact_slot(data, orig, dec, top)
+        if lv is None: self.c['encoder_unmatched'] += 1; return None
+        if new is None: self.c['encoder_exact_unusable'] += 1; return None
+        self.c['encoder_matched'] += 1; self.c[f'encoder_level:{used}'] += 1
+        if used != lv: self.c['encoder_stronger_level'] += 1
+        return new
+
+    def fit_zstd(self, data, orig, top, dec=None):
         """`data` compressed into the slot of `orig`: the stream and one skippable frame of zeros to the slot's end (a data.arc entry whose size the table records: the stream and a zero tail).
         None when it does not fit (or leaves a tail under 8 bytes, too short for the frame's header)"""
+        if dec is not None and self.zdict(orig) is None:
+            new = self.exact_fit(data, orig, dec, top)
+            if new is not None: return new
+        elif dec is not None: self.c['encoder_unmatched'] += 1
         if top == 'arc':
             comp = zstd_stream(data, len(orig), self.zdict(orig), like=orig)
             if comp is None: return None
@@ -368,12 +413,13 @@ class Walker:
         c = self.c
         if depth > B.MAX_DEPTH: c['too_deep'] += 1; return None
         kind = self.kind(d, name, hint)
+        if self.debug == 'zero-only' and kind in ('zstd', 'yaz0'): c['debug_compressed_left'] += 1; return None
         if kind == 'zstd':
             c['zstd'] += 1
             dec = B.unzstd(d, self.dicts)
             r, delta = self.sub(dec, name, depth + 1, hint)
             if r is None: self.take(delta); return None
-            new = self.fit_zstd(r, d, top)
+            new = self.fit_zstd(r, d, top, dec)
             if new is None: self.reject(delta, 'zstd_no_fit'); c['recompress_failed:zstd'] += 1; return None
             self.take(delta); c['recompressed:zstd'] += 1
             return new
@@ -425,13 +471,19 @@ class Walker:
                 nn = n[:top_csz]
             if nn[:4] != ZSTD_MAGIC and not (len(nn) >= 4 and struct.unpack('<I', nn[:4])[0] in B.SKIPPABLE): raise Mismatch(f'{name}: no zstd frame')
             if o != n:
-                try: bad = Z.forbidden(nn, o, skippable_ok=top_csz is None)   # a data.arc entry never gets a skippable frame (zero tail); other zstd files are padded with one to fill their slot
+                try: bad = Z.forbidden(nn, o, skippable_ok=top_csz is None, rle_literals=Z.match_level(o, B.unzstd(o, self.dicts)) is not None)   # a data.arc entry never gets a skippable frame (zero tail); other zstd files are padded with one to fill their slot
                 except (ValueError, IndexError) as e: raise Mismatch(f'{name}: the new zstd data is not a readable frame run ({e})')
                 if bad: raise Mismatch(f'{name}: the new zstd frame uses {bad}, which the original does not; the game decodes only the original archive\'s features')
             ho, hn = zstd_header(o), zstd_header(nn)
+            do, dn = B.unzstd(o, self.dicts), B.unzstd(nn, self.dicts)
+            if o != n and self.zdict(o) is None:   # encoder identity: where the original frame is reproducible, the new one is exactly what the same encoder makes of the new content
+                exp, used, lv = self.exact_slot(dn, o, do, 'arc' if top_csz is not None else None)
+                if lv is None: self.c['encoder_identity_unmatched'] += 1
+                elif exp is None: self.c['encoder_identity_fallback'] += 1
+                elif exp != n: raise Mismatch(f'{name}: the new zstd frame is not what the original encoder (zstd v1.3.5, level {used}) makes of the new content')
+                else: self.c['encoder_identity_checked'] += 1
             if ho is not None and hn is not None and o != n and ho != hn:
                 raise Mismatch(f'{name}: zstd frame header changed ({ho} -> {hn}); the game decodes only the original layout')
-            do, dn = B.unzstd(o, self.dicts), B.unzstd(nn, self.dicts)
             if len(do) != len(dn): raise Mismatch(f'{name}: the inflated size changed')
             self.check(do, dn, name, depth + 1, hint)
             self.c['containers_checked:zstd'] += 1
@@ -576,6 +628,7 @@ class Arc:
         self.table_off = self.base + self.T['fs_off']
         self.table_size = 16 + self.T['stored']
         self.table = False
+        self.encoder = None   # how the rewritten table frame was made: {'level': n} (zstd v1.3.5, reproduces the original) or {'unmatched': True}
         if want_table:
             fs = bytes(self.T['fs'])
             fits = zstd_table_frame(fs, self.T['stored'], None) is not None
@@ -594,7 +647,12 @@ class Arc:
             for fdi in self.fd.get(at, ()):
                 p = T['FD'] + 16 * fdi + 4
                 if struct.unpack_from('<I', fs, p)[0] == old[at]: struct.pack_into('<I', fs, p, new); n += 1
-        frame = zstd_table_frame(bytes(fs), T['stored'], orig[16:16 + T['stored']])
+        frame, lv = None, Z.match_level(orig[16:16 + T['stored']], bytes(T['fs']))
+        if lv is not None:
+            frame = Z.exact_compress(bytes(fs), lv)
+            if len(frame) > T['stored'] or Z.forbidden(frame, rle_literals=True): frame, lv = None, None
+        self.encoder = dict(level=lv) if lv is not None else dict(unmatched=True)
+        if frame is None: frame = zstd_table_frame(bytes(fs), T['stored'], orig[16:16 + T['stored']])
         if frame is None: raise RuntimeError('the rewritten data.arc table does not fit its slot')
         ho = zstd_header(orig[16:])
         if zstd_header(frame) != ho: raise Mismatch(f'the rewritten data.arc table frame has header {zstd_header(frame)}, the original {ho}: the game decodes only the original layout')
@@ -611,7 +669,7 @@ def log(msg): print('tex_once: ' + msg, file=sys.stderr, flush=True)
 
 def tool_hash():
     h = hashlib.sha256()
-    for f in ('tex_once.py', 'sparse_image.py', 'tex_once_native.c', 'tex_once_zstd.py', 'tex_once_zstd.patch' if False else 'tex_once_zstd_norle.patch', 'tex_once_zstd_build.sh'):
+    for f in ('tex_once.py', 'sparse_image.py', 'tex_once_native.c', 'tex_once_zstd.py', 'tex_once_zstd_norle.patch', 'tex_once_zstd_build.sh', 'tex_once_zstd135_build.sh'):
         with open(os.path.join(HERE, f), 'rb') as fh: h.update(fh.read())
     return h.digest()
 
@@ -667,6 +725,8 @@ def compression_info(target, zl, pack_stats):
 
 def run(args):
     t0 = time.monotonic()
+    dbg = debug_mode()
+    if dbg: log(f'DEBUG MODE {dbg}: not a shippable image')
     romfs = B.find_romfs(args.input)
     if not os.path.isfile(romfs): log(f'[RED] {romfs} is a folder: tex_once needs a RomFS image'); return 2
     if S.is_sparse(romfs): log(f'[RED] {romfs} is already a DMSPARS1 image'); return 2
@@ -689,7 +749,7 @@ def run(args):
     import romfs as romfs_mod
     img = romfs_mod.Image(romfs)
     logical = os.path.getsize(romfs)
-    fp = hashlib.sha256(b'tex_once %d\0' % TOOL_VERSION + tool_hash() + b'size %d\0max_dim %d\0block %d\0bc1 %d\0arc %s\0' % (logical, max_dim, block, bc1, args.arc_mode.encode())
+    fp = hashlib.sha256(b'tex_once %d\0' % TOOL_VERSION + tool_hash() + b'size %d\0max_dim %d\0block %d\0bc1 %d\0arc %s\0dbg %s\0' % (logical, max_dim, block, bc1, args.arc_mode.encode(), dbg.encode())
                         + hashlib.sha256(img.index).digest() + have['fingerprint'] + b'%d' % have['bytes'] + (b'zstd %d\0' % zl if zl is not None else b'')).hexdigest()
     target, rep_path = os.path.join(out, 'romfs.img'), os.path.join(out, 'report.json')
     old = read_report(rep_path)
@@ -704,12 +764,12 @@ def run(args):
         if os.path.exists(f): os.unlink(f)
     lib = find_astc_lib(pack, out)
     native = build_native(os.path.join(out, 'lib'))
-    Z.configure(os.path.join(out, 'lib')); Z.build(os.path.join(out, 'lib'))
+    Z.configure(os.path.join(out, 'lib')); Z.build(os.path.join(out, 'lib')); Z.build_exact(os.path.join(out, 'lib'))
     files = B.image_files(romfs)
     dicts = B.zs_dicts(romfs, files, lib)
     arc = None
     if any(n == '/data.arc' for n, _, _ in files):
-        arc = Arc(romfs, files, args.arc_mode == 'table')
+        arc = Arc(romfs, files, args.arc_mode == 'table' and dbg != 'zero-only')       # zero-only: the table is never rewritten
         if arc.T is None: arc = None
     arc_base = arc.base if arc else 0
     items = B.smash_arc_files(romfs, files)
@@ -763,6 +823,7 @@ def run(args):
     except BaseException:
         writer.abort(); raise
     strip_seconds = time.monotonic() - t1
+    embed = dbg != 'repack-only'
     pack_stats, pack_v2, pack_seconds = None, os.path.join(out, 'pack-v2.tmp'), 0
     try:
         if zl is not None:
@@ -770,7 +831,7 @@ def run(args):
             pack_stats = S.write_pack_v2(pack, pack_v2, zl, args.workers, progress=lambda n, m: n % 20 == 0 and time.monotonic() - tp > 15 and log(f'pack {n}/{m} batches, {time.monotonic() - tp:.0f} s'))
             pack_seconds = round(time.monotonic() - tp, 1)
             log(f'pack compressed: {have["bytes"] / 2**30:.2f} -> {pack_stats["size"] / 2**30:.2f} GB, {time.monotonic() - tp:.0f} s')
-        stats = writer.finish(pack_v2 if zl is not None else pack)
+        stats = writer.finish(None if not embed else pack_v2 if zl is not None else pack)
     except BaseException:
         writer.abort(); raise
     finally:
@@ -778,7 +839,7 @@ def run(args):
     log(f'written: {stats["physical"] / 2**30:.2f} GB ({stats["stored"] / 2**30:.2f} GB of RomFS + {stats["pack_size"] / 2**30:.2f} GB pack), {time.monotonic() - t1:.0f} s; checking')
     # ---- self-check
     t2 = time.monotonic()
-    problems = []
+    problems = []; table_same = table_identity = None
     name_of = {m[0]: m[2] for m in marks if m[3] == 'item'}
     vtasks = []
     for i, t in enumerate(tasks):
@@ -797,7 +858,9 @@ def run(args):
         if sp.read(0, 32) != os.pread(fd, 32, 0): problems.append('DMROMFS1 header differs')
         ioff = struct.unpack_from('<Q', os.pread(fd, 32, 0), 8)[0]
         if sp.read(ioff, len(img.index)) != img.index: problems.append('DMROMFS1 index differs')
-        if zl is not None:
+        if not embed:
+            if sp.pack_offset != 0: problems.append('repack-only: a pack is embedded')
+        elif zl is not None:
             if sp.version != 2 or sp.pack_version != 2 or sp.pack_size != pack_stats['size']: problems.append('embedded pack missing, not v2, or of another size')
             else:
                 try: sp.inflate_all()
@@ -825,7 +888,16 @@ def run(args):
                     bad = Z.forbidden(frame, os.pread(fd, T['stored'], arc.table_off + 16))
                     if bad or Z.frame_features(frame)['frames'] != 1: problems.append(f'data.arc table frame: {bad or "not exactly one frame"}')
                     if zstd_header(frame) != zstd_header(os.pread(fd, 8, arc.table_off + 16)): problems.append('data.arc table frame header differs from the original')
+                    if arc.encoder and arc.encoder.get('level') is not None:
+                        if Z.exact_compress(table_new, arc.encoder['level']) != frame: problems.append('data.arc table frame is not what zstd v1.3.5 makes of the new table')
+                        else: table_identity = True
+                        table_same = frame == os.pread(fd, stored_new, arc.table_off + 16)
                 except ValueError as e: problems.append(f'data.arc table frame unreadable: {e}')
+    enc = {k: v for k, v in sorted(totals.items()) if k.startswith('encoder_')}
+    enc_check = {k[len('encoder_identity_'):]: v for k, v in sorted(vtotals.items()) if k.startswith('encoder_identity_')}
+    encoder_rep = dict(encoder='zstd v1.3.5 streaming, level detected per frame', matched=enc.pop('encoder_matched', 0), unmatched=enc.pop('encoder_unmatched', 0), unusable=enc.pop('encoder_exact_unusable', 0), stronger_level=enc.pop('encoder_stronger_level', 0),
+                       levels={k.split(':', 1)[1]: enc.pop(k) for k in [k for k in enc if k.startswith('encoder_level:')]}, table=dict(arc.encoder or {}, identical_to_original=table_same, identity_checked=table_identity) if arc else None,
+                       identity_check=enc_check)
     writer_c = collections.Counter({k: totals[k] for k in ('planes_tagged', 'planes_zeroed_cap', 'textures_changed')})
     for k in writer_c:
         if writer_c[k] != vtotals.get(k, 0): problems.append(f'{k}: the strip counted {writer_c[k]}, the check found {vtotals.get(k, 0)}')
@@ -833,7 +905,7 @@ def run(args):
     passed = not problems
     rep = dict(tool_version=TOOL_VERSION, input_fingerprint=fp, input=romfs, pack=pack, block=block, bc1_block=bc1, max_dim=max_dim, arc_mode='table' if arc and arc.table else 'pad' if arc else 'none',
                bytes=dict(logical=logical, physical=stats['physical'], pack=stats['pack_size'], romfs_stored=stats['stored'], extents=stats['extents'], **compression_bytes(target, have['bytes'])),
-               compression=compression_info(target, zl, pack_stats),
+               compression=compression_info(target, zl, pack_stats), encoder=encoder_rep,
                errors=dict(containers_unreadable=n_errors, samples=errors[:10]), **split_counters(totals),
                self_check=dict(passed=passed, problems=problems[:20], seconds=round(time.monotonic() - t2, 1)),
                seconds=dict(strip=round(strip_seconds, 1), pack_compress=pack_seconds, total=round(time.monotonic() - t0, 1)))
@@ -958,7 +1030,7 @@ def run_manifest(args):
     if not B.read_pack_header(pack): log(f'[RED] {pack} is no complete ASTC pack'); return 2
     lib = find_astc_lib(pack, out)
     native = build_native(os.path.join(out, 'lib'))
-    Z.configure(os.path.join(out, 'lib')); Z.build(os.path.join(out, 'lib'))
+    Z.configure(os.path.join(out, 'lib')); Z.build(os.path.join(out, 'lib')); Z.build_exact(os.path.join(out, 'lib'))
     files = B.image_files(romfs)
     dicts = B.zs_dicts(romfs, files, lib)
     arc = None
