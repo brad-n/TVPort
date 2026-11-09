@@ -89,7 +89,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [Taiko Risshiden V DX](#taiko-risshiden-v-dx) | 1 | 0 | 0 | 2 | 0 | `game` |
 | [The Legend of Zelda: Breath of the Wild](#the-legend-of-zelda-breath-of-the-wild) | 7 | 0 | 43 | 0 | 0 | `build` → `game` ×2 |
 | [The Legend of Zelda: Link's Awakening](#the-legend-of-zelda-links-awakening) | 1 | 0 | 0 | 0 | 0 | `build` → `game` |
-| [The Legend of Zelda: Ocarina of Time](#the-legend-of-zelda-ocarina-of-time) | 0 | 0 | 2 | 0 | 0 | `build` → `game` |
+| [The Legend of Zelda: Ocarina of Time](#the-legend-of-zelda-ocarina-of-time) | 0 | 0 | 3 | 0 | 0 | `build` → `game` |
 | [The Legend of Zelda: Tears of the Kingdom](#the-legend-of-zelda-tears-of-the-kingdom) | 0 | 0 | 18 | 0 | 0 | `build` → `game` |
 | [Xenoblade Chronicles 3](#xenoblade-chronicles-3) | 6 | 0 | 0 | 0 | 0 | `build` → `game` |
 
@@ -599,8 +599,9 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 
 - **`build` → `game`**, frame rate, blocked: frame-step stubs have no function-matched form yet, judgement: frame step from the measured frame time. This game's own frame loop; the frame-step state page is general
 
-- **v131072 `main`** `e0f3ccfa…` ([patches.py:45](../../dm/games/0400486024DEC000/patches.py#L45))
+- **v131072 `main`** `e0f3ccfa…` ([patches.py:75](../../dm/games/0400486024DEC000/patches.py#L75))
   - frame step `+0x6e6cc4`: frame step from the measured frame time, never below the game's own (state +0x38)
+  - frame step `+0x31d3ee4`: dynamic-resolution status: a host render scale not yet applied asks for new 3D sizes once
   - frame step `+0x31d3f38`: view scale = the host render scale (1.0 = the game's dynamic resolution)
   - render scale stub (the launcher offers DM_RENDER_SCALE)
 
