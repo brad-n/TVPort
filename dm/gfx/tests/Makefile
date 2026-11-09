@@ -213,6 +213,9 @@ t_gmem_survive: t_gmem_survive.m $(MTL_T_DEP)
 .PHONY: check_t_gmem_survive
 check_t_gmem_survive: t_gmem_survive
 	DM_NVN_POOL_UNWIRE=0 DM_NVN_GMEM_MODE='learned!' MTL_DEBUG_LAYER=1 ./t_gmem_survive
+t_pool_retire: t_pool_retire.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_retire.m $(MTL_T_SRC) $(FW)
+check_t_pool_retire: RUN_ENV = MTL_DEBUG_LAYER=1
 t_gmem_words: t_gmem_words.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_gmem_words.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_gmem_words
@@ -691,3 +694,9 @@ check_t_render_counter_overlap: t_render_counter_overlap
 # DM_NVN_TEX_PURGE on the GPU: an idle packaged texture is made Volatile / Empty and restored byte-exact (T_PURGE_MODE=release|off for the switch rules)
 t_tex_purge: t_tex_purge.m t_astc_upload.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_tex_purge.m $(MTL_T_SRC) $(FW)
+t_tg_spill: t_tg_spill.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_tg_spill.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_tg_spill
+check_t_tg_spill: t_tg_spill
+	MTL_DEBUG_LAYER=1 DM_NVN_DISPATCH_OWN=0 ./$<
+	MTL_DEBUG_LAYER=1 DM_NVN_DISPATCH_OWN=1 ./$<
