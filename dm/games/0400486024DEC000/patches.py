@@ -3,7 +3,7 @@
 from nso_asm import ADRP, B, BEQ
 
 
-def CBZ_W(frm, to, rt):
+def cbz_w(frm, to, rt):
     off = to - frm
     assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
     return 0x34000000 | (((off >> 2) & 0x7FFFF) << 5) | rt
@@ -63,9 +63,9 @@ def render_scale(ctx):   # fork: v131072's own addresses (every site asserts its
         emit(w)
     done = here() + 4 * 7   # word 12 of this stub
     emit(BEQ(here(), done))   # applied already
-    emit(CBZ_W(here(), done, 17))   # not set
+    emit(cbz_w(here(), done, 17))   # not set
     emit(0x52091a30)   # eor w16,w17,#0x3f800000
-    emit(CBZ_W(here(), done, 16))   # 1.0: the game's own
+    emit(cbz_w(here(), done, 16))   # 1.0: the game's own
     emit(0x7100051f)   # cmp w8,#1
     emit(BEQ(here(), done))   # status 1 is the game's other request: left alone
     emit(0x52800008)   # mov w8,#0              a new scale: the sizes are computed this frame
@@ -77,10 +77,10 @@ def render_scale(ctx):   # fork: v131072's own addresses (every site asserts its
     emit(ADRP(16, here(), ctx.state))
     emit(0xb9401211)   # ldr w17,[x16,#0x10]     render scale (float bits)
     orig = here() + 4 * 5
-    emit(CBZ_W(here(), orig, 17))   # not set
+    emit(cbz_w(here(), orig, 17))   # not set
     emit(0xb9001611)   # str w17,[x16,#0x14]     applied (the status stub's test)
     emit(0x52091a30)   # eor w16,w17,#0x3f800000
-    emit(CBZ_W(here(), orig, 16))   # 1.0: the game's own ratio
+    emit(cbz_w(here(), orig, 16))   # 1.0: the game's own ratio
     emit(0x1e270220)   # fmov s0,w17             the host's scale instead of the controller's ratio
     assert here() == orig
     emit(0xbd4e5a81)   # ldr s1,[x20,#0xe58]     the original

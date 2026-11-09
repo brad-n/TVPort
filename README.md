@@ -6,6 +6,8 @@
 
 Changes in this fork that the TVPort and nxnative releases don't have yet, in plain terms. This fork's TVPort shows **Version 1.3.0** in About, with a build number that goes up with every change, so you can tell which build you're running. Upstream fixes we brought in early are listed with their pull request numbers, so they're easy to drop once upstream accepts them.
 
+**Synced to upstream:** nxnative `main` at commit `143c0d09` (2026-11-09; 63 commits past the 2026-11-07 sync, including the recycled render-target memory for dynamic resolution, the faster extended-product shader code and the host-set frame step for Ocarina of Time). #1543 and #1368 are in upstream now and were dropped from the list below.
+
 **Smaller games on the Apple TV**
 - **Store textures once:** the game's textures are kept once, in the Apple TV's own format, instead of twice (original plus converted copy). Mario Kart 8 Deluxe went from 21.5 GB to 13.6 GB.
 - **Compress game data:** the game file on the Apple TV is compressed without losing anything and unpacked as it's read. Mario Kart 8 Deluxe went from 13.6 GB to 9.3 GB.
@@ -22,11 +24,9 @@ Changes in this fork that the TVPort and nxnative releases don't have yet, in pl
 
 **Fixes from upstream pull requests, included early** (nxnative by seedds; not yet merged upstream)
 - **#1459:** the "use Apple's MetalFX upscaler" setting now works on Ocarina of Time. It was looking for the wrong file, so it did nothing.
-- **#1543:** when Ocarina of Time runs below 60 fps, the game keeps real-time speed, so it looks choppier instead of going into slow motion.
 - **A residency budget for the whole GPU set** (`DM_NVN_RESIDENCY_BUDGET_MB=<n>|auto`). The raw-memory cap only covered one way pools get wired; the set still overflowed through texture-upload and draw lookups (Ocarina of Time on the Apple TV 4K ran out of GPU memory at the world load). Over the budget, the least recently used memory pools leave the set, never one the current or a running submission uses; if what is in use alone is over the budget, the log says which kinds and how many MB, so you can tell a "frame too big" problem from a pool problem.
 - **#1142:** the graphics code remembers the memory pool it looked up last and tries it first, which saves a little CPU time on every draw.
 - **#1162:** the graphics code remembers when a draw has nothing waiting to be written before it, so repeated draws of the same material skip that check (switch it off with `DM_NVN_UBDC=0`).
-- **#1368:** Ocarina of Time's foliage, shadows and attack effects have their special graphics pipelines prepared before the first frame from a saved list, so they no longer pop in late. Any new one is still built in the background and added to the list for next time.
 
 ## What’s new in TVPort 1.2.3 build 44
 
