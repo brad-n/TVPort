@@ -513,6 +513,15 @@ t_gpu_pass: t_gpu_pass.m $(MTL_T_DEP)
 check_t_gpu_pass: t_gpu_pass
 	MTL_DEBUG_LAYER=1 ./t_gpu_pass
 	MTL_DEBUG_LAYER=1 ./t_gpu_pass global
+# Compute dispatches between the clears and draws of one target (DM_NVN_LAZY_CLEAR_WIDE, DM_NVN_CS_HOIST_WIDE) submissions with no GPU work (DM_NVN_EMPTY_SUB) cuts at dispatches (DM_NVN_CUT_DISPATCH) and alias flushes after writes only (DM_NVN_ALIAS_DIRTY): the expectations follow the switches, so it runs with them off and on, and on the encode thread
+t_cs_pass: t_cs_pass.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_cs_pass.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_cs_pass
+check_t_cs_pass: t_cs_pass
+	MTL_DEBUG_LAYER=1 ./t_cs_pass
+	MTL_DEBUG_LAYER=1 DM_NVN_CS_HOIST_WIDE=1 ./t_cs_pass
+	MTL_DEBUG_LAYER=1 DM_NVN_LAZY_CLEAR_WIDE=1 DM_NVN_CS_HOIST_WIDE=1 DM_NVN_EMPTY_SUB=1 DM_NVN_CUT=2 DM_NVN_CUT_DISPATCH=1 DM_NVN_ALIAS_DIRTY=1 ./t_cs_pass
+	MTL_DEBUG_LAYER=1 DM_NVN_LAZY_CLEAR_WIDE=1 DM_NVN_CS_HOIST_WIDE=1 DM_NVN_EMPTY_SUB=1 DM_NVN_CUT=2 DM_NVN_CUT_DISPATCH=1 DM_NVN_ALIAS_DIRTY=1 DM_NVN_ENC_THREAD=1 ./t_cs_pass
 t_unwritten_store: t_unwritten_store.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_unwritten_store.m $(MTL_T_SRC) $(FW)
 check_t_unwritten_store: RUN_ENV = MTL_DEBUG_LAYER=1

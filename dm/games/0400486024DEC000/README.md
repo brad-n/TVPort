@@ -56,6 +56,32 @@ Measured on an M6 Mac with 16 GB, headless, on one walk with camera turns (`walk
 - With a window, the first start on a new chain runs the pipeline prebuild first: 33,190 shader pairs, 691 s on this Mac. A run with no window skips it.
 - The opening movie runs at the movie's own 24 fps pace during the story section and cannot be skipped: about 8 minutes on a new file.
 
+### GPU time and passes in Kokiri Forest (2026-11-09)
+
+Measured on a Mac mini M2 Pro (the Apple TV 4K's GPU generation) with the TV-like settings (handheld mode, `DM_RENDER_SCALE=0.5`, `DM_SHADOW_MAP_SIZE=6144`, the encode thread, the TV's texture and heap caps), the `balcony-still` route (Link's balcony, Kokiri Forest below, standing still), `scripts/bench.py`, two runs a side, the GPU held by one run at a time. The frame holds 2 vsyncs (33.3 ms) on the Mini, so the changes show in GPU time, not frame rate.
+
+- Where the GPU waits: the encoder stamps of `DM_NVN_GPUPROF` showed 6.8 ms idle in a 24.3 ms span; Metal System Trace puts it at about 2.8 ms of a 25 ms frame, the rest being vertex work before passes stamped after their vertex stage ([GPU profiles time the frame's command buffers](../../../docs/reference/rendering.md#gpu-profiles-time-the-frames-command-buffers)). Of the real idle, about 1-1.3 ms is between command buffers: the frame's first big command buffer and the main scene submission were committed after the GPU had run out (the host still recording them), and a few were committed in time but started 0.3-0.5 ms late. The rest is inside command buffers, mostly between a compute encoder and the next pass. The resource-alias flush that every encoder barrier carried for the 2.4 GB pool held in chunks cost about 0.8 ms of GPU a frame (`DM_NVN_VIS_ALIAS=0`, diagnostic: GPU p50 23.41 → 22.64 ms).
+- The game submits each frame on four queues; queue 1's job is split into about 22 submissions by its event waits and signals with queue 5's compute, and each is a Metal command buffer (37 a frame).
+- The 960x540 RG11B10F scene target (with its Depth32F) was opened 19 times in a dumped frame (`DM_NVN_PASSDUMP=4200` with `DM_NVN_PASSDUMP_ALL`, which now names the caller that ended each pass). What came between two of its passes:
+  - other targets drawn in between (light masks, shadow cascades, bloom, the ground mist): 6;
+  - a queue boundary (an event wait or a fence sync, the async compute of queue 5 between, such as the ambient cache's image writes and the exposure): 4. A Metal command buffer ends there, so the pass must. Merging across them would need the waits resolved at encode and the other queue's dispatches moved ahead;
+  - a draw that samples an attachment of its own pass (same-pass feedback, a snapshot or a split): 4;
+  - a dispatch that samples the depth the pass just drew (`70f8568719810874`, occlusion culling): 1, it must stay;
+  - the depth attachment changing (the main depth and a second 960x540 depth): 1;
+  - the masked indirect multi-draw's compute (`mdx_run`) in the middle of the main lit pass: 1, it could run before the pass (open);
+  - a culling dispatch (`93b8cf2a4840b5f2`) that samples a depth the pass does not attach: 1, movable in principle, but the draws before it read textures by handle, so the hoist cannot prove it ([the wider scan](../../../docs/reference/rendering.md#compute-dispatches-between-the-draws-of-a-pass-run-ahead-of-it) moves nothing here);
+  - a clear-only pass landed by a dispatch that writes only a storage buffer (`a361c4347e39b1c3`): 1, gone with `DM_NVN_LAZY_CLEAR_WIDE=1` ([lazy clears](../../../docs/reference/rendering.md#lazy-clears-folded-into-the-next-pass), which also keeps the clears a texture bind landed: 121 → 119 passes, 4.1 MB less loaded and stored a frame).
+- Measured changes (base GPU p50 23.4-23.5 ms, span 26.5-26.8 ms, 121 passes, 160.5 MB loaded and 167.4 MB stored a frame; the pictures alike, the scene being animated; two A/B sessions):
+  - `DM_NVN_ALIAS_DIRTY=1` ([the alias flush only after writes](../../../docs/reference/rendering.md#the-resource-alias-flush-only-after-gpu-memory-writes)): GPU p50 23.53 → 23.16 ms, span 26.8 → 26.2 ms;
+  - `DM_NVN_EMPTY_SUB=1` ([submissions with no GPU work](../../../docs/reference/frame-rate.md#submissions-with-no-gpu-work)): span 26.8 → 25.3 ms, GPU p50 23.53 → 23.18 ms, with one unexplained run of slow frames;
+  - `DM_NVN_CUT_FIRST=16 DM_NVN_CUT_DISPATCH=1`: span 26.5 → 25.9 ms in the first session, 26.8 → 26.4 ms in the second (noisy);
+  - `DM_NVN_LAZY_CLEAR_WIDE=1`: 2 passes and 8.2 MB a frame fewer, GPU time within noise;
+  - all four together: span 26.8 → 25.2 ms (6%), GPU p50 23.53 → 23.20 ms, 119 passes;
+  - `DM_NVN_CS_HOIST_WIDE=1`: nothing moved; `DM_NVN_POOL_UNWIRE=0`: no gain.
+
+  The frame stays at 2 vsyncs on the Mini, so none changes its frame rate there; on the Apple TV, GPU-bound at 57-85 ms, each ms of span counts, and the pass traffic weighs more on its memory bandwidth. All stay off by default until run on the TV.
+
+
 ## Dynamic resolution
 
 - The controller (v131072; found by fingerprint, so the addresses are only for reading): the parameters are `game__gfx__DynamicResolutionParam` (`LoadThreshold`, `ReduceCounterMax`, `IncreaseCounterMax`, and a list of levels, each a `ResolutionReduceScale` and a `Priority`). Once a frame the update (`main+0x805aa0`) reads the frame's GPU time, subtracts what its cost model predicts at the current size and keeps the trend of that residual. The level function (`main+0x8065e0`) adds the residual to the model's cost at each level and returns the best level under the threshold: 0, the full 1536x864, when the current size fits. The update moves down after `ReduceCounterMax` frames that ask for it and back up after `IncreaseCounterMax`. Scripted `GPULoad` hints from event data (`main+0x31c3de0`) and `OneshotSetDynamicResolutionLoadThreshold` adjust it in cutscenes.
@@ -138,6 +164,7 @@ From an empty save: at about 45 s `A` (title), `A` (New Game), then the movie. F
 - [A control section's words read as a BAHS entry](../../../docs/reference/shaders.md#a-control-sections-words-read-as-a-bahs-entry): six map rows that were no shaders, one of them failing the build; `tera_common` gave its variation pairs once its row was gone.
 - [Freeing a memory pool during a texture ID walk](../../../docs/reference/nvn-objects.md#freeing-a-memory-pool-during-a-texture-id-walk): the `-[NvPkg buffer]: unrecognized selector` crash after a save or a scene change.
 - [Extended products behind spirv-cross's optnone helper](../../../docs/reference/shaders.md#extended-products-behind-spirv-crosss-optnone-helper): 348,587 constant divisions left as unoptimized calls; the Kokiri Forest deck 54.0 → 59.1 fps on an M4 Pro.
+- [GPU profiles time the frame's command buffers](../../../docs/reference/rendering.md#gpu-profiles-time-the-frames-command-buffers), [the resource-alias flush only after GPU memory writes](../../../docs/reference/rendering.md#the-resource-alias-flush-only-after-gpu-memory-writes), [submissions with no GPU work](../../../docs/reference/frame-rate.md#submissions-with-no-gpu-work): where the GPU waits in a Kokiri Forest frame ([measurements](#gpu-time-and-passes-in-kokiri-forest-2026-11-09)).
 - [HMMA chains keep their matrices in the SIMD-group](../../../docs/reference/shaders.md#hmma-chains-keep-their-matrices-in-the-simd-group): the NDVE movie networks behind the title and the opening, 14.8 → 11.4 ms of compute a frame on this M6.
 - [Raw global memory lookups that start from their last entry](../../../docs/reference/shaders.md#raw-global-memory-lookups-that-start-from-their-last-entry): the foliage, vertex and compute shaders read structures word by word through loaded addresses; about 2 ms less GPU a frame at the spawn point.
 - [The GPU idles with the next command buffer already committed](../../../docs/reference/frame-rate.md#the-gpu-idles-with-the-next-command-buffer-already-committed): the 25-40 ms frames.

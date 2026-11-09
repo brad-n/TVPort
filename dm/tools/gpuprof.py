@@ -10,9 +10,13 @@ line per phase. This tool reads both:
   gpuprof.py log.txt --frames 600 1200     only those frames
   gpuprof.py log.txt --timeline 600        every encoder of frame 600 in GPU order, with the idle gaps between them
   gpuprof.py log.txt --ab                  the [ab] phases: medians per configuration and the difference from the base
+  gpuprof.py log.txt --gaps                where the GPU waited between the frame's command buffers (their "cb" lines: recorded, committed, GPU start and end
+                                           on the CPU clock), and the stretches between encoders inside one command buffer, by the kinds of encoder around them
 
 Times are GPU timestamps taken where each encoder begins and ends (relaxed: encoders may overlap), so the sum over encoders is not the frame's GPU time; the frame line's
-span (first start to last end) is closer to it. See docs/agents/05-debugging.md, "GPU time on the device".
+span (first start to last end) is closer to it. See docs/agents/05-debugging.md, "GPU time on the device". A render pass's start is stamped after its vertex stage, so the
+stretch before a pass that waited on a full barrier (after a compute encoder) holds that pass's vertex work: --gaps counts the time between command buffers (their
+own GPU start and end, from Metal's commit feedback) as idle, and lists the stretches inside one apart.
 """
 import argparse, collections, re, statistics, sys
 
@@ -147,6 +151,51 @@ def ab_summary(phases, skip=1):
     return res
 
 
+CB = re.compile(r'\[gpuprof\] F(\d+) cb (\d+) (\S) recorded (\S+)\.\.(\S+) commit (\S+) drained (\S+) gpu (\S+)\.\.(\S+)')
+ENC_CB = re.compile(r'\[gpuprof\] F(\d+)\s+(\d+)\s.* cb (\d+)$')
+WHY = {'c': 'a segment cut', 's': 'the end of a submission', 'v': 'an event signal', 'm': 'a multi-draw count wait'}
+def gaps(lines, frames, only):
+    """Per frame: GPU idle between command buffers (from their feedback times), split by whether the next one was committed after the GPU ran out (the host was late)
+    or before (the GPU or the kernel was), and the stretches inside one command buffer by the encoders around them"""
+    cbs = collections.defaultdict(dict); enc_cb = {}
+    num = lambda x: float(x) if x != 'nan' else None
+    for ln in lines:
+        m = CB.search(ln)
+        if m: f, k, why, b, r, c, d, gs, ge = m.groups(); cbs[int(f)][int(k)] = dict(why=why, beg=num(b), rec=num(r), com=num(c), gs=num(gs), ge=num(ge)); continue
+        m = ENC_CB.search(ln.rstrip())
+        if m: enc_cb[(int(m.group(1)), int(m.group(2)))] = int(m.group(3))
+    if not cbs: print('no command buffer lines (a host with the DM_NVN_GPUPROF command buffer timeline)', file=sys.stderr); return 1
+    for f, cs in sorted(cbs.items()):
+        if only and f not in only: continue
+        ks = sorted(cs); late = early = 0.0; nl = ne = 0; worst = []
+        # command buffers with no GPU time report a completion time, not where they ran: the idle is taken between those that ran, in commit order, and charged to the next
+        # one that ran, naming the empty ones committed between them
+        run = [k for k in ks if None not in (cs[k]['gs'], cs[k]['ge'], cs[k]['com']) and cs[k]['ge'] > cs[k]['gs']]
+        for a_, b_ in zip(run, run[1:]):
+            A, B = cs[a_], cs[b_]
+            if B['gs'] - A['ge'] <= 5: continue
+            g = B['gs'] - A['ge']; between = [k for k in ks if a_ < k < b_]
+            if B['com'] > A['ge']: late += g; nl += 1
+            else: early += g; ne += 1
+            worst.append((g, a_, b_, B, between))
+        busy = sum(c['ge'] - c['gs'] for c in cs.values() if c['gs'] is not None and c['ge'] is not None)
+        span = cs[ks[-1]]['ge'] - cs[ks[0]]['gs'] if cs[ks[-1]]['ge'] is not None and cs[ks[0]]['gs'] is not None else 0
+        empty = sum(1 for c in cs.values() if c['gs'] is not None and c['ge'] == c['gs'])
+        inside = collections.Counter(); ninside = collections.Counter()
+        es = sorted(frames.get(f, []), key=lambda e: e.start); end = None; prev = None
+        for e in es:
+            if end is not None and enc_cb.get((f, e.idx)) is not None and enc_cb.get((f, e.idx)) == enc_cb.get((f, prev.idx)) and e.start - end > 20:
+                key = f'{prev.kind}->{e.kind}'.replace('C', 'compute').replace('R', 'pass'); inside[key] += e.start - end; ninside[key] += 1
+            end = e.start + e.us if end is None else max(end, e.start + e.us); prev = e
+        print(f'frame {f}: {len(cs)} command buffers ({empty} with no GPU time), GPU span {span / 1e3:.2f} ms, busy {busy / 1e3:.2f} ms; idle between them {(late + early) / 1e3:.2f} ms: '
+              f'{late / 1e3:.2f} ms committed after the GPU ran out ({nl}), {early / 1e3:.2f} ms committed before ({ne})')
+        for g, a_, b_, B, between in sorted(worst, key=lambda w: -w[0])[:4]:
+            print(f'    {g:7.1f} us before cb {b_} ({WHY.get(B["why"], B["why"])} ended it): began recording {B["beg"] - cs[a_]["ge"]:+.0f} us, committed {B["com"] - cs[a_]["ge"]:+.0f} us from the GPU running out'
+                  + (f'; after cb {" ".join(map(str, between))}, with no GPU time' if between else ''))
+        if inside: print('    inside command buffers (vertex work before a pass after a full barrier, or idle): ' + ', '.join(f'{k} {v / 1e3:.2f} ms ({ninside[k]})' for k, v in inside.most_common()))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('log', help='the run log or Documents/log.txt')
@@ -156,6 +205,7 @@ def main(argv=None):
     ap.add_argument('--timeline', type=int, metavar='FRAME', help='every encoder of that frame in GPU order')
     ap.add_argument('--ab', action='store_true', help='summarise the DM_AB [ab] lines instead')
     ap.add_argument('--ab-skip', type=int, default=1, help='with --ab: phases left out at the start (default 1)')
+    ap.add_argument('--gaps', action='store_true', help='GPU idle between the command buffers of each profiled frame, and the stretches inside them')
     a = ap.parse_args(argv)
     with open(a.log, errors='replace') as fh: lines = fh.readlines()
 
@@ -178,6 +228,7 @@ def main(argv=None):
     frames, flines = parse(lines)
     if not frames: print('no [gpuprof] encoder lines (DM_NVN_GPUPROF=<frame> or every:<n>)', file=sys.stderr); return 1
     only = set(a.frames) if a.frames else None
+    if a.gaps: return gaps(lines, frames, only)
 
     if a.timeline is not None:
         es = frames.get(a.timeline)

@@ -15,7 +15,7 @@ typedef struct nq_node {
     tex_t texture; double period; int crop[4];
 } nq_node;
 typedef struct nq_owned { struct nq_owned *next; unsigned kind; uint64_t data[]; } nq_owned;
-typedef struct nq_job { struct nq_job *next; nq_node *first, *last; nq_receipt *receipt; nq_owned *owned; nvn_hmap objects; uint64_t frame; } nq_job;
+typedef struct nq_job { struct nq_job *next; nq_node *first, *last; nq_receipt *receipt; nq_owned *owned; nvn_hmap objects; uint64_t frame; unsigned popped, last_kind; } nq_job;   // popped, last_kind: nodes taken so far and the kind + 1 of the last (the pass dump's S line, mtl_sub_origin)
 static void nq_job_free(nq_job *j) {
     for(nq_owned *o=j->owned,*next;o;o=next) { next=o->next; if(o->kind==CAP_K_PROG) mtl_prog_unpin((prog_t *)o->data); else if(o->kind==CAP_K_TEX) mtl_tex_unpin(((tex_t *)o->data)->serial); free(o); }
     free(j->objects.keys); free(j->objects.vals); free(j);
@@ -145,6 +145,7 @@ static void *nq_worker(void *unused) {
             else pthread_cond_wait(&nq_cv,&nq_mu);
         }
         j->first=n->next; if(!j->first) j->last=NULL;
+        unsigned node_idx=j->popped++, node_prev=j->last_kind; j->last_kind=n->kind+1;
         // Round-robin ready queues: a continually fed independent producer cannot starve another queue.
         if(q->next) { nq_queue **link=&nq_queues; while(*link!=q) link=&(*link)->next; *link=q->next; nq_queue *tail=nq_queues; while(tail->next) tail=tail->next; tail->next=q; q->next=NULL; }
         if(n->kind==NQ_SYNC || n->kind==NQ_EVENT) { uint64_t f=n->receipt?n->receipt->fence:n->wait_fence; if(f>q->physical) q->physical=f; }
@@ -160,7 +161,7 @@ static void *nq_worker(void *unused) {
             if(n->kind==NQ_COMMANDS) {
                 uint64_t handle=(uintptr_t)n->bytes;
                 nvn_cap_submit(1,&handle);
-                mtl_sub_begin(); nvn_ft_poll(); mtl_sub_index(&handle,1);
+                mtl_sub_origin(q->serial,node_idx,node_prev); mtl_sub_begin(); nvn_ft_poll(); mtl_sub_index(&handle,1);
                 mtl_exec_rest(NULL,0); mtl_exec(n->bytes); fence=mtl_sub_commit();
             } else {
                 nvn_cap_present(&n->texture,n->crop);
