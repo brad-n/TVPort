@@ -2,3 +2,5 @@
 kokiri-deck	35:A~0.2,40:A~0.2,43:A~0.2,105:RRight~4,111:LUp~3,116:RLeft~4,122:LUp~3	85	45	the Kokiri Forest deck save: standing 20 s, then the camera turns right, Link walks, the camera turns left, he walks again
 title-movie	0:L0/0	20	30	the title movie from an empty save, the NDVE networks at the game's own quality (PR #1741)
 kokiri-still	35:A~0.2,40:A~0.2,43:A~0.2,50:A~0.2,57:A~0.2,64:A~0.2	85	180	the Kokiri Forest deck save, standing still for 3 minutes: for same-process alternating measurements (DM_NVN_UB), whose phases need a scene that does not change
+house-still	f1400:A,f1900:A,f2150:A	80	30	a new file's first autosave (Link's house, the save list's only entry): title, Load, the save, Load; standing in the house where the TV lost its walls, 30 s
+balcony-still	f1400:A,f1900:A,f2150:A	80	30	a manual save on Link's balcony after Saria's greeting (System, Save; the first entry of the save list): Kokiri Forest from above, standing still 30 s

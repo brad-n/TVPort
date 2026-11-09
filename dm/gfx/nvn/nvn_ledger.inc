@@ -17,6 +17,7 @@ static const char *lg_fmt(uint32_t f, char *buf, size_t n) {
     case 252: return "D32F"; case 253: return "S8"; case 260: return "D32FS8";
     default: if (f >= 186 && f <= 225) snprintf(buf, n, "ASTC%u", f); else if (f >= 130 && f <= 153) snprintf(buf, n, "BC%u", f); else snprintf(buf, n, "fmt%u", f); return buf; }
 }
+static int lg_ucmp(const void *a, const void *b) { uintptr_t x = *(const uintptr_t *)a, y = *(const uintptr_t *)b; return x < y ? -1 : x > y; }   // macbench: pool buffer pointers
 static int lg_cmp(const void *a, const void *b) { const lg_group *x = a, *y = b; return x->bytes < y->bytes ? 1 : x->bytes > y->bytes ? -1 : 0; }
 static uint64_t g_lg_t0;
 static void lg_dump(void) { @autoreleasepool {
@@ -59,6 +60,28 @@ static void lg_dump(void) { @autoreleasepool {
     for (int i = 0; i < nrt && i < 8; i++) { char fb[16]; uint64_t k = rt[i].key;
         MLOG("[ledger]   render targets %llux%llu x%llu %s%s: %u, %.0f MB", (unsigned long long)(k >> 48), (unsigned long long)(k >> 32 & 0xffff), (unsigned long long)(k >> 24 & 0xff), lg_fmt((uint32_t)(k & 0xffff), fb, sizeof fb), (k >> 16 & 0xff) > 1 ? " (multisampled)" : "", rt[i].n, rt[i].bytes / M); }
     for (int i = 0; i < nsm && i < 6; i++) { char fb[16]; MLOG("[ledger]   sampled textures %s: %u, %.0f MB", lg_fmt((uint32_t)sm[i].key, fb, sizeof fb), sm[i].n, sm[i].bytes / M); }
+    {   // macbench (measurement only): the residency set's buffers that are not memory pools, and its heaps, by power-of-two size class; the host's own fixed consumers by count
+        uintptr_t *pb; int npb = 0;
+        pthread_mutex_lock(&g_mu); pb = malloc(sizeof *pb * (size_t)(g_npool + 1));
+        for (int i = 0; i < g_npool; i++) if (g_pools[i].buf) pb[npb++] = (uintptr_t)(__bridge void *)g_pools[i].buf;
+        pthread_mutex_unlock(&g_mu);
+        qsort(pb, (size_t)npb, sizeof *pb, lg_ucmp);
+        uint64_t bn[48] = {0}, bb[48] = {0}, hn[48] = {0}, hb[48] = {0};
+        for (id a in live) {
+            int isb = [a conformsToProtocol:@protocol(MTLBuffer)], ish = !isb && [a conformsToProtocol:@protocol(MTLHeap)];
+            if (!isb && !ish) continue;
+            uintptr_t p = (uintptr_t)(__bridge void *)a;
+            if (isb && bsearch(&p, pb, (size_t)npb, sizeof *pb, lg_ucmp)) continue;
+            uint64_t sz = ((id<MTLAllocation>)a).allocatedSize; int k = sz ? 63 - __builtin_clzll(sz) : 0; if (k > 47) k = 47;
+            if (isb) { bn[k]++; bb[k] += sz; } else { hn[k]++; hb[k] += sz; }
+        }
+        free(pb);
+        for (int w = 0; w < 2; w++) { char line[1400]; int o = 0; line[0] = 0; uint64_t *n = w ? hn : bn, *b = w ? hb : bb;
+            for (int k = 47; k >= 0 && o < 1300; k--) if (n[k]) o += snprintf(line + o, sizeof line - o, " >=%llu %s: %llu, %.1f MB;", (unsigned long long)(k >= 20 ? 1ull << (k - 20) : k >= 10 ? 1ull << (k - 10) : 0), k >= 20 ? "MB" : "KB", (unsigned long long)n[k], b[k] / M);
+            MLOG("[ledger]   macbench %s by size:%s", w ? "heaps in the set" : "non-pool buffers in the set", line); }
+        MLOG("[ledger]   macbench: c1 banks %lu x %u MB, per-frame arenas %lu, sparse tile heaps %lu, uniform shadow buffer %.0f MB, upload block %.0f MB",
+             (unsigned long)g_c1_banks.count, C1_BANK_SIZE >> 20, (unsigned long)g_arenas.count, (unsigned long)g_sp_heaps.count, g_ubs_size / M, g_up_block_size / M);
+    }
 } }
 static void *lg_thread(void *arg) {
     double sec = *(double *)arg; pthread_setname_np("dm-ledger");
