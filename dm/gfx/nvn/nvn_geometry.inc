@@ -670,12 +670,17 @@ static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
 // 73 % of the submit thread in Ocarina of Time's Kokiri Forest, frames of 90 ms and more against 25 ms of GPU work
 static void mesh_tasks_draw(const p_draw *dw) {
     if (!S.prog || (!dw->ind && dw->count <= 0)) return;
-    // Diagnostic DM_NVN_SKIP_MESH=1 (off by default): drops every task / mesh draw, as DM_NVN_SKIP_FS drops draws by fragment shader, to measure what they cost in all (the picture is wrong)
-    { static int skip = -1; if (skip < 0) { const char *e = getenv("DM_NVN_SKIP_MESH"); skip = e && atoi(e); if (skip) MLOG("DM_NVN_SKIP_MESH: task / mesh draws dropped (diagnostic; the picture is wrong)"); } if (skip) return; }
+    // Diagnostic DM_NVN_SKIP_MESH (off by default): =1 drops every task / mesh draw, =task those with a task shader, =notask those without, as DM_NVN_SKIP_FS drops draws by
+    // fragment shader, to measure what they cost (the picture is wrong)
+    static int skip = -1;
+    if (skip < 0) { const char *e = getenv("DM_NVN_SKIP_MESH"); skip = !e ? 0 : !strcmp(e, "task") ? 2 : !strcmp(e, "notask") ? 3 : atoi(e) ? 1 : 0;
+        if (skip) MLOG("DM_NVN_SKIP_MESH=%s: %s task / mesh draws dropped (diagnostic; the picture is wrong)", e, skip == 2 ? "the" : skip == 3 ? "the task-less" : "all"); }
+    if (skip == 1) return;
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
     if (skip_fs_draw(pr)) return;   // DM_NVN_SKIP_FS by the fragment shader, as for other draws
     NvShader *ts = pr ? pr->sh[3] : nil, *ms = pr ? pr->sh[4] : nil;
     if (ts && ts->mesh_kind != 1) ts = nil;
+    if ((skip == 2 && ts) || (skip == 3 && !ts)) return;
     if (!ms || ms->mesh_kind != 2 || !ms->fn || (ts ? !ts->fn : !ms->mesh_notask || !ms->mesh_obj)) {
         RED_ONCE(150, "DrawMeshTasks without its task and mesh shaders (task %s mesh %s): draw skipped", ts ? ts->key : "-", ms ? ms->key : "-"); return; }
     image_prepare(pr, 1u << 3 | 1u << 4);
@@ -688,6 +693,7 @@ static void mesh_tasks_draw(const p_draw *dw) {
         if (!ind || !mtl_gpu_addr(dw->ind, 8, &mb, &mo, &ind_rec)) { RED_ONCE(154, "DrawMeshTasksIndirect record at %#llx is in no memory pool: draw skipped", (unsigned long long)dw->ind); return; }
     }
     g_mtk.on = 1; g_mtk.miss = 0; g_mtk.ts = ts; g_mtk.ms = ms; g_mtk.first = (uint32_t)dw->first; g_mtk.count = (uint32_t)dw->count;
+    PD("k %llu task / mesh draw: task %s mesh %s fragment %s workgroups %d from %d%s", g_stat_pass, ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", dw->count, dw->first, dw->ind ? " (indirect)" : "");
     g_mtk.ind = ind; g_mtk.ind_rec = ind_rec;
     g_geo_program = raster;
     p_draw triangle = {.prim = 4, .count = 3, .instances = 1};
