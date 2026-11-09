@@ -80,6 +80,7 @@ class MovieKeys(unittest.TestCase):
         self.assertEqual(movie(MOVIE_MAP), ['#define DM_GAME_MOVIE_KEYS "49dff010b9832251,4f41ccf24f163e0d"', '#define DM_GAME_MOVIE_N 2'])
 
     def test_ocarina_has_its_22(self):
+        sys.path.insert(0, str(REPO / 'dm/games'))   # the test runs on its own too: it cannot count on UpscalerKeys having put dm/games on the path
         import game
         keys = game.movie_keys(game.load('0400486024DEC000'))
         self.assertEqual(len(keys), 22)
