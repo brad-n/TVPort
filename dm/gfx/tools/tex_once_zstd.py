@@ -23,12 +23,15 @@ E_CONTINUE, E_END = 0, 2
 
 _work = None
 _lib = None
+_exact = None
+_oneshot = None
+_exact_cache = {}
 
 
 def configure(work):
     """Where the dylib is built and cached (the tool's lib folder)"""
-    global _work, _lib
-    if work != _work: _lib = None
+    global _work, _lib, _exact, _oneshot
+    if work != _work: _lib = None; _exact = None; _oneshot = None
     _work = work
 
 
@@ -107,7 +110,10 @@ def compress(data, level, dict_content=None, like=None):
     L = _open()
     data = bytes(data)
     _ok(L, L.ZSTD_CCtx_reset(L.cctx, 3), 'reset')   # session and parameters
-    for k, v in params_like(like, level).items(): _ok(L, L.ZSTD_CCtx_setParameter(L.cctx, k, v), 'parameter')
+    opts = params_like(like, level)
+    h = frame_header(like) if like else None
+    if h is not None and h[1] is None and (h[0] >> 5) & 1 and C_WINDOW_LOG not in opts: opts[C_WINDOW_LOG] = min(27, max(10, (len(data) - 1).bit_length()))   # Single_Segment needs a window that covers the content (the original's did)
+    for k, v in opts.items(): _ok(L, L.ZSTD_CCtx_setParameter(L.cctx, k, v), 'parameter')
     if dict_content:
         dc = bytes(dict_content)
         _ok(L, L.ZSTD_CCtx_loadDictionary(L.cctx, dc, len(dc)), 'dictionary')
@@ -156,12 +162,140 @@ def frame_features(buf, max_frames=1 << 20, zero_tail=False):
     return res
 
 
-def forbidden(new, orig=None, skippable_ok=False):
+def forbidden(new, orig=None, skippable_ok=False, rle_literals=False):
     """Reasons a frame `new` uses a zstd feature that the archive's own frames (`orig`, when given) do not: block types outside raw/compressed, literal types outside raw/Huffman/treeless,
     a skippable frame where the original has none (unless skippable_ok). -> list of strings"""
     f = frame_features(new)
     bad = []
     if f['blocks'] - ALLOWED_BLOCKS: bad.append(f'block types {sorted(f["blocks"] - ALLOWED_BLOCKS)}')
-    if f['literals'] - ALLOWED_LITERALS: bad.append(f'literal types {sorted(f["literals"] - ALLOWED_LITERALS)}')
+    if f['literals'] - (ALLOWED_LITERALS | {'rle'} if rle_literals else ALLOWED_LITERALS): bad.append(f'literal types {sorted(f["literals"] - ALLOWED_LITERALS)}')
     if f['skippable'] and not skippable_ok and (orig is None or not frame_features(orig)['skippable']): bad.append('a skippable frame')
     return bad
+
+
+# ---- the exact encoder: zstd v1.3.5, streaming, unknown size -------------------------------------------------------------------------------------------------------------------------
+# Super Smash Bros. Ultimate's data.arc frames (entries at level 9, window 2^21; the table at level 22) are what ZSTD_initCStream(level) + ZSTD_compressStream + ZSTD_endStream of v1.3.5 make of
+# their content (no content size in the header). Re-packing with that encoder, at the level that reproduces each original frame, gives frames the game's own decoder reads.
+
+def build_exact(work, script='tex_once_zstd135_build.sh', stem='libzstd135'):
+    """The unpatched libzstd a build script pins (v1.3.5 for Smash, v1.4.4 for Ocarina), cached in work by its script's hash. -> path"""
+    h = hashlib.sha256()
+    with open(os.path.join(HERE, script), 'rb') as fh: h.update(fh.read())
+    lib = os.path.join(work, f'{stem}-{h.hexdigest()[:16]}.dylib')
+    if os.path.exists(lib): return lib
+    os.makedirs(work, exist_ok=True)
+    import bntx_astc as B
+    env = dict(os.environ, MACOSX_DEPLOYMENT_TARGET=B.min_os())
+    r = subprocess.run(['sh', os.path.join(HERE, script), work, lib], capture_output=True, text=True, env=env)
+    if r.returncode: raise RuntimeError(f'building the zstd encoder ({script}) failed:\n{r.stderr[-2000:]}')
+    return lib
+
+
+def _open_exact():
+    global _exact
+    if _exact is not None: return _exact
+    work = _work or os.environ.get('TEX_ONCE_ZSTD_WORK') or os.path.join(tempfile.gettempdir(), f'tex_once_zstd-{os.getuid()}')
+    L = ctypes.CDLL(build_exact(work))
+    vp, sz, ui, i = ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint, ctypes.c_int
+    L.ZSTD_createCStream.restype = vp
+    L.ZSTD_initCStream.argtypes = [vp, i]; L.ZSTD_initCStream.restype = sz
+    L.ZSTD_compressBound.argtypes = [sz]; L.ZSTD_compressBound.restype = sz
+    L.ZSTD_isError.argtypes = [sz]; L.ZSTD_isError.restype = ui
+    L.ZSTD_getErrorName.argtypes = [sz]; L.ZSTD_getErrorName.restype = ctypes.c_char_p
+    class In(ctypes.Structure): _fields_ = [('src', vp), ('size', sz), ('pos', sz)]
+    class Out(ctypes.Structure): _fields_ = [('dst', vp), ('size', sz), ('pos', sz)]
+    L.In, L.Out = In, Out
+    L.ZSTD_compressStream.argtypes = [vp, ctypes.POINTER(Out), ctypes.POINTER(In)]; L.ZSTD_compressStream.restype = sz
+    L.ZSTD_endStream.argtypes = [vp, ctypes.POINTER(Out)]; L.ZSTD_endStream.restype = sz
+    L.zcs = L.ZSTD_createCStream()
+    _exact = L
+    return L
+
+
+def _open_oneshot():
+    global _oneshot
+    if _oneshot is not None: return _oneshot
+    work = _work or os.environ.get('TEX_ONCE_ZSTD_WORK') or os.path.join(tempfile.gettempdir(), f'tex_once_zstd-{os.getuid()}')
+    L = ctypes.CDLL(build_exact(work, 'tex_once_zstd144_build.sh', 'libzstd144'))
+    vp, sz, ui, i = ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint, ctypes.c_int
+    L.ZSTD_compress.argtypes = [vp, sz, vp, sz, i]; L.ZSTD_compress.restype = sz
+    L.ZSTD_compressBound.argtypes = [sz]; L.ZSTD_compressBound.restype = sz
+    L.ZSTD_isError.argtypes = [sz]; L.ZSTD_isError.restype = ui
+    L.ZSTD_getErrorName.argtypes = [sz]; L.ZSTD_getErrorName.restype = ctypes.c_char_p
+    _oneshot = L
+    return L
+
+
+def exact_compress(data, level, oneshot=False):
+    """`data` as one zstd frame the way zstd v1.3.5 streams it with no pledged size: no content size in the header, the window of `level`, no checksum, no dictionary.
+    oneshot: the way zstd v1.4.4 compresses a buffer in one call (ZSTD_compress): the content size in the header and, when the window covers the content, Single_Segment (no window descriptor)"""
+    if oneshot:
+        L = _open_oneshot()
+        data = bytes(data)
+        cap = L.ZSTD_compressBound(len(data)) + 64
+        out = ctypes.create_string_buffer(cap)
+        n = _ok(L, L.ZSTD_compress(out, cap, data, len(data), level), 'compress')
+        return out.raw[:n]
+    L = _open_exact()
+    data = bytes(data)
+    _ok(L, L.ZSTD_initCStream(L.zcs, level), 'init')
+    cap = L.ZSTD_compressBound(len(data)) + 64
+    out = ctypes.create_string_buffer(cap)
+    src = ctypes.create_string_buffer(data, len(data)) if data else None
+    i, o = L.In(ctypes.cast(src, ctypes.c_void_p), len(data), 0), L.Out(ctypes.cast(out, ctypes.c_void_p), cap, 0)
+    while i.pos < i.size: _ok(L, L.ZSTD_compressStream(L.zcs, ctypes.byref(o), ctypes.byref(i)), 'compress')
+    while _ok(L, L.ZSTD_endStream(L.zcs, ctypes.byref(o)), 'end'): pass
+    return out.raw[:o.pos]
+
+
+def level_window(level):
+    """The window descriptor byte exact_compress gives frames of `level`"""
+    if level not in _exact_cache: _exact_cache[level] = exact_compress(b'\0', level)[5]
+    return _exact_cache[level]
+
+
+def tail_ok(tail):
+    """What may follow a frame in its slot: nothing, zeros, or skippable frame(s)"""
+    if not tail or tail.count(0) == len(tail): return True
+    try: f = frame_features(tail)
+    except (ValueError, IndexError): return False
+    return f['frames'] == 0
+
+
+def is_oneshot(orig):
+    """Whether the original frame has the layout of a one-shot compress (Ocarina): a content size and Single_Segment (no window descriptor), no dictionary ID, no checksum. False for the streamed layout (Smash)"""
+    h = frame_header(orig)
+    return h is not None and h[1] is None and bool((h[0] >> 5) & 1) and (h[0] & 7) == 0
+
+
+def same_window_levels(level, oneshot=False):
+    """The levels of the encoder that give frames the header (window) of `level`'s, `level` first, then the stronger ones ascending, then the weaker ones descending"""
+    same = list(range(1, 23)) if oneshot else [lv for lv in range(1, 23) if level_window(lv) == level_window(level)]   # a one-shot frame's header does not depend on the level; the caller compares the headers
+    return [level] + [lv for lv in same if lv > level] + [lv for lv in reversed(same) if lv < level]
+
+
+def match_level(orig, dec, big=8 << 20):
+    """The level at which exact_compress(dec) reproduces the zstd frame at the start of `orig` byte for byte (the rest of `orig` being zeros or skippable frames), or None.
+    Only levels with the frame's window descriptor are tried: the one that matched last for that window first, then 9, 22, then the rest (the rest only for content under `big` bytes; stronger levels are slow).
+    A frame with a dictionary has no match. A frame with a content size and Single_Segment (is_oneshot) is tried against zstd v1.4.4's one-shot compress, Ocarina's encoder (level 19), at every level for
+    content under 1 MB, else at the last level that matched, 19, 20, 22, 9, 3"""
+    orig = bytes(orig)
+    h = frame_header(orig)
+    if h is None: return None
+    if is_oneshot(orig):
+        for lv in dict.fromkeys([_exact_cache.get('last-oneshot'), 19, 20, 22, 9, 3] + (list(range(1, 23)) if len(dec) < (1 << 20) else [])):
+            if lv is None: continue
+            comp = exact_compress(dec, lv, True)
+            if orig[:len(comp)] == comp and tail_ok(orig[len(comp):]):
+                _exact_cache['last-oneshot'] = lv
+                return lv
+        return None
+    if h[1] is None or h[0] != 0: return None
+    cands = [lv for lv in range(1, 23) if level_window(lv) == h[1]]
+    first = [lv for lv in (_exact_cache.get(('last', h[1])), 9, 22) if lv in cands]
+    for lv in dict.fromkeys(first + (cands if len(dec) < big else [])):
+        comp = exact_compress(dec, lv)
+        if orig[:len(comp)] == comp and tail_ok(orig[len(comp):]):
+            _exact_cache[('last', h[1])] = lv
+            return lv
+    return None
