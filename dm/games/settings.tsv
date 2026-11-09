@@ -19,7 +19,7 @@ DM_DYNAMIC_RESOLUTION	toggle	-	0	fixups:DYNAMIC_RESOLUTION	Game	Dynamic resoluti
 DM_RENDER_SCALE	range	0.5:1.0:0.05	1.0	fixups:RENDER_SCALE	Game	Render scale		level=basic
 DM_OPMODE	choice	1=Docked,0=Handheld	DM_GAME_OPMODE	always	Game	Console mode		level=basic
 DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	always	Game	Upscaling	Uses more GPU time and can increase heat.
-DM_UPSCALER	choice	game=Game's own,metalfx=MetalFX	game	DM_GAME_UPSCALER_N!=0	Game	Game's upscaler
+DM_UPSCALER	choice	game=Game's own,metalfx=MetalFX,bilinear=Off (plain scale)	game	DM_GAME_UPSCALER_N!=0	Game	Game's upscaler	Off (plain scale) turns the game's upscaling network off and stretches the game's own smaller picture with a plain bilinear scale: far less GPU time, a softer picture, and no MetalFX is used.
 DM_MOVIE_NETWORK	choice	game=Game's own,bypass=Plain picture	game	DM_GAME_MOVIE_N!=0	Game	Movie enhancement	The game runs its movies through a neural network. Plain picture skips it: far less GPU time, a movie without the enhancement.
 DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language		level=basic
 DM_FULLSCREEN	choice	0=Window,1=Fullscreen	0	platform:mac	Game	Display mode		level=basic
