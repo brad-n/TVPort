@@ -1164,6 +1164,19 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Fix:** profile key `shader_no_rescale` (default 0, `IGpuAccessor.QueryHostRenderScaleOne`, the job's `no_rescale`): neither is written. Exact: x / 1.0 is x, and a scale of 1.0 leaves a fetch's coordinate and a size as they are.
 - **Check:** `test_dmsh_fragw.py` `NoRescale`.
 
+### Translation shapes measured and left as they are
+
+What the translation writes that looked expensive and is not, or could not be made cheaper exactly, measured on the Mac mini's M2 Pro (2026-11-09; small compute kernels over a million threads, the iPhone / Apple TV math mode and the Mac's; `mb_*.metal` in the work notes):
+
+- **NaN-safe min, max and clamp:** `precise::min` / `max` / `clamp` ([min, max and clamp with a NaN operand](#min-max-and-clamp-with-a-nan-operand)) cost what the `fast::` forms cost, and `precise::clamp(x, 0, 1)` what `saturate(x)` costs; `saturate(NaN)` is 0 there, as Maxwell's .SAT gives.
+- **Half-precision pairs:** HADD2 / HMUL2 / HFMA2 as `float2(as_type<half2>(...))`, float math and a pack cost what native `half2` math costs (2.13 against 2.06 ms for 2 billion operations); the conversions are free.
+- **NaN texture coordinates:** the select that turns a NaN coordinate into 0 (`nfZero`, [third_party/ryujinx/README.md](../../dm/third_party/ryujinx/README.md)) is needed: the M2 Pro's sampler gives another texel than at coordinate 0 for 15 of 36 combinations of address mode, filter and NaN component, and gathers likewise.
+- **Textures from a pool array:** a sample through `(&pool->e[0])[min(i, n)]` cost what a sample of an argument-buffer texture costs, with the index from a constant or a device buffer; `dm_pool_mark`'s read and OR added about 3%, and a plain read of the bitmap word is no cheaper than the atomic one.
+- **NoContraction adds:** spirv-cross's `spvFAdd` (`fma(1, l, r)` behind `[[clang::optnone]]`) is a real call on the GPU: a loop of `spvFAdd(x * b, c)` took 9.6 times as long as `x * b + c`. Not replaced: an always-inline add under `#pragma METAL fp math_mode(safe)` (or `fp contract(off)`) is fused with the caller's product all the same, so the product loses its rounding (all 1,048,576 results equal the fused ones, in both math modes). Rare in Ocarina of Time (5 calls in its 15 hottest shaders), but the ground mist makes one in each ray-march step and one in each light of its light loop.
+- **Compile level of the hot shaders:** at `-O2` or `-Os` instead of `-O1` ([Front end at -O1](#front-end-at--o1-apples-control-flow-lowering)) the ground mist's pass took 1,733 / 1,748 µs against 1,770 at `-O1`, within the run-to-run noise.
+- **Large per-thread arrays:** of Ocarina of Time's 8,376 shaders, 11 declare a 1,024-word thread array (the size of the control section's local memory); in 9 every index is a constant and Metal's front end promotes it to registers (no `alloca` left at `-O1`); two mesh shaders (`9ecd96cec34c7315`, `740e2b04db624fb1`) index it at run time and keep a 4 KB stack array, but neither is drawn in the Kokiri Forest frames measured.
+- **SIMD-group functions on iOS:** spirv-cross runs once, without `--msl-ios`, so subgroup shuffles are `simd_shuffle`, not quad-only, in the iPhone libraries too.
+
 ### The read log turned storage buffers back into word reads
 
 - **Symptom:** after `shader_raw_read_log` the storage buffers of every shader with a raw load are declared `device`, not `const device`, and `wide_loads` ([Storage words read one by one](#storage-words-read-one-by-one)) leaves their words single: Ocarina of Time's ground mist had 15 wide reads before the log and none after.
