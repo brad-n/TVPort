@@ -1,4 +1,4 @@
-"""Execute Ocarina's emitted frame step stub: the game's step, or the measured one when that is longer."""
+"""Execute Ocarina's emitted stubs: the frame step (the game's step, or the measured one when that is longer) and the render scale (the 3D views' scale from the host)."""
 import importlib
 import importlib.util
 from pathlib import Path
@@ -20,6 +20,7 @@ except ImportError:
     unicorn = arm = None
 
 BASE, AREA, STATE, SITE = 0x4000000, 0x800000, 0x900000, 0x6e6cc4
+SCALE_SITE, MODULE = 0x31d3f38, 0x3300000   # the graphics module's frame update joins here; MODULE stands for x20
 
 
 class Ctx:
@@ -49,7 +50,7 @@ def float_reg(value):
 def run(constant, target, seconds):
     assert unicorn is not None and arm is not None
     machine = unicorn.Uc(unicorn.UC_ARCH_ARM64, unicorn.UC_MODE_ARM)
-    machine.mem_map(BASE, 0xa00000)
+    machine.mem_map(BASE, 0x3400000)
     machine.reg_write(arm.UC_ARM64_REG_CPACR_EL1, 3 << 20)   # the FP unit is off at reset
     ctx = Ctx(machine)
     profile.real_speed(ctx)
@@ -62,6 +63,49 @@ def run(constant, target, seconds):
     return step, mark, ctx, machine.reg_read(arm.UC_ARM64_REG_PC)
 
 
+def scaled(host, ratio):
+    """Run the render scale stub from its site to the instruction after it: the scale it leaves in s0 (the ratio the controller returned, or the host's) and the s1 it loads."""
+    assert unicorn is not None and arm is not None
+    machine = unicorn.Uc(unicorn.UC_ARCH_ARM64, unicorn.UC_MODE_ARM)
+    machine.mem_map(BASE, 0x3400000)
+    machine.reg_write(arm.UC_ARM64_REG_CPACR_EL1, 3 << 20)
+    ctx = Ctx(machine)
+    profile.real_speed(ctx)
+    machine.mem_write(BASE + STATE + 0x10, struct.pack('<f', host))
+    machine.mem_write(BASE + MODULE + 0xe58, struct.pack('<f', 1536.0))
+    machine.reg_write(arm.UC_ARM64_REG_X20, BASE + MODULE)
+    machine.reg_write(arm.UC_ARM64_REG_S0, float_reg(ratio))
+    machine.reg_write(arm.UC_ARM64_REG_S1, float_reg(7.0))
+    machine.emu_start(BASE + SCALE_SITE, BASE + SCALE_SITE + 4, count=16)
+    out = [struct.unpack('<f', struct.pack('<I', machine.reg_read(r) & 0xffffffff))[0] for r in (arm.UC_ARM64_REG_S0, arm.UC_ARM64_REG_S1)]
+    return out, ctx, machine.reg_read(arm.UC_ARM64_REG_PC)
+
+
+@unittest.skipIf(unicorn is None, 'optional ARM64 execution dependency: unicorn')
+class RenderScale(unittest.TestCase):
+    def test_the_site_is_the_join_of_the_dynamic_and_forced_ratios(self):
+        ctx = scaled(1.0, 0.6)[1]
+        self.assertEqual(ctx.sites[SCALE_SITE], '815a4ebd')   # ldr s1,[x20,#0xe58]
+        self.assertEqual(ctx.render_scale, 1)
+
+    def test_one_or_unset_keeps_the_controllers_ratio(self):
+        for host in (1.0, 0.0):
+            with self.subTest(host=host):
+                (s0, s1), _, pc = scaled(host, 0.6)
+                self.assertAlmostEqual(s0, 0.6, places=6)
+                self.assertEqual(s1, 1536.0)   # the displaced load ran
+                self.assertEqual(pc, BASE + SCALE_SITE + 4)
+
+    def test_a_factor_replaces_the_ratio(self):
+        for host in (0.5, 0.75, 0.9):
+            for ratio in (0.5, 0.6, 1.0, 1.03):
+                with self.subTest(host=host, ratio=ratio):
+                    (s0, s1), _, pc = scaled(host, ratio)
+                    self.assertAlmostEqual(s0, host, places=6)
+                    self.assertEqual(s1, 1536.0)
+                    self.assertEqual(pc, BASE + SCALE_SITE + 4)
+
+
 @unittest.skipIf(unicorn is None, 'optional ARM64 execution dependency: unicorn')
 class RealSpeed(unittest.TestCase):
     def test_registered_build(self):
@@ -71,7 +115,7 @@ class RealSpeed(unittest.TestCase):
         step, mark, ctx, pc = run(60.0, 60.0, 0.0)
         self.assertEqual(step, 1.0)
         self.assertEqual(mark, 1)
-        self.assertEqual(ctx.sites, {SITE: '2818201e'})
+        self.assertEqual(ctx.sites[SITE], '2818201e')
         self.assertEqual(pc, BASE + SITE + 4)
 
     def test_a_slow_frame_steps_by_its_time(self):
