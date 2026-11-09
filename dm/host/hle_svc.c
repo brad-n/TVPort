@@ -497,6 +497,7 @@ static void alias_query(uint64_t addr, uint64_t *base, uint64_t *size, int *mapp
 // bytes, so the call returns 0 and alias_initialize zeroes what does not read 0 when they are mapped again
 // alias: the range lies in the alias region, where the game maps and unmaps the same ranges every frame (Zelda: about 0.5 GB a second): punching those at once would make every page fault
 // in again from a hole; they are only marked (g_alias_rel), and guest_file_sweep punches those still given back after a whole sweep interval. The heap's are punched at once
+int dm_guest_in_files(void) { return g_gf_n != 0; }   // nvn_dirty_discard (DM_TEX_RELEASE) and the texture purge: an anonymous mapping over the files' range would undo them
 static int guest_release(uintptr_t lo, uintptr_t hi, int alias) {
     if (g_gf_n) {
         if (mprotect((void *)lo, hi - lo, PROT_NONE)) die("guest_release mprotect %#lx+%#lx errno=%d", (unsigned long)lo, (unsigned long)(hi - lo), errno);

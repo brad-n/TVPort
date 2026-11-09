@@ -231,6 +231,15 @@ DM_NVN_TEXDUMP	diagnostic	`=<frame>:<path>`, `size=<W>x<H>:<path>` or `layers=<n
 DM_NVN_TEXINFO	diagnostic	`=<W>x<H>` logs storage and description of every texture of that size on first use, registration and initialization (pool, flags, packaged, non-zero bytes, swizzles)
 DM_NVN_TEXRAW	diagnostic	`=<serial>,…` or `info` (the textures `DM_NVN_TEXINFO` picked out): saves those textures' raw bytes at the `DM_NVN_TEXDUMP` frame, with a text header line
 DM_NVN_TEXSNAP	diagnostic	`=<in-frame pass index>,…`: with `DM_NVN_TEXDUMP`, copies those passes' colour attachments as they end and saves them with the end-of-frame dump
+DM_NVN_TEX_PURGE	switch	`1` lets a packaged texture (uploaded from guest bytes, dirty-page tracked, never written by the GPU) that nothing has used for `DM_NVN_TEX_PURGE_IDLE` frames give its GPU copy back while the process is short of memory (`os_proc_available_memory` under `DM_NVN_TEX_PURGE_LOW_MB`, until it is above `DM_NVN_TEX_PURGE_HIGH_MB`): out of the residency set, Volatile, and Empty once idle for `DM_NVN_TEX_PURGE_EMPTY_IDLE`; a use sets it back and uploads it again in place from the guest bytes or the ASTC cache when its contents went. Off with `DM_TEX_RELEASE` on an anonymous guest. Off by default. Fork-only (idea: yuchanns/nxnative-tvos)
+DM_NVN_TEX_PURGE_EMPTY_IDLE	switch	`=<frames>` (default 240; 0 = never) a purged texture idle this long while the process is still short of memory becomes Empty instead of Volatile (`DM_NVN_TEX_PURGE`)
+DM_NVN_TEX_PURGE_EVERY	switch	`=<frames>` (default 30) between looks for idle textures to purge (`DM_NVN_TEX_PURGE`)
+DM_NVN_TEX_PURGE_FAKE_AVAIL_MB	diagnostic	`=<MB>` what the purge sees as `os_proc_available_memory` (tests; the Mac has no such call and never purges without it) (`DM_NVN_TEX_PURGE`)
+DM_NVN_TEX_PURGE_HIGH_MB	switch	`=<MB>` (default 1024) available memory above which the purge stops again (`DM_NVN_TEX_PURGE`)
+DM_NVN_TEX_PURGE_IDLE	switch	`=<frames>` (default 60) a packaged texture unused this long is a candidate for the purge (`DM_NVN_TEX_PURGE`)
+DM_NVN_TEX_PURGE_KEEP_MB	switch	`=<MB>` (default 64) of the most recently used idle textures (idle under twice `DM_NVN_TEX_PURGE_IDLE`) that stay resident (`DM_NVN_TEX_PURGE`)
+DM_NVN_TEX_PURGE_LOW_MB	switch	`=<MB>` (default 896) available memory below which the purge starts (`DM_NVN_TEX_PURGE`)
+DM_NVN_TEX_PURGE_MIN_KB	switch	`=<KB>` (default 256) textures smaller than this are never purged (`DM_NVN_TEX_PURGE`)
 DM_NVN_TREG_ID	diagnostic	`=<n>` logs every registration of texture ID n: what it holds from then on, and the frame being recorded
 DM_NVN_TSV	diagnostic	`=<path>` writes the per-frame NVN call table and timing rows (frame, metric, value) to a TSV, read by `scripts/bench.py`
 DM_NVN_TSV_CALLS	diagnostic	`0` makes `DM_NVN_TSV` write only the timing rows, without the call counts (about two thirds of the file)
@@ -406,6 +415,9 @@ DM_TEST_SWKBD_LAG_MS	diagnostic	`=<ms>` sleeps that long between the keyboard ha
 DM_TEST_TRANSFORM_FEEDBACK	test	Path to the native t_transform_feedback executable used by the Python feedback tests
 DM_TEST_UP_LEAK	diagnostic	`=1` keeps the old upload staging block instead of retiring it, as before the fix, to measure the leak
 DM_TEST_UP_LOST	diagnostic	`=<batch index>` treats that batch of uploads as dropped, to exercise the re-upload path
+DM_TEX_RELEASE	switch	`1` gives back the guest copy of a texture's storage in a `CPU_NO_ACCESS` pool once its upload (or its creation, for a GPU-only texture) has completed on the GPU: its whole pages become zero pages; `2` also releases still-protected pages of CPU-visible textures uploaded by the tracked path (a later CPU write faults and re-uploads as before); `probe` only counts; off by default ([memory](reference/memory.md#the-guest-copy-of-uploaded-textures-given-back))
+DM_TEX_RELEASE_METHOD	diagnostic	`free` releases with `madvise(MADV_FREE_REUSABLE)` instead of fresh zero pages (`DM_TEX_RELEASE`)
+DM_TEX_REL_DONOR	switch	`0` lets a texture made again over storage `DM_TEX_RELEASE` gave back read its zero pages; by default it is a GPU copy of the texture released there when that one has the same description, still has its host texture and its storage was not written since ([memory](reference/memory.md#the-guest-copy-of-uploaded-textures-given-back))
 DM_THERMAL_CAP	switch	`0` turns off the thermal cap, which holds the frame step at 30 fps while iOS reports a serious or critical thermal state (on by default)
 DM_THR	diagnostic	`=1` logs each SVC (except `SleepThread`) with its first four arguments, and each `CreateThread` with entry, stack, priority and core
 DM_THRCPU	diagnostic	`=<tsv path>[,<seconds>]` writes each thread's CPU time (100% = one core) and the total every interval (default 10 s); on iOS a relative path is under `Documents`
