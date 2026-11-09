@@ -146,6 +146,10 @@ t_link_ticks: t_link_ticks.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_link_ticks.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
 t_cpu_tex: t_cpu_tex.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_cpu_tex.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+# The game's dispatches side by side in the copy encoder where no barrier of its and nothing else lies between them (dispatch_enc, DM_NVN_DISPATCH_OVERLAP)
+t_dispatch_overlap: t_dispatch_overlap.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_dispatch_overlap.m $(MTL_T_SRC) $(FW)
+check_t_dispatch_overlap: RUN_ENV = MTL_DEBUG_LAYER=1
 .PHONY: check_t_cpu_tex
 check_t_cpu_tex: t_cpu_tex
 	MTL_DEBUG_LAYER=1 ./t_cpu_tex --metal
@@ -197,6 +201,16 @@ t_gmem_budget: t_gmem_budget.m $(MTL_T_DEP)
 .PHONY: check_t_gmem_budget
 check_t_gmem_budget: t_gmem_budget
 	DM_NVN_GMEM_BUDGET_MB=3 MTL_DEBUG_LAYER=1 ./t_gmem_budget
+t_gmem_learned: t_gmem_learned.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_gmem_learned.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_gmem_learned
+check_t_gmem_learned: t_gmem_learned
+	DM_NVN_GMEM_MODE='learned!' MTL_DEBUG_LAYER=1 ./t_gmem_learned
+t_gmem_survive: t_gmem_survive.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_gmem_survive.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_gmem_survive
+check_t_gmem_survive: t_gmem_survive
+	DM_NVN_POOL_UNWIRE=0 DM_NVN_GMEM_MODE='learned!' MTL_DEBUG_LAYER=1 ./t_gmem_survive
 t_gmem_words: t_gmem_words.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_gmem_words.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_gmem_words
@@ -518,6 +532,7 @@ check_t_rt_recycle: t_rt_recycle
 	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_rt_recycle
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_rt_recycle
 	DM_NVN_RT_RECYCLE=0 MTL_DEBUG_LAYER=1 ./t_rt_recycle
+	DM_NVN_RH_FIT_DIV=16 DM_NVN_RH_CAP_MB=128 DM_NVN_RH_IDLE_MS=3000 MTL_DEBUG_LAYER=1 ./t_rt_recycle
 # A game's upscaler drawn by MetalFX (any profile; the profile's upscaler shaders, from its shader map, when it has some); with and without the switch, and on the encoding thread
 t_upscaler_mfx: t_upscaler_mfx.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upscaler_mfx.m $(MTL_T_SRC) $(FW)

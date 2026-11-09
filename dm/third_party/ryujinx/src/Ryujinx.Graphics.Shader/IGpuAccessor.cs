@@ -214,6 +214,15 @@ namespace Ryujinx.Graphics.Shader
         }
 
         /// <summary>
+        /// nxnative: queries whether raw global memory loads log the pool table entry they read (a profile's shader_raw_read_log), so the host can keep resident what the shaders read.
+        /// </summary>
+        /// <returns>True if a raw load sets its entry's bit in the read log, false for no read log</returns>
+        bool QueryHostRawReadLog()
+        {
+            return false;
+        }
+
+        /// <summary>
         /// Queries host about the presence of the FrontFacing built-in variable bug.
         /// </summary>
         /// <returns>True if the bug is present on the host device used, false otherwise</returns>

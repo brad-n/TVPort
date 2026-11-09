@@ -56,7 +56,7 @@ int main(void) { @autoreleasepool {
     CHECK("a commit with no words changes nothing", g_gmem_buf.gpuAddress == t3);
     // a write log is read against the table the shader searched: when its block's word is repointed at a newer table, the log follows it
     id<MTLBuffer> t3buf = g_gmem_buf;
-    uint64_t w4 = t3; (void)gml_take(t3buf); NvGmlLog *lg = g_gml_last;
+    uint64_t w4 = t3; (void)gml_take(t3buf, 1); NvGmlLog *lg = g_gml_last;
     CHECK("a log is taken with the table its block holds", lg && lg->map == t3buf);
     mtl_pool_add(mem + 32 * MB, 4 * MB); mtl_pool_addressed(mem + 32 * MB, 4 * MB);             // a pool the block's table lacks
     gmem_slot_note(&w4, (__bridge void *)lg);

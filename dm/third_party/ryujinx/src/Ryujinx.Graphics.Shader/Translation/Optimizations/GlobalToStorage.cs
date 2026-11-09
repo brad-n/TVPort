@@ -896,6 +896,12 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
         // that writes a whole frame costs a load, not an atomic (Ocarina of Time's movie compute ran at 41 ms a frame on a hash set of pages, which also ran out of slots)
         private const int GmemLogCbOffset = 1;
 
+        // nxnative: the read log (dmsh_abi.h DMSH_GMEM_RLOG_*), the second half of the same log buffer, for a game whose profile sets shader_raw_read_log (IGpuAccessor.QueryHostRawReadLog): a raw load
+        // that chooses a pool table entry other than the one it chose last sets that entry's bit at GmemMapEntries / 32 words past the write bitmap. The host reads the bits on completion: the entries
+        // that were listed as resident get a fresh use stamp, and a stub (an entry that stands for memory the host has not made resident, whose delta points into a page of zeros) is made resident
+        // for the next table, so the residency of raw memory follows what the shaders read, not every pool the game has
+        private const int GmemReadLogWords = (1 << GmemMapLog2) / 32;
+
         // nxnative: a global memory access whose address the search traced to no storage buffer, an address the shader loaded from memory (Donkey Kong Bananza: gsys's vertex
         // shader that resets the terrain's indirect draw records reads each record's address from a storage buffer). Ryujinx drops such an access (a load reads 0). Here it
         // goes to the address itself: a tagged hint for its 2 MiB chunk, else a branchless binary search, finds the host's pool holding it, the address moves by that pool's delta (its Metal GPU address minus its
@@ -930,6 +936,9 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             {
                 return false;
             }
+
+            bool readLog = !writes && operation.Inst == Instruction.Load && gpuAccessor.QueryHostRawReadLog() &&
+                resourceManager.TryGetStorageBufferBinding(GmemMapCbSlot, GmemLogCbOffset, write: true, out logBinding);
 
             resourceManager.Properties.UsesPhysicalPointers = true;
 
@@ -1009,6 +1018,18 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             Operand found = context.IMultiply(selected, Const(GmemMapEntryWords));
             Operand lblSkip = Label();
             context.BranchIfFalse(lblSkip, Below(MapWord(found, 3), MapWord(found, 2)));   // an address in no pool: the entry below it ends below it
+
+            if (readLog)
+            {
+                // A load logs the entry only when it chose it by the hint or the search: the entry it chose last in this invocation was logged then
+                Operand rword = context.IAdd(context.ShiftRightU32(selected, Const(5)), Const(GmemReadLogWords));
+                Operand rbit = context.ShiftLeft(Const(1), context.BitwiseAnd(selected, Const(31)));
+                Operand lblRead = Label();
+
+                context.BranchIfTrue(lblRead, context.ICompareNotEqual(context.BitwiseAnd(context.Load(StorageKind.StorageBuffer, logBinding, Const(0), rword), rbit), Const(0)));
+                context.AtomicOr(StorageKind.StorageBuffer, logBinding, Const(0), rword, rbit);
+                context.MarkLabel(lblRead);
+            }
 
             // The last entry's range held it, or the hint's or the search's entry does
             context.MarkLabel(lblChosen);

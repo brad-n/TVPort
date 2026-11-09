@@ -85,6 +85,9 @@
 // Where such a store or atomic lands is known only when the GPU runs it, so each one also sets the bit of its table entry in a write log, reserved under the same slot at offset 1
 // (Ryujinx GlobalToStorage.GmemLogCbOffset): a bitmap of the entries of the table bound beside it, bit i in 32-bit word i / 32. The host learns the pools from it
 #define DMSH_KIND_GMEM_LOG "gmem_log"    // that write log: the host gives each draw or dispatch its own, cleared (nvn_mtl.m gml_take)
+// A game whose profile sets shader_raw_read_log has the same buffer twice as long: the second half, from word DMSH_GMEM_MAP_ENTRIES / 32 on, is a read log of the same shape, which a raw load sets the
+// bit of the entry it chose (by the hint or the search, not when it reuses the entry it chose last) -- shaders with loads only get the log binding too. In nvn_mtl.m's DM_NVN_GMEM_MODE=learned an
+// entry whose last 4 bytes (the table entry's padding) are 1 is a stub: memory the host has not made resident, whose delta points into a page of zeros; the read bit says a shader wants it
 #define DMSH_GMEM_LOG_CB_OFFSET 1
 
 // A pool binding points at a buffer the host keeps (nvn_mtl.m pool_gpu): a 32-bit bound n (the highest index the shader may read), then from DMSH_POOL_HEAD one 8-byte resource ID per ID

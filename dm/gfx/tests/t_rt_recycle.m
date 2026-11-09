@@ -93,6 +93,18 @@ int main(void) { @autoreleasepool {
     mtl_sub_commit(); mtl_drain(); mtl_sub_begin();   // rh_trim
     CHECK(waiting() == 0 && g_rh_trimmed == before && g_rh_bytes == 0, "heaps that waited too long are freed when a submission begins");
     CHECK(!first_heap || !resident(first_heap), "and leave the residency set");
+    {   // the cap: five waiting heaps of a quarter of it, a quarter more than it holds, and the oldest go when a submission begins (the newest stay)
+        uint64_t q = rh_cap() / 4, tr0 = g_rh_trimmed; id<MTLHeap> hs[5];
+        for (int i = 0; i < 5; i++) { MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypePlacement; hd.size = q; hd.storageMode = MTLStorageModePrivate; hs[i] = [g_dev newHeapWithDescriptor:hd]; res_add(hs[i]);
+            NvRecycledHeap *o = [NvRecycledHeap new]; o->heap = hs[i]; o = nil; }
+        res_commit();
+        CHECK(waiting() == 5 && g_rh_bytes > rh_cap(), "more than the cap waits");
+        mtl_sub_commit(); mtl_drain(); mtl_sub_begin();   // rh_trim
+        CHECK(g_rh_bytes <= rh_cap() && waiting() >= 3 && g_rh_trimmed > tr0, "the oldest are freed down to the cap");
+        CHECK(!resident(hs[0]) && resident(hs[4]), "the oldest leave the residency set, the newest stays");
+        CHECK(rh_cap() == (getenv("DM_NVN_RH_CAP_MB") ? (uint64_t)atoi(getenv("DM_NVN_RH_CAP_MB")) << 20 : (TARGET_OS_IPHONE ? 64u << 20 : 256u << 20)), "the cap follows the switch");
+        CHECK(rh_fit_div() == (getenv("DM_NVN_RH_FIT_DIV") ? (uint64_t)atoi(getenv("DM_NVN_RH_FIT_DIV")) : (TARGET_OS_IPHONE ? 16 : 8)), "the fit follows the switch");
+    }
     mtl_sub_commit(); mtl_drain(); free(mem);
     printf("t_rt_recycle: %d checks, %d failed\n", checks, failed); return failed != 0;
 } }
