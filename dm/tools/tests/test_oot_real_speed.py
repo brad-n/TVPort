@@ -1,4 +1,4 @@
-"""Execute Ocarina's emitted stubs: the frame step (the game's step, or the measured one when that is longer) and the render scale (the 3D views' scale from the host)."""
+"""Execute Ocarina's emitted stubs: the frame step (the game's step, or the measured one when that is longer) and the render scale (the 3D views' scale from the host) and the static shadow map size (the literal 12288 of its texture from the host)."""
 import importlib
 import importlib.util
 from pathlib import Path
@@ -140,6 +140,56 @@ class RenderScale(unittest.TestCase):
             for status_byte in (0, 1, 2):
                 with self.subTest(host=host, status=status_byte):
                     self.assertEqual(status(host, 0.0, status_byte)[0], status_byte)
+
+
+SHADOW_SITES = {0xc30c24: 3, 0xc30c2c: 4, 0x344d78: 3}   # mov w3 / w4,#0x3000: the fine static depth shadow texture's width and height, and the render target call
+
+
+def shadow_size(site, host, canary=0x5a5a5a5a5a5a5a5a):
+    """Run the stub of one static shadow map site: the register it leaves, whether the others are untouched, and where it goes on."""
+    assert unicorn is not None and arm is not None
+    machine = unicorn.Uc(unicorn.UC_ARCH_ARM64, unicorn.UC_MODE_ARM)
+    machine.mem_map(BASE, 0x3400000)
+    ctx = Ctx(machine)
+    profile.real_speed(ctx)
+    machine.mem_write(BASE + STATE + 0xa0, struct.pack('<I', host))
+    rd = SHADOW_SITES[site]
+    others = [r for r in range(0, 8) if r != rd]
+    for r in others:
+        machine.reg_write(arm.UC_ARM64_REG_X0 + r, canary + r)
+    machine.reg_write(arm.UC_ARM64_REG_X16, canary)
+    machine.reg_write(arm.UC_ARM64_REG_X17, canary)
+    machine.emu_start(BASE + site, BASE + site + 4, count=16)
+    kept = all(machine.reg_read(arm.UC_ARM64_REG_X0 + r) == canary + r for r in others) and machine.reg_read(arm.UC_ARM64_REG_X16) == canary
+    return machine.reg_read(arm.UC_ARM64_REG_X0 + rd), kept, ctx, machine.reg_read(arm.UC_ARM64_REG_PC)
+
+
+@unittest.skipIf(unicorn is None, 'optional ARM64 execution dependency: unicorn')
+class ShadowMapSize(unittest.TestCase):
+    def test_the_sites_are_the_literals_of_the_fine_shadow_texture(self):
+        ctx = shadow_size(0xc30c24, 0)[2]
+        for site, rd in SHADOW_SITES.items():
+            self.assertEqual(ctx.sites[site], (0x52860000 | rd).to_bytes(4, 'little').hex())   # mov wN,#0x3000
+
+    def test_unset_keeps_the_games_12288(self):
+        for site in SHADOW_SITES:
+            with self.subTest(site=hex(site)):
+                got, kept, _, pc = shadow_size(site, 0)
+                self.assertEqual(got, 12288)
+                self.assertTrue(kept)
+                self.assertEqual(pc, BASE + site + 4)
+
+    def test_a_size_replaces_it(self):
+        for site in SHADOW_SITES:
+            for size in (4096, 6144, 8192):
+                with self.subTest(site=hex(site), size=size):
+                    got, kept, _, pc = shadow_size(site, size)
+                    self.assertEqual(got, size)
+                    self.assertTrue(kept)   # only the displaced mov's register changes: no scratch register is taken
+                    self.assertEqual(pc, BASE + site + 4)
+
+    def test_the_width_and_height_stay_equal(self):
+        self.assertEqual(shadow_size(0xc30c24, 6144)[0], shadow_size(0xc30c2c, 6144)[0])
 
 
 @unittest.skipIf(unicorn is None, 'optional ARM64 execution dependency: unicorn')
