@@ -563,28 +563,56 @@ static id<MTLFunction> mtk_nop_fragment(void) {
         fn = [l newFunctionWithName:@"dm_mesh_nop"]; if (!fn) MLOG("[RED] the empty fragment function did not compile: %s", e.localizedDescription.UTF8String); });
     return fn;
 }
-static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
-    NvShader *ts = g_mtk.ts, *ms = g_mtk.ms, *fs = raster->sh[1];
-    pso_key k; pso_key_fill(&k, ms, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, 0);
-    memset(k.attr, 0, sizeof k.attr); memset(k.attr_hi, 0, sizeof k.attr_hi); memset(k.stream, 0, sizeof k.stream);
-    k.fsfn = (__bridge void *)(ts ? ts->fn : ms->fn);   // with ms in the key's vertex place: the task shader is the third of the pipeline's functions
-    os_unfair_lock_lock(&g_pso_mtk_lock); id ps = hm_get_id(&g_pso_mtk, &k);
-    if (!ps) { if (!g_pso_mtk_building) g_pso_mtk_building = [NSObject new]; hm_put_id(&g_pso_mtk, &k, g_pso_mtk_building); }
-    os_unfair_lock_unlock(&g_pso_mtk_lock);
-    if (ps) return ps == NSNull.null || ps == g_pso_mtk_building ? nil : ps;
-    MTLRenderPipelineDescriptor *d = pso_desc(&k, ms, fs, nil, 0);
+static id<MTLRenderPipelineState> mtk_build(const pso_key *k, NvShader *ts, NvShader *ms, NvShader *fs, NSError **error) {
+    MTLRenderPipelineDescriptor *d = pso_desc(k, nil, fs, nil, 0);
+    if (!pso_ds_valid((uint32_t)d.depthAttachmentPixelFormat, (uint32_t)d.stencilAttachmentPixelFormat)) return nil;
     MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
     m.meshFunction = ms->fn; m.fragmentFunction = d.fragmentFunction ?: mtk_nop_fragment(); m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
     if (ts) { m.objectFunction = ts->fn; m.payloadMemoryLength = (ts->mesh_payload + 15u) & ~15u; m.maxTotalThreadsPerObjectThreadgroup = ts->mesh_threads; }
     m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageEnabled = d.alphaToCoverageEnabled;
     for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
     m.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
+    return [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:error];
+}
+static void mtk_bind_key(pso_key *k, NvShader *ts, NvShader *ms, NvShader *fs) {
+    k->vs = (__bridge void *)ms; k->fs = (__bridge void *)fs;
+    k->fsfn = (__bridge void *)(ts ? ts->fn : ms->fn);   // the third function, distinct from a specialized fragment
+}
+static void mtk_claim(pso_key *k, NvShader *ts, NvShader *ms, NvShader *fs, id<MTLRenderPipelineState> ps) {
+    mtk_bind_key(k, ts, ms, fs);
+    os_unfair_lock_lock(&g_pso_mtk_lock);
+    id current = hm_get_id(&g_pso_mtk, k);
+    if (!current || current == g_pso_mtk_building) hm_put_id(&g_pso_mtk, k, ps);   // a build still running for it will put the same pipeline
+    os_unfair_lock_unlock(&g_pso_mtk_lock);
+}
+static NSMutableArray<NSString *> *g_mtk_rec;   // M rows of pipelines the background queue finished: written by the submit thread (the record files are not locked)
+static void mtk_record_drain(void) {
+    NSArray *rows = nil;
+    os_unfair_lock_lock(&g_pso_mtk_lock); if (g_mtk_rec.count) { rows = [g_mtk_rec copy]; [g_mtk_rec removeAllObjects]; } os_unfair_lock_unlock(&g_pso_mtk_lock);
+    for (NSString *r in rows) { pso_record("%s", r.UTF8String); pso_user_record("%s", r.UTF8String); }
+}
+static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
+    NvShader *ts = g_mtk.ts, *ms = g_mtk.ms, *fs = raster->sh[1];
+    pso_key k; pso_key_fill(&k, ms, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, 0);
+    memset(k.attr, 0, sizeof k.attr); memset(k.attr_hi, 0, sizeof k.attr_hi); memset(k.stream, 0, sizeof k.stream);
+    mtk_bind_key(&k, ts, ms, fs);
+    mtk_record_drain();
+    os_unfair_lock_lock(&g_pso_mtk_lock); id ps = hm_get_id(&g_pso_mtk, &k);
+    if (!ps) { if (!g_pso_mtk_building) g_pso_mtk_building = [NSObject new]; hm_put_id(&g_pso_mtk, &k, g_pso_mtk_building); }
+    os_unfair_lock_unlock(&g_pso_mtk_lock);
+    if (ps) return ps == NSNull.null || ps == g_pso_mtk_building ? nil : ps;
+    // A pipeline the prewarm (M rows) did not prepare is built in the background and its draws are left out until it is ready (never a stall on the submit thread); its row is recorded for the next start
     const char *tk = ts ? ts->key : "-", *mk = ms->key, *fk = fs ? fs->key : "-"; pso_key kk = k;
     dispatch_async(pp_bg_queue(), ^{
         NSError *e = nil; uint64_t t0 = bp_now();
-        id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:&e];
-        MLOG("%stask / mesh pipeline: task %s mesh %s fragment %s, %.1f ms in the background%s%s", p ? "" : "[RED] ", tk, mk, fk, (bp_now() - t0) / 1e6, p ? "" : ": ", p ? "" : e.localizedDescription.UTF8String);
-        os_unfair_lock_lock(&g_pso_mtk_lock); hm_put_id(&g_pso_mtk, &kk, p ?: NSNull.null); os_unfair_lock_unlock(&g_pso_mtk_lock);
+        id<MTLRenderPipelineState> p = mtk_build(&kk, ts, ms, fs, &e);
+        MLOG("%stask / mesh pipeline: task %s mesh %s fragment %s, %.1f ms in the background%s%s", p ? "" : "[RED] ", tk, mk, fk, (bp_now() - t0) / 1e6, p ? "" : ": ", p ? "" : (e ? e.localizedDescription.UTF8String : "invalid depth/stencil formats"));
+        NSString *row = nil;
+        if (p) { pso_key rk = kk; rk.fsfn = NULL; pso_skey sk; char hex[sizeof sk * 2 + 1]; pso_skey_from(&rk, ms, fs, 0, NULL, &sk); pso_skey_hex(&sk, hex);
+                 row = [NSString stringWithFormat:@"M\t%s\t%s\n", tk, hex]; }
+        os_unfair_lock_lock(&g_pso_mtk_lock); hm_put_id(&g_pso_mtk, &kk, p ?: NSNull.null);
+        if (row) { if (!g_mtk_rec) g_mtk_rec = [NSMutableArray array]; [g_mtk_rec addObject:row]; }
+        os_unfair_lock_unlock(&g_pso_mtk_lock);
     });
     return nil;
 }
