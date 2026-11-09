@@ -494,6 +494,13 @@ struct SettingsForm: View {
                     Text("Draws the game's 3D scene at a lower resolution, so the GPU keeps up; menus and text stay sharp. Below Full the size is fixed, in place of the game's own dynamic resolution. Takes effect at the next Build & Install.")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
+                Picker("Upscaler", selection: upscalerBinding) {
+                    Text("Game's own (default)").tag("game")
+                    Text("MetalFX").tag("metalfx")
+                    Text("Off — simple scaling, most speed").tag("off")
+                }
+                Text("How the game's image is scaled up to the screen. Off uses plain scaling and leaves the most speed for the game; the picture is a little softer. Takes effect at the next Build & Install.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Picker("Frame rate", selection: fpsBinding(profileFPS ?? 0)) {
                     if profileFPS == nil { Text("Game default").tag(0) }
                     Text("30 fps").tag(30)
@@ -694,6 +701,10 @@ struct SettingsForm: View {
 
     private var coolBinding: Binding<Bool> {
         Binding(get: { library.current?.coolWhenHot ?? true }, set: { value in library.update { $0.coolWhenHot = value ? nil : false } })
+    }
+
+    private var upscalerBinding: Binding<String> {
+        Binding(get: { library.current?.upscaler ?? "game" }, set: { value in library.update { $0.upscaler = value == "game" ? nil : value } })
     }
 
     private var renderScaleBinding: Binding<Double> {

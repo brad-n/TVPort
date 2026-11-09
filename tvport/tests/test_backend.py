@@ -1,6 +1,6 @@
 import json
 import io
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 import subprocess
 import sys
@@ -449,6 +449,27 @@ class Saves(unittest.TestCase):
             (patched / 'main.fixups.tsv').write_text('# FPS_STATE_OFF\t0x3ad4000\n# RENDER_SCALE\t1\n')
             self.assertTrue(backend.Game(Path(folder)).render_scale_supported())
             self.assertTrue(backend.Game(Path(folder)).frame_step_supported())
+
+    def test_upscaler_reaches_the_app(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game = self.make_game(folder)
+            self.assertNotIn('DM_UPSCALER', backend.write_env(game, 'handheld', 512).read_text())   # the game's own
+            self.assertNotIn('DM_UPSCALER', backend.write_env(game, 'handheld', 512, upscaler='game').read_text())
+            self.assertIn('DM_UPSCALER=metalfx\n', backend.write_env(game, 'handheld', 512, upscaler='metalfx').read_text())
+            self.assertIn('DM_UPSCALER=bilinear\n', backend.write_env(game, 'handheld', 512, upscaler='off').read_text())
+
+    def test_upscaler_option_and_persistence(self):
+        for argv, expected in (([], 'game'), (['--upscaler', 'game'], 'game'), (['--upscaler', 'metalfx'], 'metalfx'), (['--upscaler', 'off'], 'off')):
+            with patch.object(sys, 'argv', ['backend.py', 'build', '/x'] + argv), patch.object(backend, 'cmd_build') as build, patch.object(backend, 'BUNDLED', False):
+                backend.main()
+            self.assertEqual(build.call_args.args[0].upscaler, expected)
+        with patch.object(sys, 'argv', ['backend.py', 'build', '/x', '--upscaler', 'bilinear']), patch.object(backend, 'cmd_build'), patch.object(backend, 'BUNDLED', False), redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit): backend.main()
+        with tempfile.TemporaryDirectory() as folder:
+            game = self.make_game(folder)
+            self.assertEqual(game.state().get('upscaler', 'game'), 'game')
+            game.save_state(upscaler='off')
+            self.assertEqual(backend.Game(Path(folder)).state()['upscaler'], 'off')
 
     def test_frame_rate_target_reaches_the_app(self):
         with tempfile.TemporaryDirectory() as folder:
