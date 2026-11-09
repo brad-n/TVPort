@@ -1709,6 +1709,11 @@ static void power_line(uint64_t frame) {
         if (ps[0] != pps[0] || ps[2] != pps[2] || ps[3] != pps[3]) LOG("[nvn] pool tables up to frame %llu, per frame: %.2f built whole (%.2f ms), %.2f patched, %.2f kept; of these two %.2f over memory pool changes, %.2f over a new submission",
             frame, (ps[0] - pps[0]) / nf, (ps[1] - pps[1]) / 1e3 / nf, (ps[2] - pps[2]) / nf, (ps[3] - pps[3]) / nf, (ps[4] - pps[4]) / nf, (ps[5] - pps[5]) / nf);
         memcpy(pps, ps, sizeof pps);
+        { void mtl_xs_stats(uint64_t s[16]); static uint64_t pxs[16]; uint64_t xs[16]; mtl_xs_stats(xs); double d[16]; for (int i = 0; i < 16; i++) d[i] = (xs[i] - pxs[i]) / nf;   // nvn_mtl.m g_xs
+          LOG("[nvn] draw translation up to frame %llu, per frame: %.1f submissions (encode thread waited at %.1f ends); texture views made %.1f (%.1f of retired registrations), %.1f transient views dropped; "
+              "pool table IDs taken again %.1f (%.1f transient); argument blocks encoded because: none yet %.1f, a binding changed %.1f, the program changed %.1f, a generation changed %.1f, another pass %.1f, compute %.1f, base instance %.1f, pool table %.1f; reused across passes %.1f",
+              frame, d[5], d[6], d[0], d[1], d[2], d[3], d[4], d[7], d[8], d[15], d[9], d[10], d[11], d[12], d[13], d[14]);
+          memcpy(pxs, xs, sizeof pxs); }
         char tc[400]; dm_thread_cpu(tc, sizeof tc, s);
         LOG("[nvn] threads up to frame %llu: CPU %s", frame, tc); }
     else { char yt[192], rs[400], tc[400]; dm_yield_top(yt, sizeof yt); mtl_res_stats(rs, sizeof rs); dm_thread_cpu(tc, sizeof tc, 1); }   // the first call only takes the baselines

@@ -228,6 +228,7 @@ static void rec_drain(void) {
     pthread_mutex_lock(&g_rb_mu);
     while (g_rb_head || g_rb_busy) { blocked = 1; pthread_cond_wait(&g_rb_idle, &g_rb_mu); }
     pthread_mutex_unlock(&g_rb_mu);
+    g_xs[XS_DRAIN_WAIT] += blocked;
     if (ws_on()) ws_put(WS_DRAIN, w0, blocked);
 }
 // A block of records from another thread than the submit thread (the present snapshot's copy): it goes in one piece behind every block published so far. Everything the game
@@ -246,6 +247,32 @@ static void rec_own_push(rec_blk *b) {
     pthread_mutex_unlock(&g_rb_mu);
 }
 static __attribute__((noreturn)) void rec_missing(id o, SEL s) { MDIE("deferred encoding: %s has no stand-in for -%s (DM_NVN_ENC_THREAD=0 runs without it)", object_getClassName(o), sel_getName(s)); }
+// DM_NVN_ENC_ASYNC=1 (with DM_NVN_ENC_THREAD): a submission's end hands its records, the commit of its command buffer and the signal of its fence among them, to the encode thread and returns,
+// instead of waiting until the encode thread has made them all (rec_drain). The submit thread translates the next submission meanwhile: Ocarina of Time on the Mac mini waited there at
+// every submission, about a sixth of the replay thread's time. What the wait made sure of still holds without it:
+//   the queue sees the commits, uploads, event signals and mapping updates in the order they were recorded, as the one encode thread makes them in that order;
+//   whatever waits for the GPU (a game's SyncWait or QueueFinish, an allocator, arena or ring slot reused once its fence has passed) waits for a fence the GPU signals only after the
+//   encode thread has committed its command buffer, and its records are handed over before mtl_sub_commit returns, so such a wait cannot wait for records still on the submit thread;
+//   a command buffer made outside the records (q_cb, the old queue) still drains first;
+//   a present: the presenting thread commits the frame's display command buffer only once the encode thread has passed a note recorded behind the frame's last commit (pres_commit_mark
+//   on the submit thread, pres_commit_wait on the present thread), so the window never shows a frame whose work is not yet on the queue.
+// Objects the records use are retained by them (rec_obj); resources and argument blocks go only behind fences, as before. Off by default
+static int g_enc_async = -1;
+static int enc_async(void) {
+    if (__builtin_expect(g_enc_async >= 0, 1)) return g_enc_async && g_rb_started;
+    const char *e = getenv("DM_NVN_ENC_ASYNC"); g_enc_async = e && atoi(e) > 0 && rec_on();
+    if (g_enc_async) MLOG("DM_NVN_ENC_ASYNC=1: a submission's end hands its commit to the encode thread without waiting for it");
+    return g_enc_async && g_rb_started;
+}
+static _Atomic uint64_t g_pres_cmt; static uint64_t g_pres_v;   // the last present note the encode thread has passed / the last one recorded
+// On the submit thread, as a present is queued: a note behind everything recorded so far (0 = none needed: the records are drained at each submission's end)
+static uint64_t pres_commit_mark(void) {
+    if (!enc_async()) return 0;
+    rec_t *r = rec_put(RO_NOTE, 0); r->a[0] = (uint64_t)(uintptr_t)&g_pres_cmt; r->a[1] = ++g_pres_v;
+    rec_publish();
+    return g_pres_v;
+}
+static void pres_commit_wait(uint64_t v) { if (v) rec_note_wait(&g_pres_cmt, v); }
 
 // Argument tables: every stand-in is made once and kept for good (rec_table), so the real table is passed without a retain
 @interface DmRecTable : NSObject { @public id real; } @end
