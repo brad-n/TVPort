@@ -2,6 +2,24 @@
 
 <img src="docs/images/tvport/app-icon.png" alt="TVPort app icon" width="128" height="128">
 
+## What this fork adds (brad-n/TVPort)
+
+Changes in this fork that the TVPort and nxnative releases don't have yet, in plain terms. Upstream fixes we brought in early are listed with their pull request numbers, so they're easy to drop once upstream accepts them.
+
+**Smaller games on the Apple TV**
+- **Store textures once:** the game's textures are kept once, in the Apple TV's own format, instead of twice (original plus converted copy). Mario Kart 8 Deluxe went from 21.5 GB to 13.6 GB.
+- **Compress game data:** the game file on the Apple TV is compressed without losing anything and unpacked as it's read. Mario Kart 8 Deluxe went from 13.6 GB to 9.3 GB.
+- **More textures converted ahead of time:** more of the Switch's texture formats (BC4, BC5, BC6H) are converted on the Mac before install, so the Apple TV does less work while you play.
+- **Texture size cap for native ASTC textures:** large textures that are already in the Apple TV's format (mostly Switch 2 games) are shrunk to the cap you choose. At a cap of 256, Ocarina of Time's textures use about 90% less memory.
+
+**Switch 2 games (experimental)**
+- **Switch 2 game files (`.nup`):** TVPort finds and builds them, needs no keys, and names the app from the folder when the package carries no name.
+- **Larger address space:** Switch 2 games reserve about 12.5 GB of memory addresses, which tvOS only allows with Apple's Extended Virtual Addressing permission. TVPort asks for it only for games that need it. This needs a paid Apple Developer Program account, plus a one-time step per game on Apple's developer site to enable the permission for that game's app ID.
+
+**Fixes from upstream pull requests, included early** (nxnative by seedds; not yet merged upstream)
+- **#1459:** the "use Apple's MetalFX upscaler" setting now works on Ocarina of Time. It was looking for the wrong file, so it did nothing.
+- **#1543:** when Ocarina of Time runs below 60 fps, the game keeps real-time speed, so it looks choppier instead of going into slow motion.
+
 ## What’s new in TVPort 1.2.3 build 44
 
 - Added separate Swap A/B and Swap X/Y controls. Existing combined swaps stay enabled, and new games inherit your most recent choices.
