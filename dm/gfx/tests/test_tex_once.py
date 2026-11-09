@@ -1123,6 +1123,88 @@ class ExactEncoderTests(unittest.TestCase):
             self.assertEqual(slot[16:16 + n], tool.Z.exact_compress(fs_new, 22))
 
 
+class SingleSegmentFrameTests(unittest.TestCase):
+    """Ocarina's .zs frames: one-shot zstd v1.4.4 level 19 (content size, Single_Segment: descriptor 0xA0, no window descriptor). The game decodes only that layout (tex_once_zstd.is_oneshot)"""
+    @staticmethod
+    def content(seed=1):   # repeating chunks, no long runs of one byte: the frame holds no RLE block
+        r = random.Random(seed)
+        return b''.join(r.randbytes(60) * r.randint(2, 30) for _ in range(700))
+
+    def walker(self):
+        w = tool.Walker.__new__(tool.Walker)
+        w.dicts, w.zdicts, w.c, w.new_csz = {}, {}, __import__('collections').Counter(), None
+        return w
+
+    def test_zero_rich_content_takes_the_no_rle_path_with_the_same_layout(self):
+        dec = self.content(); new = dec[:900] + bytes(len(dec) - 900) + bytes(300_000); dec = dec + random.Random(3).randbytes(300_000)   # the strip leaves whole blocks of zeros: v1.4.4 would emit RLE blocks
+        orig = tool.Z.exact_compress(dec, 19, True) + tool.skippable_frame(300_000)
+        self.assertEqual(tool.zstd_header(orig), (0xA0, None))
+        w = self.walker()
+        r = w.fit_zstd(new, orig, None, dec)
+        self.assertIsNotNone(r); self.assertEqual(len(r), len(orig))
+        self.assertEqual(tool.zstd_header(r), (0xA0, None))
+        d = tool.B.zstd_module().ZstdDecompressor(); self.assertEqual(d.decompress(r), new)
+        frame = r[:len(r) - len(d.unused_data)]
+        self.assertEqual(w.c['encoder_exact_unusable'], 1); self.assertEqual(tool.Z.forbidden(frame, orig, skippable_ok=True), [])
+
+    def test_oneshot_frames_have_the_ocarina_header(self):
+        f = tool.Z.exact_compress(self.content(), 19, True)
+        self.assertEqual(tool.zstd_header(f), (0xA0, None))
+        self.assertTrue(tool.Z.is_oneshot(f))
+        self.assertFalse(tool.Z.is_oneshot(tool.Z.exact_compress(self.content(), 9)))   # Smash's streamed layout
+        self.assertEqual(tool.B.zstd_module().decompress(f), self.content())
+
+    def test_level_detection_finds_the_oneshot_level(self):
+        data = self.content()
+        for level in (19, 9):
+            f = tool.Z.exact_compress(data, level, True)
+            lv = tool.Z.match_level(f, data)
+            self.assertIsNotNone(lv); self.assertEqual(tool.Z.exact_compress(data, lv, True), f)
+            self.assertEqual(tool.Z.match_level(f + tool.skippable_frame(64), data), lv)
+            self.assertIsNone(tool.Z.match_level(f, data[:-1] + b'\x01'))
+
+    def test_walker_repacks_with_the_original_encoder_and_layout(self):
+        dec = self.content(); new = dec[:5000] + bytes(20_000) + dec[25_000:]   # zeroed texture planes, but no whole block of zeros
+        orig = tool.Z.exact_compress(dec, 19, True) + tool.skippable_frame(300)
+        w = self.walker()
+        r = w.fit_zstd(new, orig, None, dec)
+        comp = tool.Z.exact_compress(new, 19, True)
+        self.assertIsNotNone(r); self.assertTrue(r.startswith(comp)); self.assertEqual(len(r), len(orig))
+        self.assertEqual(tool.zstd_header(r), tool.zstd_header(orig))
+        self.assertEqual((w.c['encoder_matched'], w.c['encoder_unmatched']), (1, 0))
+        w.kind = lambda o, name, hint: 'zstd'
+        inner = w.check; w.check = lambda o, n, name, depth=0, *a, **k: inner(o, n, name, depth, *a, **k) if depth == 0 else None
+        w.check(orig, r, 'x')                                                                  # the self-check accepts it and proves it is the original encoder's output
+        self.assertEqual(w.c['encoder_identity_checked'], 1)
+        # the self-check stays strict about the layout: the old streamed frame (descriptor 0x80, window descriptor) is refused
+        z = tool.B.zstd_module(); P = z.CompressionParameter
+        streamed = z.compress(new, options={P.compression_level: 3, P.content_size_flag: 1, P.window_log: 17})
+        streamed += bytes(len(orig) - len(streamed)) if len(streamed) < len(orig) else b''
+        bad = streamed[:len(orig)]
+        self.assertNotEqual(tool.zstd_header(bad), tool.zstd_header(orig))
+        with self.assertRaises(Exception): w.check(orig, bad, 'x')
+
+    def test_unmatched_single_segment_frame_keeps_its_layout_or_stays_unstripped(self):
+        z = tool.B.zstd_module(); P = z.CompressionParameter
+        dec = self.content(); new = dec[:5000] + bytes(20_000) + dec[25_000:]
+        other = z.compress(dec, options={P.compression_level: 3, P.content_size_flag: 1}) + tool.skippable_frame(300)   # another encoder, same layout
+        self.assertEqual(tool.zstd_header(other)[1], None)
+        self.assertIsNone(tool.Z.match_level(other, dec))
+        w = self.walker()
+        r = w.fit_zstd(new, other, None, dec)
+        self.assertIsNotNone(r); self.assertEqual(w.c['encoder_unmatched'], 1)
+        self.assertEqual(tool.zstd_header(r), tool.zstd_header(other))
+        self.assertEqual(tool.Z.forbidden(r, other, skippable_ok=True), [])
+        # content too large for the level's window: the compress is no longer Single_Segment, so the frame is left unstripped (None), never written with another layout
+        big = random.Random(5).randbytes(3000) + bytes(3 << 20)
+        orig = z.compress(big, options={P.compression_level: 1, P.content_size_flag: 1, P.window_log: 23}) + bytes(2000)
+        self.assertEqual(tool.zstd_header(orig)[1], None)
+        self.assertEqual(tool.zstd_header(orig), (0xA0, None))
+        w = self.walker()
+        r = w.fit_zstd(big[:100] + bytes(len(big) - 100), orig, 'arc', big)
+        self.assertTrue(r is None or tool.zstd_header(r) == tool.zstd_header(orig))
+
+
 class TableSlotTests(unittest.TestCase):
     def test_table_is_one_frame_with_stored_size_of_that_frame(self):
         payloads = [(random.Random(i).randbytes(5000), 5000) for i in range(3)]

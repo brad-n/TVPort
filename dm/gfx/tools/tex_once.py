@@ -352,10 +352,12 @@ class Walker:
         then stronger levels of the same window: a texture with small planes can compress a few bytes worse after the strip"""
         lv = level if level is not None else Z.match_level(orig, dec)
         if lv is None: return None, None, None
-        for use in Z.same_window_levels(lv) if len(data) < (8 << 20) else [lv]:
-            comp = Z.exact_compress(data, use)
+        one = Z.is_oneshot(orig)
+        for use in Z.same_window_levels(lv, one) if len(data) < (8 << 20) else [lv]:
+            comp = Z.exact_compress(data, use, one)
+            if one and Z.frame_header(comp) != Z.frame_header(orig): continue   # a level whose window does not cover the content is no longer Single_Segment: not the original layout
             new = self.pad_exact(comp, len(orig), top)
-            if new is not None and not Z.forbidden(comp, rle_literals=True):
+            if new is not None and not Z.forbidden(comp, rle_literals=not one):   # Smash's originals hold RLE literals; no Ocarina frame is known to hold RLE anything, and the stripped (zero-rich) content would get RLE blocks from v1.4.4: such a frame takes the no-RLE path
                 if top == 'arc': self.new_csz = len(comp)
                 return new, use, lv
         return None, None, lv
@@ -378,10 +380,11 @@ class Walker:
         elif dec is not None: self.c['encoder_unmatched'] += 1
         if top == 'arc':
             comp = zstd_stream(data, len(orig), self.zdict(orig), like=orig)
-            if comp is None: return None
+            if comp is None or zstd_header(comp) != zstd_header(orig): return None
             self.new_csz = len(comp)
             return comp + bytes(len(orig) - len(comp))
-        return zstd_slot(data, len(orig), self.zdict(orig), like=orig)
+        new = zstd_slot(data, len(orig), self.zdict(orig), like=orig)
+        return new if new is not None and zstd_header(new) == zstd_header(orig) else None   # the layout the game decodes is the original's: a frame that cannot keep it stays unstripped
 
     def sub(self, d, name, depth, hint, top=None):
         """strip() with its own counters: -> (new bytes or None, the counters it made); an error leaves the container as it is"""
@@ -471,7 +474,7 @@ class Walker:
                 nn = n[:top_csz]
             if nn[:4] != ZSTD_MAGIC and not (len(nn) >= 4 and struct.unpack('<I', nn[:4])[0] in B.SKIPPABLE): raise Mismatch(f'{name}: no zstd frame')
             if o != n:
-                try: bad = Z.forbidden(nn, o, skippable_ok=top_csz is None, rle_literals=Z.match_level(o, B.unzstd(o, self.dicts)) is not None)   # a data.arc entry never gets a skippable frame (zero tail); other zstd files are padded with one to fill their slot
+                try: bad = Z.forbidden(nn, o, skippable_ok=top_csz is None, rle_literals=not Z.is_oneshot(o) and Z.match_level(o, B.unzstd(o, self.dicts)) is not None)   # a data.arc entry never gets a skippable frame (zero tail); other zstd files are padded with one to fill their slot
                 except (ValueError, IndexError) as e: raise Mismatch(f'{name}: the new zstd data is not a readable frame run ({e})')
                 if bad: raise Mismatch(f'{name}: the new zstd frame uses {bad}, which the original does not; the game decodes only the original archive\'s features')
             ho, hn = zstd_header(o), zstd_header(nn)
@@ -669,7 +672,7 @@ def log(msg): print('tex_once: ' + msg, file=sys.stderr, flush=True)
 
 def tool_hash():
     h = hashlib.sha256()
-    for f in ('tex_once.py', 'sparse_image.py', 'tex_once_native.c', 'tex_once_zstd.py', 'tex_once_zstd_norle.patch', 'tex_once_zstd_build.sh', 'tex_once_zstd135_build.sh'):
+    for f in ('tex_once.py', 'sparse_image.py', 'tex_once_native.c', 'tex_once_zstd.py', 'tex_once_zstd_norle.patch', 'tex_once_zstd_build.sh', 'tex_once_zstd135_build.sh', 'tex_once_zstd144_build.sh'):
         with open(os.path.join(HERE, f), 'rb') as fh: h.update(fh.read())
     return h.digest()
 
