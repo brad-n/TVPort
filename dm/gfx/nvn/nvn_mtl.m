@@ -3083,6 +3083,11 @@ static void tex_put(uint64_t k, id o) {   // serials from 2^62 up are external t
 @implementation NvPkg
 - (void)dealloc { defer_obj_release(tex); defer_obj_release(spare); free(edge[0]); free(edge[1]); }
 @end
+// The Metal texture a serial's entry stands for: a packaged texture's entry is its NvPkg, which only the packaged path of tex_mtl_ looked into. Every place that hands an entry out as a texture
+// goes through this: tex_mtl_ handed an NvPkg out when its texture was resolved while not counted as taken from storage (its pool's CPU-written classification dropped by
+// nvnMemoryPoolFinalize before the magic is cleared, on another thread), and the view code then sent it texture messages: "-[NvPkg buffer]: unrecognized selector" in tex_by_id, Ocarina of
+// Time as a song is learned on the ocarina (found by the ninboy-hat-for-macos fork; t_pkg_unwrap). No forwarding on NvPkg: an entry that reaches texture code unwrapped is a bug to find
+static inline id pkg_tex(id o) { if ([o isKindOfClass:[NvPkg class]]) { NvPkg *pk = o; return pk->view ? pk->view : pk->tex; } return o; }
 // Packaged textures by storage and description. Engines make many texture objects over one texture's bytes, each with a serial of its own: Ocarina of Time's 32,768 registered IDs name 3,607 storages,
 // 2.0 GB, and an upload per serial took 6 GB, past what a 16 GB Mac can keep wired once the pools are added. A new serial with the same storage and description takes the same NvPkg, so its
 // dirty-page checks and re-uploads are one. Weak: the serials' entries own it, and a table entry never keeps one alive. Under g_smu; a pool's entries go when it is finalized (mtl_alias_drop_pool)
@@ -5281,11 +5286,7 @@ static id<MTLTexture> image_texture(const tex_t *t, MTLTextureDescriptor *d) {
     return mt;
 }
 // The host texture a texture already has, made and refreshed by nothing: for a texture whose storage is gone (a memory pool finalized, tex_mtl_ and tex_by_id). nil if it has none
-static id<MTLTexture> tex_made(const tex_t *t) {
-    id have = tex_get(t->serial);
-    if ([have isKindOfClass:[NvPkg class]]) { NvPkg *pk = have; return pk->view ? pk->view : pk->tex; }
-    return have;
-}
+static id<MTLTexture> tex_made(const tex_t *t) { return pkg_tex(tex_get(t->serial)); }
 // NVN formats whose Metal format is the other one of an sRGB / linear pair (g_pfv_srgb) of a format's Metal format: up to 4, zero-terminated (an RGBA8 texture has RGBA8_SRGB and RGBX8_SRGB)
 static const uint8_t *srgb_twins(uint32_t f) {
     static uint8_t tw[256][5]; static dispatch_once_t once;
@@ -5396,7 +5397,9 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         static int nstale; if (nstale++ < 4) MLOG("stale sRGB / linear view dropped ser=%llu format %lu (%d so far)", (unsigned long long)t->serial, (unsigned long)((id<MTLTexture>)have).pixelFormat, nstale);
         serial_del(t->serial); have = nil;
     }
-    if (have) { if (t->pool && nvn_sparse_pool(t->pool)) sparse_gpu_look(t, have); return have; }
+    if (have) {   // an NvPkg here: packaged before, not now (see pkg_tex); a placement sparse one still follows the game's mappings
+        if ([have isKindOfClass:[NvPkg class]] && ((NvPkg *)have)->ps) sparse_look(((NvPkg *)have)->ps, t);
+        have = pkg_tex(have); if (t->pool && nvn_sparse_pool(t->pool)) sparse_gpu_look(t, have); return have; }
     if (t->d.target == 10) {   // Buffer texture (TARGET_BUFFER): create the texture-buffer view directly on the memory pool buffer (zero copy; the GPU reads the pool's current content at execution time, same as NVN semantics)
         uint32_t pf = 0; uint8_t swz[4]; int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
         void *mb; uint64_t mo;
