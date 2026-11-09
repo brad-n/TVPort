@@ -105,6 +105,7 @@ static void rec_note_wait(_Atomic uint64_t *p, uint64_t v) {
 }
 
 // ---------- The encode thread ----------
+static void gp_cb_committed(uint32_t k);   // DM_NVN_GPUPROF: the queue took the profiled frame's command buffer k (nvn_mtl.m gpc_commit)
 static id g_rx_cb, g_rx_enc;   // the encode thread's real command buffer and open encoder
 static void rec_exec(const rec_t *r) {
     const uint64_t *a = r->a; id e = g_rx_enc;
@@ -119,6 +120,7 @@ static void rec_exec(const rec_t *r) {
         pthread_mutex_lock(&g_res_mu);
         if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
         pthread_mutex_unlock(&g_res_mu);
+        if (r->op == RO_COMMIT && a[3]) gp_cb_committed((uint32_t)a[3] - 1);
         if (r->op == RO_COMMIT) g_rx_cb = nil;
         break; }
     case RO_SIGNAL: [g_q4 signalEvent:rec_id(a[0]) value:a[1]]; break;
@@ -340,12 +342,15 @@ static void rec_cb_block(id cb, void (^block)(id<MTL4CommandBuffer>)) {
     else block(cb);
 }
 static id rec_table(id t) { if (!rec_on() || !t) return t; DmRecTable *s = [DmRecTable new]; s->real = t; return s; }
-// The replay's main command buffer: committed once the uniform shadows queued so far are made (ubc_wait)
+// The replay's main command buffer: committed once the uniform shadows queued so far are made (ubc_wait). g_rec_commit_tag: its DM_NVN_GPUPROF record + 1 (gpc_commit), taken by this commit
+static uint32_t g_rec_commit_tag;
 static void rec_commit(id cb, MTL4CommitOptions *o) {
-    if ([cb isKindOfClass:[DmRecCB class]]) { rec_t *r = rec_put(RO_COMMIT, 1); r->a[0] = rec_obj(o); r->a[2] = ubc_head(); return; }
+    uint32_t tag = g_rec_commit_tag; g_rec_commit_tag = 0;
+    if ([cb isKindOfClass:[DmRecCB class]]) { rec_t *r = rec_put(RO_COMMIT, 1); r->a[0] = rec_obj(o); r->a[2] = ubc_head(); r->a[3] = tag; return; }
     ubc_wait(ubc_head());
     id<MTL4CommandBuffer> buffers[] = {cb};
     if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
+    if (tag) gp_cb_committed(tag - 1);
 }
 // An upload batch: its place in the queue is after what is recorded so far (it reads no uniform shadow)
 static void rec_commit_upload(id cb, MTL4CommitOptions *o) {
