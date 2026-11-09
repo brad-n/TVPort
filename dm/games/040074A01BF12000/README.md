@@ -17,7 +17,7 @@ A Switch 2 game: update v458752 over the base game, SDK 20.5.19 built for the Sw
 | `sys_resource 0x0` | [`game.tsv`](game.tsv) | the NPDM declares no system resource: virtual address memory off, the game sets a heap. Without the key the host answers 32 MB, and the SDK's VammManager then maps memory up front (GetInfo 0x21) |
 | `app_pool 0x240000000`, `mem_reserve 0x270000000` | `game.tsv` | the Switch 2 leaves games 9 GB of its 12 GB (not measured here); with a Switch 1 pool (3.2 GB) the game's heaps did not fit: `AudioSystemHeap` creation returned null (`main+0x564b48`) |
 | `romfs_marker System/Resource/ResourceSizeTable.Product.rsizetable.zs` | `game.tsv` | a file every version has |
-| `render_cond on` | `game.tsv` | agl's render buffer binding wraps its clears in render conditions (`SetRenderEnableConditional` at `main+0x12798c`, before the `ClearColor` at `main+0x1279d4`); drawn unconditionally, a clear-only rebinding of the composite target right after the composite draw wiped it before the upscaler read it, and every gameplay frame was black |
+| `render_cond` (automatic, the default for every game) | — | agl's render buffer binding wraps its clears in render conditions (`SetRenderEnableConditional` at `main+0x12798c`, before the `ClearColor` at `main+0x1279d4`); drawn unconditionally, a clear-only rebinding of the composite target right after the composite draw wiped it before the upscaler read it, and every gameplay frame was black |
 
 ## Files
 

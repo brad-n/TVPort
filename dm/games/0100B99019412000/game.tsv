@@ -37,8 +37,7 @@ app_pool	0xCD500000
 sys_resource	0x0
 
 # ---- Graphics ----
-# the game skips clears under render conditions (SetRenderEnableConditional): without evaluating them every level was black behind its HUD
-render_cond	on
+# render_cond: automatic for every game now (on from its first render-enable call), so no line here. Why it matters: the game skips clears under render conditions (SetRenderEnableConditional): without evaluating them every level was black behind its HUD
 
 # ---- Shader split (shader_split.py; BNSH / BAHS) ----
 shader_groups	/Model/=model /Pack/=pack /Sequence/=sequence /Banc/=banc /Scene/=scene /Effect/=effect /Sound/=sound /Layout/=layout /Tex/=tex /ViewPlaneIntroSequence/=viewplaneintrose /Env/=env /AI/=ai /Mals/=mals /Lib/=lib /Movie/=movie /RSDB/=rsdb /CameraSequence/=camerasequence /UI/=ui /Lua/=lua /System/=system /Component/=component /Font/=font /GameData/=gamedata /GameParameter/=gameparameter

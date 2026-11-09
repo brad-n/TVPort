@@ -1315,6 +1315,21 @@ static void rc_query_operand(rc_report *r) {
     if (r->opaque_later) { r->known=0; r->opaque_later=0; }
     if (r->opaque_unreliable) r->unreliable=1;
 }
+// The profile's render_cond (game.py DM_GAME_RENDER_COND): 1 on, 0 off, 2 auto (the default): off until the game first records SetRenderEnable or SetRenderEnableConditional
+// (hle_nvn.c), on from then. Ten games set it, and without it Tears of the Kingdom and Animal Crossing: New Horizons render black; a game that never calls either keeps the host's
+// old behaviour (everything draws, a timestamp report's counter field holds the time), and render_cond off keeps it for a game that calls them (Portal 2)
+// -1 until first read: a collection's DM_GAME_RENDER_COND is its program's entry (game.py, dm_game_cur), not a constant
+static _Atomic int g_rc_on = -1;
+int mtl_render_cond(void) {
+    int v = atomic_load_explicit(&g_rc_on, memory_order_relaxed);
+    if (v < 0) { int unset = -1; atomic_compare_exchange_strong(&g_rc_on, &unset, DM_GAME_RENDER_COND == 1); v = atomic_load(&g_rc_on); }
+    return v;
+}
+void mtl_render_cond_seen(void) {
+    int off = 0;
+    if (DM_GAME_RENDER_COND == 2 && !mtl_render_cond() && atomic_compare_exchange_strong(&g_rc_on, &off, 1))
+        MLOG("render_cond auto: the game records render enable; its conditions are evaluated at replay from here on (render_cond off in its profile turns this off)");
+}
 static void rc_note(uint64_t addr, int kind) {
     rc_report *r=rc_ensure(addr);
     r->conservative=kind==3;   // counter kinds the host does not implement; a samples-passed result is read once it has landed (rc_value)
@@ -2581,7 +2596,7 @@ static void post_run(post_rec *r, uint64_t c0, uint64_t c1) {
             free(l); if (ops[i].mode == VIS_REPORT) { uint64_t rec[2] = {g_vis_acc, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec); }
         }
         else if (ops[i].kind == 4) mirror_rb_land(ops[i].vis);
-        else { uint64_t t = rep_ticks(&ops[i], sc, seg_last, c0, c1), rec[2] = {(ops[i].type == 0 || ops[i].type == 0x10) && !DM_GAME_RENDER_COND ? t : 0, t}; memcpy((void *)ops[i].addr, rec, sizeof rec); }   // render_cond: a timestamp report's counter field is 0, as on the GPU (see rc_value)
+        else { uint64_t t = rep_ticks(&ops[i], sc, seg_last, c0, c1), rec[2] = {(ops[i].type == 0 || ops[i].type == 0x10) && !mtl_render_cond() ? t : 0, t}; memcpy((void *)ops[i].addr, rec, sizeof rec); }   // render_cond: a timestamp report's counter field is 0, as on the GPU (see rc_value)
     }
     // Forwarded counter values expire once their CPU-visible reports have landed.
     // This precedes event publication so a released CPU writer is never hidden by stale knowledge.
@@ -16468,7 +16483,7 @@ void mtl_exec(const uint8_t *p) {
                 PD("Y signal_event cmd=%p dst=%p mode=%u value=%u", p, val, m, v); mtl_sub_event(val, m, v); g_sub_sig = 1; break; }
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); g_cnt_report[t & 31]++;
                 PD("Q report type=%llu cmd=%p dst=%#llx", (unsigned long long)t, p, (unsigned long long)ad);
-                if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : t == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 2 : 3);
+                if (mtl_render_cond()) rc_note(ad, t == 0 || t == 0x10 ? 1 : t == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 2 : 3);
                 if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) {
                     if (!g_vis_on) {   // a report with no reset before it: the counter runs from the queue's creation, so counting starts here (Occlusion queries)
                         g_vis_on = 1; g_vis_counting = 1; MLOG("occlusion queries: samples passed reported with no ResetCounter before it: counting from this report");

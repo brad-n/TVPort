@@ -49,5 +49,5 @@ Choose offline mode at the network prompt, then New Game and English voices. Adv
 
 - Rebuild the complete game libraries and host on the current upstream chain, then repeat gameplay validation.
 - Test battles, later story scenes and save/load over a longer playthrough.
-- `SetRenderEnableConditional` still reports that the host draws unconditionally. No visual failure was identified in the tested opening; conditional rendering remains unvalidated.
+- `SetRenderEnableConditional` still reports that the host draws unconditionally. No visual failure was identified in the tested opening; conditional rendering remains unvalidated. Since 2026-11-09 `render_cond` is automatic for every game (on from its first render-enable call), so these conditions are evaluated now; not re-checked in a run since.
 - Device validation remains for the user after sideloading.

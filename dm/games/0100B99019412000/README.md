@@ -10,7 +10,7 @@ The provisional profile's guesses held, with `render_cond` added and two host ch
 
 | Setting | Where | Why |
 |---|---|---|
-| `render_cond on` | [`game.tsv`](game.tsv) | the game skips clears under render conditions (`SetRenderEnableConditional`), as Tears of the Kingdom ([0100F2C0115B6000](../0100F2C0115B6000/README.md)) and Animal Crossing: New Horizons ([01006F8002326000](../01006F8002326000/README.md)) do; without evaluating them every level was black behind its HUD |
+| `render_cond` (automatic, the default for every game) | — | the game skips clears under render conditions (`SetRenderEnableConditional`), as Tears of the Kingdom ([0100F2C0115B6000](../0100F2C0115B6000/README.md)) and Animal Crossing: New Horizons ([01006F8002326000](../01006F8002326000/README.md)) do; without evaluating them every level was black behind its HUD |
 | `sys_resource 0x0` | `game.tsv` | the NPDM declares no system resource, so `IsVirtualAddressMemoryEnabled` is false, as on Horizon: no virtual address memory. The game sets a 3.14 GB heap (pool − used memory) |
 | 4 GB layout: `mem_reserve 0x100000000`, `mem_alias 0x10000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000` | `game.tsv` | 256 MB in front + 256 MB alias region + 256 MB stack region + 3.25 GB heap region |
 | `shader_groups` (one group per RomFS top folder, `/Model/` … `/GameParameter/`) | `game.tsv` | see [Files and shaders](#files-and-shaders) |

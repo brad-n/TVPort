@@ -10,7 +10,7 @@ Brought up on the Mac from 4.0.0: boot, the title with its demo race, the Mii pi
 
 | Setting | Where | Why |
 |---|---|---|
-| `render_cond on` | [`game.tsv`](game.tsv) | the race records `SetRenderEnableConditional` as a course loads: evaluated at replay, as on the GPU (drawn anyway, the same race route at the same frames looked the same; evaluated is NVN's behaviour) |
+| `render_cond` (automatic, the default for every game) | — | the race records `SetRenderEnableConditional` as a course loads: evaluated at replay, as on the GPU (drawn anyway, the same race route at the same frames looked the same; evaluated is NVN's behaviour) |
 | 4 GB layout: `mem_reserve 0x100000000`, `mem_alias 0x10000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000` | `game.tsv` | no virtual address memory: the game sets a 3.03 GB heap (pool − 64 MB) in the 3.25 GB heap region |
 | `sys_resource 0x0` | `game.tsv` | the NPDM declares 0 MB of system resource: `IsVirtualAddressMemoryEnabled` is false, as on Horizon |
 | `modules main subsdk0 sdk` | `game.tsv` | every module `main` imports from |

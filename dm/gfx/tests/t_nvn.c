@@ -395,7 +395,8 @@ int main(void) {
     EXPECT("buffer copy 64 B identical", 0, memcmp(src, dst, 64));
     uint64_t ts[2]; memcpy(ts, cnt, 16);
     EXPECT("counter timestamp written (non-zero)", 1, ts[1] != 0);
-    EXPECT("its counter field: the time, 0 with the profile's render_cond (as on the GPU)", DM_GAME_RENDER_COND ? 0 : ts[1], ts[0]);
+    EXPECT("render_cond: off before any render-enable call unless the profile says on (auto, the default, waits for the first)", DM_GAME_RENDER_COND == 1, mtl_render_cond());
+    EXPECT("its counter field: the time, 0 once render_cond is on (as on the GPU)", mtl_render_cond() ? 0 : ts[1], ts[0]);
     NVNcounterData fixed_counter = {0, 614400};
     EXPECT("614400 raw counter ticks = 1 ms", 1000000, P(nvnDeviceGetTimestampInNanoseconds)(&dev, &fixed_counter));
     NVNcounterData reported_counter; memcpy(&reported_counter, cnt, sizeof reported_counter);

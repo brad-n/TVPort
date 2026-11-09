@@ -13,7 +13,7 @@ Update 1.0.3 (`v196608`) over the base game, SDK 13.3.0. Valve's Source engine a
 | `pad_layout full` | `game.tsv` | first-person: move with the left stick, look with the right |
 | `shader_groups /game.zip/=game` | `game.tsv` | the shipped programs come from `game.zip`; the run-time captures go to `other` |
 
-No `render_cond`: see [Rendering](#rendering).
+`render_cond off` in [`game.tsv`](game.tsv): every other game evaluates conditional rendering from its first render-enable call (automatic, the default since 2026-11-09), which drops furniture here; see [Rendering](#rendering).
 
 ## Rendering
 

@@ -9,7 +9,7 @@ Update 1.4.3 (v720896) over the base game, SDK 20.5.22. Nintendo EPD's engine (s
 | Frame step, `fps_target 60` | [`patches.py`](patches.py) `MATCH_FRAME_STEP` (six functions, found by fingerprint on any build that keeps them), [`game.tsv`](game.tsv) | 60 fps at normal speed; see [Frame rate](#frame-rate) |
 | Node area cut 1 GB → 62 MB | `dm/tools/sdk_patches.py` SDK-wide rules, `sdk` build `574284b4…` | the resource heaps ran out of alias region (issue #70); see [Memory](#memory) |
 | 5 GB guest layout: `mem_reserve 0x140000000`, `mem_alias 0x98000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000` | `game.tsv` | 256 MB in front + 2.375 GB alias + 256 MB stack + 2.125 GB heap region. 5 GB is the total proven on a phone (one reservation of at most 6 GB without the extended virtual addressing entitlement) |
-| `render_cond on` | `game.tsv` | the 3D scene was black: the game skips clears with conditional rendering |
+| `render_cond` (automatic, the default for every game) | — | the 3D scene was black: the game skips clears with conditional rendering |
 | `tex_flush_upload on` | `game.tsv` | streamed textures are written by the CPU into pool memory in GPU layout and published with `nvnMemoryPoolFlushMappedRange` |
 | `tex_dirty_upload on` | `game.tsv` | textures filled from the CPU with no flush at all (the magenta cave, the unlit stone blocks) |
 | Integer output rows | [`shader_facts_manual.tsv`](shader_facts_manual.tsv) | no PC version, so the translator has no output types: agl's BC4 encoder and the Ultrahand mask (`e3fb0bb58a691e10`, R8Uint, from PR #11; the Mac route does not reach it) |
