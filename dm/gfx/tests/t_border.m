@@ -37,7 +37,7 @@ static void choice(const float B[4], uint8_t wrap, int reduction, int want_twin,
     }
 }
 
-static id<MTLTexture> g_tex;
+static id<MTLTexture> g_tex; static int g_plain;   // --plain: the shader border_emu left alone (shader_border_emu 0): it never reads the twin or the block, so every sample is Metal's own colour
 static void gpu_case(id<MTLComputePipelineState> p, int sid, const float B[4], int mask_on) {
     samp_par sp = {0}; sp.magf = 1; sp.minf = 1; sp.ws = sp.wt = sp.wr = 5; sp.lod_max = 0; memcpy(sp.border, B, 16);
     mtl_reg_samp(sid, &sp);
@@ -45,10 +45,10 @@ static void gpu_case(id<MTLComputePipelineState> p, int sid, const float B[4], i
     id<MTLSamplerState> s = samp_by_id(sid); int twin = g_sview_w[sid] != NULL; uint64_t rid = g_srid[sid], rid_w = twin ? g_srid_w[sid] : rid; float k[4]; memcpy(k, twin ? g_sbk[sid] : (float[4]){0}, 16);
     os_unfair_lock_unlock(&g_rmu);
     CHECK(s != nil, "sampler %d created", sid);
-    int bn, bw; float kk[4]; const uint8_t w[3] = { 5, 5, 5 }; int want = nvn_border(B, w, 0, &bn, &bw, kk);
+    int bn, bw; float kk[4]; const uint8_t w[3] = { 5, 5, 5 }; int want = nvn_border(B, w, 0, &bn, &bw, kk) && DM_GAME_SHADER_BORDER_EMU;   // a profile with shader_border_emu 0 makes no twin
     CHECK(twin == want, "sampler %d: twin %d, nvn_border says %d", sid, twin, want);
     id<MTLBuffer> block = [g_dev newBufferWithLength:DMSH_BORDER_K + 16 options:MTLResourceStorageModeShared];
-    uint32_t mask = twin && mask_on; memcpy(block.contents, &mask, 4); memcpy((uint8_t *)block.contents + DMSH_BORDER_K, k, 16);
+    uint32_t mask = twin && mask_on && !g_plain; memcpy(block.contents, &mask, 4); memcpy((uint8_t *)block.contents + DMSH_BORDER_K, k, 16);
     id<MTLBuffer> args = [g_dev newBufferWithLength:32 options:MTLResourceStorageModeShared];   // the members as border_emu lays them out: texture, sampler, its twin, the block
     uint64_t a[4] = { g_tex.gpuResourceID._impl, rid, rid_w, block.gpuAddress }; memcpy(args.contents, a, 32);
     id<MTLBuffer> uv = [g_dev newBufferWithBytes:UV length:sizeof UV options:MTLResourceStorageModeShared];
@@ -58,7 +58,7 @@ static void gpu_case(id<MTLComputePipelineState> p, int sid, const float B[4], i
     [e useResource:g_tex usage:MTLResourceUsageRead]; [e useResource:block usage:MTLResourceUsageRead];
     [e dispatchThreads:MTLSizeMake(NUV, 1, 1) threadsPerThreadgroup:MTLSizeMake(NUV, 1, 1)]; [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     CHECK(cb.status == MTLCommandBufferStatusCompleted, "sampler %d: GPU work completed", sid);
-    const float *got = out.contents; const float *Bref = mask ? B : nvn_mtl_border[bn];   // the mask clear: Metal's nearest colour
+    const float *got = out.contents; const float *Bref = mask ? B : nvn_mtl_border[bn];   // plain or not   // the mask clear: Metal's nearest colour
     for (int i = 0; i < NUV; i++) { float ref[4]; reference(Bref, UV[i][0], UV[i][1], ref);
         for (int c = 0; c < 4; c++) CHECK(fabsf(got[4 * i + c] - ref[c]) < 6e-3f, "border %g,%g,%g,%g mask %u at (%g, %g) channel %d: %g, expected %g", B[0], B[1], B[2], B[3], mask, UV[i][0], UV[i][1], c, got[4 * i + c], ref[c]); }
 }
@@ -73,8 +73,9 @@ int main(int argc, char **argv) { @autoreleasepool {
     choice((float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 0, 0, 0, 0);   // the border is never read
     choice((float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 5, 1, 0, 0);   // a min reduction is not linear in it
     mtl_init();
-    if (argc > 1) {   // the rewritten shader
-        NSError *error = nil; NSString *src = [NSString stringWithContentsOfFile:@(argv[1]) encoding:NSUTF8StringEncoding error:&error];
+    g_plain = argc > 2 && !strcmp(argv[1], "--plain"); const char *path = argc > 1 ? argv[argc - 1] : NULL;
+    if (path) {   // the rewritten shader (--plain: the unrewritten one)
+        NSError *error = nil; NSString *src = [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:&error];
         id<MTLLibrary> lib = src ? [g_dev newLibraryWithSource:src options:nil error:&error] : nil;
         id<MTLComputePipelineState> p = lib ? [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"main0"] error:&error] : nil;
         CHECK(p != nil, "the rewritten shader compiles: %s", error.localizedDescription.UTF8String);
@@ -84,7 +85,11 @@ int main(int argc, char **argv) { @autoreleasepool {
             float px[H][W][4]; for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) for (int c = 0; c < 4; c++) px[y][x][c] = texel(x, y, c);
             [g_tex replaceRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0 withBytes:px bytesPerRow:16 * W];
             if (![g_dev supports32BitFloatFiltering]) { fprintf(stderr, "t_border: this GPU does not filter RGBA32Float, GPU cases skipped\n"); }
-            else {
+            else if (g_plain) {   // no twin, no block in the shader: Metal's own colours exactly, the others at Metal's nearest, whatever the host made of the sampler
+                gpu_case(p, 14, (float[4]){0, 0, 0, 1}, 1); gpu_case(p, 15, (float[4]){1, 1, 1, 1}, 1); gpu_case(p, 16, (float[4]){0, 0, 0, 0}, 1);
+                gpu_case(p, 11, (float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 1); gpu_case(p, 12, (float[4]){0.25f, 0.5f, 0.75f, 1}, 1);
+                printf("t_border: plain cases run\n");
+            } else {
                 gpu_case(p, 11, (float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 1);
                 gpu_case(p, 11, (float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 0);
                 gpu_case(p, 12, (float[4]){0.25f, 0.5f, 0.75f, 1}, 1);
