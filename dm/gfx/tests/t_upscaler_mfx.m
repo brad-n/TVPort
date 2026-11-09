@@ -4,12 +4,14 @@
 // none swaps no shader; the MetalFX draw itself (up_mfx_encode) does not look at the key. The colour (up_mfx_color) comes from synthetic code holding the curves' constants: a variant with sRGB input
 // comes out decoded to linear, one whose code squares its result (square-rooted input) comes out squared, and one whose output stays encoded is left to its shader
 #include "../nvn/nvn_mtl.m"
+#import <objc/runtime.h>
 void *front_metal_layer(void) { return NULL; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
 module_t *g_mod; int g_nmod;
 void svc_thread_dump(void) {}
 uint64_t now_ns(void) { return bp_now(); }
 static int checks, failed;
+static int g_mfx_calls;   // calls of MetalFX's descriptors (the support check and the scaler makers), counted by the hooks below
 #define CHECK(c, label) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: %s\n", label); } } while (0)
 static tex_t texture(uint64_t serial, unsigned w, unsigned h, int format) {
     tex_t t = {.magic = MAGIC('T','E','X',0), .serial = serial, .off = serial << 24};
@@ -55,8 +57,23 @@ static NvShader *upscaler(const char *key) {
     s->rf.b[1] = (nvn_rbind){.kind = NVN_RB_IMG, .dtt = MTLTextureType2D, .dpf = NVN_DPF_FLOAT, .reg = 1, .rw = 1};
     return s;
 }
+// Counts every call of the MetalFX descriptors' support check and scaler makers (the first of them, supportsMetal4FX:, is the suspect of the tvOS GPU wedge): DM_UPSCALER=bilinear must make none
+static void count_calls(Class c, SEL sel, int meta) {
+    Method m = meta ? class_getClassMethod(c, sel) : class_getInstanceMethod(c, sel); if (!m) return;
+    IMP old = method_getImplementation(m); unsigned n = method_getNumberOfArguments(m);
+    // integers in and out: ARC must not retain or release what the originals return (a BOOL, or a +1 scaler that goes straight to the caller)
+    IMP imp = n == 4 ? imp_implementationWithBlock(^uintptr_t(uintptr_t s, uintptr_t a, uintptr_t b) { g_mfx_calls++; return ((uintptr_t(*)(uintptr_t, SEL, uintptr_t, uintptr_t))old)(s, sel, a, b); })
+                     : imp_implementationWithBlock(^uintptr_t(uintptr_t s, uintptr_t a) { g_mfx_calls++; return ((uintptr_t(*)(uintptr_t, SEL, uintptr_t))old)(s, sel, a); });
+    method_setImplementation(m, imp);
+}
+static void hook_mfx(void) {
+    Class sp = NSClassFromString(@"MTLFXSpatialScalerDescriptor"), tp = NSClassFromString(@"MTLFXTemporalScalerDescriptor");
+    count_calls(sp, @selector(supportsMetal4FX:), 1); count_calls(tp, @selector(supportsMetal4FX:), 1);
+    count_calls(sp, @selector(newSpatialScalerWithDevice:compiler:), 0); count_calls(sp, @selector(newSpatialScalerWithDevice:), 0);
+    count_calls(tp, @selector(newTemporalScalerWithDevice:compiler:), 0); count_calls(tp, @selector(newTemporalScalerWithDevice:), 0);
+}
 int main(void) { @autoreleasepool {
-    mtl_init();
+    mtl_init(); hook_mfx();
     const float enc[2] = {0.0031308f, 1 / 2.4f}, dec[2] = {0.04045f, 2.4f}, both[4] = {0.0031308f, 1 / 2.4f, 0.04045f, 2.4f}, dec16[3] = {0.040435791015625f, 2.3984375f, 0.07745361328125f}, enc16[1] = {0.41650390625f};
     float once[1] = {2.4f}; uint8_t rare[256] = {0}; memcpy(rare, once, 4);
     CHECK(color_of(both, 4, NULL, 0) == UP_COLOR_LINEAR, "an encode and a decode in floats: linear input and output (Bananza)");
@@ -94,7 +111,7 @@ int main(void) { @autoreleasepool {
     CHECK(color_of(dec, 2, NULL, 0) == UP_COLOR_KEEP, "a shape no pack has shown (a decode in floats, no encode): the shader runs");
     CHECK(color_of(NULL, 0, (const float[4]){0.040435791015625f, 2.3984375f, 0.07745361328125f, enc16[0]}, 4) == UP_COLOR_KEEP, "a half float encode must not read as encoded input: the shader runs");
     CHECK(up_mfx_color(rare, sizeof rare) != UP_COLOR_SRGB, "a constant used once is chance, not a curve");
-    const char *up = getenv("DM_UPSCALER"); int on = up && !strcmp(up, "metalfx");
+    const char *up = getenv("DM_UPSCALER"); int on = up && !strcmp(up, "metalfx"), bil = up && !strcmp(up, "bilinear"), draw = on || bil;   // draw: the game's upscaler is replaced by a draw of ours (MetalFX, or the plain scale)
     tex_t in = texture(77, 960, 540, NVN_FORMAT_RGBA16F), out = texture(78, 1920, 1080, NVN_FORMAT_RGBA16F), same = texture(79, 960, 540, NVN_FORMAT_RGBA16F);
     out.d.flags |= NVN_TEXTURE_FLAGS_IMAGE; same.d.flags |= NVN_TEXTURE_FLAGS_IMAGE;
     mtl_reg_tex(701, &in, NULL); mtl_reg_image(702, &out, NULL); mtl_reg_image(703, &same, NULL);
@@ -102,16 +119,34 @@ int main(void) { @autoreleasepool {
     fill(tex_mtl(&in), MTLClearColorMake(colour[0], colour[1], colour[2], colour[3])); fill(tex_mtl(&out), MTLClearColorMake(0, 0, 0, 1));
     char key[24] = "7629d857a0a93833_b"; if (DM_GAME_UPSCALER_N) snprintf(key, sizeof key, "%.16s_b", DM_GAME_UPSCALER_KEYS);   // the profile's first upscaler, else Bananza's (not named here)
     NvShader *named = upscaler(key), *other = upscaler("0123456789abcdef_b");
-    CHECK(up_mfx_wanted(named) == (on && DM_GAME_UPSCALER_N), "a shader the profile names is swapped exactly when DM_UPSCALER=metalfx (none in a profile without upscalers)");
+    CHECK(up_mfx_wanted(named) == (draw && DM_GAME_UPSCALER_N), "a shader the profile names is swapped exactly when DM_UPSCALER=metalfx or bilinear (none in a profile without upscalers)");
     CHECK(!up_mfx_wanted(other), "a shader the profile does not name is never swapped");
     memset(&S, 0, sizeof S); S.tex[5][0] = 701; S.img[5][1] = 702;
     { const uint32_t rects[8] = {0, 0, 959, 539, 0, 0, 1919, 1079}; memcpy(S.push[1], rects, sizeof rects); }   // c[24]: input and output rectangles (origin, inclusive last texel)
-    mtl_sub_begin(); int drawn = on && up_mfx_encode(named);
-    CHECK(drawn == on, "the named shader's dispatch is drawn by MetalFX");
+    mtl_sub_begin(); int drawn = draw && up_mfx_encode(named);
+    CHECK(drawn == draw, "the named shader's dispatch is drawn by MetalFX, or by the plain scale");
     CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error(), "the submission completes");
     os_unfair_lock_lock(&g_rmu); id<MTLTexture> written = tex_by_id(702); os_unfair_lock_unlock(&g_rmu);
-    CHECK(matches(written, on ? colour : black, MTLRegionMake2D(0, 0, 1920, 1080), black), on ? "MetalFX filled the whole 1920x1080 image with the texture's colour" : "without the switch the image is untouched");
-    if (on) {
+    CHECK(matches(written, draw ? colour : black, MTLRegionMake2D(0, 0, 1920, 1080), black), draw ? "the scale filled the whole 1920x1080 image with the texture's colour" : "without the switch the image is untouched");
+    if (bil) {   // a ramp across the texture comes out as a smooth ramp (bilinear), the right way round and across the whole image
+        NSUInteger w = 960, h = 540; id<MTLBuffer> b = [g_dev newBufferWithLength:w * h * 8 options:MTLResourceStorageModeShared]; __fp16 *hp = b.contents;
+        for (NSUInteger y = 0; y < h; y++) for (NSUInteger x = 0; x < w; x++) { __fp16 *q = hp + 4 * (y * w + x); q[0] = (float)x / (w - 1); q[1] = 0; q[2] = 0; q[3] = 1; }
+        id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+        [e copyFromBuffer:b sourceOffset:0 sourceBytesPerRow:w * 8 sourceBytesPerImage:w * h * 8 sourceSize:MTLSizeMake(w, h, 1) toTexture:tex_mtl(&in) destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        mtl_sub_begin(); CHECK(up_mfx_encode(named), "the plain scale takes a ramp"); CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error(), "the ramp submission completes");
+        id<MTLBuffer> rb = [g_dev newBufferWithLength:1920 * 1080 * 8 options:MTLResourceStorageModeShared];
+        cb = q_cb(); e = [cb blitCommandEncoder];
+        [e copyFromTexture:written sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(1920, 1080, 1) toBuffer:rb destinationOffset:0 destinationBytesPerRow:1920 * 8 destinationBytesPerImage:1920 * 1080 * 8];
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        const __fp16 *rp = rb.contents; 
+        #define RAMP(x) ((float)rp[4 * (540 * 1920 + (x))])
+        CHECK(fabsf(RAMP(960) - 0.5f) < 0.01f && fabsf(RAMP(480) - 0.25f) < 0.01f && fabsf(RAMP(1440) - 0.75f) < 0.01f && RAMP(2) < 0.01f && RAMP(1917) > 0.99f, "a ramp scaled up keeps its slope: 0, 1/4, 1/2, 3/4, 1 at the edges and quarters");
+        int odd = 0; for (int x = 1; x < 1920; x++) if (RAMP(x) < RAMP(x - 1) - 0.002f) odd++;
+        CHECK(!odd, "the scaled ramp never steps back (smooth, not mirrored or tiled)");
+        fill(tex_mtl(&in), MTLClearColorMake(colour[0], colour[1], colour[2], colour[3])); fill(written, MTLClearColorMake(0, 0, 0, 1));
+    }
+    if (draw) {
         tex_t packed = texture(80, 976, 548, NVN_FORMAT_R11G11B10F);
         mtl_reg_tex(704, &packed, NULL);
         const float hdr[4] = {2.0f, 0.5f, 0.25f, 1.0f};
@@ -171,6 +206,11 @@ int main(void) { @autoreleasepool {
         CHECK(!up_mfx_encode(named) && g_up_mfx_kept == kept + 1, "an image no larger than the texture leaves the dispatch to the shader");
         mtl_wait(mtl_sub_commit(), 5000000000ull);
     }
-    printf("t_upscaler_mfx (%s): %d checks, %d failed\n", on ? "metalfx" : "game", checks, failed);
+    if (bil) {
+        CHECK(g_mfx_calls == 0, "DM_UPSCALER=bilinear reaches no MetalFX function (no support check, no scaler made)");
+        CHECK(!g_up_mfx_n && !g_up_mfx[0].sc && !g_up_mfx[0].in, "bilinear made no MetalFX scaler or scaler texture");
+    }
+    if (on) CHECK(g_mfx_calls > 0, "control: the MetalFX path does call MetalFX, so the counting hooks see it");
+    printf("t_upscaler_mfx (%s): %d checks, %d failed\n", on ? "metalfx" : bil ? "bilinear" : "game", checks, failed);
     return failed != 0;
 }}

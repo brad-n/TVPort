@@ -491,6 +491,9 @@ check_t_upscaler_mfx: t_upscaler_mfx
 	DM_NVN_ENC_THREAD=0 DM_UPSCALER=metalfx ./t_upscaler_mfx
 	DM_NVN_ENC_THREAD=1 DM_UPSCALER=metalfx ./t_upscaler_mfx
 	MTL_DEBUG_LAYER=1 ./t_upscaler_mfx
+	DM_NVN_ENC_THREAD=0 DM_UPSCALER=bilinear ./t_upscaler_mfx
+	DM_NVN_ENC_THREAD=1 DM_UPSCALER=bilinear ./t_upscaler_mfx
+	MTL_DEBUG_LAYER=1 DM_UPSCALER=bilinear ./t_upscaler_mfx
 # The movie library's enhancement network replaced by a plain scale (DM_MOVIE_NETWORK=bypass; any profile, the roles checked against a profile that lists movie keys)
 t_movie_bypass: t_movie_bypass.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_movie_bypass.m $(MTL_T_SRC) $(FW)

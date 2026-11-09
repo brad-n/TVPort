@@ -14999,15 +14999,20 @@ enum { UP_MFX_SCALERS = 4 };
 static up_mfx_scaler g_up_mfx[UP_MFX_SCALERS]; static int g_up_mfx_next;
 static uint64_t g_up_mfx_n, g_up_mfx_kept;   // dispatches drawn by MetalFX, dispatches of a named shader left to it
 void mtl_up_mfx_stats(uint64_t *n, uint64_t *kept) { *n = g_up_mfx_n; *kept = g_up_mfx_kept; }
-static int up_mfx_on(void) {
+// DM_UPSCALER=bilinear (UP_MODE_BILINEAR) draws the same shaders as a plain bilinear scale (up_bil_encode) and never reaches MetalFX: the choice is read from the text alone, and
+// this is the only place that asks MetalFX whether it can scale (supportsMetal4FX:, the first MetalFX call, the suspect of an intermittent GPU wedge on tvOS), and only for metalfx
+enum { UP_MODE_GAME, UP_MODE_METALFX, UP_MODE_BILINEAR };
+static int up_mode(void) {
     static int v = -1;
     if (v >= 0) return v;
-    const char *e = getenv("DM_UPSCALER"); v = e && !strcmp(e, "metalfx");
-    if (e && *e && strcmp(e, "metalfx") && strcmp(e, "game")) MLOG("[RED] DM_UPSCALER=%s: metalfx or game; keeping the game's", e);
-    if (v && !(g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev])) { MLOG("upscaler: this GPU has no Metal 4 MetalFX spatial scaler; the game's own upscaler draws"); v = 0; }
-    if (v) MLOG("upscaler (DM_UPSCALER): metalfx, the game's upscaler shaders (%d, from the shader map) are drawn by MetalFX's spatial scaler", DM_GAME_UPSCALER_N);
+    const char *e = getenv("DM_UPSCALER"); v = e && !strcmp(e, "metalfx") ? UP_MODE_METALFX : e && !strcmp(e, "bilinear") ? UP_MODE_BILINEAR : UP_MODE_GAME;
+    if (e && *e && strcmp(e, "metalfx") && strcmp(e, "bilinear") && strcmp(e, "game")) MLOG("[RED] DM_UPSCALER=%s: metalfx, bilinear or game; keeping the game's", e);
+    if (v == UP_MODE_METALFX && !(g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev])) { MLOG("upscaler: this GPU has no Metal 4 MetalFX spatial scaler; the game's own upscaler draws"); v = UP_MODE_GAME; }
+    if (v == UP_MODE_METALFX) MLOG("upscaler (DM_UPSCALER): metalfx, the game's upscaler shaders (%d, from the shader map) are drawn by MetalFX's spatial scaler", DM_GAME_UPSCALER_N);
+    if (v == UP_MODE_BILINEAR) MLOG("upscaler (DM_UPSCALER): bilinear, the game's upscaler shaders (%d, from the shader map) are drawn as a plain bilinear scale (no network, no MetalFX)", DM_GAME_UPSCALER_N);
     return v;
 }
+static int up_mfx_on(void) { return up_mode() == UP_MODE_METALFX; }
 // The colour a variant of the network takes and writes, from the sRGB curves in its code (their constants are immediates, whole bytes in the code). The variants differ inside a pack, so this is the shader's and not the game's:
 // Bananza's all encode linear input (0.0031308, 1 / 2.4 as floats) and come in threes: no decode at the end (the output stays encoded), a decode clamped to 0-1, a decode up to 128. Splatoon Raiders' all read colour that is encoded
 // already and come in twos: no decode, a decode clamped to 0-1 (as half floats: 0.04045, 2.4 and 1 / 12.92 rounded to 0.0404358, 2.3984375 and 0.0774536). Only the variants with linear output are drawn, in these two shapes; a variant
@@ -15060,7 +15065,7 @@ static int up_mfx_named(NvShader *cs) {
     return 0;
 }
 static void up_mfx_read_color(NvShader *cs, const NVNshaderData *sd) {
-    if (cs->up_color || !DM_GAME_UPSCALER_N || !up_mfx_on() || !up_mfx_named(cs)) return;
+    if (cs->up_color || !DM_GAME_UPSCALER_N || !up_mode() || !up_mfx_named(cs)) return;
     uint32_t nctl, ncode = 0; if (sd->control) nvn_ctl_lens(sd->control, &nctl, &ncode);
     cs->up_color = sd->data && ncode && ncode < (1u << 24) ? up_mfx_color((const void *)(uintptr_t)sd->data, ncode) : UP_COLOR_KEEP;
     MLOG("upscaler %s: %s", cs->key, cs->up_color == UP_COLOR_LINEAR ? "input and output in one colour space (linear, or no sRGB curve in the code), MetalFX in HDR mode" : cs->up_color == UP_COLOR_SRGB ? "sRGB-encoded input, linear output, MetalFX in perceptual mode" : cs->up_color == UP_COLOR_ROOT ? "square-rooted input, linear output (the shader squares): squared into linear, then MetalFX in HDR mode" : "neither of the colour shapes MetalFX draws; the game's shader runs");
@@ -15069,7 +15074,7 @@ static void up_mfx_read_color(NvShader *cs, const NVNshaderData *sd) {
 static int up_mfx_wanted(NvShader *cs) {
     if (cs->up_mfx) return cs->up_mfx == 1;
     cs->up_mfx = 2;
-    if (!DM_GAME_UPSCALER_N || !up_mfx_on()) return 0;
+    if (!DM_GAME_UPSCALER_N || !up_mode()) return 0;
     if (up_mfx_named(cs) && (cs->up_color == UP_COLOR_LINEAR || cs->up_color == UP_COLOR_SRGB || cs->up_color == UP_COLOR_ROOT)) cs->up_mfx = 1;
     return cs->up_mfx == 1;
 }
@@ -15108,8 +15113,9 @@ static int up_mfx_rect(const uint32_t v[4], NSUInteger w, NSUInteger h, NVNcopyR
     if (v[0] > INT_MAX || v[1] > INT_MAX || rw > INT_MAX || rh > INT_MAX || (uint64_t)v[0] + rw > w || (uint64_t)v[1] + rh > h) return 0;
     *r = (NVNcopyRegion){(int)v[0], (int)v[1], 0, (int)rw, (int)rh, 1}; return 1;
 }
-// The dispatch of upscaler cs as MetalFX's spatial scaler from its texture slot's rectangle to its image slot's (see above): 1 when drawn, 0 to run the shader
-static int up_mfx_encode(NvShader *cs) {
+// The texture, image and rectangles of upscaler cs's dispatch (its texture slot, its image slot, the push constants' rectangles); 0 when the dispatch is not one to draw: the shader runs
+// (an image no larger than the texture, a shape or format that cannot be drawn, or bindings that are not one texture and one image)
+static int up_mfx_bind(NvShader *cs, id<MTLTexture> *inp, id<MTLTexture> *outp, tex_t *doutp, NVNcopyRegion *irp, NVNcopyRegion *orp) {
     int ti = -1, oi = -1;
     for (int i = 0; i < cs->rf.nb; i++) { int k = cs->rf.b[i].kind; if (k == NVN_RB_TEX && ti < 0) ti = i; else if (k == NVN_RB_IMG && oi < 0) oi = i; else if (k == NVN_RB_TEX || k == NVN_RB_IMG) return 0; }
     if (ti < 0 || oi < 0) { static int once; if (!once++) MLOG("[RED] upscaler %s: not one texture and one image; the shader draws", cs->key); return 0; }
@@ -15130,6 +15136,52 @@ static int up_mfx_encode(NvShader *cs) {
     if (!in || !out || in == out || in.textureType != MTLTextureType2D || out.textureType != MTLTextureType2D || in.sampleCount != 1 || out.sampleCount != 1 ||
         fmt_int_or_ds(in.pixelFormat) || fmt_int_or_ds(out.pixelFormat) || mtl_fmt_block(out.pixelFormat) || !up_mfx_rect(v, in.width, in.height, &ir) || !up_mfx_rect(v + 4, out.width, out.height, &orr) ||
         orr.width < ir.width || orr.height < ir.height || (orr.width == ir.width && orr.height == ir.height)) { g_up_mfx_kept++; return 0; }
+    *inp = in; *outp = out; *doutp = dout; *irp = ir; *orp = orr;
+    return 1;
+}
+// ---- DM_UPSCALER=bilinear: the network replaced by Metal's own bilinear scale (up_plain_scale), in the colour the network would write; no MetalFX symbol is reached from here ----
+// Linear: input and output share a colour space, one scale. Root-encoded input (gamma 2, linear output): the scale squares each sample on the way (x * |x|). sRGB input, linear output:
+// the input is scaled in its encoded values (as the network works on them) into a RGBA8Unorm scratch of the output rectangle's size, which an sRGB view of decodes in the draw into the game's image
+static int up_plain_scale(id<MTLTexture> in, id<MTLTexture> out, const NVNcopyRegion *sr, const NVNcopyRegion *dr, int square);   // below
+typedef struct { id<MTLTexture> img, view; NSUInteger w, h; int refused; } up_bil_scratch;
+static up_bil_scratch g_up_bil;
+static uint64_t g_up_bil_n;   // dispatches drawn by the bilinear scale
+static up_bil_scratch *up_bil_scratch_for(NSUInteger w, NSUInteger h) {
+    if (g_up_bil.w == w && g_up_bil.h == h) return g_up_bil.refused ? NULL : &g_up_bil;
+    if (g_up_bil.img) { res_remove(g_up_bil.img); defer_obj_release(g_up_bil.img); if (g_up_bil.view) defer_obj_unref(g_up_bil.view); }   // a recorded scale still holds them
+    g_up_bil = (up_bil_scratch){.w = w, .h = h, .refused = 1};
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];
+    td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    id<MTLTexture> img = [g_dev newTextureWithDescriptor:td], view = [img newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB];
+    MLOG("%supscaler: bilinear sRGB scratch %lux%lu%s", img && view ? "" : "[RED] ", (unsigned long)w, (unsigned long)h, img && view ? "" : ": none made; the game's upscaler draws this size");
+    if (!img || !view) return NULL;
+    img.label = @"upscaler bilinear scratch"; res_add(img); res_commit();
+    g_up_bil.img = img; g_up_bil.view = view; g_up_bil.refused = 0;
+    return &g_up_bil;
+}
+static int up_bil_encode(NvShader *cs) {
+    id<MTLTexture> in, out; tex_t dout; NVNcopyRegion ir, orr;
+    if (!up_mfx_bind(cs, &in, &out, &dout, &ir, &orr)) return 0;
+    int srgb = cs->up_color == UP_COLOR_SRGB, root = cs->up_color == UP_COLOR_ROOT;
+    if (!(out.usage & MTLTextureUsageRenderTarget)) { g_up_mfx_kept++; return 0; }
+    up_bil_scratch *sc = srgb ? up_bil_scratch_for((NSUInteger)orr.width, (NSUInteger)orr.height) : NULL;
+    if (srgb && !sc) { g_up_mfx_kept++; return 0; }
+    NVNcopyRegion whole = {0, 0, 0, orr.width, orr.height, 1};
+    zskip_del(dout.serial);
+    int ok = srgb ? up_plain_scale(in, sc->img, &ir, &whole, 0) && copy_t2t_draw(sc->view, out, 0, 0, 0, 0, &whole, &orr, 0, 0)   // scaled encoded, then drawn 1:1 through the sRGB view, which decodes
+                  : up_plain_scale(in, out, &ir, &orr, root);
+    args_dirty_all();
+    if (!ok) { g_up_mfx_kept++; return 0; }   // a scratch or the image can be part drawn; the game's shader still produces the whole output
+    if (!g_up_bil_n++) MLOG("upscaler: first dispatch of %s drawn as a bilinear scale, %dx%d at %d,%d of %lux%lu (format %lu) → %dx%d at %d,%d of %lux%lu (format %lu)%s", cs->key, ir.width, ir.height, ir.xoffset, ir.yoffset,
+                            (unsigned long)in.width, (unsigned long)in.height, (unsigned long)in.pixelFormat, orr.width, orr.height, orr.xoffset, orr.yoffset, (unsigned long)out.width, (unsigned long)out.height,
+                            (unsigned long)out.pixelFormat, srgb ? ", decoded from sRGB" : root ? ", squared into linear" : "");
+    return 1;
+}
+// The dispatch of upscaler cs as MetalFX's spatial scaler from its texture slot's rectangle to its image slot's (see above), or as a bilinear scale (DM_UPSCALER=bilinear): 1 when drawn, 0 to run the shader
+static int up_mfx_encode(NvShader *cs) {
+    if (up_mode() == UP_MODE_BILINEAR) return up_bil_encode(cs);
+    id<MTLTexture> in, out; tex_t dout; NVNcopyRegion ir, orr;
+    if (!up_mfx_bind(cs, &in, &out, &dout, &ir, &orr)) return 0;
     int srgb = cs->up_color == UP_COLOR_SRGB, root = cs->up_color == UP_COLOR_ROOT;
     up_mfx_scaler *e = up_mfx_scaler_for((NSUInteger)ir.width, (NSUInteger)ir.height, (NSUInteger)orr.width, (NSUInteger)orr.height, cs->up_color); if (!e) { g_up_mfx_kept++; return 0; }
     id<MTL4FXSpatialScaler> sc = e->sc;
