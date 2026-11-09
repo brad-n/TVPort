@@ -146,7 +146,12 @@ static double guest_file_free_important(void) {
     CFURLRef u = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)g_gf_dir, (CFIndex)strlen(g_gf_dir), true);   // a new URL each time: one caches the values it gave
     double r = -1; int64_t x; CFTypeRef v = NULL;
     if (!u) return r;
+#if TARGET_OS_TV
+    (void)x; (void)v;   // tvOS has no purgeable-space key (kCFURLVolumeAvailableCapacityForImportantUsageKey is unavailable there): the stop rule stays on f_bavail
+    if (0) {
+#else
     if (CFURLCopyResourcePropertyForKey(u, kCFURLVolumeAvailableCapacityForImportantUsageKey, &v, NULL) && v) {
+#endif
         if (CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)v, kCFNumberSInt64Type, &x) && x >= 0) r = (double)x;
         CFRelease(v);
     }
