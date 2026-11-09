@@ -368,6 +368,7 @@ class Walker:
         if lv is None: self.c['encoder_unmatched'] += 1; return None
         if new is None: self.c['encoder_exact_unusable'] += 1; return None
         self.c['encoder_matched'] += 1; self.c[f'encoder_level:{used}'] += 1
+        if Z.is_oneshot(orig): self.c['encoder_oneshot'] += 1
         if used != lv: self.c['encoder_stronger_level'] += 1
         return new
 
@@ -767,7 +768,7 @@ def run(args):
         if os.path.exists(f): os.unlink(f)
     lib = find_astc_lib(pack, out)
     native = build_native(os.path.join(out, 'lib'))
-    Z.configure(os.path.join(out, 'lib')); Z.build(os.path.join(out, 'lib')); Z.build_exact(os.path.join(out, 'lib'))
+    Z.configure(os.path.join(out, 'lib')); Z.build(os.path.join(out, 'lib')); Z.build_exact(os.path.join(out, 'lib')); Z.build_exact(os.path.join(out, 'lib'), 'tex_once_zstd144_build.sh', 'libzstd144')   # built once here: the workers would race to clone
     files = B.image_files(romfs)
     dicts = B.zs_dicts(romfs, files, lib)
     arc = None
@@ -898,7 +899,7 @@ def run(args):
                 except ValueError as e: problems.append(f'data.arc table frame unreadable: {e}')
     enc = {k: v for k, v in sorted(totals.items()) if k.startswith('encoder_')}
     enc_check = {k[len('encoder_identity_'):]: v for k, v in sorted(vtotals.items()) if k.startswith('encoder_identity_')}
-    encoder_rep = dict(encoder='zstd v1.3.5 streaming, level detected per frame', matched=enc.pop('encoder_matched', 0), unmatched=enc.pop('encoder_unmatched', 0), unusable=enc.pop('encoder_exact_unusable', 0), stronger_level=enc.pop('encoder_stronger_level', 0),
+    encoder_rep = dict(encoder='level detected per frame: zstd v1.3.5 streaming (Smash), v1.4.4 one-shot (Ocarina)', oneshot=enc.pop('encoder_oneshot', 0), matched=enc.pop('encoder_matched', 0), unmatched=enc.pop('encoder_unmatched', 0), unusable=enc.pop('encoder_exact_unusable', 0), stronger_level=enc.pop('encoder_stronger_level', 0),
                        levels={k.split(':', 1)[1]: enc.pop(k) for k in [k for k in enc if k.startswith('encoder_level:')]}, table=dict(arc.encoder or {}, identical_to_original=table_same, identity_checked=table_identity) if arc else None,
                        identity_check=enc_check)
     writer_c = collections.Counter({k: totals[k] for k in ('planes_tagged', 'planes_zeroed_cap', 'textures_changed')})
@@ -1033,7 +1034,7 @@ def run_manifest(args):
     if not B.read_pack_header(pack): log(f'[RED] {pack} is no complete ASTC pack'); return 2
     lib = find_astc_lib(pack, out)
     native = build_native(os.path.join(out, 'lib'))
-    Z.configure(os.path.join(out, 'lib')); Z.build(os.path.join(out, 'lib')); Z.build_exact(os.path.join(out, 'lib'))
+    Z.configure(os.path.join(out, 'lib')); Z.build(os.path.join(out, 'lib')); Z.build_exact(os.path.join(out, 'lib')); Z.build_exact(os.path.join(out, 'lib'), 'tex_once_zstd144_build.sh', 'libzstd144')   # built once here: the workers would race to clone
     files = B.image_files(romfs)
     dicts = B.zs_dicts(romfs, files, lib)
     arc = None
