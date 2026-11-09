@@ -7,6 +7,7 @@ DM_AOC_DIR	path	Folder of add-on content: one numbered subfolder per DLC index h
 DM_AOC_OWNED	switch	`0` reports no add-on content even when `DM_AOC_DIR` has some, for runs without the DLC
 DM_APP_DM	path	Set by the iOS app of a game of several programs: the running program's `dm/p<N>` folder, where the settings screen finds its `launcher.json`
 DM_APP_VERSION	switch	Overrides the IPA's version in `build_ipa.sh`; by default it is the packed game's display version from its control data (the update's when one is packed)
+DM_ASTC_MAX_DIM	player	`=<pixels>` the same cap for textures that are ASTC in the game (any block size, LDR and sRGB; 2D and 2D array with a mip chain; cube, 3D and sparse-pool textures are never cut): the finest levels are left out until the longest side fits, never upscaled; a texture over the cap without enough levels is kept whole (counted in the `ASTC cap:` log line). Default: `DM_BC_MAX_DIM` on a GPU without BC (the Apple TV 4K), nothing on a GPU with BC (a Mac); set it explicitly to cap anywhere, `0` to turn it off
 DM_AUDIO	switch	`1` plays audio through Core Audio, `0` uses the silent sink; real output is the default on iOS, the silent sink on the Mac (the Mac launcher sets `1`)
 DM_AUDIO_DUMP	diagnostic	`=<file>` writes every PCM block the game appends as is (16-bit, 48 kHz, channel count as in the OpenAudioOut log), to judge whether a sound played
 DM_AUDIO_MUTE	switch	`=1` runs the real Core Audio output path (callback pacing, background take-over) with the output silenced, for lifecycle tests on the Mac without noise
@@ -14,7 +15,6 @@ DM_AUDREN_TRACE	diagnostic	When set, the CPU audio renderer logs every update wi
 DM_AV1_DAV1D	switch	`=1` decodes AV1 movies with dav1d even where VideoToolbox decodes AV1 (Apple M3 and A17 Pro on), to compare the two or to check the path older chips take (`hle_movie_av1.c`)
 DM_BC6H_R11G11B10	player	`=0` on a GPU without BC formats: unsigned BC6H is stored as RGBA16Float again; by default it is RG11B10Float (4 bytes a pixel, no alpha, a sampled alpha reads 1), signed BC6H is always RGBA16Float
 DM_BC_MAX_DIM	player	`=<pixels>` on a GPU without BC formats: a 2D or 2D array BC texture with a mip chain drops its finest levels until its longest side fits; `0` or unset keeps them all. Native ASTC textures follow it too on such a GPU (see `DM_ASTC_MAX_DIM`)
-DM_ASTC_MAX_DIM	player	`=<pixels>` the same cap for textures that are ASTC in the game (any block size, LDR and sRGB; 2D and 2D array with a mip chain; cube, 3D and sparse-pool textures are never cut): the finest levels are left out until the longest side fits, never upscaled; a texture over the cap without enough levels is kept whole (counted in the `ASTC cap:` log line). Default: `DM_BC_MAX_DIM` on a GPU without BC (the Apple TV 4K), nothing on a GPU with BC (a Mac); set it explicitly to cap anywhere, `0` to turn it off
 DM_BOOTPROF	diagnostic	When set, logs boot timing: the loader's breakdown (mapping, relocation, probes), Metal library loading, pipeline creation, texture uploads and the first present
 DM_BUNDLE_ID	switch	Overrides the iOS app's bundle ID in `build_ipa.sh` (default `org.nxnative.<title ID in lowercase>`)
 DM_CHEATS	path	Folder of Atmosphère cheat files: `<folder>/<build ID>.txt` or an SD-card layout (`atmosphere/contents/<title ID>/cheats/`) under it (default `<DM_ROOT>/cheats`); the Mac menu lists and toggles them
@@ -81,9 +81,7 @@ DM_HOME_QUIT_CAPTURE	test	`=<folder>`: `tests/t_home_quit_mac.m` also draws the 
 DM_HOME_QUIT_TEXT	switch	The texts of the Home button's quit prompt in the player's language, one per line: the hold indicator, the title, the note, the quit and the cancel button; a front end such as NX2Apple sets it ([Starting a game](frontends.md#starting-a-game)), an empty or missing line keeps the English text
 DM_HTML	path	Folder of the offline HTML pages (default: `html` beside the RomFS)
 DM_ICON	path	`=<image>` gives `build_ipa.sh` another app icon (default the `icon.jpg` beside the RomFS)
-DM_ICON_CROP_SCALE	player	Artwork crop zoom for the generated Apple TV icon (1 is 100%).
-DM_ICON_CROP_X	player	Horizontal position of the Apple TV icon crop, normalized from -1 to 1 (0 is centered).
-DM_ICON_CROP_Y	player	Vertical position of the Apple TV icon crop, normalized from -1 to 1 (0 is centered).
+DM_ICON_BACKDROP	diagnostic	
 DM_IMPORTS	diagnostic	When set, logs each import the loader binds to a host function and each forced takeover
 DM_JIT_CAPTURE	path	Folder the Mac host writes what a game's `nn::jit` plugin makes to, one `<key>.jit` per request, for `dm/tools/jit_capture.py`; the NSP script sets it
 DM_JIT_LOG	diagnostic	`1` logs every `nn::jit` `GenerateCode` request
@@ -110,6 +108,7 @@ DM_MOTION_AXES	switch	`=<map>` such as `x,-z,y`: maps Apple's controller axes to
 DM_MOTION_GAIN	switch	`=<gain>`: how fast the orientation is pulled toward the measured gravity, in rad/s per unit error (default 0.5; `0` integrates the gyro alone)
 DM_MOTION_HID	switch	On the Mac, `0` disables the passive Switch Pro Controller HID motion fallback (`motion_pro_mac.h`); enabled by default when exactly one physical Pro and one GameController Pro can use the same player slot; usable GameController motion takes priority
 DM_MOTION_LOG	diagnostic	`=1` logs player 1's mapped motion sample once a second per source (phone / GameController / controller HID; acceleration in G, gyro in revolutions/s), for checking the axes: flat and still reads acc 0 0 -1
+DM_MOVIE_NETWORK	player	`bypass` skips the movie library's enhancement network (nn::ndve, found by the shader map: Ocarina of Time's `Ndve-*.dat.zs`): its YUV stage runs, its 12 layers do not, and its last stage becomes a bilinear scale of the picture into the image the game draws, about 1-2 ms of GPU instead of about 90 on an Apple TV 4K (3rd generation); `trace` runs the network and logs its first 400 dispatches (bindings, formats, sizes); `game` (the default) runs the network. No MetalFX is used
 DM_MOVIE_TRACE	diagnostic	When set, the movie decoder logs every call with its thread and decoder (by default the first 12 calls, then every 2^k-th)
 DM_MSL_DIR	path	Parent folder of the shader libraries: NVN loads from `b-<chain version>/` or the one file `b-<chain version>.img` beneath it, Vulkan from `vk/`, GL from `gl/`; the app and the Mac launcher set it
 DM_NICK	switch	The account nickname the game sees (default `Player`)
@@ -119,10 +118,10 @@ DM_NRO_DIR	path	folder of NROs the shader split reads like `main`, and in which 
 DM_NVN_ALLOCPROF	diagnostic	`=1` charges Metal allocation growth to each replayed op type and function, and logs command allocator sizes and each new texture (serial, size, format, storage); `=2` also gives each main submission a fresh command allocator and reports command memory by operation, by encoder, by submission size and the indirect-count multi-draws encoded; each memory report also adds what the residency set holds by kind against all of GPU allocated, the readbacks not landed yet, and the objects taken out of the residency set that are still alive, by the line that made each resident
 DM_NVN_API	switch	`=<major>.<minor>` overrides the NVN API version `nvnDeviceGetInteger` reports (by default decided by the SDK version or the profile's `device_api`: 55.15 for SDK 11 and later, 53.313 before)
 DM_NVN_ASTC_CACHE	path	`=<dir>` the writable ASTC cache for `DM_NVN_BC_ASTC` (tvOS default `<Library/Caches>/astc-cache`): one `<sha256 of format, size, block and the BC plane>.astc` file per converted plane, written by the background encoder (or on the submit thread with `DM_NVN_ASTC_MISS=sync`) on a miss (temporary file, then rename), read before encoding
-DM_NVN_ASTC_CACHE_RO	path	`=<dir or file>` the read-only prebuilt ASTC cache, tried before `DM_NVN_ASTC_CACHE`; never written. Either a directory of `<key>.astc` files or ONE pack file (`astc-ro.pack`, made on a Mac by `dm/gfx/tools/bntx_astc.py` and sent to the Apple TV as a single file: an index of keys sorted for binary search, entries read with `pread` and hash-checked; a corrupt or short pack is ignored). tvOS default: `<Library/Caches>/astc-ro.pack` if that exists, else `<Library/Caches>/astc-ro` if that is a directory
 DM_NVN_ASTC_CACHE_MAX	diagnostic	`=<MB>` size cap of the writable ASTC cache directory (entries already in it count); once reached nothing more is written and nothing is deleted. Default 2048
-DM_NVN_ASTC_MIN_FREE_MB	diagnostic	`=<MB>` free disk under which ASTC cache writes stop. Default 1024
+DM_NVN_ASTC_CACHE_RO	path	`=<dir or file>` the read-only prebuilt ASTC cache, tried before `DM_NVN_ASTC_CACHE`; never written. Either a directory of `<key>.astc` files or ONE pack file (`astc-ro.pack`, made on a Mac by `dm/gfx/tools/bntx_astc.py` and sent to the Apple TV as a single file: an index of keys sorted for binary search, entries read with `pread` and hash-checked; a corrupt or short pack is ignored). tvOS default: `<Library/Caches>/astc-ro.pack` if that exists, else `<Library/Caches>/astc-ro` if that is a directory
 DM_NVN_ASTC_MAP_CACHE	diagnostic	`=0` makes the tvOS pre-play ASTC cache snapshot keep only the small entries in memory (no 512 MB reclaimable file mapping of the rest)
+DM_NVN_ASTC_MIN_FREE_MB	diagnostic	`=<MB>` free disk under which ASTC cache writes stop. Default 1024
 DM_NVN_ASTC_MISS	switch	`=sync` or `=background` (default). What `DM_NVN_BC_ASTC` does on an ASTC cache miss. `background`: the texture is made and uploaded in its decoded format as without ASTC, the BC planes are copied into a bounded queue (`DM_NVN_ASTC_QUEUE_MB`) and low-priority threads encode them into `DM_NVN_ASTC_CACHE`, so the next launch hits. A texture's format is decided once, when it is first asked about, and kept: ASTC when its storage already holds BC data and every plane of it is cached, decoded otherwise. `sync`: every eligible texture is ASTC and a miss is encoded on the submit thread (0.7 to 6 s for a 2048x2048 plane): for tests only
 DM_NVN_ASTC_PREWARM	diagnostic	`=0` skips the tvOS pre-play snapshot of the ASTC cache directories (entries are then read from disk on demand)
 DM_NVN_ASTC_QUEUE_MB	diagnostic	`=<MB>` total BC bytes waiting for the ASTC encoder threads; a plane that does not fit is dropped and counted. Default 64 on iOS and tvOS, 256 on a Mac
@@ -133,6 +132,7 @@ DM_NVN_BC1_ASTC	switch	`=4`, `=5` or `=6`: the ASTC block of BC1 (and BC1 sRGB) 
 DM_NVN_BC4_ASTC	switch	`=4`, `=5` or `=6`: the ASTC block of unsigned BC4 textures when `DM_NVN_BC_ASTC` is on; `=0` keeps BC4 decoded (R8). Default 6: BC4 is stored R8 on a GPU without BC (8 bits a texel), ASTC 6x6 takes 3.56 bits, 4x4 would take the same 8. The texture holds (R,0,0,1) so it samples what R8 does. Signed BC4 (SNORM) is never ASTC. The prebuilt pack must be made with the same block (`bntx_astc.py --bc4-block`)
 DM_NVN_BC5_ASTC	switch	`=4`, `=5` or `=6`: the ASTC block of unsigned BC5 textures when `DM_NVN_BC_ASTC` is on; `=0` keeps BC5 decoded (RG8). Default 4 (8 bits a texel against RG8's 16). The texture holds (R,G,0,1) so it samples what RG8 does. Signed BC5 (SNORM normal maps) is never ASTC. The prebuilt pack must be made with the same block (`bntx_astc.py --bc5-block`)
 DM_NVN_BC6H_ASTC	switch	`=4`, `=5` or `=6`: the ASTC HDR block of unsigned BC6H textures when `DM_NVN_BC_ASTC` is on and the GPU has ASTC HDR (Metal GPU family Apple6, the A13, and later; the A15 has it); `=0` keeps BC6H decoded (RG11B10Float). Default 4 (8 bits a texel against 32). Signed BC6H is never ASTC. The prebuilt pack must be made with the same block (`bntx_astc.py --bc6h-block`)
+DM_NVN_BC_ALIAS	diagnostic	
 DM_NVN_BC_ASTC	switch	`=4` or `=6` stores BC1/2/3/7 2D and 2D-array textures as ASTC 4x4 / 6x6 LDR instead of RGBA8 on a GPU without BC (the Apple TV 4K); BC1 takes 1/8 of the memory, BC2/3/7 1/4. Unsigned BC4, BC5 and BC6H follow with blocks of their own (`DM_NVN_BC4_ASTC`, `DM_NVN_BC5_ASTC`, `DM_NVN_BC6H_ASTC`). Converted on the CPU (ASTC FASTEST) and cached, see `DM_NVN_ASTC_CACHE`. Off when unset or 0, and on a GPU with BC unless `DM_TEST_NO_BC` is set
 DM_NVN_BF_WANT	path	`=<file>`: appends the key of each fragment shader whose passes could not be merged for lack of a readable-tile version to that file, once per key
 DM_NVN_BLIT_ORDER	diagnostic	`0` drops the barriers between dependent operations in the copy encoder, which reproduces the fountain's vertical stripes in Mario Wonder
@@ -259,8 +259,8 @@ DM_OPMODE	player	The operation mode the game sees: `0` handheld, `1` console (de
 DM_PAD_IDENTICAL	switch	`0` stops reading identical pads here when GameController lists fewer of their model than IOKit has, such as two Pro Controllers over USB (each a player of its own: a Pro Controller from its report 0x30, another model from its HID elements; `pad_hid_mac.h`, `pad_pro.h`); `DM_HID_PADS=0` stops it too; Mac only
 DM_PAD_MERGE	switch	`=1` merges every controller into player 1, as before, instead of giving each controller a player of its own (Mac and iOS)
 DM_PAD_PRESS_TO_JOIN	player	`1`: a controller is no player until one of its buttons is pressed, then it is the lowest player free, whatever its port, link or model, identical pads included (`front_mac.m`, `DmGamepad.m`, `pad_slots.h`); not with `DM_PAD_MERGE`. Launcher setting
-DM_PAD_SWAP_AB_XY	player	Legacy combined controller swap; each independent pair setting overrides it when present.
 DM_PAD_SWAP_AB	player	Swap physical controller A/B buttons for this game (1 on, 0 off).
+DM_PAD_SWAP_AB_XY	player	Legacy combined controller swap; each independent pair setting overrides it when present.
 DM_PAD_SWAP_XY	player	Swap physical controller X/Y buttons for this game (1 on, 0 off).
 DM_PATCH_FRONT	switch	`=<bytes>`: the size of the patch area right before the module base for a long text (`BIG_TEXT`); set only by the rewriter's own rerun with the size it needs
 DM_PHONE_MOTION	switch	On iOS, whether the phone's own device motion drives player 1's six-axis sensor: `auto` (default) while no controller supplies fresh motion, `1` phone only, `0` never; each source keeps its own orientation
@@ -350,6 +350,7 @@ DM_SF_TRACE	diagnostic	`=1` logs every request on the game's own HIPC client ses
 DM_SHAKE_G	switch	`=<G>`: on iOS, the acceleration beyond gravity above which a flick of the phone shakes the controller's six-axis sensor (default 1.5)
 DM_SHARED_FONT	path	Font file served for every shared-font type except the Nintendo extension (default `$DM_FONT_DIR/standard.ttf`, then macOS's Arial Unicode)
 DM_SHARED_FONT_EXT	path	Font file served for shared-font type 5, the Nintendo extension with the button icons (default `$DM_FONT_DIR/nintendo_ext.ttf`, made by `make_ext_font.py`)
+DM_SHELF	diagnostic	
 DM_SHOW_FPS	player	`1` shows the frame-rate counter on the iPhone (frames put on screen per second, top left); at IPA build it sets `DMShowFPS` in `Info.plist`, which `Documents/env.txt` overrides
 DM_SLOWFRAME	diagnostic	`=1` writes the per-frame timing breakdown to the log only for dropped frames (kept in a ring of the last 16 frames, judged 8 frames late)
 DM_SPIN	switch	`0` makes the rewriter's spin gate return at once, so guest poll loops spin with no sleep; the gate stays (on by default)
@@ -357,6 +358,7 @@ DM_SPIN_LIST	diagnostic	`=1` makes `patch_nso.py` print every guest poll loop it
 DM_SPIN_POLL	switch	`=<µs>`: how long a spin-gate wait polls before it sleeps with the yield back-off (default 2000; `0` yields on every pass)
 DM_STALL_DUMP	diagnostic	`=<ms>` logs every guest thread's state, wait and stack (the deadlock dump) when no frame has been presented for that long, at most 4 times a run
 DM_SVC	diagnostic	`=1` logs memory SVCs (`SetHeapSize`, `MapMemory`, `Map`/`UnmapPhysicalMemory`) with their addresses and sizes
+DM_SWITCHTV_GROUP	diagnostic	
 DM_SYMCHECK	diagnostic	`=1` checks every hashed module symbol lookup against a linear search and logs a red line for each mismatch
 DM_TBUF_ALIGN	diagnostic	`=<bytes>` uses that value as the linear-texture alignment when it is larger than the device's `minimumLinearTextureAlignmentForPixelFormat`, for buffer textures and for linear textures on a pool's buffer: a Mac can then reproduce a phone's larger alignment (a 64-byte one fails the buffers and linear textures a device with 64 bytes cannot view), to check `tbuf_as_2d`'s aligned-row copy and the upload of unaligned linear textures (`linear_fit`)
 DM_TEAM_ID	switch	Apple team ID for the per-game Xcode project, used when `--team-id` / `TEAM_ID` is not given; `build_ipa.sh` uses the placeholder `0000000000` (unsigned) when unset
@@ -385,6 +387,7 @@ DM_TEST_UP_LOST	diagnostic	`=<batch index>` treats that batch of uploads as drop
 DM_THERMAL_CAP	switch	`0` turns off the thermal cap, which holds the frame step at 30 fps while iOS reports a serious or critical thermal state (on by default)
 DM_THR	diagnostic	`=1` logs each SVC (except `SleepThread`) with its first four arguments, and each `CreateThread` with entry, stack, priority and core
 DM_THRCPU	diagnostic	`=<tsv path>[,<seconds>]` writes each thread's CPU time (100% = one core) and the total every interval (default 10 s); on iOS a relative path is under `Documents`
+DM_TOP_SHELF_ART	diagnostic	
 DM_TOUCH_HAPTICS	player	`0` turns off the light haptic tap when a touch control is pressed (on by default); launcher setting
 DM_TOUCH_LOG	diagnostic	`=1` logs each touch-screen read with touch points (sample, finger, position, attributes) and each gesture entry, up to 500 lines
 DM_TVOS	switch	`=1` makes `dm/ios/tools/build_ipa.sh` build for tvOS (the Apple TV project, `project_tv.yml`)
