@@ -167,6 +167,18 @@ static class SwshXlate
         public bool QueryHostReducedPrecision() => _job["reduced"] is JsonNode n && (bool)n;
         // Job raw_read_log = true (a profile's shader_raw_read_log): raw global memory loads set their pool table entry's bit in the read log (GlobalToStorage GmemReadLogWords)
         public bool QueryHostRawReadLog() => _job["raw_read_log"] is JsonNode n && (bool)n;
+        // Job fragw_fold = true (a profile's shader_fragw_fold): the perspective inputs' x * w * (1 / w) is folded whichever operand comes first (Optimizer.EliminateMultiplyByFragmentCoordWCommuted)
+        public bool QueryHostFragCoordWFoldCommuted() => _job["fragw_fold"] is JsonNode n && (bool)n;
+        // Job ftz_cmp = true (a profile's shader_ftz_cmp): a .FTZ comparison with a constant flushes nothing the constant decides (InstEmit.GetFtzFPComparison)
+        public bool QueryHostFtzCompareConstant() => _job["ftz_cmp"] is JsonNode n && (bool)n;
+        // Job unord_cmp = true (a profile's shader_unord_cmp): an unordered float comparison is the negation of the ordered opposite (InstEmit.GetFPComparison)
+        public bool QueryHostUnorderedCompareNot() => _job["unord_cmp"] is JsonNode n && (bool)n;
+        // Job raw_loop = true (a profile's shader_raw_loop): a raw lookup's binary search is a loop (GlobalToStorage)
+        public bool QueryHostRawSearchLoop() => _job["raw_loop"] is JsonNode n && (bool)n;
+        // Job raw_regs = true (a profile's shader_raw_regs): a raw lookup keeps its last entry's start, end and delta in private words (GlobalToStorage)
+        public bool QueryHostRawRangeRegisters() => _job["raw_regs"] is JsonNode n && (bool)n;
+        // Job no_rescale = true (a profile's shader_no_rescale): the host's render scales are all 1.0 (nvn_mtl.m support_buf), so the translator writes no rescale (InstEmitAttribute.EmitIpa, TexturePass)
+        public bool QueryHostRenderScaleOne() => _job["no_rescale"] is JsonNode n && (bool)n;
         // Job softfloat64 = true: the host has no FP64, so Ryujinx's DoubleToFloat pass lowers double operations to float (Metal has no double type). Set only on the retry of a
         // shader whose first translation declared a 64-bit float (see Main): answering "no" for every shader would also drop the Float64 capability from all the others
         public bool QueryHostSupportsShaderFloat64() => !(_job["softfloat64"] is JsonNode n && (bool)n);

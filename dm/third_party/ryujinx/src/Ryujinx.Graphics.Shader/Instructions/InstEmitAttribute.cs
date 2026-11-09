@@ -193,7 +193,11 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 {
                     // FragCoord X/Y must be divided by the render target scale, if resolution scaling is active,
                     // because the shader code is not expecting scaled values.
-                    res = context.FPDivide(res, context.Load(StorageKind.ConstantBuffer, SupportBuffer.Binding, Const((int)SupportBufferField.RenderScale), Const(0)));
+                    // nxnative (the profile key shader_no_rescale, IGpuAccessor.QueryHostRenderScaleOne): the host never scales a render target (nvn_mtl.m support_buf holds 1.0), so x / 1.0 is x
+                    if (!context.TranslatorContext.GpuAccessor.QueryHostRenderScaleOne())
+                    {
+                        res = context.FPDivide(res, context.Load(StorageKind.ConstantBuffer, SupportBuffer.Binding, Const((int)SupportBufferField.RenderScale), Const(0)));
+                    }
 
                     if (imm10 == AttributeConsts.PositionY && context.TranslatorContext.Options.TargetApi != TargetApi.OpenGL)
                     {

@@ -28,6 +28,26 @@ _RO = re.compile(r'^\s*const device ' + _IDENT + r'\* (' + _BUF + r') \[\[id\(\d
 _OP = r'(?:[-+*/%|&^]|<<|>>)?=(?!=)'
 _WRITE = re.compile(r'atomic_|_barrier\(|\.write\(|\]\s*' + _OP + r'|^\s*\*|^\s*' + _IDENT + r'\s*' + _OP)   # lines a run does not reach across
 _VEC = {2: 'packed_uint2', 3: 'packed_uint3', 4: 'packed_uint4'}
+# With unwritten (the profile key shader_wide_device, dmsh_build.py WIDE_DEVICE): a storage buffer declared device (not const) that the shader never writes counts as read-only too.
+# The translator declares every storage buffer of a shader device as soon as one is written: a raw global memory read log (GlobalToStorage, shader_raw_read_log) is a written
+# buffer, so the read log turned every other buffer of each shader with a raw load device and its words back into single loads (Ocarina of Time's ground mist 5ad65c0eefd09c7f:
+# 15 wide reads before the log, none after). Such a buffer appears only as (*spvDescriptorSet0.<b>)._m0[...] read, never assigned, never with its address taken, never passed to a
+# function; and none counts while a raw pointer may write game memory (a store or an atomic through reinterpret_cast<device ...>, which may alias a buffer's words). The log's own
+# atomics go to the host's log buffer, a function's parameter here, which no storage buffer of the game shares
+_DEV = re.compile(r'^\s*device ' + _IDENT + r'\* (' + _BUF + r') \[\[id\(\d+\)\]\];', re.M)
+_PTR_WRITE = re.compile(r'reinterpret_cast<device [^>]*\*>\([^;]*\)\)\s*' + _OP + r'|atomic_\w+\([^;]*reinterpret_cast<device')
+
+
+def unwritten(msl):
+    """The device storage buffers the shader only reads (see _DEV); none while a raw pointer may write"""
+    if _PTR_WRITE.search(msl): return set()
+    out = set()
+    for b in _DEV.findall(msl):
+        e = re.escape(b)
+        if msl.count(f'spvDescriptorSet0.{b})') != len(re.findall(r'\(\*spvDescriptorSet0\.' + e + r'\)\._m0\[', msl)): continue   # passed or used otherwise
+        if re.search(r'&\(\*spvDescriptorSet0\.' + e + r'\)|\(\*spvDescriptorSet0\.' + e + r'\)\._m0\[[^\]\n]*\]\s*' + _OP, msl): continue   # address taken, assigned
+        out.add(b)
+    return out
 
 
 def _root(v, adds):   # (value, byte offset) the sums lead back to
@@ -38,9 +58,9 @@ def _root(v, adds):   # (value, byte offset) the sums lead back to
     return v, off
 
 
-def wide_loads(msl):
+def wide_loads(msl, device_unwritten=False):
     if ' >> uint(2)' not in msl: return msl
-    ro = set(_RO.findall(msl))
+    ro = set(_RO.findall(msl)) | (unwritten(msl) if device_unwritten else set())
     if not ro: return msl
     lines = msl.split('\n')
     adds, idx = {}, {}

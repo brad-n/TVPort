@@ -201,6 +201,15 @@ class Stage(unittest.TestCase):
         self.assertRegex(body, r'void dm_stage_body\([^)]*\)\n\{\n    uint _9 = 0u;\n    _5\(_9\);')
         self.assertNotIn('_9', entries)
 
+    def test_an_initialized_array_stays_in_the_body(self):   # shader_raw_regs: the last entry's range words, zero-initialized by spirv-cross ahead of the stage memory
+        i = ms.info(control(7, payload=128, max_v=128, max_p=64), sph(0xf0, b'\x30'))
+        decl = '    uint _9 = 0u;\n    spvUnsafeArray<uint, 6> _11 = spvUnsafeArray<uint, 6>({ 0u, 0u, 0u, 0u, 0u, 0u });\n'
+        src = (KERNEL % (ms.memory(i)[1] // 4, ms.memory(i)[0][3] // 4)).replace('{\n    threadgroup', '{\n' + decl + '    threadgroup', 1)
+        src = src.replace('kernel void', 'static inline __attribute__((always_inline))\nvoid _5(thread uint& _10, thread spvUnsafeArray<uint, 6>& _12) { _10 = _10 + _12[1]; }\n\nkernel void', 1).replace('    if (gl_', '    _5(_9, _11);\n    if (gl_', 1)
+        body, entries = ms.to_stage(src, i).split('[[mesh]] void main0(')
+        self.assertIn(decl + '    _5(_9, _11);', body)
+        self.assertNotIn('_11', entries)
+
     def test_past_metal_refused(self):
         with self.assertRaises(ValueError): self.mesh(vertices=300)
 

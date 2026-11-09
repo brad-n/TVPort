@@ -165,6 +165,12 @@ namespace Ryujinx.Graphics.Shader.Translation
             return Properties.AddLocalMemory(new MemoryDefinition($"gmem_last_{Properties.LocalMemories.Count}", AggregateType.U32, 1, zeroInit: true));
         }
 
+        // nxnative: the start, end and delta words of that entry (GlobalToStorage.TryGenerateRawStorageOp with shader_raw_regs), zero at the start like the entry index
+        public int AddRawLastRangeMemory()
+        {
+            return Properties.AddLocalMemory(new MemoryDefinition($"gmem_range_{Properties.LocalMemories.Count}", AggregateType.Array | AggregateType.U32, 6, zeroInit: true));
+        }
+
         // nxnative: words 1 to 3 of a raw vector load (GlobalToStorage.TryGenerateRawStorageOp), one for the shader: the helper writes them and the loads of those words read them
         // right after its call, before any other access
         private int _rawVectorMemoryId = -1;

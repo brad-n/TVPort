@@ -39,6 +39,11 @@ shader_note	Ocarina of Time shaders
 shader_raw_read_log	1
 # Border colours Metal lacks are corrected in the shaders through twin samplers (docs: dm/games/README.md shader_border_emu). Ocarina of Time never needed one in seven Apple TV runs (the host logs "which Metal lacks" zero times), so the ~86k dm_bs sites in its shaders are compiled out
 shader_border_emu	0
+# Raw global memory lookups keep the last entry's range in registers (docs/reference/shaders.md, Raw global memory lookups: the search at every lookup, the table at every hit).
+# The ground mist pass (5ad65c0eefd09c7f, 43 lookups a pixel) went from 2.12 to 1.72 ms a frame on the Mac mini (M2 Pro, TV-like settings). shader_raw_loop measured no gain: off
+shader_raw_regs	1
+# Whole-record reads of the storage buffers a shader with a raw load never writes, which the read log above had turned back into word reads (shaders.md, The read log turned storage buffers back into word reads)
+shader_wide_device	1
 
 # ---- Frame rate ----
 # The game steps its time by a frame ratio, its base rate / its frame rate, whatever the frame took: frames longer than a vsync played in slow motion. The ratio takes the host's

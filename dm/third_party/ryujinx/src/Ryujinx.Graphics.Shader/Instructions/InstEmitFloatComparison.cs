@@ -401,13 +401,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             srcA = context.FPAbsNeg(srcA, absoluteA, negateA, fpType);
             srcB = context.FPAbsNeg(srcB, absoluteB, negateB, fpType);
 
-            if (ftz)
-            {
-                srcA = FlushDenormal(context, srcA);
-                srcB = FlushDenormal(context, srcB);
-            }
-
-            Operand res = GetFPComparison(context, cmpOp, srcA, srcB, fpType);
+            Operand res = GetFtzFPComparison(context, cmpOp, srcA, srcB, ftz, fpType);
             Operand pred = GetPredicate(context, srcPred, srcPredInv);
 
             res = GetPredLogicalOp(context, logicOp, res, pred);
@@ -453,13 +447,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             srcA = context.FPAbsNeg(srcA, absoluteA, negateA, fpType);
             srcB = context.FPAbsNeg(srcB, absoluteB, negateB, fpType);
 
-            if (ftz)
-            {
-                srcA = FlushDenormal(context, srcA);
-                srcB = FlushDenormal(context, srcB);
-            }
-
-            Operand p0Res = GetFPComparison(context, cmpOp, srcA, srcB, fpType);
+            Operand p0Res = GetFtzFPComparison(context, cmpOp, srcA, srcB, ftz, fpType);
             Operand p1Res = context.BitwiseNot(p0Res);
             Operand pred = GetPredicate(context, srcPred, srcPredInv);
 
@@ -539,6 +527,71 @@ namespace Ryujinx.Graphics.Shader.Instructions
             context.Copy(Register(destPredInv, RegisterType.Predicate), p1Res);
         }
 
+        // nxnative (the profile key shader_ftz_cmp, IGpuAccessor.QueryHostFtzCompareConstant): a .FTZ comparison whose other operand is a constant (an immediate or RZ, the usual case)
+        // needs no flush of the register: against a normal non-zero constant, infinity or NaN, a denormal and 0 compare alike; against 0, the flush and the comparison are one comparison
+        // with +-FLT_MIN (x > 0 is x >= FLT_MIN, x == 0 is |x| < FLT_MIN, ...). The unordered forms keep their NaN results: a flush leaves a NaN a NaN. Exact for every input
+        internal static Operand GetFtzFPComparison(EmitterContext context, FComp cond, Operand srcA, Operand srcB, bool ftz, Instruction fpType = Instruction.FP32)
+        {
+            if (!ftz)
+            {
+                return GetFPComparison(context, cond, srcA, srcB, fpType);
+            }
+
+            if (fpType == Instruction.FP32 && context.TranslatorContext.GpuAccessor.QueryHostFtzCompareConstant())
+            {
+                if (srcB.Type == OperandType.Constant && srcA.Type != OperandType.Constant)
+                {
+                    return FtzCompareConstant(context, cond, srcA, srcB);
+                }
+
+                if (srcA.Type == OperandType.Constant && srcB.Type != OperandType.Constant)
+                {
+                    return FtzCompareConstant(context, MirrorFComp(cond), srcB, srcA);
+                }
+            }
+
+            return GetFPComparison(context, cond, FlushDenormal(context, srcA), FlushDenormal(context, srcB), fpType);
+        }
+
+        // a cmp b as b cmp' a
+        private static FComp MirrorFComp(FComp cond)
+        {
+            FComp u = cond & FComp.Nan;
+
+            return (cond & ~FComp.Nan) switch
+            {
+                FComp.Lt => FComp.Gt | u,
+                FComp.Le => FComp.Ge | u,
+                FComp.Gt => FComp.Lt | u,
+                FComp.Ge => FComp.Le | u,
+                _ => cond,
+            };
+        }
+
+        // flush(v) cmp c, c a constant
+        private static Operand FtzCompareConstant(EmitterContext context, FComp cond, Operand v, Operand c)
+        {
+            const float FltMin = 1.17549435e-38f;
+
+            float k = c.AsFloat();
+            FComp b = cond & ~FComp.Nan, u = cond & FComp.Nan;
+
+            if (b is FComp.F or FComp.Num || (k != 0 && !float.IsSubnormal(k)))
+            {
+                return GetFPComparison(context, cond, v, c);   // F, T, NUM, NAN, and a normal non-zero, infinite or NaN constant: the flush changes nothing
+            }
+
+            return b switch   // c is 0 (or a denormal, which flushes to 0)
+            {
+                FComp.Lt => GetFPComparison(context, FComp.Le | u, v, ConstF(-FltMin)),
+                FComp.Le => GetFPComparison(context, FComp.Lt | u, v, ConstF(FltMin)),
+                FComp.Gt => GetFPComparison(context, FComp.Ge | u, v, ConstF(FltMin)),
+                FComp.Ge => GetFPComparison(context, FComp.Gt | u, v, ConstF(-FltMin)),
+                FComp.Eq => GetFPComparison(context, FComp.Lt | u, context.FPAbsolute(v), ConstF(FltMin)),
+                _ => GetFPComparison(context, FComp.Ge | u, context.FPAbsolute(v), ConstF(FltMin)),   // Ne
+            };
+        }
+
         private static Operand GetFPComparison(EmitterContext context, FComp cond, Operand srcA, Operand srcB, Instruction fpType = Instruction.FP32)
         {
             Operand res;
@@ -572,6 +625,25 @@ namespace Ryujinx.Graphics.Shader.Instructions
                     FComp.Ge => Instruction.CompareGreaterOrEqual,
                     _ => throw new ArgumentException($"Unexpected condition \"{cond}\"."),
                 };
+                FComp ordered = cond & ~FComp.Nan;
+
+                // nxnative (the profile key shader_unord_cmp, IGpuAccessor.QueryHostUnorderedCompareNot): an unordered comparison as the negation of the ordered opposite, one comparison
+                // where a cmp b || isnan(a) || isnan(b) took three and two ORs (!(a >= b) is LTU: true for a < b and for a NaN). EQU keeps its form (its opposite would be the
+                // ordered not-equal). The same results for every input
+                if ((cond & FComp.Nan) != 0 && ordered != FComp.Eq && context.TranslatorContext.GpuAccessor.QueryHostUnorderedCompareNot())
+                {
+                    Instruction opposite = ordered switch
+                    {
+                        FComp.Lt => Instruction.CompareGreaterOrEqual,
+                        FComp.Le => Instruction.CompareGreater,
+                        FComp.Gt => Instruction.CompareLessOrEqual,
+                        FComp.Ge => Instruction.CompareLess,
+                        _ => Instruction.CompareEqual,   // Ne
+                    };
+
+                    return context.BitwiseNot(context.Add(opposite | fpType, Local(), srcA, srcB));
+                }
+
                 res = context.Add(inst | fpType, Local(), srcA, srcB);
 
                 if ((cond & FComp.Nan) != 0)
