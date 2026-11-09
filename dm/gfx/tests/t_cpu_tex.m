@@ -93,7 +93,12 @@ static void finalized_upload(int write_after_record) {
     CHECK(registered && registered.width == 4, "finalized registered descriptor resolves a Metal texture");
     CHECK(tex_fit(2, tex_by_id(2), MTLTextureType2DArray, &compatible_id), "late compatible view resolves");
     CHECK(mtl_wait(mtl_sub_commit(),5000000000ull), "registered descriptor upload completed");
-    CHECK(!g_treg[1].view && !g_treg[2].view && !g_treg[2].alt, "late descriptor views retire at submission end");
+    if (view_keep()) {   // DM_NVN_VIEW_KEEP (on by default): they last until the end of a submission that many frames later
+        CHECK(g_treg[1].view && g_treg[2].view, "late descriptor views live on within their frames");
+        mtl_set_frame(atomic_load(&g_cur_frame) + (uint64_t)view_keep()); mtl_sub_begin();
+        CHECK(mtl_wait(mtl_sub_commit(),5000000000ull), "a later frame's submission completed");
+    }
+    CHECK(!g_treg[1].view && !g_treg[2].view && !g_treg[2].alt, "late descriptor views retire at the end of their submission (or frames, DM_NVN_VIEW_KEEP)");
     // Resolve again: a retired serial may already hold an NvPkg in the ghost cache.
     mtl_sub_begin(); mtl_exec((const uint8_t *)handle);
     CHECK(mtl_wait(mtl_sub_commit(),5000000000ull), "recorded snapshot can be replayed again");
