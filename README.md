@@ -8,6 +8,9 @@ Changes in this fork that the TVPort and nxnative releases don't have yet, in pl
 
 **Synced to upstream:** nxnative `main` at commit `143c0d09` (2026-11-09; 63 commits past the 2026-11-07 sync, including the recycled render-target memory for dynamic resolution, the faster extended-product shader code and the host-set frame step for Ocarina of Time). #1543 and #1368 are in upstream now and were dropped from the list below.
 
+**Engine fixes reach games you already built**
+- **Patch changes re-apply:** when the engine's code patches for a game change (its patches, the code rewriter, or its game profile), TVPort now notices on the next build and rewrites that game's code again, instead of reusing the old result. It re-uses everything else already built (the extracted files and shaders), so this is much quicker than a first build. It needs your prod.keys file, as a first build does.
+
 **Smaller games on the Apple TV**
 - **Store textures once:** the game's textures are kept once, in the Apple TV's own format, instead of twice (original plus converted copy). Mario Kart 8 Deluxe went from 21.5 GB to 13.6 GB.
 - **Compress game data:** the game file on the Apple TV is compressed without losing anything and unpacked as it's read. Mario Kart 8 Deluxe went from 13.6 GB to 9.3 GB.
