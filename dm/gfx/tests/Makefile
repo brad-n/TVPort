@@ -227,6 +227,9 @@ check_t_args_cache: RUN_ENV = MTL_DEBUG_LAYER=1
 t_enc_async: t_enc_async.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_enc_async.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
 check_t_enc_async: RUN_ENV = MTL_DEBUG_LAYER=1
+t_pkg_unwrap: t_pkg_unwrap.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_pkg_unwrap.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
+check_t_pkg_unwrap: RUN_ENV = MTL_DEBUG_LAYER=1
 t_view_keep: t_view_keep.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_view_keep.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
 check_t_view_keep: RUN_ENV = MTL_DEBUG_LAYER=1
