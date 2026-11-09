@@ -188,6 +188,11 @@ t_addr_known: t_addr_known.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_addr_known.m $(MTL_T_SRC) $(FW)
 t_pool_chunks: t_pool_chunks.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_chunks.m $(MTL_T_SRC) $(FW)
+t_gmem_budget: t_gmem_budget.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_gmem_budget.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_gmem_budget
+check_t_gmem_budget: t_gmem_budget
+	DM_NVN_GMEM_BUDGET_MB=3 MTL_DEBUG_LAYER=1 ./t_gmem_budget
 t_gmem_words: t_gmem_words.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_gmem_words.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_gmem_words
