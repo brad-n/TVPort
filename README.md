@@ -15,6 +15,7 @@ Changes in this fork that the TVPort and nxnative releases don't have yet, in pl
 **Switch 2 games (experimental)**
 - **Switch 2 game files (`.nup`):** TVPort finds and builds them, needs no keys, and names the app from the folder when the package carries no name.
 - **Larger address space:** Switch 2 games reserve about 12.5 GB of memory addresses, which tvOS only allows with Apple's Extended Virtual Addressing permission. TVPort asks for it only for games that need it. This needs a paid Apple Developer Program account, plus a one-time step per game on Apple's developer site to enable the permission for that game's app ID.
+- **App icon, Top Shelf art and game info from Nintendo's store:** the public title list TVPort normally uses has no Switch 2 games, so a Switch 2 game used to get no icon and no details in SwitchTV. When that list has nothing for a game, TVPort now looks the game up on Nintendo's own store page and uses its picture as the app icon and Top Shelf art, and its name, description, publisher, release date and genres in SwitchTV. It only fills gaps: artwork you chose, or anything the title list already has, is left alone, and with no internet the game just has no art, as before.
 
 **Fixes from upstream pull requests, included early** (nxnative by seedds; not yet merged upstream)
 - **#1459:** the "use Apple's MetalFX upscaler" setting now works on Ocarina of Time. It was looking for the wrong file, so it did nothing.
