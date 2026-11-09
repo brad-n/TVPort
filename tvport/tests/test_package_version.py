@@ -32,5 +32,15 @@ class PackageVersion(unittest.TestCase):
         self.assertNotIn('1.2.3', (REPO / 'tvport/app/project.yml').read_text())
 
 
+    def test_every_tvport_module_the_backend_imports_is_packaged(self):
+        # TVPort.app runs backend.py from Contents/Resources: a sibling module left out breaks it at that import (nintendo_store.py, 2026-11-08)
+        import re
+        here = {p.stem for p in (REPO / 'tvport').glob('*.py')}
+        used = set()
+        for name in ('backend.py', 'switchtv_catalog.py', 'save_import.py'):
+            used |= {m for m in re.findall(r'^\s*(?:import|from)\s+(\w+)', (REPO / 'tvport' / name).read_text(), re.M) if m in here}
+        packaged = {Path(n).stem for n in package_tvport.TVPORT_FILES}
+        self.assertFalse(used - packaged, f'modules backend.py needs but the package leaves out: {sorted(used - packaged)}')
+
 if __name__ == '__main__':
     unittest.main()

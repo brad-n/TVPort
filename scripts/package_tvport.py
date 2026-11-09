@@ -78,6 +78,9 @@ def uv_files(uv_arg) -> tuple:
     return uv, run([uv, '--version']).split()[1], licenses
 
 
+TVPORT_FILES = ('backend.py', 'save_import.py', 'switchtv_catalog.py', 'nintendo_store.py', 'requirements.txt')   # what Contents/Resources carries beside the engine: backend.py runs from there, so every module it imports must be here
+
+
 def build_number(repo: Path = REPO) -> str:
     """The app's build number: how many commits the checkout's history holds, so every packaged change counts up (About shows Version 1.3.0 (1329))"""
     return run(['git', '-C', repo, 'rev-list', '--count', 'HEAD']).strip()
@@ -130,7 +133,7 @@ def main() -> int:
                 cwd=REPO, env=dict(os.environ, COPYFILE_DISABLE='1'))
         info = {'id': engine_id, 'commit': commit, 'dirty': dirty, 'chain': chain, 'files': len(files), 'uv': uv_version, 'made': datetime.now(timezone.utc).isoformat(timespec='seconds')}
         (resources / 'engine.json').write_text(json.dumps(info, indent=1) + '\n')
-        for name in ('backend.py', 'save_import.py', 'switchtv_catalog.py', 'requirements.txt'):
+        for name in TVPORT_FILES:
             shutil.copy2(REPO / 'tvport' / name, resources / name)
         licenses = resources / 'Licenses'
         licenses.mkdir()
