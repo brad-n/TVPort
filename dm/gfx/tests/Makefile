@@ -583,6 +583,11 @@ t_zsnap: t_zsnap.m
 	clang -O1 -g -Wall -fobjc-arc -o $@ t_zsnap.m -framework Metal -framework Foundation
 check_t_zsnap: t_zsnap
 	@set -e; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; python3 test_dmsh_zsnap.py --fixture "$$work"; MTL_DEBUG_LAYER=1 ./t_zsnap "$$work"
+# A non-finite colour output stored to an R11G11B10F target is 0 (dmsh_build.py finite_rg11; test_dmsh_finite_rg11.py makes the shader)
+t_finite_rg11: t_finite_rg11.m
+	clang -O1 -g -Wall -fobjc-arc -o $@ t_finite_rg11.m -framework Metal -framework Foundation
+check_t_finite_rg11: t_finite_rg11
+	@set -e; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; python3 test_dmsh_finite_rg11.py --fixture "$$work"; MTL_DEBUG_LAYER=1 ./t_finite_rg11 "$$work"
 # MUFU.SIN / COS lowered from turns through the fraction (InstEmitAmpereAlu.cs ATurnsToRadians), on the GPU against a double-precision reference
 t_mufu_turns: t_mufu_turns.m
 	clang -O1 -g -Wall -fobjc-arc -o $@ t_mufu_turns.m -framework Metal -framework Foundation

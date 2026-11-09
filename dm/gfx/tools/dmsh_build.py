@@ -385,6 +385,34 @@ def border_emu(msl):
 ZSNAP = ('static inline __attribute__((always_inline)) float dm_zsnap(float z, float d, float zw)   // see frag_z_snap\n'
          '{\n    float lo = as_type<float>(as_type<int>(z) - 1) - zw * 0x1p-20f;\n    return (z > 0.0f && d < z && d >= lo) ? d : z;\n}\n')
 ZSNAP_WIDTH = 'dm_zw'
+# A non-finite colour output stored to an R11G11B10F target. Maxwell stores NaN and infinity there as black; Metal stores the format's largest value (65024), and the bloom chain spreads it
+# over the screen as white fog (Ocarina of Time's ground mist, 5ad65c0eefd09c7f, divides by a weight sum of 0 and its composite 888c1068ac8f7043 writes the result to the RG11B10F scene target;
+# upstream issue #1839; Brilliant Diamond's disabled TV, #997 and the closed #1149). The target's format is the pipeline's, not the shader's, so main0 carries the sanitizer behind a
+# function constant: dm_nf_mask, bit n set = colour output n is an R11G11B10F attachment (nvn_mtl.m nf_fn specializes the entry point per pipeline, only for such pipelines). Default 0: the
+# branch is gone from every other pipeline's code. Other formats keep their value: Maxwell stores NaN and infinity in float16 and float32, and an infinite unorm value saturates
+# The tests are on the bit patterns, not isfinite / isnan: the shaders compile with Metal's default fast math, which may assume no NaN or infinity and fold those away
+FINITE_DECL = ('constant uint dm_nf_fc [[function_constant(%d)]];   // see finite_rg11\n'
+               'constant uint dm_nf_mask = is_function_constant_defined(dm_nf_fc) ? dm_nf_fc : 0u;\n'
+               'static inline __attribute__((unused)) float dm_nf_fix(float v) { return (as_type<uint>(v) & 0x7f800000u) == 0x7f800000u ? 0.0f : v; }\n'
+               'static inline __attribute__((unused)) half dm_nf_fix(half v) { return (as_type<ushort>(v) & 0x7c00u) == 0x7c00u ? half(0) : v; }\n'
+               + ''.join(f'static inline __attribute__((unused)) float{n} dm_nf_fix(float{n} v) {{ return select(v, float{n}(0), (as_type<uint{n}>(v) & 0x7f800000u) == 0x7f800000u); }}\n'
+                         f'static inline __attribute__((unused)) half{n} dm_nf_fix(half{n} v) {{ return select(v, half{n}(0), (as_type<ushort{n}>(v) & 0x7c00u) == 0x7c00u); }}\n' for n in (2, 3, 4))) % abi.FINITE_FC
+def finite_rg11(msl):
+    """→ msl with, before each `return out;` of main0, `if (dm_nf_mask & 1u << n) out.<member> = dm_nf_fix(out.<member>);` for each float / half colour output n of main0_out, and the
+    declarations after `using namespace metal;` once. A main0 whose outputs are all integer, with no `return out;` line or already rewritten stays as it is"""
+    if 'dm_nf_fix' in msl or 'using namespace metal;\n' not in msl: return msl
+    st = re.search(r'struct main0_out\s*\{(.*?)\};', msl, re.S)
+    e = re.search(r'^fragment\s+main0_out\s+main0\s*\(', msl, re.M)
+    if not st or not e: return msl
+    outs = re.findall(r'^\s*(?:float|half)[234]?\s+(\w+)\s*\[\[\s*color\((\d+)\)\s*\]\]\s*;', st.group(1), re.M)
+    brace = msl.find('{', e.end())
+    if not outs or brace < 0: return msl
+    end = block_end(msl, brace)
+    lines = ''.join(f'{{ind}}if (dm_nf_mask & {1 << int(n)}u) out.{m} = dm_nf_fix(out.{m});\n' for m, n in outs)
+    body, k = re.subn(r'^([ \t]*)return out;$', lambda r: lines.replace('{ind}', r.group(1)) + r.group(0), msl[brace:end], flags=re.M)
+    if not k: return msl
+    msl = msl[:brace] + body + msl[end:]
+    return msl.replace('using namespace metal;\n', 'using namespace metal;\n\n' + FINITE_DECL, 1)
 def frag_z_snap(msl):
     """→ (msl with each paired gl_FragCoord.z read in main0 as dm_zsnap(gl_FragCoord.z, <texture value>, dm_zw) and dm_zw = fwidth(gl_FragCoord.z) first in main0's body, the number of reads).
     main0's body is dm_body_main0's when it has one (dmsh_side.shared_body: a library's sources), the build's rewrite comes before that"""
@@ -437,7 +465,11 @@ PRE_STATS = collections.Counter()
 # -O1: the front end's -O2 (CorrelatedValuePropagation, then SimplifyCFG) folds the translated shaders' repeated tests of one value into switches whose cases jump past their own join.
 # Apple's GPU backend then exceeds its control-flow ID budget ("Max Unstruct ID 758 ... exceeds supported limit", a note, not an error) and falls back to a slower lowering:
 # Odyssey's alRenderMaterialUber took 25 minutes and 17.3 MB of GPU code, 31 s and 1.3 MB at -O1. Ordinary shaders come out within a few percent either way (the backend optimizes again)
-MAC_METAL = ['xcrun', '-sdk', 'macosx', 'metal', '-c', '-O1', '-fpreserve-invariance']
+# -fwrapv: signed integer overflow wraps, as SPIR-V's integer arithmetic and the Switch's GPUs do; in MSL it is undefined, and the front end folds around it. Ocarina of Time's mesh shader
+# 35785cddc971290c sign-extends a packed 16-bit vertex field as a = w * 65536, then (a >> 31) << 16 | uint(a) >> 16; without the flag the compiler took the sign bits from bits 15-30 of w,
+# so the lightmap / probe UV's x came out far too large and models drawn with mesh shaders took their ambient light from the wrong texels (the bright band on the Deku Tree's walls).
+# The flag also drops inbounds from pointer arithmetic (Metal's clang has no -fwrapv-pointer) and keeps loop bounds that may wrap (test_dmsh_wrapv.py)
+MAC_METAL = ['xcrun', '-sdk', 'macosx', 'metal', '-c', '-O1', '-fpreserve-invariance', '-fwrapv']
 MAC_RECORD = ' '.join(MAC_METAL) + '; xcrun -sdk macosx metallib'
 # The compiles run the tools xcrun names, found once: each xcrun launch looks them up again, about 4 ms of a compile's two launches (8 ms a shader). -isysroot is what xcrun -sdk passes
 # (as SDKROOT), and the outputs are the same bytes (.air and .metallib, checked on Odyssey's shaders); without it the driver targets the running macOS, not the SDK, and they differ.
@@ -1659,7 +1691,7 @@ def finish(key, w, j, c1):
     except ValueError as e: return 'pool rewrite failed', str(e)[:160], None
     src = dmsh_wide.wide_loads(src)   # storage words the translator split, read whole again (see dmsh_wide.py)
     src = border_emu(src)   # border colours Metal lacks (see border_emu)
-    if j['stage'] == 'ps': src = frag_z_snap(src)[0]   # gl_FragCoord.z against a depth of its own surface (see frag_z_snap)
+    if j['stage'] == 'ps': src = finite_rg11(frag_z_snap(src)[0])   # gl_FragCoord.z against a depth of its own surface (see frag_z_snap); a non-finite colour output of an R11G11B10F target (see finite_rg11)
     open(msl, 'w').write(src)
     first, spill = [], 0
     mesh = j.get('mesh_stage')
