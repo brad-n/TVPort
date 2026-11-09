@@ -283,6 +283,9 @@ static void ws_report(uint64_t frame, uint64_t frames) {
 }
 #include "nvn_rec.h"   // deferred encoding (DM_NVN_ENC_THREAD)
 static NSHashTable *g_res_objects;
+// Residency budget accounting (DM_NVN_RESIDENCY_BUDGET_MB, see res_evict_to_budget): bytes the set holds, in all and by kind (0 texture, 1 heap, 2 shared buffer, 3 private buffer); under g_res_mu
+static uint64_t g_res_bytes, g_res_kb[4];
+static int res_kind(id o) { return [o conformsToProtocol:@protocol(MTLTexture)] ? 0 : [o conformsToProtocol:@protocol(MTLHeap)] ? 1 : ((id<MTLBuffer>)o).storageMode == MTLStorageModeShared ? 2 : 3; }
 static NSMapTable *g_res_line; static NSHashTable *g_retired;   // DM_NVN_ALLOCPROF: each resident object's res_add line; objects taken out of the set (weak: only the live ones stay)
 static _Atomic unsigned g_image_heap_n, g_big_n;   // g_big_n: large pools in chunks, whose buffers overlap (BIG_MIN)
 static inline MTL4VisibilityOptions resource_vis(void) { return MTL4VisibilityOptionDevice | (g_image_heap_n || g_big_n ? MTL4VisibilityOptionResourceAlias : 0); }
@@ -301,6 +304,7 @@ static void res_add_at(id<MTLAllocation> allocation, int line) { @autoreleasepoo
     { int k = 0; while (k < RS_SITES - 1 && g_rs_site[k].line && g_rs_site[k].line != line) k++; g_rs_site[k].line = line; g_rs_site[k].n++; g_rs_site[k].bytes += r.allocatedSize; }
     [g_res addAllocation:(id<MTLAllocation>)r];
     [g_res_objects addObject:r];
+    { uint64_t z = r.allocatedSize; g_res_bytes += z; g_res_kb[res_kind(r)] += z; }
     if (allocprof_on()) { if (!g_res_line) g_res_line = [NSMapTable weakToStrongObjectsMapTable]; [g_res_line setObject:@(line) forKey:r]; }   // where it became resident, for the retired-but-alive report (mtl_mem_stat)
     g_res_dirty = 1;
     pthread_mutex_unlock(&g_res_mu);
@@ -312,6 +316,7 @@ static void res_remove(id<MTLAllocation> r) { @autoreleasepool {
     if (![g_res_objects containsObject:r]) { pthread_mutex_unlock(&g_res_mu); return; }
     [g_res removeAllocation:(id<MTLAllocation>)r];
     [g_res_objects removeObject:r];
+    { uint64_t z = r.allocatedSize; int k = res_kind(r); g_res_bytes -= MIN(z, g_res_bytes); g_res_kb[k] -= MIN(z, g_res_kb[k]); }
     if (allocprof_on()) { if (!g_retired) g_retired = [NSHashTable weakObjectsHashTable]; [g_retired addObject:r]; }   // still listed while something keeps it alive
     g_res_dirty = 1; g_rs_rm++;
     pthread_mutex_unlock(&g_res_mu);
@@ -749,6 +754,9 @@ static _Atomic uint64_t *pool_stamp_new(void) {   // caller holds g_mu
 enum { BIG_MIN = 512u << 20, BIG_S = 16u << 20, BIG_UNKNOWN = 64u << 20, BIG_MAX = 32 };
 typedef struct { uintptr_t lo, hi, a, b; const void *mem; int *chunk, full; NSMutableArray *old; } big_pool;   // chunk: stride → g_pools index + 1; full: the whole pool's entry + 1; old: buffers a longer chunk replaced, alive with the pool
 static big_pool g_big[BIG_MAX]; static int g_nbig;
+// Chunk buffers a longer chunk replaced and that were in the residency set (kept alive by big_pool.old); the residency budget (res_evict_to_budget) takes them out again. Under g_mu
+typedef struct { __unsafe_unretained id<MTLBuffer> buf; _Atomic uint64_t *used; } old_res_ent;
+static old_res_ent *g_old_res; static int g_n_old_res, g_cap_old_res;
 static id<MTLBuffer> pool_buf(uintptr_t a, uintptr_t b);   // a pool's zero-copy buffer over [a, b), made over writable pages (beside the GPU-written storage spans below)
 static int big_of(uint64_t addr) { for (int i = 0; i < g_nbig; i++) if (addr >= g_big[i].lo && addr < g_big[i].hi) return i; return -1; }
 void mtl_pool_add(const void *mem, uint64_t size) {
@@ -813,6 +821,7 @@ void mtl_pool_del(const void *mem) {
             if (bg < 0) break;   // a large pool has an entry per chunk
             i--; }
     if (bg >= 0) {
+        for (int q = 0; q < g_n_old_res; q++) if ([g_big[bg].old containsObject:g_old_res[q].buf]) g_old_res[q--] = g_old_res[--g_n_old_res];
         for (id<MTLBuffer> b in g_big[bg].old) defer_obj_release(b);
         free(g_big[bg].chunk); g_big[bg] = g_big[--g_nbig]; g_pidx_ok = 0; g_plast = -1; atomic_fetch_add(&g_pool_gen, 1); atomic_fetch_sub(&g_big_n, 1);
     }
@@ -837,6 +846,9 @@ static int big_new(big_pool *b, uintptr_t lo, uintptr_t hi, uintptr_t end, uint6
     g_pidx_ok = 0; atomic_fetch_add(&g_pool_gen, 1);
     g_pools[g_npool++] = (pool_ent){lo < b->lo ? b->lo : lo, hi > b->hi ? b->hi : hi, lo, buf, buf.gpuAddress, b->mem, 0, pool_stamp_new(), 0, 0, clock_gettime_nsec_np(CLOCK_MONOTONIC), end > b->hi ? b->hi : end, unk};
     [g_keep addObject:buf];
+    {   // The chunks of a large pool overlap, and GPU allocated counts every buffer's whole length: say how much they add up to (Ocarina of Time: GPU allocated 2.9 -> 8.5 GB at the world load)
+        static uint64_t n, bytes, tex_bytes, said; n++; bytes += end - lo; if (t_tex_upload_lookup) tex_bytes += end - lo;
+        if ((bytes >> 28) > said) { said = bytes >> 28; MLOG("large pool chunks: %llu zero-copy buffers made so far, %llu MB of buffer length in all (%llu MB of it for texture uploads reading their storage); the last %llu MB at %p", (unsigned long long)n, (unsigned long long)(bytes >> 20), (unsigned long long)(tex_bytes >> 20), (unsigned long long)((end - lo) >> 20), (void *)lo); } }
     return g_npool - 1;
 }
 // The entry of a large pool for [addr, addr + len): the chunk of its stride, made or lengthened to reach as far as asked; -1 past the pool's end
@@ -850,7 +862,10 @@ static int big_lookup(big_pool *b, uint64_t addr, uint64_t len) {
     if (i >= 0 && (have >= b->hi || have >= addr + want)) return i;
     int n = big_new(b, lo, lo + BIG_S, end, end >= b->b ? 1 : BIG_UNKNOWN); if (n < 0) return -1;
     if (i >= 0) {   // lengthened: what is encoded with the shorter chunk keeps it, resident, until the pool goes
-        [b->old addObject:g_pools[i].buf]; [g_keep removeObject:g_pools[i].buf]; g_pools[n].res = 0; if (g_pools[i].res) g_pool_res_n--;
+        [b->old addObject:g_pools[i].buf]; [g_keep removeObject:g_pools[i].buf];
+        if (g_pools[i].res) { if (g_n_old_res == g_cap_old_res) { g_cap_old_res = g_cap_old_res ? g_cap_old_res * 2 : 16; g_old_res = realloc_or_die(g_old_res, (size_t)g_cap_old_res * sizeof *g_old_res, "the replaced chunk table"); }
+            g_old_res[g_n_old_res++] = (old_res_ent){g_pools[i].buf, g_pools[i].used}; }
+        g_pools[n].res = 0; if (g_pools[i].res) g_pool_res_n--;
         g_pools[i] = g_pools[n]; g_npool--; n = i;
     }
     b->chunk[k] = n + 1;
@@ -932,6 +947,88 @@ static void pool_age(void) {   // the submit thread, at a submission's start, be
                      n, (unsigned long long)(f - start), (unsigned long long)(b >> 20), left, (unsigned long long)(left_b >> 20), (unsigned long long)rw_n, (unsigned long long)(rw_b >> 20));
     if (n) lines++;
     phase = 0; next = f + POOL_AGE_EVERY;
+}
+
+// ---------- Global residency budget ----------
+// DM_NVN_RESIDENCY_BUDGET_MB=<n>|auto (unset / 0: off; auto: 75% of Metal's recommendedMaxWorkingSetSize). Every path that makes something resident (res_add) counts into g_res_bytes. Over the budget, the
+// least recently addressed memory pools (zero-copy buffers over guest memory: pools, large-pool chunks, chunks a longer one replaced) leave the residency set, down to the budget: the evictable kind, since
+// the engine stamps each pool with the submission that last looked its address up (pool_used). Textures, heaps, staging, arenas and the other buffers carry no such stamp (shaders reach a texture through
+// an ID table, not a lookup), so they are never evicted; they count against the budget and show in the over-budget line.
+// Safety is pool_age's, with the same two phases: phase 1 (the start of a submission, before anything of it is encoded) bumps the pool and registration generations, so every cache (per-thread address table,
+// vertex streams, argument blocks, raw pool table) goes back to a lookup, which stamps; phase 2, once every submission up to that point has completed (g_done >= B), takes out pools whose stamp is <= B: none
+// is used by a submission still running (those are all <= B and completed) nor by one encoded since (stamped > B). A pool the current submission looked up is stamped > B and stays; so is one an in-flight
+// submission looked up. A pool taken out and addressed again is put back at that lookup (pool_res), as after pool_age.
+// If what is left (referenced pools, pinned pools, the non-pool kinds) alone exceeds the budget, nothing referenced is evicted and the line says what makes the set that large.
+static uint64_t g_rb_budget; static int g_rb_init;
+static uint64_t g_rb_evicted_n, g_rb_evicted_b, g_rb_phases, g_rb_over_n; static char g_rb_over_msg[512];
+static uint64_t res_budget(void) {
+    if (!g_rb_init) { const char *e = getenv("DM_NVN_RESIDENCY_BUDGET_MB"); uint64_t v = 0;
+        if (e && !strcmp(e, "auto")) v = (uint64_t)g_dev.recommendedMaxWorkingSetSize / 4 * 3; else if (e && atoi(e) > 0) v = (uint64_t)atoi(e) << 20;
+        g_rb_init = 1; g_rb_budget = v;
+        if (v) MLOG("residency set kept within %llu MB: the least recently addressed memory pools leave it over that (DM_NVN_RESIDENCY_BUDGET_MB; Metal's recommended working set %llu MB)", (unsigned long long)(v >> 20), (unsigned long long)(g_dev.recommendedMaxWorkingSetSize >> 20)); }
+    return g_rb_budget;
+}
+static uint64_t res_bytes_now(void) { pthread_mutex_lock(&g_res_mu); uint64_t b = g_res_bytes; pthread_mutex_unlock(&g_res_mu); return b; }
+static void res_recount(void) { @autoreleasepool {   // objects that died without a res_remove would leave the running totals high: count the set again
+    pthread_mutex_lock(&g_res_mu); uint64_t tot = 0, kb[4] = {0};
+    for (id<MTLAllocation> o in g_res_objects.allObjects) { uint64_t z = o.allocatedSize; tot += z; kb[res_kind(o)] += z; }
+    g_res_bytes = tot; memcpy(g_res_kb, kb, sizeof kb);
+    pthread_mutex_unlock(&g_res_mu);
+} }
+typedef struct { uint64_t used, bytes; int pool; } rb_cand;   // pool: index in g_pools, or -(k + 1) for g_old_res[k]
+static int rb_cmp(const void *pa, const void *pb) { const rb_cand *a = pa, *b = pb; if (a->used != b->used) return a->used < b->used ? -1 : 1; if (a->bytes != b->bytes) return a->bytes > b->bytes ? -1 : 1; return a->pool < b->pool ? -1 : a->pool > b->pool; }
+// Takes pools whose stamp is <= safe out of the residency set, least recently addressed first, until the set fits budget. Returns the bytes taken out. Caller must know no submission with a fence > safe,
+// and none still running with a fence <= safe, can read them (res_budget_step)
+static uint64_t res_evict_to_budget(uint64_t budget, uint64_t safe) {
+    if (!budget || res_bytes_now() <= budget) return 0;
+    uint64_t freed = 0, n = 0, ref_b = 0, pin_b = 0, ref_n = 0, pin_n = 0, pool_b = 0;
+    pthread_mutex_lock(&g_mu);
+    rb_cand *cd = malloc((size_t)(g_npool + g_n_old_res + 1) * sizeof *cd); if (!cd) MDIE("residency budget: out of memory"); int nc = 0;
+    for (int i = 0; i < g_npool; i++) { const pool_ent *p = &g_pools[i]; if (!p->res) continue; uint64_t z = p->buf.allocatedSize; pool_b += z;
+        if (p->pin) { pin_b += z; pin_n++; continue; }
+        if (atomic_load_explicit(p->used, memory_order_relaxed) > safe) { ref_b += z; ref_n++; continue; }
+        cd[nc++] = (rb_cand){atomic_load_explicit(p->used, memory_order_relaxed), z, i}; }
+    for (int k = 0; k < g_n_old_res; k++) { uint64_t z = g_old_res[k].buf.allocatedSize; pool_b += z;
+        if (atomic_load_explicit(g_old_res[k].used, memory_order_relaxed) > safe) { ref_b += z; ref_n++; continue; }
+        cd[nc++] = (rb_cand){atomic_load_explicit(g_old_res[k].used, memory_order_relaxed), z, -(k + 1)}; }
+    qsort(cd, (size_t)nc, sizeof *cd, rb_cmp);
+    uint8_t *old_gone = calloc((size_t)g_n_old_res + 1, 1); if (!old_gone) MDIE("residency budget: out of memory");
+    for (int q = 0; q < nc && res_bytes_now() > budget; q++) {
+        if (cd[q].pool >= 0) { pool_ent *p = &g_pools[cd[q].pool]; res_remove(p->buf); p->res = 0; p->aged = 1; g_pool_res_n--; g_pool_aged_n++; g_pool_aged_b += p->hi - p->lo; }
+        else { res_remove(g_old_res[-cd[q].pool - 1].buf); old_gone[-cd[q].pool - 1] = 1; }
+        freed += cd[q].bytes; n++;
+    }
+    free(cd);
+    { int w = 0; for (int k = 0; k < g_n_old_res; k++) if (!old_gone[k]) g_old_res[w++] = g_old_res[k]; g_n_old_res = w; }   // a replaced chunk out of the set is not looked at again
+    free(old_gone);
+    if (n) { atomic_fetch_add(&g_pool_gen, 1); g_rb_evicted_n += n; g_rb_evicted_b += freed; }   // the per-thread tables hold only resident pools
+    pthread_mutex_unlock(&g_mu);
+    uint64_t now = res_bytes_now();
+    if (n) { static int lines; if (lines++ < 20 || !(lines % 50)) MLOG("residency budget: %llu least recently addressed pools left the residency set, %llu MB; the set holds %llu MB of the %llu MB budget (%llu pools evicted in all, %llu MB)", (unsigned long long)n, (unsigned long long)(freed >> 20), (unsigned long long)(now >> 20), (unsigned long long)(budget >> 20), (unsigned long long)g_rb_evicted_n, (unsigned long long)(g_rb_evicted_b >> 20)); }
+    if (now > budget) {   // nothing evictable is left: what the set consists of
+        pthread_mutex_lock(&g_res_mu); uint64_t kb[4]; memcpy(kb, g_res_kb, sizeof kb); pthread_mutex_unlock(&g_res_mu);
+        g_rb_over_n++;
+        snprintf(g_rb_over_msg, sizeof g_rb_over_msg, "[RED] residency budget exceeded by what is referenced or cannot be evicted: the set holds %llu MB against a %llu MB budget. Pools addressed by the current or a running submission %llu (%llu MB), pinned pools %llu (%llu MB), "
+                 "other (never evicted): textures %llu MB, heaps %llu MB, non-pool shared buffers %llu MB, private buffers %llu MB. The frame itself is too big for the budget: lower the render resolution or the texture sizes, this is not a pool problem",
+                 (unsigned long long)(now >> 20), (unsigned long long)(budget >> 20), (unsigned long long)ref_n, (unsigned long long)(ref_b >> 20), (unsigned long long)pin_n, (unsigned long long)(pin_b >> 20),
+                 (unsigned long long)(kb[0] >> 20), (unsigned long long)(kb[1] >> 20), (unsigned long long)((kb[2] > pool_b ? kb[2] - pool_b : 0) >> 20), (unsigned long long)(kb[3] >> 20));
+        if (g_rb_over_n <= 3 || !(g_rb_over_n % 200)) MLOG("%s (%llu times)", g_rb_over_msg, (unsigned long long)g_rb_over_n);
+    }
+    return freed;
+}
+static void res_budget_step(void) {   // the submit thread, at a submission's start, before anything of it is encoded (after pool_age)
+    static uint64_t B, resume; static int phase;
+    uint64_t budget = res_budget(); if (!budget) return;
+    uint64_t f = atomic_load(&g_fence);
+    if (phase) {
+        if (atomic_load(&g_done) < B) return;
+        res_recount();
+        uint64_t freed = res_evict_to_budget(budget, B);
+        phase = 0; resume = f + (freed ? 4 : 60);   // nothing to take out: the frame holds it all; do not flush the caches again every few submissions
+        return;
+    }
+    if (f < resume || res_bytes_now() <= budget) return;
+    B = f; phase = 1; g_rb_phases++; atomic_fetch_add(&g_reg_gen, 1); atomic_fetch_add(&g_pool_gen, 1);
 }
 
 // ---------- Submission ----------
@@ -1156,7 +1253,7 @@ void mtl_prepare(void) {
 static void sub_cut_begin(void); static void ts_sub_begin(void), ts_boundary(void); static int ts_on(void);
 static void gmem_commit_patch(void);   // the raw pool table words of the arguments encoded so far follow the pools (gmem_slot_note)
 void mtl_sub_begin(void) {
-    mtl_init(); g_sub_serial++; spin_sub_begin(); pool_age(); g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL; g_rc_npend = 0; g_rc_skip = 0;
+    mtl_init(); g_sub_serial++; spin_sub_begin(); pool_age(); res_budget_step(); g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL; g_rc_npend = 0; g_rc_skip = 0;
     sub_cut_begin();
     defer_drain();
     defer_reset();
