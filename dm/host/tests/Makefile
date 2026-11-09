@@ -47,6 +47,7 @@ run: $(B)/t_diag_path $(B)/t_diag_path_ios $(B)/t_net_eventfd $(B)/t_language $(
 	$(B)/t_condvar_old
 	$(B)/t_pollwait
 	$(B)/t_preempt
+	$(B)/t_host_bt
 	$(B)/t_preempt --all-peers
 	$(B)/t_pctl
 	$(B)/t_net_eventfd
@@ -265,6 +266,12 @@ $(B)/t_condvar_old: t_condvar.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_
 	$(CLANG) -O1 -Wno-unused-function -DDM_TEST_HOOKS -DDM_TEST_CV_OLD_ORDER -I.. $(GINC) -o $@ t_condvar.c t_condvar_stub.c ../hle_thread.c
 $(B)/t_pollwait: t_pollwait.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_pollwait.c t_condvar_stub.c
+$(B)/t_host_bt: t_host_bt.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_host_bt.c t_condvar_stub.c
+.PHONY: host_bt
+host_bt: $(B)/t_host_bt
+	$(B)/t_host_bt
+
 $(B)/t_preempt: t_preempt.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_preempt.c t_condvar_stub.c
 .PHONY: preempt
