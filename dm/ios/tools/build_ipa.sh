@@ -67,6 +67,16 @@ export DM_SCHEME_NAME
 lib_has() { python3 "$DM/tools/shader_lib.py" has "$1" 2> /dev/null; }
 lib_cat() { python3 "$DM/tools/shader_lib.py" cat "$1" "$2" 2> /dev/null; }
 lib_path() { python3 "$DM/tools/shader_lib.py" path "$1"; }
+# The profile tables an NVN game's full shader build makes from its Mac outputs (not in the repository): the host takes each only when its header names the libraries' chain and inputs
+# (dmsh_chain.py table_head, nvn_mtl.m), and ignores it otherwise. Without c1_full.tsv every shader's c1 takes 64 KiB of its own (Ocarina of Time: 117 banks, 468 MB, in Link's house,
+# about a quarter of what an Apple TV lets the app have); without cb_extent.tsv whole uniform bindings are copied. So c1_full.tsv must name them, a cb_extent.tsv that is there must too,
+# and an Apple TV build (DM_TVOS=1) needs both. V: the chain version; IN: the profile's inputs digest; GD: the profile folder
+chain_table_ok() { head -1 "$1" 2> /dev/null | grep -q "^# chain b-$V inputs $IN "; }
+check_chain_tables() {
+  chain_table_ok "$GD/c1_full.tsv" || die "$GD/c1_full.tsv is missing or not made from these libraries (chain $V, inputs $IN): a full dmsh_build.py run makes it and cb_extent.tsv"
+  if [ -f "$GD/cb_extent.tsv" ] || [ "${DM_TVOS:-0}" = 1 ]; then chain_table_ok "$GD/cb_extent.tsv" ||
+    die "$GD/cb_extent.tsv is missing or not made from these libraries (chain $V, inputs $IN$([ "${DM_TVOS:-0}" = 1 ] && echo '; an Apple TV build needs it')): a full dmsh_build.py run makes it and c1_full.tsv"; fi
+}
 # The checks of one program's inputs (GAME, GD, PATCHED, ROMFS, MSL_IOS, GFXAPI, MODS, MARKER as set): every program of a game of several programs passes them
 check_program() {
 [ -f "$PATCHED/main.fixups.tsv" ] || die "no rewritten main in $PATCHED (run dm/tools/patch_nso.py first)"
@@ -83,12 +93,12 @@ if [ "$GFXAPI" = vulkan ]; then [ -f "$MSL_IOS/vk/vk_shaders.metallib" ] || die 
 elif [ "$GFXAPI" = gl ]; then [ -f "$MSL_IOS/gl/gl_shaders.metallib" ] || die "no iOS GL shader library $MSL_IOS/gl (dm/gfx/tools/gl_shaders.py \"$ROMFS\" <main> <Mac dir> --ios \"$MSL_IOS\")"
 else [ -n "$V" ] && lib_has "$MSL_IOS/b-$V" || die "no iOS shader libraries $MSL_IOS/b-$V (IOSOUT=$MSL_IOS dmsh_build.py ...)"
   # One chain version serves every game and every state of a profile's tables: the libraries' stamp (b-$V/inputs.tsv, written by a full dmsh_build.py run) must name this game and the
-  # digest of its profile's current inputs, and c1_full.tsv (not in the repository: the same build makes it, and cb_extent.tsv, from its Mac outputs) must name that digest, or the host ignores it
+  # digest of its profile's current inputs, and c1_full.tsv / cb_extent.tsv (not in the repository: the same build makes them from its Mac outputs) must name that digest (check_chain_tables)
   IN=$(DM_GAME="$GAME" python3 "$DM/gfx/tools/dmsh_chain.py" --inputs) || die "dmsh_chain.py --inputs (game profile $GD)"
   STAMP=$(lib_cat "$MSL_IOS/b-$V" inputs.tsv)
   printf '%s\n' "$STAMP" | grep -qxF "$(printf 'game\t%s' "$GAME")" && printf '%s\n' "$STAMP" | grep -qxF "$(printf 'inputs\t%s' "$IN")" ||
     die "the iOS shader libraries $MSL_IOS/b-$V are not a full build from this profile's current tables (inputs $IN; their stamp: $([ -n "$STAMP" ] && printf '%s\n' "$STAMP" | grep -v '^#' | tr '\n\t' '  ' || echo none)): build them again (IOSOUT=$MSL_IOS dmsh_build.py ...)"
-  head -1 "$GD/c1_full.tsv" 2> /dev/null | grep -q "^# chain b-$V inputs $IN " || die "$GD/c1_full.tsv is missing or not made from these libraries (chain $V, inputs $IN): a full dmsh_build.py run makes it and cb_extent.tsv"; fi
+  check_chain_tables; fi
 }
 check_program
 P0=$GAME; P0_PATCHED=$PATCHED; P0_ROMFS=$ROMFS; P0_MSL=$MSL_IOS; P0_GFX=$GFXAPI
