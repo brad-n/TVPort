@@ -10,6 +10,7 @@ Changes in this fork that the TVPort and nxnative releases don't have yet, in pl
 - **Store textures once:** the game's textures are kept once, in the Apple TV's own format, instead of twice (original plus converted copy). Mario Kart 8 Deluxe went from 21.5 GB to 13.6 GB.
 - **Compress game data:** the game file on the Apple TV is compressed without losing anything and unpacked as it's read. Mario Kart 8 Deluxe went from 13.6 GB to 9.3 GB.
 - **More textures converted ahead of time:** more of the Switch's texture formats (BC4, BC5, BC6H) are converted on the Mac before install, so the Apple TV does less work while you play.
+- **Graphics memory cap for games that read memory through pointers (opt-in):** some games, like Ocarina of Time, have graphics programs that follow raw addresses, so the app keeps all of the game's graphics memory pieces loaded into the GPU (about 1.6 GB) and the Apple TV's GPU runs out of memory. `DM_NVN_GMEM_BUDGET_MB=<n>` (or `auto`) limits that to the pieces recently used or known to be written, and loads others only when a draw needs them. Off by default; not yet tested on the TV.
 - **Texture size cap for native ASTC textures:** large textures that are already in the Apple TV's format (mostly Switch 2 games) are shrunk to the cap you choose. At a cap of 256, Ocarina of Time's textures use about 90% less memory.
 
 **Switch 2 games (experimental)**

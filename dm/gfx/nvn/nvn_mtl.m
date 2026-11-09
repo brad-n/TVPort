@@ -485,7 +485,7 @@ static want_list g_bf_want = {"DM_NVN_BF_WANT", PTHREAD_MUTEX_INITIALIZER}, g_du
 void bf_want_note(const char *key) { want_note(&g_bf_want, key); }
 
 // ---------- Memory pools ----------
-typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; _Atomic uint64_t *used; int pin, aged; uint64_t born; uintptr_t end; uint64_t unk; uint32_t n_tex_reads, n_other; } pool_ent;   // res: already in the residency set (on demand, see pool_res); born: when it was added (ns); end, unk: a large pool's chunk (see BIG_MIN); n_tex_reads / n_other: lookups by texture uploads / by anything else (mem_census)
+typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; _Atomic uint64_t *used; int pin, aged; uint64_t born; uintptr_t end; uint64_t unk; uint32_t n_tex_reads, n_other; int gm; } pool_ent;   // gm: in the raw pool table last built with a residency budget (gmem_map)   // res: already in the residency set (on demand, see pool_res); born: when it was added (ns); end, unk: a large pool's chunk (see BIG_MIN); n_tex_reads / n_other: lookups by texture uploads / by anything else (mem_census)
 static pool_ent *g_pools; static int g_npool, g_cap;
 static int g_pidx_ok, g_plast = -1;   // whether the address→pool index is valid, the last hit (pool_find)
 static NSMutableArray *g_keep;                  // Holds the buffer references (pool_ent has non-owning pointers)
@@ -726,9 +726,11 @@ void mtl_pool_addressed(const void *mem, uint64_t size) {
 // (they measured on a 17 Pro Max a 512 MB render-target pool addressed 0 times in a run, with about 530 MB more device wired memory; a 4 GB A14 was ended by the system within seconds of launch because of it).
 // So a pool is not put into the residency set when created; it is put in, and the residency set committed on the spot, the first time the GPU gets its address through mtl_addr / mtl_gpu_addr -- these are the only two ways the GPU gets pool addresses,
 // and committing on the spot is earlier than any command buffer commit that uses it. CPU-side reads of pool contents through mtl_addr trigger it too (conservative, never misses). Caller holds g_mu
+static uint64_t gmem_budget(void); static _Atomic uint64_t g_gmem_stale;   // DM_NVN_GMEM_BUDGET_MB; and a count of pools wired that the raw pool table, built under that budget, left out
 static void pool_res(int i) {
     if (g_pools[i].res) return;
     res_add(g_pools[i].buf); res_commit(); g_pools[i].res = 1; g_pool_res_n++;
+    if (!g_pools[i].gm && gmem_budget() && addr_meets(g_pools[i].lo, g_pools[i].hi)) atomic_fetch_add(&g_gmem_stale, 1);   // used by a draw now: the next table lists it
     if (g_pools[i].aged) { g_pools[i].aged = 0; g_pool_rewired_n++; g_pool_rewired_b += g_pools[i].hi - g_pools[i].lo; }
 }
 // The fence of the submission being encoded, stamped on a pool at each lookup (pool_age): stores into memory that is never freed, since a thread's address cache can outlive the pool
@@ -9644,20 +9646,69 @@ static uint64_t support_gpu(void) { static uint64_t gpu; if (!gpu) gpu = support
 // Layout (dmsh_abi.h DMSH_GMEM_MAP_*): sorted by start, entry 0 empty, then the pools as disjoint ranges (a pool overlapping an earlier one keeps only its part past that one's end: every
 // pool wraps the guest's own pages, so any pool holding an address gives its GPU address), unused entries starting at ~0. Rebuilt when the pools change; the replaced table goes through
 // deferred release, so submissions encoded with it keep it. Only pools something gave an address in are listed (mtl_pool_addressed), each made resident, as the shader may reach any of them
-static id<MTLBuffer> g_gmem_buf; static uint64_t g_gmem_gen;
+static id<MTLBuffer> g_gmem_buf; static uint64_t g_gmem_gen, g_gmem_stale_seen;
+// DM_NVN_GMEM_BUDGET_MB=<n>|auto (0 / unset: off). The table above wires every pool the driver gave an address in, and the 300-submission pool aging (pool_age) cannot stop that: it bumps the pool generation,
+// the next draw of a raw-memory shader rebuilds the table, and the rebuild wires them all again. Ocarina of Time on the Apple TV 4K (A15): 3,660 pools, 1.6 GB, wired about four times per 300 frames while a
+// movie played (6.3 GB added to and removed from the residency set per window, all from this loop), and at the first scene the set (766 MB of textures, 1,718 MB of pools) reached 2,538 MB of Metal's 2,730 MB
+// working set and the GPU ended its command buffers with kIOGPUCommandBufferCallbackErrorOutOfMemory. With a budget the table wires only that many bytes of pools: first those the raw stores are known to have
+// written (gml_snapshot), then pools a draw has wired, then the most recently looked up, then the newest. The others are left out of the table (and not wired), as pools past its 8,191 entries are; a pool that is looked
+// up later is wired by pool_res, which asks for a new table (g_gmem_stale)
+static uint64_t gmem_budget(void) {
+    static uint64_t v; static int init;
+    if (!init) { const char *e = getenv("DM_NVN_GMEM_BUDGET_MB");
+        if (e && !strcmp(e, "auto")) v = (uint64_t)g_dev.recommendedMaxWorkingSetSize / 3; else if (e && atoi(e) > 0) v = (uint64_t)atoi(e) << 20;
+        init = 1; if (v) MLOG("raw global memory wires at most %llu MB of memory pools (DM_NVN_GMEM_BUDGET_MB)", (unsigned long long)(v >> 20)); }
+    return v;
+}
+typedef struct { uint64_t bytes, used, born; int res, learned; } gmem_cand;
+static int gmem_rank_cmp(const void *pa, const void *pb) {   // best first: learned, wired, most recently looked up, newest; the index last, so the order is total
+    const struct { gmem_cand c; int i; } *a = pa, *b = pb;
+    if (a->c.learned != b->c.learned) return b->c.learned - a->c.learned;
+    if (a->c.res != b->c.res) return b->c.res - a->c.res;
+    if (a->c.used != b->c.used) return a->c.used > b->c.used ? -1 : 1;
+    if (a->c.born != b->c.born) return a->c.born > b->c.born ? -1 : 1;
+    return a->i - b->i;
+}
+// keep[i] = 1 for the candidates the table lists: in rank order while the bytes fit the budget; a learned one always (the raw stores have written there). Returns the bytes kept
+static uint64_t gmem_pick(const gmem_cand *c, int n, uint64_t budget, uint8_t *keep) {
+    uint64_t kept = 0;
+    if (!budget) { for (int i = 0; i < n; i++) { keep[i] = 1; kept += c[i].bytes; } return kept; }
+    struct { gmem_cand c; int i; } *o = malloc((size_t)(n ? n : 1) * sizeof *o); if (!o) MDIE("raw pool table: out of memory");
+    for (int i = 0; i < n; i++) { o[i].c = c[i]; o[i].i = i; }
+    qsort(o, (size_t)n, sizeof *o, gmem_rank_cmp);
+    for (int k = 0; k < n; k++) { int i = o[k].i; keep[i] = o[k].c.learned || kept + o[k].c.bytes <= budget; if (keep[i]) kept += o[k].c.bytes; }
+    free(o); return kept;
+}
+static int gml_snapshot(uint64_t **lo, uint64_t **hi);   // below: the ranges the raw stores have been seen to write (a copy; the caller frees both)
 static id<MTLBuffer> gmem_map(void) {
-    uint64_t gen = atomic_load(&g_pool_gen);
-    if (g_gmem_buf && g_gmem_gen == gen) return g_gmem_buf;
+    uint64_t gen = atomic_load(&g_pool_gen), budget = gmem_budget(), stale = atomic_load(&g_gmem_stale);
+    if (g_gmem_buf && g_gmem_gen == gen && (!budget || g_gmem_stale_seen == stale)) return g_gmem_buf;
+    uint64_t *glo = NULL, *ghi = NULL; int ng = budget ? gml_snapshot(&glo, &ghi) : 0;   // before g_mu: gml_read holds the log's lock while it takes g_mu
     id<MTLBuffer> b = [g_dev newBufferWithLength:DMSH_GMEM_MAP_ENTRIES * DMSH_GMEM_MAP_ENTRY options:MTLResourceStorageModeShared];
     uint8_t *t = (uint8_t *)b.contents; memset(t, 0, b.length);
     for (int k = 1; k < DMSH_GMEM_MAP_ENTRIES; k++) memset(t + (size_t)k * DMSH_GMEM_MAP_ENTRY, 0xff, 8);
     int n = 1, over = 0; uint64_t end = 0;
     pthread_mutex_lock(&g_mu);
-    for (int k = 0; k < g_nbig; k++) if (!g_big[k].full && addr_meets(g_big[k].lo, g_big[k].hi)) { int n = big_new(&g_big[k], g_big[k].a, g_big[k].b, g_big[k].b, 0); if (n >= 0) g_big[k].full = n + 1; }   // the pool table reaches all of a large pool
-    gen = atomic_load(&g_pool_gen); pidx_sort();
+    for (int k = 0; k < g_nbig; k++) if (!g_big[k].full && addr_meets(g_big[k].lo, g_big[k].hi) && (!budget || g_big[k].b - g_big[k].a <= budget)) { int n = big_new(&g_big[k], g_big[k].a, g_big[k].b, g_big[k].b, 0); if (n >= 0) g_big[k].full = n + 1; }   // the pool table reaches all of a large pool
+    gen = atomic_load(&g_pool_gen); stale = atomic_load(&g_gmem_stale); pidx_sort();
+    uint8_t *keep = NULL; int nk = 0; uint64_t kept = 0, left_out = 0; int n_out = 0;
+    if (budget) {   // which of the addressed pools the table lists, by rank (gmem_pick); index k is the position in the sorted pool order
+        gmem_cand *cd = malloc((size_t)(g_npool ? g_npool : 1) * sizeof *cd); keep = malloc((size_t)(g_npool ? g_npool : 1)); if (!cd || !keep) MDIE("raw pool table: out of memory");
+        for (int k = 0; k < g_npool; k++) { const pool_ent *p = &g_pools[g_pidx[k]]; keep[k] = 0;
+            if (!addr_meets(p->lo, p->hi)) continue;
+            int lr = 0; for (int j = 0; j < ng && !lr; j++) lr = p->lo < ghi[j] && glo[j] < p->hi;
+            cd[nk] = (gmem_cand){p->hi - p->lo, atomic_load_explicit(p->used, memory_order_relaxed), p->born, p->res, lr}; nk++; }
+        uint8_t *kk = malloc((size_t)(nk ? nk : 1)); if (!kk) MDIE("raw pool table: out of memory");
+        kept = gmem_pick(cd, nk, budget, kk);
+        for (int k = 0, j = 0; k < g_npool; k++) { const pool_ent *p = &g_pools[g_pidx[k]]; if (!addr_meets(p->lo, p->hi)) continue; keep[k] = kk[j++]; if (!keep[k]) { n_out++; left_out += p->hi - p->lo; } }
+        free(kk); free(cd);
+    }
+    free(glo); free(ghi);
     for (int k = 0; k < g_npool; k++) {
         pool_ent *p = &g_pools[g_pidx[k]];
         if (!addr_meets(p->lo, p->hi)) continue;
+        p->gm = !budget || keep[k];
+        if (!p->gm) continue;
         if (!p->res) { res_add(p->buf); p->res = 1; g_pool_res_n++; }
         uint64_t lo = MAX((uint64_t)p->lo, end), hi = p->hi;
         if (lo >= hi) continue;
@@ -9665,6 +9716,8 @@ static id<MTLBuffer> gmem_map(void) {
         uint64_t e[3] = {lo, hi, p->gpu - p->base}; memcpy(t + (size_t)n++ * DMSH_GMEM_MAP_ENTRY, e, sizeof e); end = hi;
     }
     pthread_mutex_unlock(&g_mu);
+    free(keep);
+    if (budget) { static int said; if (said++ < 20 || !(said % 100)) MLOG("raw global memory: %llu MB of memory pools in the table, %d pools (%llu MB) left out for the %llu MB budget", (unsigned long long)(kept >> 20), n_out, (unsigned long long)(left_out >> 20), (unsigned long long)(budget >> 20)); }
     // Each 2 MiB chunk wholly inside an entry gets a hint, so most accesses skip the binary search. A colliding chunk replaces the hint and the shader's tag check sends the other to the search
     for (int k = 1; k < n; k++) {
         const uint64_t *e = (const uint64_t *)(t + (size_t)k * DMSH_GMEM_MAP_ENTRY);
@@ -9677,7 +9730,7 @@ static id<MTLBuffer> gmem_map(void) {
     if (over) RED_ONCE(140, "raw global memory: %d more memory pools than the %d entries of the pool table; addresses in them are not reached", over, DMSH_GMEM_MAP_ENTRIES - 1);
     res_add(b); res_commit();
     if (g_gmem_buf) defer_obj_release(g_gmem_buf);
-    g_gmem_buf = b; g_gmem_gen = gen;
+    g_gmem_buf = b; g_gmem_gen = gen; g_gmem_stale_seen = stale;
     { static int said; if (!said++) MLOG("raw global memory: pool table of %d ranges (pool generation %llu), rebuilt whenever a pool comes or goes", n - 1, (unsigned long long)gen); }
     return b;
 }
@@ -9724,6 +9777,10 @@ static pthread_mutex_t g_gml_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_gml_lo[GML_MAX], g_gml_hi[GML_MAX]; static int g_gml_n, g_gml_stable, g_gml_over;   // the learned ranges; over: the set filled: a write anywhere from then on
 static uint64_t g_gml_logs, g_gml_miss;
 static NSMutableArray<id<MTLBuffer>> *g_gml_free;
+static int gml_snapshot(uint64_t **lo, uint64_t **hi) {
+    pthread_mutex_lock(&g_gml_mu); int n = g_gml_n; *lo = malloc((size_t)(n ? n : 1) * 8); *hi = malloc((size_t)(n ? n : 1) * 8); if (!*lo || !*hi) MDIE("learned ranges: out of memory");
+    memcpy(*lo, g_gml_lo, (size_t)n * 8); memcpy(*hi, g_gml_hi, (size_t)n * 8); pthread_mutex_unlock(&g_gml_mu); return n;
+}
 static void gml_read(id<MTLBuffer> b, id<MTLBuffer> map, int predicted, uint64_t fence) {   // map: the table the shader used, whose entries the bits name
     const uint32_t *w = (const uint32_t *)b.contents; const uint8_t *t = (const uint8_t *)map.contents;
     int added = 0, shadowed = 0; double age_lo = 1e30, age_hi = -1;
