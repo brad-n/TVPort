@@ -8,6 +8,10 @@ def cbz_w(frm, to, rt):
     assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
     return 0x34000000 | (((off >> 2) & 0x7FFFF) << 5) | rt
 
+def cbnz_w(frm, to, rt):
+    return cbz_w(frm, to, rt) | 0x01000000
+
+
 # The game's frame ratio. Once a frame the function at main+0x6e6be0 (v131072) divides its base rate (60.0, or 30.0 while bit 0 of [x21+0x24f] is set) by the int frame rate at
 # [x21+0x2c8] (fdiv s8,s1,s0 at +0xe4) and hands the result to the time object (main+0x3b4e300: ratio at +0x10, 1 / ratio at +0x14, round(60 / ratio) at +0x1c), which the game
 # steps by; the frame's own time never enters it, so a frame that takes two vsyncs at rate 60 plays at half speed. The stub gives the ratio the host's step instead: step × base / 60
@@ -39,6 +43,7 @@ def frame_step(ctx):
     fs_put(site, [B(site, start)], 'frame ratio: the host\'s step × base rate / 60 instead of base rate / the game\'s frame rate (state page target fps; 0 = the game\'s ratio)')
     dynamic_resolution(ctx)
     render_scale(ctx)
+    shadow_map(ctx)
 
 def render_scale(ctx):   # fork: v131072's own addresses (every site asserts its bytes); a rule's function at another offset (another build) gets none
     if ctx.base != 0x6e6be0: return
@@ -87,6 +92,26 @@ def render_scale(ctx):   # fork: v131072's own addresses (every site asserts its
     emit(B(here(), 0x31d3f3c))
     ctx.put(0x31d3f38, [B(0x31d3f38, start)], 'view scale = the host render scale (1.0 = the game\'s dynamic resolution)')
     ctx.render_scale = 1
+
+
+def shadow_map(ctx):   # fork: v131072's own addresses (every site asserts its bytes); a rule's function at another offset (another build) gets none
+    if ctx.base != 0x6e6be0: return
+    here, emit = ctx.here, ctx.emit
+    # Static shadow map size (state +0xa0, u32 pixels written by the loader: DM_SHADOW_MAP_SIZE, 0 = the game's). The game keeps two depth textures (format 0x5a, Depth16) for its static
+    # depth shadows, the samplers cSamplerFineStaticDepthShadow / cSamplerCoarseStaticDepthShadow: a fine one of 12288x12288 (296 MB of the graphics memory on tvOS) and a coarse one of
+    # 4096x4096. Both sizes are literals, not the StaticSdwWidth parameter (4096 in Main.gsys__ModelSceneConfigParam, read into the config at +0x548). The fine one is made at
+    # main+0xc30c24 / main+0xc30c2c (width and height of the texture info of the function at main+0xc30870) and once more at main+0x344d78 (the call main+0xc2f3f0, which makes a render
+    # target of one size for both sides); the stubs put the host's size in place of the literal, so the game itself allocates the smaller texture and sizes its viewports from it. Each
+    # stub clobbers only the register the displaced mov wrote. No other 0x3000 / 12288.0 / 1/12288 literal belongs to the map (searched in the whole of main's code)
+    for site, rd in ((0xc30c24, 3), (0xc30c2c, 4), (0x344d78, 3)):
+        ctx.site(site, (0x52860000 | rd).to_bytes(4, 'little').hex())   # mov wN,#0x3000
+        start = here()
+        emit(ADRP(rd, here(), ctx.state))
+        emit(0xb940a000 | (rd << 5) | rd)   # ldr wN,[xN,#0xa0]     the host's size
+        emit(cbnz_w(here(), here() + 8, rd))   # set: keep it
+        emit(0x52860000 | rd)   # mov wN,#0x3000        the game's own
+        emit(B(here(), site + 4))
+        ctx.put(site, [B(site, start)], 'static shadow map size = the host size (0 = the game\'s 12288)')
 
 
 # The game's dynamic resolution (game__gfx__DynamicResolutionParam: LoadThreshold, ReduceCounterMax, IncreaseCounterMax and a list of levels, each a ResolutionReduceScale and a
@@ -142,5 +167,8 @@ BINDING = [
      'checked': 'v131072 main: one function with each fingerprint (the level function a leaf, x2..x11 / x16 / x17 / s0..s2 free), its callers, the update and the controller fields read by disassembly, the fields read in play (2026-11-08); the climb run natively against a model of the update and in play to full size (2026-11-09)'},
     {'what': 'view scale = the host render scale (DM_RENDER_SCALE)', 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
      'why': "the 3D views' scale store and the dynamic-resolution status in the graphics module's frame update, at v131072's offsets (the match rule's function is at main+0x6e6be0 there)",
+     'blocked': 'no function-matched form yet; sits beside the frame ratio stub, which is matched'},
+    {'what': 'static shadow map size (DM_SHADOW_MAP_SIZE)', 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+     'why': "the literal 12288 (mov wN,#0x3000) of the fine static depth shadow texture, at v131072's offsets (the match rule's function is at main+0x6e6be0 there)",
      'blocked': 'no function-matched form yet; sits beside the frame ratio stub, which is matched'},
 ]

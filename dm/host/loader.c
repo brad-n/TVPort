@@ -329,6 +329,11 @@ void dm_fps_state_apply(void) {
     const char *dr = getenv("DM_DYNAMIC_RESOLUTION"); uint32_t dyn = dr && !strcmp(dr, "1");
     if (dr && strcmp(dr, "0") && strcmp(dr, "1")) LOG("[RED] DM_DYNAMIC_RESOLUTION=%s: must be 0 or 1; keeping full resolution", dr);
     memcpy(dm_fps_state + 0x40, &dyn, sizeof dyn);
+    // Static shadow map size (Ocarina of Time's stubs at main+0xc30c24, main+0xc30c2c, main+0x344d78; u32 pixels at +0xa0): DM_SHADOW_MAP_SIZE makes the game's 12288x12288 fine static depth
+    // shadow texture (296 MB) that size instead; 4096 to 12288 in multiples of 1024. 0, 12288 or unset keeps the game's own
+    const char *ss = getenv("DM_SHADOW_MAP_SIZE"); uint32_t sz = 0;
+    if (ss && *ss) { char *end; unsigned long v = strtoul(ss, &end, 10); if (end == ss || *end || (v != 0 && (v < 4096 || v > 12288 || v % 1024))) LOG("[RED] DM_SHADOW_MAP_SIZE=%s: 4096 to 12288 in multiples of 1024; keeping the game's size", ss); else if (v != 12288) { sz = (uint32_t)v; if (sz) LOG("%s: static shadow map %ux%u instead of the game's 12288x12288 (DM_SHADOW_MAP_SIZE)", g_fps_mod, sz, sz); } }
+    memcpy(dm_fps_state + 0xa0, &sz, sizeof sz);
     // Screen shape: DM_SCREEN_ASPECT, the screen's width / height between 1.3 and 1.77, makes the builds with screen-shape stubs
     // (Breath of the Wild 1.9.0's patches.py) render that shape: the output keeps its width (1920) and takes the height that gives the ratio, a multiple of 48 so the
     // 2/3-size layout space (1280 wide) stays whole: 1.43 → 1920x1344 and 1280x896. State +0x48 u32 output height, +0x4c u32 layout height, +0x50 its float; 0 = 16:9
