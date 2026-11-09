@@ -6088,7 +6088,7 @@ static void shmap_read(void) {
     MLOG("shader route B (translated Switch originals): shader map %lu entries (%s), metallib directory %s", (unsigned long)g_shmap.count, path.UTF8String, g_msl_dir.UTF8String);
 }
 
-@interface NvShader : NSObject { @public id<MTLFunction> fn, tf_fn, discard_fn, fn_u, fn_m, fn_d, geo_fn; uint8_t mask_m;   // fn_u: the integer-output entry point (dmsh_build.py fs_uint), for pipelines whose colour attachments are all unsigned integer (pso_desc); fn_m: the mixed one, its outputs in mask_m unsigned integer; fn_d: the dual-source one (dmsh_build.py fs_dual)
+@interface NvShader : NSObject { @public id<MTLFunction> fn, tf_fn, discard_fn, fn_u, fn_m, fn_d, geo_fn; int nf_ok; NSMutableDictionary<NSNumber *, id<MTLFunction>> *nffn;   /* nf_ok: the library's entry points carry the non-finite colour output rewrite (dmsh_build.py finite_rg11, function constant DMSH_FINITE_FC); nffn: their specializations (nf_fn) */ uint8_t mask_m;   // fn_u: the integer-output entry point (dmsh_build.py fs_uint), for pipelines whose colour attachments are all unsigned integer (pso_desc); fn_m: the mixed one, its outputs in mask_m unsigned integer; fn_d: the dual-source one (dmsh_build.py fs_dual)
     uint16_t tf_stride[4]; uint32_t cb_ext[16], sb_ro; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, layer_out; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     uint32_t geo_vertices, geo_invocations, geo_output, geo_stride, geo_index_stride;
     uint8_t mesh_kind, mesh_notask; uint16_t mesh_threads, mesh_payload;   // an NVN2 task (1) or mesh (2) shader, a mesh shader with no task, its workgroup's threads, its payload's bytes (dmsh_meshstage.py)
@@ -6396,6 +6396,7 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
     if (stage == 1 && j[@"entry_m"]) { o->fn_m = fn4_note([lib newFunctionWithName:j[@"entry_m"]], lib, j[@"entry_m"], nil); o->mask_m = (uint8_t)[j[@"uint_mask_m"] unsignedIntValue];
         if (!o->fn_m) MLOG("[RED] shader %s: no mixed integer-output entry point %s in its library", pc.UTF8String, [j[@"entry_m"] UTF8String]); }
     if (stage == 1 && j[@"entry_d"]) { o->fn_d = fn4_note([lib newFunctionWithName:j[@"entry_d"]], lib, j[@"entry_d"], nil); if (!o->fn_d) MLOG("[RED] shader %s: no dual-source entry point %s in its library", pc.UTF8String, [j[@"entry_d"] UTF8String]); }
+    if (stage == 1) o->nf_ok = o->fn.functionConstantsDictionary[@"dm_nf_fc"] != nil;
     if (o->fn.functionConstantsDictionary.count) {   // a compute shader with constants has MTLDevice pipelines (cps_new): it is specialized through its library (fn_spec otherwise)
         NSError *fe = nil; MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new]; id<MTLFunction> (*spec)(id<MTLLibrary>, NSString *, MTLFunctionConstantValues *, NSError **) = stage == 5 ? fn_lib_spec : fn_spec;
         id<MTLFunction> f = spec(lib, entry, cv, &fe);
@@ -8268,6 +8269,35 @@ static void lo_bind(id<MTLCommandEncoder> en) {
     }
     enc_r_args((id<MTL4RenderCommandEncoder>)en, MTLRenderStageFragment, gpu, DMSH_LOGIC_BUFFER);
 }
+// A pixel shader's entry point (base: fn, fn_u, fn_m or fn_d) specialized for a pipeline with R11G11B10F colour attachments: mask bit n = colour output n is one (DMSH_FINITE_FC, dmsh_build.py
+// finite_rg11). That entry point then stores 0 for a NaN or infinity, as Maxwell does there, where Metal stores the format's largest value and the bloom spreads it over the screen (Ocarina of
+// Time's ground mist, upstream issue #1839). Kept per shader. DM_NVN_FINITE_RG11=0 leaves every pipeline with the unspecialized entry point (the rewrite compiles out)
+static int finite_rg11_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_FINITE_RG11"); on = !(e && *e && atoi(e) == 0); if (!on) MLOG("non-finite colour outputs to R11G11B10F targets: off (DM_NVN_FINITE_RG11=0)"); } return on; }
+static os_unfair_lock g_nf_lock = OS_UNFAIR_LOCK_INIT;
+static _Atomic int g_nf_variants;
+static id<MTLFunction> nf_fn(NvShader *fs, id<MTLFunction> base, uint32_t mask) {
+    int w = base == fs->fn ? 0 : base == fs->fn_u ? 1 : base == fs->fn_m ? 2 : base == fs->fn_d ? 3 : -1;
+    if (w < 0 || !mask) return base;
+    MTL4FunctionDescriptor *d = fn4_of(base);
+    if ([d isKindOfClass:[MTL4SpecializedFunctionDescriptor class]]) d = ((MTL4SpecializedFunctionDescriptor *)d).functionDescriptor;
+    if (![d isKindOfClass:[MTL4LibraryFunctionDescriptor class]]) return base;
+    id<MTLLibrary> lib = ((MTL4LibraryFunctionDescriptor *)d).library; NSString *name = ((MTL4LibraryFunctionDescriptor *)d).name;
+    if (!lib || !name) return base;
+    NSNumber *key = @(w << 8 | (mask & 0xff));
+    os_unfair_lock_lock(&g_nf_lock);
+    id<MTLFunction> f = fs->nffn[key];
+    if (!f) {
+        NSError *e = nil; MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new]; uint32_t m = mask & 0xff;
+        [cv setConstantValue:&m type:MTLDataTypeUInt atIndex:DMSH_FINITE_FC];
+        f = fn_spec(lib, name, cv, &e);
+        if (!f) { static int n; if (n++ < 8) MLOG("[RED] shader %s: the non-finite output entry point %s (mask %02x) failed: %s", fs->key, name.UTF8String, m, e.localizedDescription.UTF8String); f = base; }
+        else if (atomic_fetch_add(&g_nf_variants, 1) < 3) MLOG("non-finite colour outputs to R11G11B10F targets: %s entry %s specialized for outputs 0x%02x", fs->key, name.UTF8String, m);
+        if (!fs->nffn) fs->nffn = [NSMutableDictionary dictionary];
+        fs->nffn[key] = f;
+    }
+    os_unfair_lock_unlock(&g_nf_lock);
+    return f;
+}
 #define PSO_WHOLE @"built whole"   // pso_desc's label for pso_build_ex: no base, see there
 static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged) {
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
@@ -8312,6 +8342,10 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
         id<MTLFunction> lf = fsfn ? nil : lo_fn(fs, d.fragmentFunction, targets);
         if (lf) d.fragmentFunction = lf;
         else if (fsfn) RED_ONCE(136, "logic operation not applied to a specialized fragment (readable-tile merge or diagnostic) of %s", fs->key);
+    }
+    if (fs && fs->nf_ok && !fsfn && !merged && !k->atest && !k->logic && finite_rg11_on()) {   // a float colour output to an R11G11B10F attachment (finite_rg11): the entry point that stores 0 for a NaN or infinity
+        uint32_t nfm = 0; for (int i = 0; i < 8; i++) if (k->cfmt[i] == MTLPixelFormatRG11B10Float) nfm |= 1u << i;
+        if (nfm) d.fragmentFunction = nf_fn(fs, d.fragmentFunction, nfm);
     }
     if (vs && (k->fsfn == TF_MARK || k->fsfn == GEO_MARK || k->fsfn == DISCARD_MARK)) { d.fragmentFunction = nil; d.rasterizationEnabled = NO; }
     d.rasterSampleCount = k->samples ? k->samples : 1;

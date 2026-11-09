@@ -104,6 +104,8 @@
 #define DMSH_LOGIC_BUFFER 29
 // Its function constants: bool, colour target n is attached (the variant reads it only then), at this index + n (nvn_mtl.m lo_fn specializes the entry point per pass's targets)
 #define DMSH_LOGIC_FC 200
+// The pixel shaders' non-finite colour output rewrite (dmsh_build.py finite_rg11): a uint function constant, bit n set = colour output n is an R11G11B10F attachment (nvn_mtl.m nf_fn)
+#define DMSH_FINITE_FC 230
 // Compute shared memory past Metal's limit (dm/gfx/tools/dmsh_build.py tg_spill): a kernel whose threadgroup arrays exceed DMSH_TG_MAX bytes takes them from a device buffer at this compute
 // buffer index, one slice of the reflection's tg_spill bytes per workgroup, the workgroup's index in the dispatch modulo DMSH_TG_GROUPS (nvn_mtl.m dispatch binds DMSH_TG_GROUPS slices at most)
 #define DMSH_TG_SLOT 30
