@@ -470,7 +470,8 @@ static void res_top_once(NSError *err) {
     if (now - atomic_load(&since) > 60000000000ull) { atomic_store(&since, now); atomic_store(&fails, 0); }
     // On iOS the first failure ends the game: an iPad Pro (M5, Ocarina of Time at 8,523 of Metal's 8,192 MB) went down whole two failures in, and a run that went on drew broken frames
     // that took 120-600 ms of GPU each. The Mac keeps going until the 33rd within a minute, as a failure there can pass
-    enum { OOM_FAILS_MAX = TARGET_OS_IPHONE ? 0 : 32 };
+    int OOM_FAILS_MAX = TARGET_OS_IPHONE ? 0 : 32;
+    { const char *e = getenv("DM_OOM_FAILS_MAX"); if (e && *e) OOM_FAILS_MAX = atoi(e); }   // DM_OOM_FAILS_MAX=<n>: failures within a minute that are tolerated (32 lets a run go on past the first on iOS)
     int n = atomic_fetch_add(&fails, 1) + 1;
     if (n > OOM_FAILS_MAX) MDIE("the GPU is out of memory: %d command buffer%s failed within a minute (GPU allocated %llu MB, recommended working set %llu MB)", n, n == 1 ? "" : "s", (unsigned long long)(g_dev.currentAllocatedSize >> 20), (unsigned long long)(g_dev.recommendedMaxWorkingSetSize >> 20));
 }
