@@ -16,8 +16,13 @@ struct LayerArgs { uint W, H; uint tiles_x, tiles_y; };   // output size (pixels
 // one HMMA.16816 for an 8-pixel by 8-channel slice: a0/a1 = input channels 0-7 / 8-15 of the block, b0/b1 the matching weight rows; first: C = 0. Each block of 8
 // products is summed in f32 onto the f16 accumulator and rounded once to f16, as Ampere does (shaders.md, "HMMA rounds its f16 accumulator once per 8 products").
 // The rounding builds a new matrix: writing the rounded halves into acc's own thread_elements() (an element of the callers' accumulator arrays) made the layers
-// 15 to 50 times slower on an M6
-static inline hmat hmma_round(simdgroup_float8x8 f) { hmat h; h.thread_elements()[0] = half(f.thread_elements()[0]); h.thread_elements()[1] = half(f.thread_elements()[1]); return h; }
+// 15 to 50 times slower on an M6. It is one more multiply-accumulate onto f into a half result, of -0 x +0 products: x + -0 is x for every x, so the result is f
+// rounded to f16, the same bits as converting each lane's two elements (dmsh_build.py HMMA_BODY, test_dmsh_hmma.py RoundingByProduct), and Apple8 GPUs (M1 / M2,
+// the A15) run it as matrix work where the conversions cost them many times the network's own (NDSR on an M2 Pro: 3.3 against 1.5 ms)
+static inline hmat hmma_round(simdgroup_float8x8 f) {
+    const hmat nz = make_filled_simdgroup_matrix<half, 8, 8>(-0.0h), pz = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+    hmat h; simdgroup_multiply_accumulate(h, nz, pz, f); return h;
+}
 static inline void hmma(thread hmat &acc, hmat a0, hmat a1, hmat b0, hmat b1, bool first) {
     simdgroup_float8x8 f;
     if (first) simdgroup_multiply(f, a0, b0);
