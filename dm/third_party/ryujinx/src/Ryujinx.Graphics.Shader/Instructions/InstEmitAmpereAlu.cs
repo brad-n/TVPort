@@ -183,13 +183,26 @@ namespace Ryujinx.Graphics.Shader.Instructions
             return x.Bit(80) ? FlushDenormal(context, v) : v;
         }
 
+        // a cmp b with .FTZ: with shader_ftz_cmp through GetFtzFPComparison, which flushes nothing a constant operand decides; without it each operand's flush follows its own read, as before
+        private static Operand AFsetCompare(EmitterContext context, AmpereOp x, ASrc a, ASrc b)
+        {
+            FComp cond = (FComp)x.Bits(76, 80);
+
+            if (context.TranslatorContext.GpuAccessor.QueryHostFtzCompareConstant())
+            {
+                return GetFtzFPComparison(context, cond, AFloat(context, a), AFloat(context, b), x.Bit(80));
+            }
+
+            return GetFPComparison(context, cond, AFtz(context, x, AFloat(context, a)), AFtz(context, x, AFloat(context, b)));
+        }
+
         // FSET Rd, a, b: 1.0 where (a cmp b) bop P (87..90) holds, else 0.0
         public static void AFset(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
             (ASrc a, ASrc b) = ASecond(context, x);
 
-            Operand res = GetFPComparison(context, (FComp)x.Bits(76, 80), AFtz(context, x, AFloat(context, a)), AFtz(context, x, AFloat(context, b)));
+            Operand res = AFsetCompare(context, x, a, b);
             res = GetPredLogicalOp(context, (BoolOp)x.Bits(74, 76), res, APred(context, x, 87, 90));
 
             ASet(context, x, context.ConditionalSelect(res, ConstF(1), Const(0)));
@@ -201,7 +214,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             AmpereOp x = new(context.CurrOp);
             (ASrc a, ASrc b) = ASecond(context, x);
 
-            Operand cmp = GetFPComparison(context, (FComp)x.Bits(76, 80), AFtz(context, x, AFloat(context, a)), AFtz(context, x, AFloat(context, b)));
+            Operand cmp = AFsetCompare(context, x, a, b);
             Operand p = APred(context, x, 87, 90);
             BoolOp bop = (BoolOp)x.Bits(74, 76);
 

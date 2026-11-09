@@ -16,8 +16,12 @@ namespace Ryujinx.Graphics.Shader.Translation.Transforms
         {
             if (node.Value is TextureOperation texOp)
             {
-                node = InsertTexelFetchScale(context.Hfm, node, context.ResourceManager, context.Stage);
-                node = InsertTextureSizeUnscale(context.Hfm, node, context.ResourceManager, context.Stage);
+                // nxnative (shader_no_rescale): with every render scale 1.0 a texel fetch and a size query are their own unscaled values
+                if (!context.GpuAccessor.QueryHostRenderScaleOne())
+                {
+                    node = InsertTexelFetchScale(context.Hfm, node, context.ResourceManager, context.Stage);
+                    node = InsertTextureSizeUnscale(context.Hfm, node, context.ResourceManager, context.Stage);
+                }
 
                 if (texOp.Inst == Instruction.TextureSample)
                 {

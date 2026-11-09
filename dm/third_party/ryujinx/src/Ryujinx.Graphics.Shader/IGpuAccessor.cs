@@ -223,6 +223,61 @@ namespace Ryujinx.Graphics.Shader
         }
 
         /// <summary>
+        /// nxnative: queries whether the pixel shader pass that removes the w multiply of perspective inputs (Optimizer.EliminateMultiplyByFragmentCoordW) also takes the multiply's
+        /// operands in either order (a profile's shader_fragw_fold). Ampere code multiplies by 1 / w with an FMUL of its own, whose first operand is often the reciprocal.
+        /// </summary>
+        /// <returns>True to match both operand orders, false for the upstream order only</returns>
+        bool QueryHostFragCoordWFoldCommuted()
+        {
+            return false;
+        }
+
+        /// <summary>
+        /// nxnative: queries whether a .FTZ comparison with a constant operand drops the other operand's flush where the constant decides alike (a profile's shader_ftz_cmp, InstEmit.GetFtzFPComparison).
+        /// </summary>
+        /// <returns>True for the constant forms, false to flush both operands</returns>
+        bool QueryHostFtzCompareConstant()
+        {
+            return false;
+        }
+
+        /// <summary>
+        /// nxnative: queries whether an unordered float comparison is written as the negation of the ordered opposite (a profile's shader_unord_cmp, InstEmit.GetFPComparison).
+        /// </summary>
+        /// <returns>True for !(a opposite b), false for a cmp b || isnan(a) || isnan(b)</returns>
+        bool QueryHostUnorderedCompareNot()
+        {
+            return false;
+        }
+
+        /// <summary>
+        /// nxnative: queries whether a raw global memory lookup's binary search over the pool table is a loop rather than unrolled (a profile's shader_raw_loop, GlobalToStorage).
+        /// </summary>
+        /// <returns>True for the loop, false for the unrolled steps</returns>
+        bool QueryHostRawSearchLoop()
+        {
+            return false;
+        }
+
+        /// <summary>
+        /// nxnative: queries whether a raw global memory lookup keeps its last entry's start, end and delta in private words, so a hit reads no pool table word (a profile's shader_raw_regs, GlobalToStorage).
+        /// </summary>
+        /// <returns>True for the private words, false to read the table on every lookup</returns>
+        bool QueryHostRawRangeRegisters()
+        {
+            return false;
+        }
+
+        /// <summary>
+        /// nxnative: queries whether every render scale the support buffer holds is 1.0, so gl_FragCoord.xy, texel fetches and size queries need no rescale (a profile's shader_no_rescale).
+        /// </summary>
+        /// <returns>True to leave the rescale out, false for Ryujinx's resolution scaling code</returns>
+        bool QueryHostRenderScaleOne()
+        {
+            return false;
+        }
+
+        /// <summary>
         /// Queries host about the presence of the FrontFacing built-in variable bug.
         /// </summary>
         /// <returns>True if the bug is present on the host device used, false otherwise</returns>

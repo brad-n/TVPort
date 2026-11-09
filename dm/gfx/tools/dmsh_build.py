@@ -26,6 +26,16 @@ if f'"{CHAIN}"' not in open(dmsh_chain.HEADER).read(): sys.exit(f'[RED] {dmsh_ch
 INPUTS = dmsh_chain.inputs(GAME)   # the digest of the profile's inputs, which a full build stamps on its libraries (b-<V>/inputs.tsv)
 RAW_READ_LOG = GAME.get('shader_raw_read_log', '0') == '1'   # raw global loads log the pool table entry they read (the job's raw_read_log): the host keeps resident what they read (nvn_mtl.m gmem_map, DM_NVN_GMEM_MODE=learned)
 BORDER_EMU = GAME.get('shader_border_emu', '1') == '1'   # 0: border_emu leaves every sample alone (no twin samplers, no border block, no dm_bs): for a game whose samplers never need a border colour Metal lacks (Ocarina of Time). The profile's shader_* keys are in each shader's cache key and the library stamp, so changing it rebuilds
+# Translator options a profile key turns on, each 0 (the default: upstream's form) or 1, each with a job option of its own (dmsh_xlate Program.cs) and each its own rollback:
+#   shader_fragw_fold: a pixel shader's perspective inputs drop their x * w * (1 / w) whichever operand of either multiply comes first (Optimizer.EliminateMultiplyByFragmentCoordWCommuted)
+#   shader_ftz_cmp: a .FTZ comparison with a constant flushes nothing the constant decides (InstEmit.GetFtzFPComparison)
+#   shader_unord_cmp: an unordered float comparison is the negation of the ordered opposite, one comparison instead of three and two ORs (InstEmit.GetFPComparison)
+#   shader_raw_loop: a raw global memory lookup's binary search over the pool table is a loop, not 13 unrolled steps at each lookup (GlobalToStorage)
+#   shader_raw_regs: a raw lookup keeps its last entry's start, end and delta in private words, so a hit reads no table word (GlobalToStorage)
+#   shader_no_rescale: no division of gl_FragCoord.xy and no texel-fetch or size rescale by the support buffer's render scale, which the host always fills with 1.0 (InstEmitAttribute.EmitIpa, TexturePass)
+XLATE_KEYS = {'shader_fragw_fold': 'fragw_fold', 'shader_ftz_cmp': 'ftz_cmp', 'shader_unord_cmp': 'unord_cmp', 'shader_raw_loop': 'raw_loop', 'shader_raw_regs': 'raw_regs', 'shader_no_rescale': 'no_rescale'}
+XLATE_OPTS = {opt: True for key, opt in XLATE_KEYS.items() if GAME.get(key, '0') == '1'}
+WIDE_DEVICE = GAME.get('shader_wide_device', '0') == '1'   # 1: wide_loads also merges the words of device storage buffers the shader never writes (dmsh_wide.py unwritten)
 XLATE = os.environ.get('XLATE', os.path.join(dmsh_chain.XLATE_DIR, 'dmsh_xlate'))
 SPIRV_CROSS = dmsh_chain.SPIRV_CROSS   # the in-repo build the lock records
 FACTS = dmsh_facts.load()
@@ -865,7 +875,7 @@ def job_for(key, name, rec, w):
         if stage == 'ps' and early_fragment_tests(rec[ci:], code): extra['early_fragment_tests'] = True
     cp = os.path.join(w, key + '.bin'); open(cp, 'wb').write(code)
     j = {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), **extra,
-         'debug': os.environ.get('XLATE_DEBUG', '1') != '0', 'reduced': os.environ.get('XLATE_REDUCED', '1') == '1', **({'raw_read_log': True} if RAW_READ_LOG else {})}   # translation options (see dmsh_xlate/Program.cs); relaxed precision is on by default (GPU float last-bit error does not enter game state, whole frame −26% on the second Mac)   # c1: used by the translator to read indirect jump tables
+         'debug': os.environ.get('XLATE_DEBUG', '1') != '0', 'reduced': os.environ.get('XLATE_REDUCED', '1') == '1', **({'raw_read_log': True} if RAW_READ_LOG else {}), **XLATE_OPTS}   # translation options (see dmsh_xlate/Program.cs); relaxed precision is on by default (GPU float last-bit error does not enter game state, whole frame −26% on the second Mac)   # c1: used by the translator to read indirect jump tables
     if extra.get('mesh_stage'): return j, c1   # its threads and memory come from its control section (above)
     if key not in FACTS: j['no_facts'] = True; return j, c1   # not in the answer table: queries use defaults (listed separately in the summary)
     j.update(FACTS[key])
@@ -1692,7 +1702,7 @@ def finish(key, w, j, c1):
     except ValueError as e: return 'shared store rewrite failed', str(e)[:160], None
     try: src = pool_arrays(src)   # handles traced to no slot read the pools the replay keeps (see pool_arrays)
     except ValueError as e: return 'pool rewrite failed', str(e)[:160], None
-    src = dmsh_wide.wide_loads(src)   # storage words the translator split, read whole again (see dmsh_wide.py)
+    src = dmsh_wide.wide_loads(src, WIDE_DEVICE)   # storage words the translator split, read whole again (see dmsh_wide.py)
     src = border_emu(src, BORDER_EMU)   # border colours Metal lacks (see border_emu)
     if j['stage'] == 'ps': src = finite_rg11(frag_z_snap(src)[0])   # gl_FragCoord.z against a depth of its own surface (see frag_z_snap); a non-finite colour output of an R11G11B10F target (see finite_rg11)
     open(msl, 'w').write(src)

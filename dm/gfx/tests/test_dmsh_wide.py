@@ -118,10 +118,33 @@ class WideLoads(unittest.TestCase):
         plain = LIGHT.replace('const device', 'device')
         self.assertEqual(wide_loads(plain), plain)
 
+    # shader_wide_device: every buffer device, as the translator declares them once one is written (a raw read log). fp_s4 is written below, fp_s2 is passed to a function
+    DEVICE = LIGHT.replace('const device', 'device').replace('    out.m_0 = float4(', '    (*spvDescriptorSet0.fp_s4)._m0[int(_20)] = 7u;\n    out.m_0 = float4(')
+
+    def test_device_buffers_without_the_option(self):
+        self.assertNotIn('_dmw', wide_loads(self.DEVICE))
+
+    def test_unwritten_device_buffers_read_whole(self):
+        out = wide_loads(self.DEVICE, True)
+        self.assertIn('packed_uint4 _dmw0 = *(const device packed_uint4*)&(*spvDescriptorSet0.fp_s3)._m0[int(_3499)];', out)   # fp_s3 is only read
+        self.assertEqual(out.count('_dmw'), wide_loads(LIGHT).count('_dmw'))   # the same runs as with the buffers const (fp_s2's run is in another block there too)
+        self.assertIn('(*spvDescriptorSet0.fp_s4)._m0[int(_20)]', out)   # written: left alone
+
+    def test_what_is_not_unwritten(self):
+        import dmsh_wide
+        self.assertEqual(dmsh_wide.unwritten(self.DEVICE), {'fp_s2', 'fp_s3'})
+        call = self.DEVICE.replace('    out.m_0 = float4(', '    uint _91 = _17((*spvDescriptorSet0.fp_s2), 3);\n    out.m_0 = float4(')
+        self.assertEqual(dmsh_wide.unwritten(call), {'fp_s3'})   # passed to a function: it may write it
+        address = self.DEVICE.replace('    out.m_0 = float4(', '    uint _92 = atomic_fetch_add_explicit((device atomic_uint*)&(*spvDescriptorSet0.fp_s3)._m0[int(_20)], 1u, memory_order_relaxed);\n    out.m_0 = float4(')
+        self.assertEqual(dmsh_wide.unwritten(address), {'fp_s2'})
+        for raw in ('    *(reinterpret_cast<device uint*>(as_type<ulong>(uint2(uint(_20), uint(_21))))) = uint(_24);',
+                    '    uint _93 = atomic_fetch_add_explicit((device atomic_uint*)(reinterpret_cast<device uint*>(as_type<ulong>(uint2(uint(_20), uint(_21))))), 1u, memory_order_relaxed);'):
+            self.assertEqual(dmsh_wide.unwritten(self.DEVICE.replace('    out.m_0 = float4(', raw + '\n    out.m_0 = float4(')), set(), raw)   # a raw pointer may write any buffer's memory
+
     @unittest.skipUnless(shutil.which('xcrun') and sys.platform == 'darwin', 'Metal compiler')
     def test_compiles(self):
         with tempfile.TemporaryDirectory() as d:
-            for name, src in (('before', LIGHT), ('after', wide_loads(LIGHT))):
+            for name, src in (('before', LIGHT), ('after', wide_loads(LIGHT)), ('device', wide_loads(self.DEVICE, True))):
                 m = os.path.join(d, name + '.metal'); Path(m).write_text(src)
                 r = subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', '-O1', '-fpreserve-invariance', m, '-o', os.path.join(d, name + '.air')],
                                    capture_output=True, text=True)

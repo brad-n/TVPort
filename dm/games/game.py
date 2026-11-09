@@ -229,6 +229,8 @@ def header_one(g):
     if rrl not in ('0', '1'): sys.exit(f'{g.id}: shader_raw_read_log must be 0 or 1: {rrl}')
     sbe = g.get('shader_border_emu', '1')   # border colours Metal lacks corrected in the shaders through twin samplers (dmsh_build.py border_emu); 0 compiles the correction out: nvn_mtl.m then makes no twin and logs the samplers that would have needed one
     if sbe not in ('0', '1'): sys.exit(f'{g.id}: shader_border_emu must be 0 or 1: {sbe}')
+    for k in ('shader_fragw_fold', 'shader_ftz_cmp', 'shader_unord_cmp', 'shader_raw_loop', 'shader_raw_regs', 'shader_wide_device', 'shader_no_rescale'):   # translator options (dmsh_build.py XLATE_KEYS): build-only keys, no host define
+        if g.get(k, '0') not in ('0', '1'): sys.exit(f'{g.id}: {k} must be 0 or 1: {g.get(k)}')
     dbr = g.get('draw_barriers', 'full')   # how draw passes are ordered (nvn_mtl.m barrier_game): full = each waits for all earlier GPU work, game = by the game's own barriers, so vertex work overlaps the previous pass's fragments
     if dbr not in ('full', 'game'): sys.exit(f'{g.id}: draw_barriers must be full or game: {dbr}')
     gts = g.get('gpu_timestamps', 'submission')   # counter timestamps (nvn_mtl.m rep_ticks): submission = one time per submission, segment = the GPU start / end of the segment holding the report

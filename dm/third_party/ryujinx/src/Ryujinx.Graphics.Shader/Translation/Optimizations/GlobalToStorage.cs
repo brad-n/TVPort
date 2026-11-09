@@ -987,7 +987,19 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             int lastBinding = resourceManager.AddRawLastEntryMemory();
             Operand last = context.Load(StorageKind.LocalMemory, lastBinding);
             Operand lastEntry = context.IMultiply(last, Const(GmemMapEntryWords));
-            Operand lastHolds = context.BitwiseAnd(AtOrBelow(MapWord(lastEntry, 1), MapWord(lastEntry, 0)), Below(MapWord(lastEntry, 3), MapWord(lastEntry, 2)));
+
+            // nxnative (the profile key shader_raw_regs, IGpuAccessor.QueryHostRawRangeRegisters): that entry's start, end and delta (its words 0 to 5) kept in private words of the
+            // invocation too, zero at the start like the entry itself (entry 0 is empty), and written when the hint or the search chooses: a hit reads no table word. Ocarina of Time's
+            // ground mist (5ad65c0eefd09c7f) makes 43 lookups a pixel, 42 of them hits that read six table words each
+            bool rangeRegs = gpuAccessor.QueryHostRawRangeRegisters();
+            int rangeBinding = rangeRegs ? resourceManager.AddRawLastRangeMemory() : 0;
+
+            Operand LastWord(int word)
+            {
+                return rangeRegs ? context.Load(StorageKind.LocalMemory, rangeBinding, Const(word)) : MapWord(lastEntry, word);
+            }
+
+            Operand lastHolds = context.BitwiseAnd(AtOrBelow(LastWord(1), LastWord(0)), Below(LastWord(3), LastWord(2)));
             context.Copy(selected, last);
             context.BranchIfTrue(lblChosen, lastHolds);
 
@@ -1005,17 +1017,47 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             // The last entry whose start is at or below the address (entry 0 starts at 0, so there always is one)
             Operand index = Const(0);
 
-            for (int step = 1 << (GmemMapLog2 - 1); step != 0; step >>= 1)
+            if (gpuAccessor.QueryHostRawSearchLoop())
             {
-                Operand candidate = context.IAdd(index, Const(step));
+                // nxnative (the profile key shader_raw_loop, IGpuAccessor.QueryHostRawSearchLoop): the same 13 steps as a loop. Unrolled, each of a shader's lookups carried its own copy of
+                // the search (Ocarina of Time's ground mist: 43 lookups, two thirds of its main function's 36,212 LLVM instructions), though a lookup searches only when the hint misses
+                // and the last entry does not hold the address
+                Operand idx = Local();
+                Operand step = Local();
+                Operand lblStep = Label();
+
+                context.Copy(idx, Const(0));
+                context.Copy(step, Const(1 << (GmemMapLog2 - 1)));
+                context.MarkLabel(lblStep);
+                Operand candidate = context.IAdd(idx, step);
                 Operand entry = context.IMultiply(candidate, Const(GmemMapEntryWords));
-                index = context.ConditionalSelect(AtOrBelow(MapWord(entry, 1), MapWord(entry, 0)), candidate, index);
+                context.Copy(idx, context.ConditionalSelect(AtOrBelow(MapWord(entry, 1), MapWord(entry, 0)), candidate, idx));
+                context.Copy(step, context.ShiftRightU32(step, Const(1)));
+                context.BranchIfTrue(lblStep, context.ICompareNotEqual(step, Const(0)));
+                index = idx;
+            }
+            else
+            {
+                for (int step = 1 << (GmemMapLog2 - 1); step != 0; step >>= 1)
+                {
+                    Operand candidate = context.IAdd(index, Const(step));
+                    Operand entry = context.IMultiply(candidate, Const(GmemMapEntryWords));
+                    index = context.ConditionalSelect(AtOrBelow(MapWord(entry, 1), MapWord(entry, 0)), candidate, index);
+                }
             }
 
             context.Copy(selected, index);
             context.MarkLabel(lblFound);
             context.Store(StorageKind.LocalMemory, lastBinding, selected);
             Operand found = context.IMultiply(selected, Const(GmemMapEntryWords));
+
+            if (rangeRegs)
+            {
+                for (int word = 0; word < 6; word++)
+                {
+                    context.Store(StorageKind.LocalMemory, rangeBinding, Const(word), MapWord(found, word));
+                }
+            }
             Operand lblSkip = Label();
             context.BranchIfFalse(lblSkip, Below(MapWord(found, 3), MapWord(found, 2)));   // an address in no pool: the entry below it ends below it
 
@@ -1048,9 +1090,9 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             // A small integer is read or written in its 32-bit word
             Operand wordLow = isSmall ? context.BitwiseAnd(addrLow, Const(~3)) : addrLow;
-            Operand hostLow = context.IAdd(wordLow, MapWord(found, 4));
+            Operand hostLow = context.IAdd(wordLow, rangeRegs ? LastWord(4) : MapWord(found, 4));   // with shader_raw_regs the chosen entry's words are the private ones by now
             Operand carry = context.ConditionalSelect(context.ICompareLessUnsigned(hostLow, wordLow), Const(1), Const(0));
-            Operand hostHigh = context.IAdd(context.IAdd(addrHigh, MapWord(found, 5)), carry);
+            Operand hostHigh = context.IAdd(context.IAdd(addrHigh, rangeRegs ? LastWord(5) : MapWord(found, 5)), carry);
 
             Operand resultValue = null;
 

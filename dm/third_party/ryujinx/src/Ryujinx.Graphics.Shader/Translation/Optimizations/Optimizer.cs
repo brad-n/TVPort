@@ -39,7 +39,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 // FragmentCoord only exists on fragment shaders, so we don't need to check other stages.
                 if (context.Stage == ShaderStage.Fragment)
                 {
-                    EliminateMultiplyByFragmentCoordW(context.Blocks[blkIndex]);
+                    EliminateMultiplyByFragmentCoordW(context.Blocks[blkIndex], context.GpuAccessor.QueryHostFragCoordWFoldCommuted());
                 }
 
                 // If the host does not support double operations, we need to turn them into float operations.
@@ -297,15 +297,64 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             return modified;
         }
 
-        private static void EliminateMultiplyByFragmentCoordW(BasicBlock block)
+        private static void EliminateMultiplyByFragmentCoordW(BasicBlock block, bool commuted)
         {
             foreach (INode node in block.Operations)
             {
                 if (node is Operation operation)
                 {
-                    EliminateMultiplyByFragmentCoordW(operation);
+                    if (commuted)
+                    {
+                        EliminateMultiplyByFragmentCoordWCommuted(operation);
+                    }
+                    else
+                    {
+                        EliminateMultiplyByFragmentCoordW(operation);
+                    }
                 }
             }
+        }
+
+        // nxnative (the profile key shader_fragw_fold, IGpuAccessor.QueryHostFragCoordWFoldCommuted): the same pattern with either operand order in both multiplies. Ampere has no IPA.MUL:
+        // its IPA reads a perspective input as x * gl_FragCoord.w (InstEmitAmpereMem.AIpa), and the shader's own FMUL takes it times 1 / gl_FragCoord.w, the reciprocal first
+        // as often as not (Ocarina of Time: 3,589 of the 3,591 such products of its 280 pixel shaders in one frame, all missed by the upstream order). Each one left costs two
+        // multiplies a component, and the reciprocal itself once none is left
+        private static void EliminateMultiplyByFragmentCoordWCommuted(Operation operation)
+        {
+            if (operation.Inst != (Instruction.FP32 | Instruction.Multiply))
+            {
+                return;
+            }
+
+            for (int side = 0; side < 2; side++)
+            {
+                Operand attrMul = operation.GetSource(side);
+                Operand reciprocal = operation.GetSource(side ^ 1);
+
+                if (attrMul.AsgOp is not Operation attrMulOp || attrMulOp.Inst != (Instruction.FP32 | Instruction.Multiply) || !IsReciprocalOfFragmentCoordW(reciprocal))
+                {
+                    continue;
+                }
+
+                for (int attrSide = 0; attrSide < 2; attrSide++)
+                {
+                    Operand attr = attrMulOp.GetSource(attrSide);
+
+                    if (Utils.IsInputLoad(attr.AsgOp) && Utils.IsInputLoad(attrMulOp.GetSource(attrSide ^ 1).AsgOp, IoVariable.FragmentCoord, 3))
+                    {
+                        operation.TurnIntoCopy(attr);
+
+                        return;
+                    }
+                }
+            }
+        }
+
+        private static bool IsReciprocalOfFragmentCoordW(Operand operand)
+        {
+            return operand.AsgOp is Operation op && op.Inst == (Instruction.FP32 | Instruction.Divide) &&
+                   op.GetSource(0).Type == OperandType.Constant && op.GetSource(0).AsFloat() == 1.0f &&
+                   Utils.IsInputLoad(op.GetSource(1).AsgOp, IoVariable.FragmentCoord, 3);
         }
 
         private static void EliminateMultiplyByFragmentCoordW(Operation operation)
