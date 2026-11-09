@@ -41,6 +41,7 @@ struct Game: Codable, Identifiable, Hashable {
     var texture: TextureDetail = .medium
     var renderScale: Double?   // the 3D views at this fraction of the game's size, for games with a render-scale stub; nil = full size. Optional: library.json saved before it decodes as is
     var coolWhenHot: Bool?     // frame-step games hold 30 fps while the TV is thermally serious; nil = on (the engine's default)
+    var upscaler: String?      // "metalfx" or "off" in place of the game's own upscaler; nil = the game's own (backend --upscaler)
     var fpsTarget: Int?        // 30 or 60 in place of the profile's fps_target; nil = the profile's
     var swapABXY: Bool?       // Legacy combined choice, retained when reading older libraries.
     var swapAB: Bool?
@@ -487,6 +488,7 @@ final class Library: ObservableObject {
         if game.swapsXY { arguments.append("--swap-xy") }
         if game.showFPS { arguments.append("--fps") }
         if let scale = game.renderScale, scale < 1, info.render_scale == true { arguments += ["--render-scale", String(scale)] }
+        if let choice = game.upscaler, choice == "metalfx" || choice == "off" { arguments += ["--upscaler", choice] }
         if game.coolWhenHot == false, info.frame_step == true { arguments.append("--no-thermal-cap") }
         if let fps = game.fpsTarget, (info.fps_target ?? 0) != 0, fps != info.fps_target { arguments += ["--fps-target", String(fps)] }
         if !team.isEmpty { arguments += ["--team", team] }
