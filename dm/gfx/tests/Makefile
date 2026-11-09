@@ -507,6 +507,12 @@ t_image_attachment_store: t_image_attachment_store.m $(MTL_T_DEP)
 check_t_image_attachment_store: RUN_ENV = MTL_DEBUG_LAYER=1
 t_image_primitive_id: t_image_primitive_id.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_image_primitive_id.m $(MTL_T_SRC) $(FW)
+t_gpu_pass: t_gpu_pass.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_gpu_pass.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_gpu_pass
+check_t_gpu_pass: t_gpu_pass
+	MTL_DEBUG_LAYER=1 ./t_gpu_pass
+	MTL_DEBUG_LAYER=1 ./t_gpu_pass global
 t_unwritten_store: t_unwritten_store.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_unwritten_store.m $(MTL_T_SRC) $(FW)
 check_t_unwritten_store: RUN_ENV = MTL_DEBUG_LAYER=1
