@@ -170,7 +170,7 @@ DM_NVN_DISPATCH_OWN	switch	`=1` gives every compute dispatch a compute encoder o
 DM_NVN_DUAL_WANT	path	`=<file>`: appends the key of each pixel shader a pipeline blends with its output 1 as the second source, while it has no dual-source entry point, to that file, once per key (the profile's `dual_want.tsv`)
 DM_NVN_EMPTY_SUB	switch	`1` (off by default): a submission with no GPU work (an event signal alone, an empty job) is not committed as a Metal command buffer; its fence completes through the shared event after everything committed before it
 DM_NVN_ENC_ASYNC	switch	`1` (off by default; needs `DM_NVN_ENC_THREAD`): a submission's end hands its records, its commit and fence signal among them, to the encode thread and goes on instead of waiting for them; the present thread commits a frame only after a note recorded behind the frame's work
-DM_NVN_ENC_LABEL	diagnostic	`=1` labels every render encoder `p<pass in frame> <width>x<height> <first 8 digits of the first draw's fragment key> d<draws>` for Instruments traces
+DM_NVN_ENC_LABEL	diagnostic	`=1` labels every render encoder `p<pass in frame> <width>x<height> <first 8 digits of the first draw's fragment key> d<draws>`, and every copy encoder that holds the game's dispatches `c<passes of the frame ended before it> n<dispatches> <first 8 digits of its first compute key>`, for Instruments traces; with `DM_NVN_GPUPROF` the `[gpuprof]` lines also name those keys (`fs` / `cs`), so a run can be matched pass by pass against another
 DM_NVN_ENC_THREAD	player	`1` runs the replay's Metal encoding on a thread of its own while the submit thread goes on translating; on by default on iOS (`0` turns it off), off on macOS
 DM_NVN_END_ALIAS	diagnostic	`1` puts the resource-alias flush back on every encoder's end barrier (each costs the command allocator about 100 KB; the start barriers carry it); `ab` alternates it with the `DM_AB` phases
 DM_NVN_FAST_WAKE	switch	`0` makes the game's `SyncWait`s wake on the commit feedback handler instead of the GPU's own signal of the fence (on by default)
@@ -236,8 +236,9 @@ DM_NVN_SHDUMP	diagnostic	`=<dir>` saves programs missing from the shader map as 
 DM_NVN_SHMAP	path	The shader map (`shader_map.tsv`); `c1_full.tsv` and `pso_manifest.tsv` are taken from the same folder. Default: the game profile's folder on the Mac; the iOS app sets it
 DM_NVN_SHOT	diagnostic	`=<frame>[,<frame>…]:<path>` saves the swapchain texture as an image at those frames (`%d` in the path = frame number)
 DM_NVN_SHOT_OUT	diagnostic	`=<W>x<H>` makes `DM_NVN_SHOT` capture the picture as the present pass upscales it to that size, the crop included, instead of the raw swapchain texture
-DM_NVN_SKIP_FS	diagnostic	`=<fragment key>[,…]` (up to 16) drops all draws of those fragment shaders, to measure their GPU cost or bisect a wrong draw; the picture is wrong
-DM_NVN_SKIP_MESH	diagnostic	`=1` drops every task and mesh draw, to measure what they cost in all; the picture is wrong
+DM_NVN_SKIP_CS	diagnostic	`=<compute key>[,…]` (up to 16) drops all dispatches of those compute shaders, as `DM_NVN_SKIP_FS` drops draws, to measure their GPU cost; the picture is wrong
+DM_NVN_SKIP_FS	diagnostic	`=<fragment key>[,…]` (up to 64) drops all draws of those fragment shaders, to measure their GPU cost or bisect a wrong draw; the picture is wrong
+DM_NVN_SKIP_MESH	diagnostic	`=1` drops every task and mesh draw, `=task` only those with a task shader, `=notask` only those without, to measure what they cost; the picture is wrong
 DM_NVN_SKIP_SMALL	diagnostic	`=<width>` drops all draws whose target width is at most that, to measure the cost of tiny render passes; the picture is wrong
 DM_NVN_SLICE_MERGE	switch	`0` keeps passes into other layers of one array or cube texture level apart (on by default: they run as one layered pass)
 DM_NVN_SNAPRAW	diagnostic	`=1` makes `DM_NVN_TEXDUMP` also save each target's raw bytes, with a text header line, since converting an HDR target to an 8-bit image truncates
