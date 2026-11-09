@@ -26,7 +26,8 @@ if f'"{CHAIN}"' not in open(dmsh_chain.HEADER).read(): sys.exit(f'[RED] {dmsh_ch
 INPUTS = dmsh_chain.inputs(GAME)   # the digest of the profile's inputs, which a full build stamps on its libraries (b-<V>/inputs.tsv)
 RAW_READ_LOG = GAME.get('shader_raw_read_log', '0') == '1'   # raw global loads log the pool table entry they read (the job's raw_read_log): the host keeps resident what they read (nvn_mtl.m gmem_map, DM_NVN_GMEM_MODE=learned)
 BORDER_EMU = GAME.get('shader_border_emu', '1') == '1'   # 0: border_emu leaves every sample alone (no twin samplers, no border block, no dm_bs): for a game whose samplers never need a border colour Metal lacks (Ocarina of Time). The profile's shader_* keys are in each shader's cache key and the library stamp, so changing it rebuilds
-# Translator options a profile key turns on, each 0 (the default: upstream's form) or 1, each with a job option of its own (dmsh_xlate Program.cs) and each its own rollback:
+# Translator options a profile key turns on or off, each 0 (upstream's form) or 1, each with a job option of its own (dmsh_xlate Program.cs) and each its own rollback;
+# the default is XLATE_DEFAULT (below): every exact form on, shader_raw_loop off (no gain measured):
 #   shader_fragw_fold: a pixel shader's perspective inputs drop their x * w * (1 / w) whichever operand of either multiply comes first (Optimizer.EliminateMultiplyByFragmentCoordWCommuted)
 #   shader_ftz_cmp: a .FTZ comparison with a constant flushes nothing the constant decides (InstEmit.GetFtzFPComparison)
 #   shader_unord_cmp: an unordered float comparison is the negation of the ordered opposite, one comparison instead of three and two ORs (InstEmit.GetFPComparison)
@@ -34,8 +35,13 @@ BORDER_EMU = GAME.get('shader_border_emu', '1') == '1'   # 0: border_emu leaves 
 #   shader_raw_regs: a raw lookup keeps its last entry's start, end and delta in private words, so a hit reads no table word (GlobalToStorage)
 #   shader_no_rescale: no division of gl_FragCoord.xy and no texel-fetch or size rescale by the support buffer's render scale, which the host always fills with 1.0 (InstEmitAttribute.EmitIpa, TexturePass)
 XLATE_KEYS = {'shader_fragw_fold': 'fragw_fold', 'shader_ftz_cmp': 'ftz_cmp', 'shader_unord_cmp': 'unord_cmp', 'shader_raw_loop': 'raw_loop', 'shader_raw_regs': 'raw_regs', 'shader_no_rescale': 'no_rescale'}
-XLATE_OPTS = {opt: True for key, opt in XLATE_KEYS.items() if GAME.get(key, '0') == '1'}
-WIDE_DEVICE = GAME.get('shader_wide_device', '0') == '1'   # 1: wide_loads also merges the words of device storage buffers the shader never writes (dmsh_wide.py unwritten)
+# On for every game since 2026-11-09, each exact (dm/games/README.md; tests: test_dmsh_fragw.py, test_dmsh_cmp_forms.py, test_dmsh_raw_compact.py, test_dmsh_wide.py,
+# test_dmsh_xlate_defaults.py); a profile's 0 turns one off. shader_wide_device is dmsh_wide.py's, not the translator's, and on likewise
+XLATE_DEFAULT = {'shader_fragw_fold': '1', 'shader_ftz_cmp': '1', 'shader_unord_cmp': '1', 'shader_raw_loop': '0', 'shader_raw_regs': '1', 'shader_no_rescale': '1', 'shader_wide_device': '1'}
+def xlate_opts(get):   # the job's translator options from the profile's keys (get: GAME.get)
+    return {opt: True for key, opt in XLATE_KEYS.items() if get(key, XLATE_DEFAULT[key]) == '1'}
+XLATE_OPTS = xlate_opts(GAME.get)
+WIDE_DEVICE = GAME.get('shader_wide_device', XLATE_DEFAULT['shader_wide_device']) == '1'   # 1: wide_loads also merges the words of device storage buffers the shader never writes (dmsh_wide.py unwritten)
 XLATE = os.environ.get('XLATE', os.path.join(dmsh_chain.XLATE_DIR, 'dmsh_xlate'))
 SPIRV_CROSS = dmsh_chain.SPIRV_CROSS   # the in-repo build the lock records
 FACTS = dmsh_facts.load()
