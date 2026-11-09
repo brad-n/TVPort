@@ -22,3 +22,7 @@ int nvn_astc_walk_planes(const nvn_texdesc *d, const void *storage, unsigned ski
 // DM_BC_MAX_DIM=<cap>: how many of a texture's finest levels the runtime leaves out on a GPU without BC (0 for no cap, a 3D/cube/1D texture, or a non-BC format). The first level kept has its longest side
 // <= cap, or it is the last level when none fits. nvn_mtl.m bc_skip and the offline prebuild (bntx_astc.py --max-dim) both take it from here, so the planes the pack holds are the planes the runtime asks for
 unsigned nvn_bc_skip_levels(const nvn_texdesc *d, int cap);
+// DM_ASTC_MAX_DIM: the same for a texture that is ASTC in the file (NVN formats 0x79-0x94, any block size, LDR and sRGB; NVN has no ASTC HDR format). Only 2D and 2D array textures; nothing is ever upscaled.
+// *short_chain (optional) is set when the texture is over the cap but its mip chain has no level that fits, so it keeps its last level (a texture without mips is left whole). nvn_mtl.m bc_skip uses it
+int nvn_fmt_astc_native(uint32_t nvn_fmt);
+unsigned nvn_astc_skip_levels(const nvn_texdesc *d, int cap, int *short_chain);
