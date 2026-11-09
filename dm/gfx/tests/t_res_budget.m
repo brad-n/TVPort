@@ -38,6 +38,7 @@ static void set_used(void *mem, uint64_t v) { pthread_mutex_lock(&g_mu); int i =
 
 int main(void) { @autoreleasepool {
     setenv("DM_NVN_POOL_UNWIRE", "0", 1);   // pool_age out of the way
+    g_rb_window_ns = 0;   // a round's phase 2 as soon as its submissions have completed (t_res_window checks the window)
     mtl_init();
     uint8_t *cmd = pool_mem(65536), *d[NP]; mtl_pool_add(cmd, 65536);
     for (int i = 0; i < NP; i++) { d[i] = pool_mem(PSZ); mtl_pool_add(d[i], PSZ); }
@@ -89,7 +90,7 @@ int main(void) { @autoreleasepool {
     EXPECT("pool last addressed within the safe point goes", 0, resident(d[2]));
     // 5. A pinned pool (a texture made on its buffer) is never taken
     for (int i = 0; i < NP; i++) touch_sub(d[i]);
-    pool_pin_at(d[4]); safe = atomic_load(&g_fence);
+    { void *b; uint64_t o; mtl_addr((uint64_t)(uintptr_t)d[4], 16, &b, &o); pool_pin_buf((__bridge id<MTLBuffer>)b); } safe = atomic_load(&g_fence);
     res_evict_to_budget(1, safe);
     EXPECT("pinned pool stays", 1, resident(d[4]));
     EXPECT("other pool goes", 0, resident(d[5]));

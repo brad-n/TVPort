@@ -19,6 +19,8 @@ static const char *lg_fmt(uint32_t f, char *buf, size_t n) {
 }
 static int lg_cmp(const void *a, const void *b) { const lg_group *x = a, *y = b; return x->bytes < y->bytes ? 1 : x->bytes > y->bytes ? -1 : 0; }
 static uint64_t g_lg_t0;
+typedef struct { uintptr_t a, b; } lg_rng;   // a resident pool buffer's memory (lg_dump: distinct memory)
+static int lg_rng_cmp(const void *x, const void *y) { uintptr_t a = ((const lg_rng *)x)->a, b = ((const lg_rng *)y)->a; return a < b ? -1 : a > b; }
 // A shared texture's memory: its heap's, once per heap (an image family's descriptions share one), none for a view or a texture over a buffer (res_size), else its own allocation
 static uint64_t lg_tex_bytes(id o, CFMutableSetRef heaps) {
     if (![o conformsToProtocol:@protocol(MTLTexture)]) return 0;
@@ -97,11 +99,17 @@ static void lg_dump(void) { @autoreleasepool {
         else { other_n++; other_b += sz; }
     }
     CFRelease(inset); CFRelease(obufs);
-    uint64_t pool_n = 0, pool_b = 0, poolres_n = 0, poolres_b = 0, dead_n = 0, dead_b = 0;
+    // The chunks of a large pool overlap (BIG_MIN), and a replaced chunk stays in the set beside the longer one (g_old_res): the resident pool buffers' lengths count shared pages more than once,
+    // and the residency budget counts those lengths. distinct_b is the memory they cover
+    uint64_t pool_n = 0, pool_b = 0, poolres_n = 0, poolres_b = 0, dead_n = 0, dead_b = 0, oldres_n = 0, oldres_b = 0, distinct_b = 0, pin_n = 0, pin_b = 0, pin_big = 0, pin_old = 0;   // pin: textures made on the buffer (pool_pin_buf); pin_big: chunks of a large pool among them
     @autoreleasepool { pthread_mutex_lock(&g_mu);
-        for (int i = 0; i < g_npool; i++) { uint64_t n = g_pools[i].hi - g_pools[i].lo; pool_n++; pool_b += n; if (g_pools[i].res && g_pools[i].buf) { poolres_n++; poolres_b += g_pools[i].buf.length; } }
+        lg_rng *rr = malloc((size_t)(g_npool + g_n_old_res + 1) * sizeof *rr); int nr = 0;
+        for (int i = 0; i < g_npool; i++) { uint64_t n = g_pools[i].hi - g_pools[i].lo; pool_n++; pool_b += n; if (g_pools[i].res && g_pools[i].buf) { uint64_t l = g_pools[i].buf.length; poolres_n++; poolres_b += l; if (rr) rr[nr++] = (lg_rng){g_pools[i].base, g_pools[i].base + l}; }
+            if (g_pools[i].pin) { pin_n++; pin_b += g_pools[i].buf.length; pin_big += g_pools[i].unk != 1 || g_pools[i].end != g_pools[i].hi; } }
+        for (int k = 0; k < g_n_old_res; k++) { id<MTLBuffer> b = g_old_res[k].buf; uintptr_t a = (uintptr_t)b.contents; oldres_n++; oldres_b += b.length; pin_old += g_old_res[k].pin != 0; if (rr) rr[nr++] = (lg_rng){a, a + b.length}; }
         for (id<MTLBuffer> b in g_dead_pools) { dead_n++; dead_b += b.length; }
-        pthread_mutex_unlock(&g_mu); }
+        pthread_mutex_unlock(&g_mu);
+        if (rr) { qsort(rr, (size_t)nr, sizeof *rr, lg_rng_cmp); uintptr_t end = 0; for (int i = 0; i < nr; i++) { uintptr_t a = rr[i].a > end ? rr[i].a : end; if (rr[i].b > a) distinct_b += rr[i].b - a; if (rr[i].b > end) end = rr[i].b; } free(rr); } }
     os_unfair_lock_lock(&g_rh_lk); unsigned rh_n = g_rh_n; uint64_t rh_b = g_rh_bytes; os_unfair_lock_unlock(&g_rh_lk);
     uint64_t up_b = 0, up_n = 0; for (unsigned s = 0; s < 3; s++) { if (g_up_slot_blk[s]) { up_b += g_up_slot_blk[s].length; up_n++; } if (g_up_slot_over[s]) { up_b += g_up_slot_over[s].length; up_n++; } }
     char avail[32] = "n/a";
@@ -113,12 +121,12 @@ static void lg_dump(void) { @autoreleasepool {
          (unsigned long long)secs, (unsigned long long)atomic_load(&g_cur_frame), total / M, g_dev.recommendedMaxWorkingSetSize / M, avail, robjs, rb / M, total > rb ? (total - rb) / M : 0.0);
     MLOG("[ledger]   render targets %llu textures, %.0f MB; sampled textures %llu, %.0f MB (ASTC %llu / %.0f MB, BC %llu / %.0f MB, other %llu / %.0f MB)",
          (unsigned long long)rt_n, rt_b / M, (unsigned long long)(st_n[0] + st_n[1] + st_n[2]), (st_b[0] + st_b[1] + st_b[2]) / M, (unsigned long long)st_n[0], st_b[0] / M, (unsigned long long)st_n[1], st_b[1] / M, (unsigned long long)st_n[2], st_b[2] / M);
-    MLOG("[ledger]   buffers in the set %llu, %.0f MB (of them resident pool buffers %llu, %.0f MB); heaps %llu, %.0f MB; other objects %llu, %.0f MB",
-         (unsigned long long)buf_n, buf_b / M, (unsigned long long)poolres_n, poolres_b / M, (unsigned long long)heap_n, heap_b / M, (unsigned long long)other_n, other_b / M);
+    MLOG("[ledger]   buffers in the set %llu, %.0f MB (of them resident pool buffers %llu, %.0f MB, and replaced chunks %llu, %.0f MB: %.0f MB of distinct memory); heaps %llu, %.0f MB; other objects %llu, %.0f MB",
+         (unsigned long long)buf_n, buf_b / M, (unsigned long long)poolres_n, poolres_b / M, (unsigned long long)oldres_n, oldres_b / M, distinct_b / M, (unsigned long long)heap_n, heap_b / M, (unsigned long long)other_n, other_b / M);
     MLOG("[ledger]   heaps by kind: recycled render targets %llu, %.0f MB; image families %llu, %.0f MB; sparse tiles %llu, %.0f MB; other %llu, %.0f MB; textures over buffers %llu (their memory is the buffers'; buffers outside the set %.0f MB)",
          (unsigned long long)hk_n[0], hk_b[0] / M, (unsigned long long)hk_n[1], hk_b[1] / M, (unsigned long long)hk_n[2], hk_b[2] / M, (unsigned long long)hk_n[3], hk_b[3] / M, (unsigned long long)ob_n, ob_b / M);
-    MLOG("[ledger]   memory pools registered %llu, %.0f MB (resident %llu, %.0f MB); pool buffers freed but alive %llu, %.0f MB; recycled heaps waiting (RH) %u, %.0f MB; upload staging kept %llu blocks, %.0f MB",
-         (unsigned long long)pool_n, pool_b / M, (unsigned long long)poolres_n, poolres_b / M, (unsigned long long)dead_n, dead_b / M, rh_n, rh_b / M, (unsigned long long)up_n, up_b / M);
+    MLOG("[ledger]   memory pools registered %llu, %.0f MB (resident %llu, %.0f MB; pinned by a texture made on the buffer %llu, %.0f MB, of them large-pool chunks %llu, and replaced chunks %llu); pool buffers freed but alive %llu, %.0f MB; recycled heaps waiting (RH) %u, %.0f MB; upload staging kept %llu blocks, %.0f MB",
+         (unsigned long long)pool_n, pool_b / M, (unsigned long long)poolres_n, poolres_b / M, (unsigned long long)pin_n, pin_b / M, (unsigned long long)pin_big, (unsigned long long)pin_old, (unsigned long long)dead_n, dead_b / M, rh_n, rh_b / M, (unsigned long long)up_n, up_b / M);
     qsort(rt, nrt, sizeof rt[0], lg_cmp); qsort(sm, nsm, sizeof sm[0], lg_cmp);
     for (int i = 0; i < nrt && i < 8; i++) { char fb[16]; uint64_t k = rt[i].key;
         MLOG("[ledger]   render targets %llux%llu x%llu %s%s: %u, %.0f MB", (unsigned long long)(k >> 48), (unsigned long long)(k >> 32 & 0xffff), (unsigned long long)(k >> 24 & 0xff), lg_fmt((uint32_t)(k & 0xffff), fb, sizeof fb), (k >> 16 & 0xff) > 1 ? " (multisampled)" : "", rt[i].n, rt[i].bytes / M); }

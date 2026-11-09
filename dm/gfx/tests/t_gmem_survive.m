@@ -14,6 +14,7 @@ static int resident(const void *mem) { pthread_mutex_lock(&g_mu); int i = pool_f
 static void touch_sub(void *mem) { void *b; uint64_t o; mtl_sub_begin(); mtl_addr((uint64_t)(uintptr_t)mem, 16, &b, &o); mtl_sub_commit(); mtl_wait_at(atomic_load(&g_fence), UINT64_MAX, WS_SYNC); }
 static void raw_subs(int n) { for (int i = 0; i < n; i++) { mtl_sub_begin(); (void)gmem_map(); mtl_sub_commit(); mtl_wait_at(atomic_load(&g_fence), UINT64_MAX, WS_SYNC); } }   // a raw-memory draw in every submission
 int main(void) { @autoreleasepool {
+    g_rb_window_ns = 0;   // rounds as soon as their submissions have completed: the checks count submissions (t_res_window checks the window)
     mtl_init();
     uint8_t *d[NP];
     for (int i = 0; i < NP; i++) { if (posix_memalign((void **)&d[i], getpagesize(), PSZ)) abort(); memset(d[i], 0, PSZ); mtl_pool_add(d[i], PSZ); mtl_pool_addressed(d[i], PSZ); }

@@ -246,6 +246,11 @@ t_res_budget: t_res_budget.m $(MTL_T_DEP)
 .PHONY: check_t_res_budget
 check_t_res_budget: t_res_budget
 	MTL_DEBUG_LAYER=1 ./t_res_budget
+t_res_window: t_res_window.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_res_window.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_res_window
+check_t_res_window: t_res_window
+	DM_NVN_POOL_UNWIRE=0 DM_NVN_GMEM_MODE='learned!' MTL_DEBUG_LAYER=1 ./t_res_window
 t_pool_age: t_pool_age.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_age.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
 .PHONY: check_t_pool_age

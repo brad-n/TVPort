@@ -627,7 +627,7 @@ static want_list g_bf_want = {"DM_NVN_BF_WANT", PTHREAD_MUTEX_INITIALIZER}, g_du
 void bf_want_note(const char *key) { want_note(&g_bf_want, key); }
 
 // ---------- Memory pools ----------
-typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; _Atomic uint64_t *used; int pin, aged; uint64_t born; uintptr_t end; uint64_t unk; uint32_t n_tex_reads, n_other; int gm, want; uint64_t rd; } pool_ent;   // gm: in the raw pool table last built with a residency budget (gmem_map); rd: the fence of the last submission whose raw loads read the pool (learned mode); want: a raw load read the pool's stub entry (DM_NVN_GMEM_MODE=learned, gml_rd_read), the next table lists it resident   // res: already in the residency set (on demand, see pool_res); born: when it was added (ns); end, unk: a large pool's chunk (see BIG_MIN); n_tex_reads / n_other: lookups by texture uploads / by anything else (mem_census)
+typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; _Atomic uint64_t *used; int pin, aged; uint64_t born; uintptr_t end; uint64_t unk; uint32_t n_tex_reads, n_other; int gm, want; uint64_t rd, rd_t; } pool_ent;   // gm: in the raw pool table last built with a residency budget (gmem_map); rd, rd_t: the fence of the last submission whose raw loads read the pool (learned mode), and when that was read (ns); want: a raw load read the pool's stub entry (DM_NVN_GMEM_MODE=learned, gml_rd_read), the next table lists it resident   // res: already in the residency set (on demand, see pool_res); born: when it was added (ns); end, unk: a large pool's chunk (see BIG_MIN); n_tex_reads / n_other: lookups by texture uploads / by anything else (mem_census)
 static pool_ent *g_pools; static int g_npool, g_cap;
 static int g_pidx_ok, g_plast = -1;   // whether the address→pool index is valid, the last hit (pool_find)
 static NSMutableArray *g_keep;                  // Holds the buffer references (pool_ent has non-owning pointers)
@@ -892,8 +892,9 @@ static _Atomic uint64_t *pool_stamp_new(void) {   // caller holds g_mu
 enum { BIG_MIN = 512u << 20, BIG_S = 16u << 20, BIG_UNKNOWN = 64u << 20, BIG_MAX = 32 };
 typedef struct { uintptr_t lo, hi, a, b; const void *mem; int *chunk, full; NSMutableArray *old; } big_pool;   // chunk: stride → g_pools index + 1; full: the whole pool's entry + 1; old: buffers a longer chunk replaced, alive with the pool
 static big_pool g_big[BIG_MAX]; static int g_nbig;
-// Chunk buffers a longer chunk replaced and that were in the residency set (kept alive by big_pool.old); the residency budget (res_evict_to_budget) takes them out again. Under g_mu
-typedef struct { __unsafe_unretained id<MTLBuffer> buf; _Atomic uint64_t *used; } old_res_ent;
+// Chunk buffers a longer chunk replaced and that were in the residency set (kept alive by big_pool.old); the residency budget (res_evict_to_budget) takes them out again, except one a texture
+// is made on (pin, see pool_pin_buf). Under g_mu
+typedef struct { __unsafe_unretained id<MTLBuffer> buf; _Atomic uint64_t *used; int pin; } old_res_ent;
 static old_res_ent *g_old_res; static int g_n_old_res, g_cap_old_res;
 static id<MTLBuffer> pool_buf(uintptr_t a, uintptr_t b);   // a pool's zero-copy buffer over [a, b), made over writable pages (beside the GPU-written storage spans below)
 static int big_of(uint64_t addr) { for (int i = 0; i < g_nbig; i++) if (addr >= g_big[i].lo && addr < g_big[i].hi) return i; return -1; }
@@ -1004,7 +1005,7 @@ static int big_lookup(big_pool *b, uint64_t addr, uint64_t len) {
     if (i >= 0) {   // lengthened: what is encoded with the shorter chunk keeps it, resident, until the pool goes
         [b->old addObject:g_pools[i].buf]; [g_keep removeObject:g_pools[i].buf];
         if (g_pools[i].res) { if (g_n_old_res == g_cap_old_res) { g_cap_old_res = g_cap_old_res ? g_cap_old_res * 2 : 16; g_old_res = realloc_or_die(g_old_res, (size_t)g_cap_old_res * sizeof *g_old_res, "the replaced chunk table"); }
-            g_old_res[g_n_old_res++] = (old_res_ent){g_pools[i].buf, g_pools[i].used}; }
+            g_old_res[g_n_old_res++] = (old_res_ent){g_pools[i].buf, g_pools[i].used, g_pools[i].pin}; }   // a texture made on it keeps reading it: the pin goes with the buffer
         g_pools[n].res = 0; if (g_pools[i].res) g_pool_res_n--;
         g_pools[i] = g_pools[n]; g_npool--; n = i;
     }
@@ -1056,8 +1057,17 @@ int mtl_gpu_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_
     return ok;
 }
 
-// A pool whose texture the host made directly on its buffer (a linear or buffer texture): the GPU reads it through that texture with no lookup, so it stays resident (pool_age)
-static void pool_pin_at(const void *mem) { pthread_mutex_lock(&g_mu); int i = pool_find((uint64_t)(uintptr_t)mem, 1); if (i >= 0) g_pools[i].pin = 1; pthread_mutex_unlock(&g_mu); }
+// A pool whose texture the host made directly on its buffer (a linear or buffer texture): the GPU reads it through that texture with no lookup, so that buffer stays resident (pool_age,
+// res_evict_to_budget). The buffer the texture was made on is pinned, not the pool entry at the texture's address: in a large pool in chunks (BIG_MIN) the lookup of unknown length
+// that pinned made a new, longer chunk there and pinned it, while the texture kept the one it was made on, which went to g_old_res unpinned; a lengthened chunk loses its pin the same
+// way. The residency budget then took that buffer out of the set under the live texture. A Mac goes on reading a buffer taken out of the set (an M2 Pro read every word of a 64 MB
+// zero-copy buffer after removeAllocation and commit), so only iOS and tvOS, which unwire its pages, would read zeros there (DM_NVN_LEDGER counts the pinned chunks)
+static void pool_pin_buf(id<MTLBuffer> b) {
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_npool; i++) if (g_pools[i].buf == b) g_pools[i].pin = 1;
+    for (int k = 0; k < g_n_old_res; k++) if (g_old_res[k].buf == b) g_old_res[k].pin = 1;
+    pthread_mutex_unlock(&g_mu);
+}
 // Memory pools the GPU has stopped addressing leave the residency set. A resident zero-copy buffer's pages are wired on iOS and tvOS (pool_res), and a pool stays addressed once: Tears of
 // the Kingdom on the Apple TV kept 677 of its 1,170 MB of pools wired, mostly texture data already uploaded into host textures, beside 1.1 GB of the system's own wired memory, so the
 // 4 GB of the TV had about 50 MB free and the rest of the game's memory went to flash and back when an area loaded (seconds-long frames). Every GPU use of a pool takes a lookup (mtl_addr,
@@ -1065,7 +1075,12 @@ static void pool_pin_at(const void *mem) { pthread_mutex_lock(&g_mu); int i = po
 // buffer (pinned). So a pass bumps both, which sends each pool's first use after it through a lookup, and POOL_AGE_IDLE submissions later, once all submissions before it have completed, it takes out
 // the pools no lookup stamped since: none of them is used by a submission still running or encoded later. One that is addressed again is put back at that lookup, as any pool is the first time.
 // DM_NVN_POOL_UNWIRE=0 off, 1 on (the default on iOS and tvOS, off on the Mac, whose memory is not as short)
-enum { POOL_AGE_EVERY = 300, POOL_AGE_IDLE = 150 };   // submissions between passes; and those a pool must go unaddressed after a pass's start to leave (about 5 s at 30 fps)
+// The window is time as well as submissions (pool_age_ns, DM_NVN_POOL_AGE_MS, 5000): a game submits several times a frame, Ocarina of Time 37 times in play, so POOL_AGE_IDLE alone was
+// 4 frames there, not the 5 s meant. Every pool the GPU used less often than that left and came back at its next use: in Link's house about 750 pools (700 MB) re-added per 300
+// frames on a Mac mini, 1,900 (4.2 GB) on the Apple TV, each re-add a residency commit that wires the pool's pages again (2,854 commits, 3.9 s of them per 300 frames there)
+enum { POOL_AGE_EVERY = 300, POOL_AGE_IDLE = 150 };   // at least: submissions between passes; and those a pool must go unaddressed after a pass's start to leave
+static int64_t g_pool_age_ns = -1;   // -1: not read yet (the tests set it)
+static uint64_t pool_age_ns(void) { if (g_pool_age_ns < 0) { const char *e = getenv("DM_NVN_POOL_AGE_MS"); long long ms = e && *e ? atoll(e) : 5000; g_pool_age_ns = (ms > 0 ? ms : 0) * 1000000ll; } return (uint64_t)g_pool_age_ns; }
 static int pool_age_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("DM_NVN_POOL_UNWIRE"); v = e ? strcmp(e, "0") != 0 : TARGET_OS_IPHONE;
@@ -1073,11 +1088,11 @@ static int pool_age_on(void) {
     return v;
 }
 static void pool_age(void) {   // the submit thread, at a submission's start, before anything of it is encoded
-    static uint64_t start, next = POOL_AGE_EVERY; static int phase, lines;
+    static uint64_t start, next = POOL_AGE_EVERY, t_start, t_next; static int phase, lines;
     if (!pool_age_on()) return;
-    uint64_t f = atomic_load(&g_fence);
-    if (!phase) { if (f < next) return; start = f; phase = 1; atomic_fetch_add(&g_reg_gen, 1); atomic_fetch_add(&g_pool_gen, 1); return; }
-    if (atomic_load(&g_done) < start || f < start + POOL_AGE_IDLE) return;
+    uint64_t f = atomic_load(&g_fence), now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    if (!phase) { if (f < next || now < t_next) return; start = f; t_start = now; phase = 1; atomic_fetch_add(&g_reg_gen, 1); atomic_fetch_add(&g_pool_gen, 1); return; }
+    if (atomic_load(&g_done) < start || f < start + POOL_AGE_IDLE || now - t_start < pool_age_ns()) return;
     unsigned n = 0, left = 0; uint64_t b = 0, left_b = 0;
     pthread_mutex_lock(&g_mu);
     for (int i = 0; i < g_npool; i++) {
@@ -1088,10 +1103,10 @@ static void pool_age(void) {   // the submit thread, at a submission's start, be
     if (n) { atomic_fetch_add(&g_pool_gen, 1); g_pool_aged_n += n; g_pool_aged_b += b; }   // the per-thread tables hold only resident pools
     uint64_t rw_n = g_pool_rewired_n, rw_b = g_pool_rewired_b;
     pthread_mutex_unlock(&g_mu);
-    if (n && (lines < 40 || !(lines % 20))) MLOG("memory pools: %u not addressed in the last %llu submissions left the residency set, %llu MB; %u stay, %llu MB; addressed again after leaving so far %llu, %llu MB",
-                     n, (unsigned long long)(f - start), (unsigned long long)(b >> 20), left, (unsigned long long)(left_b >> 20), (unsigned long long)rw_n, (unsigned long long)(rw_b >> 20));
+    if (n && (lines < 40 || !(lines % 20))) MLOG("memory pools: %u not addressed in the last %llu submissions (%.1f s) left the residency set, %llu MB; %u stay, %llu MB; addressed again after leaving so far %llu, %llu MB",
+                     n, (unsigned long long)(f - start), (now - t_start) / 1e9, (unsigned long long)(b >> 20), left, (unsigned long long)(left_b >> 20), (unsigned long long)rw_n, (unsigned long long)(rw_b >> 20));
     if (n) lines++;
-    phase = 0; next = f + POOL_AGE_EVERY;
+    phase = 0; next = f + POOL_AGE_EVERY; t_next = now + pool_age_ns();
 }
 
 // ---------- Global residency budget ----------
@@ -1105,10 +1120,22 @@ static void pool_age(void) {   // the submit thread, at a submission's start, be
 // submission looked up. A pool taken out and addressed again is put back at that lookup (pool_res), as after pool_age.
 // If what is left (referenced pools, pinned pools, the non-pool kinds) alone exceeds the budget, nothing referenced is evicted and the line says what makes the set that large.
 static uint64_t g_rb_budget; static int g_rb_init;
-static uint64_t g_rb_evicted_n, g_rb_evicted_b, g_rb_phases, g_rb_over_n; static char g_rb_over_msg[512];
+static uint64_t g_rb_evicted_n, g_rb_evicted_b, g_rb_phases, g_rb_over_n, g_rb_ref_n, g_rb_ref_b; static char g_rb_over_msg[512];   // ref: pools used within the last round's window
+// auto on iOS and tvOS takes 75% of the smaller of the working set and the process's memory limit (os_proc_available_memory plus its footprint when the first submission begins): the Apple
+// TV 4K's working set is 2,730 MB and its limit about 2,065 MB, so 75% of the working set was 2,048 MB, all of the limit, and the set took nearly all the memory the app had (run 13:
+// footprint 1.98 GB, 78-120 MB headroom, the guest's own memory paged from flash at 120-200 MB/s); now 1,549 MB there. A Mac keeps 75% of the working set
+static uint64_t res_budget_auto(void) {
+    uint64_t ws = (uint64_t)g_dev.recommendedMaxWorkingSetSize;
+#if TARGET_OS_IPHONE
+    task_vm_info_data_t vi; mach_msg_type_number_t n = TASK_VM_INFO_COUNT; uint64_t fp = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) == KERN_SUCCESS ? vi.phys_footprint : 0;
+    uint64_t lim = (uint64_t)os_proc_available_memory() + fp;
+    if (lim && lim < ws) ws = lim;
+#endif
+    return ws / 4 * 3;
+}
 static uint64_t res_budget(void) {
     if (!g_rb_init) { const char *e = getenv("DM_NVN_RESIDENCY_BUDGET_MB"); uint64_t v = 0;
-        if (e && !strcmp(e, "auto")) v = (uint64_t)g_dev.recommendedMaxWorkingSetSize / 4 * 3; else if (e && atoi(e) > 0) v = (uint64_t)atoi(e) << 20;
+        if (e && !strcmp(e, "auto")) v = res_budget_auto(); else if (e && atoi(e) > 0) v = (uint64_t)atoi(e) << 20;
         g_rb_init = 1; g_rb_budget = v;
         if (v) MLOG("residency set kept within %llu MB: the least recently addressed memory pools leave it over that (DM_NVN_RESIDENCY_BUDGET_MB; Metal's recommended working set %llu MB)", (unsigned long long)(v >> 20), (unsigned long long)(g_dev.recommendedMaxWorkingSetSize >> 20)); }
     return g_rb_budget;
@@ -1134,9 +1161,11 @@ static uint64_t res_evict_to_budget(uint64_t budget, uint64_t safe) {
         if (atomic_load_explicit(p->used, memory_order_relaxed) > safe) { ref_b += z; ref_n++; continue; }
         cd[nc++] = (rb_cand){atomic_load_explicit(p->used, memory_order_relaxed), z, i}; }
     for (int k = 0; k < g_n_old_res; k++) { uint64_t z = g_old_res[k].buf.allocatedSize; pool_b += z;
+        if (g_old_res[k].pin) { pin_b += z; pin_n++; continue; }
         if (atomic_load_explicit(g_old_res[k].used, memory_order_relaxed) > safe) { ref_b += z; ref_n++; continue; }
         cd[nc++] = (rb_cand){atomic_load_explicit(g_old_res[k].used, memory_order_relaxed), z, -(k + 1)}; }
     qsort(cd, (size_t)nc, sizeof *cd, rb_cmp);
+    g_rb_ref_n = ref_n; g_rb_ref_b = ref_b;
     uint8_t *old_gone = calloc((size_t)g_n_old_res + 1, 1); if (!old_gone) MDIE("residency budget: out of memory");
     for (int q = 0; q < nc && res_bytes_now() > budget; q++) {
         if (cd[q].pool >= 0) { pool_ent *p = &g_pools[cd[q].pool]; res_remove(p->buf); p->res = 0; p->aged = 1; g_pool_res_n--; g_pool_aged_n++; g_pool_aged_b += p->hi - p->lo; }
@@ -1163,30 +1192,40 @@ static uint64_t res_evict_to_budget(uint64_t budget, uint64_t safe) {
 }
 // Back-off: an eviction round whose pools came straight back (addressed again after leaving: g_pool_rewired_n, which pool_res counts) or that freed little only flushed every cache (the generations it bumps) and
 // cost a residency commit per pool re-added: run 11 on the Apple TV re-added 107 pools a frame, 280 commits / 2.5 s per 300 frames. The next round then waits 8, 16, ... 512 submissions, and the churn is logged per 300
+// The window (res_budget_window_ns, DM_NVN_RESIDENCY_WINDOW_MS, 1000): phase 2 also waits that long after phase 1. It used to run as soon as submission B had completed, two or three
+// submissions on in a game that submits 37 times a frame (Ocarina of Time), and the pools the rest of the frame used still had stamps from before B (a cache keyed on the generations
+// skips the lookup that stamps), so a round took pools the very next frame read. They came straight back, each a residency commit, and a pool that raw loads read
+// (DM_NVN_GMEM_MODE=learned) went back to a stub of zeros until its next read was logged: at a 1,536 or 1,024 MB budget on a Mac mini the 149 MB pool Ocarina's compute walks went
+// out and back every round, and the GPU hung in Link's house (100% busy, the game's SyncWait never woken) within a minute of play. Over the window every pool the frames use is
+// looked up and stamped again, the raw pool table among them (built again after the bump, it stamps what it lists), so only pools left unused for all of it go
+static int64_t g_rb_window_ns = -1;   // -1: not read yet (the tests set it)
+static uint64_t res_budget_window_ns(void) { if (g_rb_window_ns < 0) { const char *e = getenv("DM_NVN_RESIDENCY_WINDOW_MS"); long long ms = e && *e ? atoll(e) : 1000; g_rb_window_ns = (ms > 0 ? ms : 0) * 1000000ll; } return (uint64_t)g_rb_window_ns; }
 static uint64_t g_rb_win_rounds, g_rb_win_ev, g_rb_win_evb, g_rb_win_rw, g_rb_win_rwb, g_rb_backoffs;
 static void res_budget_step(void) {   // the submit thread, at a submission's start, before anything of it is encoded (after pool_age)
-    static uint64_t B, resume, last_f, last_n, rw_base, win_next, rw0, rwb0; static unsigned backoff; static int phase;
+    static uint64_t B, tB, resume, resume_t, last_f, last_n, rw_base, win_next, rw0, rwb0; static unsigned backoff; static int phase;
     uint64_t budget = res_budget(); if (!budget) return;
-    uint64_t f = atomic_load(&g_fence);
-    if (f >= win_next) { if (win_next && g_rb_win_rounds) MLOG("residency budget churn, last 300 submissions: %llu rounds, %llu pools evicted (%llu MB), %llu addressed again after leaving (%llu MB), back-off %u submissions (%llu rounds delayed so far)",
-        (unsigned long long)g_rb_win_rounds, (unsigned long long)g_rb_win_ev, (unsigned long long)(g_rb_win_evb >> 20), (unsigned long long)(g_pool_rewired_n - rw0), (unsigned long long)((g_pool_rewired_b - rwb0) >> 20), backoff, (unsigned long long)g_rb_backoffs);
+    uint64_t f = atomic_load(&g_fence), now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    if (f >= win_next) { if (win_next && g_rb_win_rounds) MLOG("residency budget churn, last 300 submissions: %llu rounds, %llu pools evicted (%llu MB), %llu addressed again after leaving (%llu MB), back-off %u submissions (%llu rounds delayed so far); used within the last round's window %llu pools, %llu MB",
+        (unsigned long long)g_rb_win_rounds, (unsigned long long)g_rb_win_ev, (unsigned long long)(g_rb_win_evb >> 20), (unsigned long long)(g_pool_rewired_n - rw0), (unsigned long long)((g_pool_rewired_b - rwb0) >> 20), backoff, (unsigned long long)g_rb_backoffs,
+        (unsigned long long)g_rb_ref_n, (unsigned long long)(g_rb_ref_b >> 20));
         g_rb_win_rounds = g_rb_win_ev = g_rb_win_evb = 0; rw0 = g_pool_rewired_n; rwb0 = g_pool_rewired_b; win_next = f + 300; }
     if (phase) {
-        if (atomic_load(&g_done) < B) return;
+        if (atomic_load(&g_done) < B || now - tB < res_budget_window_ns()) return;
         res_recount();
         uint64_t e0 = g_rb_evicted_n, eb0 = g_rb_evicted_b, freed = res_evict_to_budget(budget, B);
         phase = 0; resume = f + (freed ? 4 : 60);   // nothing to take out: the frame holds it all; do not flush the caches again every few submissions
+        resume_t = freed ? 0 : now + 4 * res_budget_window_ns();   // nor every window: every round bumps the generations, which rebuilds the raw pool table and every argument block
         last_f = f; last_n = g_rb_evicted_n - e0; rw_base = g_pool_rewired_n; g_rb_win_rounds++; g_rb_win_ev += last_n; g_rb_win_evb += g_rb_evicted_b - eb0;
         if (freed && freed < budget / 64) last_n = last_n ? last_n : 1, rw_base = g_pool_rewired_n - last_n;   // freed next to nothing: as if it all came back
         return;
     }
-    if (f < resume || res_bytes_now() <= budget) return;
+    if (f < resume || now < resume_t || res_bytes_now() <= budget) return;
     if (last_n) {   // did the last round's pools come back?
         uint64_t back = g_pool_rewired_n - rw_base;
         if (back * 2 >= last_n) { backoff = backoff ? (backoff < 512 ? backoff * 2 : 512) : 8; } else backoff = 0;
         if (backoff && f < last_f + backoff) { g_rb_backoffs++; return; }
     }
-    B = f; phase = 1; g_rb_phases++; atomic_fetch_add(&g_reg_gen, 1); atomic_fetch_add(&g_pool_gen, 1);
+    B = f; tB = now; phase = 1; g_rb_phases++; atomic_fetch_add(&g_reg_gen, 1); atomic_fetch_add(&g_pool_gen, 1);
 }
 
 // ---------- Submission ----------
@@ -4770,7 +4809,7 @@ static id<MTLTexture> tex_linear(const tex_t *t) {
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)pf width:t->d.width ? t->d.width : 1 height:t->d.height ? t->d.height : 1 mipmapped:NO];
     d.resourceOptions = b.resourceOptions;
     d.usage = MTLTextureUsageShaderRead | img_usage(t, (MTLPixelFormat)pf) | (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET ? MTLTextureUsageRenderTarget : 0);
-    pool_pin_at(t->mem);
+    pool_pin_buf(b);
     return [b newTextureWithDescriptor:d offset:mo bytesPerRow:row];
 }
 // CPU-written block-linear textures (WriteTexels): the game gave no packaged layout and changes the content from the CPU each frame (Engage's movie frames: a Y plane R8 + a UV plane RG8, WriteTexels every frame).
@@ -5423,7 +5462,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         size_t row = ((size_t)t->d.width * bpb + al - 1) / al * al;
         id<MTLTexture> mt = [b newTextureWithDescriptor:d offset:mo bytesPerRow:row];
         if (!mt) { RED_ONCE(39, "cannot create buffer texture: %u elements format %#x", t->d.width, t->d.format); return nil; }
-        pool_pin_at(t->mem);
+        pool_pin_buf(b);
         res_add(mt);
         tex_put(t->serial, mt);
         return mt;
@@ -11117,7 +11156,10 @@ static id<MTLBuffer> gmem_zero(void) {   // caller holds g_mu or is the only use
     return g_gmem_zero;
 }
 static uint64_t g_gmem_prom_n, g_gmem_prom_b, g_gmem_rd_logs, g_gmem_rd_bits;   // learned mode: stub entries read (pools made resident), the bytes of them, read logs processed, entries they named
-static uint64_t gmem_read_keep(void) { static uint64_t v; static int init; if (!init) { const char *e = getenv("DM_NVN_GMEM_READ_KEEP"); v = e && atoi(e) > 0 ? (uint64_t)atoi(e) : 600; init = 1; if (gmem_learned()) MLOG("raw global memory (learned): a wired pool stays resident behind its entry while a load has read it in the last %llu submissions (DM_NVN_GMEM_READ_KEEP)", (unsigned long long)v); } return v; }
+// A read also counts for pool_age_ns() (5 s): 600 submissions are 16 frames where a game submits 37 times a frame (Ocarina of Time), and a resident pool that raw loads read less often than
+// that had its entry turned back into a stub, so its next read gave zeros before the log asked for it again
+static uint64_t gmem_read_keep(void) { static uint64_t v; static int init; if (!init) { const char *e = getenv("DM_NVN_GMEM_READ_KEEP"); v = e && atoi(e) > 0 ? (uint64_t)atoi(e) : 600; init = 1; if (gmem_learned()) MLOG("raw global memory (learned): a wired pool stays resident behind its entry while a load has read it in the last %llu submissions or %.1f s (DM_NVN_GMEM_READ_KEEP, DM_NVN_POOL_AGE_MS)", (unsigned long long)v, pool_age_ns() / 1e9); } return v; }
+static int gmem_read_recent(const pool_ent *p, uint64_t now) { return p->rd && (p->rd + gmem_read_keep() >= atomic_load(&g_fence) || now - p->rd_t < pool_age_ns()); }
 typedef struct { uint64_t bytes, used, born; int res, learned, want, skip; } gmem_cand;   // want: a load read its stub; skip: not resident-eligible in learned mode (not wired, not written, not read): a stub
 static int gmem_rank_cmp(const void *pa, const void *pb) {   // best first: learned, wired, most recently looked up, newest; the index last, so the order is total
     const struct { gmem_cand c; int i; } *a = pa, *b = pb;
@@ -11199,10 +11241,11 @@ static id<MTLBuffer> gmem_map(void) {
     uint8_t *keep = NULL; int nk = 0; uint64_t kept = 0, left_out = 0, stub_b = 0; int n_out = 0, n_stub = 0;
     if (cap) {   // which of the addressed pools the table lists, by rank (gmem_pick); index k is the position in the sorted pool order
         gmem_cand *cd = malloc((size_t)(g_npool ? g_npool : 1) * sizeof *cd); keep = malloc((size_t)(g_npool ? g_npool : 1)); if (!cd || !keep) MDIE("raw pool table: out of memory");
+        uint64_t gnow = clock_gettime_nsec_np(CLOCK_MONOTONIC);
         for (int k = 0; k < g_npool; k++) { const pool_ent *p = &g_pools[g_pidx[k]]; keep[k] = 0;
             if (!addr_meets(p->lo, p->hi)) continue;
             int lr = 0; for (int j = 0; j < ng && !lr; j++) lr = p->lo < ghi[j] && glo[j] < p->hi;
-            cd[nk] = (gmem_cand){p->hi - p->lo, atomic_load_explicit(p->used, memory_order_relaxed), p->born, p->res, lr, p->want, learned && !(lr || p->want || (p->res && p->rd && p->rd + gmem_read_keep() >= atomic_load(&g_fence)))}; nk++; }
+            cd[nk] = (gmem_cand){p->hi - p->lo, atomic_load_explicit(p->used, memory_order_relaxed), p->born, p->res, lr, p->want, learned && !(lr || p->want || (p->res && gmem_read_recent(p, gnow)))}; nk++; }
         uint8_t *kk = malloc((size_t)(nk ? nk : 1)); if (!kk) MDIE("raw pool table: out of memory");
         kept = gmem_pick(cd, nk, budget ? budget : learned ? UINT64_MAX : 0, kk);
         for (int k = 0, j = 0; k < g_npool; k++) { const pool_ent *p = &g_pools[g_pidx[k]]; if (!addr_meets(p->lo, p->hi)) continue; keep[k] = kk[j++]; if (!keep[k]) { n_out++; left_out += p->hi - p->lo; } }
@@ -11353,7 +11396,7 @@ static void gml_rd_read(id<MTLBuffer> b, id<MTLBuffer> map, uint64_t fence) {
         int p = gmem_entry_pool(e[0], stub);
         if (p >= 0) { pool_ent *q = &g_pools[p];
             if (atomic_load_explicit(q->used, memory_order_relaxed) < fence) atomic_store_explicit(q->used, fence, memory_order_relaxed);
-            q->rd = fence;
+            q->rd = fence; q->rd_t = clock_gettime_nsec_np(CLOCK_MONOTONIC);
             if (stub && !q->want) { q->want = 1; promoted++; prom_b += q->hi - q->lo; } }
         pthread_mutex_unlock(&g_mu);
     }
