@@ -60,6 +60,32 @@ def macros(shader_map):
         return [l for l in (Path(d, ID) / 'game.h').read_text().splitlines() if 'UPSCALER' in l]
 
 
+MOVIE_MAP = ('package\tindex\tstage\tdm_ctl_sha16\tsource\n'
+             'cs_lib.bin\t1\tcompute\t49dff010b9832251\t/Movie/Ndve/Ndve-Nvn2-vid_seq5.dat.zs#NDVE@0x1efe90\n'
+             'cs_lib.bin\t2\tcompute\t4f41ccf24f163e0d\t/Movie/Ndve/Ndve-Nvn2-vid_seq5.dat.zs#NDSR@0x104fe0\n'
+             'cs_lib.bin\t3\tcompute\t4f41ccf24f163e0d\t/Movie/Ndve/Ndve-Nvn2-vid_seq5.dat.zs#NDSR@0x104fe0\n'   # a key twice: once
+             'ps_lib.bin\t4\tpixel\t0b35a945d761a4c7\t/Movie/Ndve/Ndve-Nvn2-vid_seq5.dat.zs#NDSR@0xf57e0\n'   # a draw shader: not the network
+             'cs_lib.bin\t5\tcompute\t0123456789abcdef\t/Lib/agl/agl_resource.Nin_Ounce_NVN2.release.sarc.zs/agl_ndsr_vr.pck#NDSR@0x97710\n')   # the game's own upscaler: not the movie's
+
+
+class MovieKeys(unittest.TestCase):
+    def test_from_shader_map(self):
+        def movie(shader_map):
+            with tempfile.TemporaryDirectory() as d:
+                Path(d, ID).mkdir(); (Path(d, ID) / 'game.tsv').write_text(TSV)
+                if shader_map is not None: (Path(d, ID) / 'shader_map.tsv').write_text(shader_map)
+                subprocess.run([sys.executable, str(GAME), 'header', ID, str(Path(d, ID) / 'game.h')], env={**os.environ, 'DM_GAMES_DIR': d}, check=True, capture_output=True)
+                return [l for l in (Path(d, ID) / 'game.h').read_text().splitlines() if 'MOVIE' in l]
+        self.assertEqual(movie(None), ['#define DM_GAME_MOVIE_KEYS ""', '#define DM_GAME_MOVIE_N 0'])
+        self.assertEqual(movie(MOVIE_MAP), ['#define DM_GAME_MOVIE_KEYS "49dff010b9832251,4f41ccf24f163e0d"', '#define DM_GAME_MOVIE_N 2'])
+
+    def test_ocarina_has_its_22(self):
+        import game
+        keys = game.movie_keys(game.load('0400486024DEC000'))
+        self.assertEqual(len(keys), 22)
+        self.assertTrue({'49dff010b9832251', '4f41ccf24f163e0d', '8e98d86c0e4a7b53', 'c2fc2ddd604c25e7'} <= set(keys))
+
+
 class UpscalerKeys(unittest.TestCase):
     def test_from_shader_map(self):
         none = ['#define DM_GAME_UPSCALER_KEYS ""', '#define DM_GAME_UPSCALER_N 0']   # the launcher hides the setting

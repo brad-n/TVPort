@@ -71,6 +71,10 @@ flowchart LR
 - **Cost:** none in GPU time (it saves 2.5-4 ms a frame in that case); the picture is Apple's scaler's rather than the game's. Frames where the game renders at its output size are not upscaled and keep the game's shader either way. Devices without MetalFX keep the game's upscaler.
 - **Not the same as [Upscaling](#upscaling):** that one scales the finished picture, HUD included, to the screen; this one replaces the game's own step inside the frame. Both can be on.
 
+### Movie enhancement
+
+Shown only for games that run their movies through a neural network of their own (nn::ndve: The Legend of Zelda: Ocarina of Time on Switch 2). **Game's own**, the default, runs it. **Plain picture** skips the network and draws the movie's decoded picture, scaled smoothly, in its place: the picture has none of the network's added detail, and a movie frame costs about 1-2 ms of GPU time instead of the network's (about 15 ms on an M-series Mac, about 90 ms on an Apple TV 4K, 3rd generation, where movies otherwise play in slow motion). No MetalFX is used.
+
 ### Game language
 
 The game's own languages. The app was packed with one of them; pick another here without repacking. A game packed from a dump or a NUP may come without its list: every language is offered then, with a note, and a game that lacks the one you pick may show another.
@@ -271,6 +275,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Press a button to join | `DM_PAD_PRESS_TO_JOIN` | `1`, `0` |
 | Upscaling | `DM_PRESENT_UPSCALE` | `off`, `metalfx` |
 | Game's upscaler | `DM_UPSCALER` | `game`, `metalfx` |
+| Movie enhancement | `DM_MOVIE_NETWORK` | `game`, `bypass` |
 | Frame buffering | `DM_PRESENT_SNAP` | `1`, `0` |
 | Metal 4 pipelines | `DM_PSO_MTL4` | `1`, `0` |
 | Pipeline prebuild | `DM_PSO_PREBUILD` | `1`, `0` |

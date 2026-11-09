@@ -2138,7 +2138,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); snap_dra
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[160];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
+static int g_red_once[162];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
 #define RED_ONCE(k, ...) do { _Static_assert((k) < sizeof g_red_once / sizeof *g_red_once, "a RED_ONCE key past g_red_once: raise its size"); if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -5664,6 +5664,7 @@ static void shmap_read(void) {
     NvShader *geo_bg_v[5], *geo_bgv_v; uint8_t geo_bg_tried;   // its kernels by input topology (_bg<n>) and its reader (_bgv), looked up once (bit 7: the reader)
     NSMutableDictionary *geo_mesh;   // a vertex shader's mesh entries by lean kernel key (geo_mesh_fn; NSNull: none)
     uint8_t up_mfx;   // a compute shader that is the game's own upscaler (DM_GAME_UPSCALER_KEYS, from the shader map): 0 not decided, 1 drawn by MetalFX when DM_UPSCALER=metalfx, 2 not one or one its colour keeps (up_mfx_wanted)
+    uint8_t movie;      // a compute shader of the movie library's enhancement network (DM_GAME_MOVIE_KEYS): 0 not decided, 1 is one, 2 is not (up_movie_named)
     uint8_t up_color;   // such a shader's colour, from its code at load with DM_UPSCALER=metalfx (up_mfx_color; UP_COLOR_UNREAD otherwise)
     int gs_loc, lay_loc; char gs_comp, lay_comp;   // a slice-writing geometry shader (no function: the layer comes from input gs_loc.gs_comp) / a vertex shader with layer entry points writing output lay_loc.lay_comp (dmsh_build.py gs_slice, vs_layer_entry); -1 = none
     uint64_t cbs_seen; uint32_t cbs_runs;   // the command buffer that listed this shader last, and how many have (cbs_note)
@@ -12538,6 +12539,7 @@ static int lc_keeps(uint32_t op) {
 }
 
 static void dispatch(const p_dispatch *dp);
+static int up_movie(NvShader *cs, const p_dispatch *dp);   // the movie library's enhancement network (DM_MOVIE_NETWORK)
 static int up_mfx_wanted(NvShader *cs); static int up_mfx_encode(NvShader *cs);   // a game's upscaler through MetalFX (see up_mfx_encode)
 // ---------- Compute dispatches moved ahead of the render pass they would split (DM_NVN_CS_HOIST) ----------
 // Metal cannot run a compute dispatch inside a render pass, so a dispatch between two draws of one pass ends it, and on a tile-based GPU every attachment is stored and loaded again:
@@ -13183,6 +13185,7 @@ static void dispatch(const p_dispatch *dp) {
     if (g_nubd && ubd_conflict_cs(cs, dp->ind)) { g_ubd_conflicts++; ubd_land(); }   // see ubd_conflict_cs
     rp_flush();   // A full clear with no draw after it waits for the next pass on its targets, but it comes before this dispatch, which may read or write them as images: land it first, as copy_t2t does
     image_prepare(prog_get(S.cprog), 0x20);
+    if (DM_GAME_MOVIE_N && up_movie(cs, dp)) return;   // a movie network dispatch traced or bypassed (DM_MOVIE_NETWORK)
     if (up_mfx_wanted(cs) && !dp->ind && up_mfx_encode(cs)) return;   // the game's upscaler, drawn by MetalFX instead (DM_UPSCALER=metalfx)
     int own = dispatch_own();
     if (own && g_blit) { enc_b_end(g_blit); g_blit = nil; }
@@ -15102,6 +15105,106 @@ static int up_mfx_encode(NvShader *cs) {
                             (unsigned long)in.width, (unsigned long)in.height, (unsigned long)in.pixelFormat, orr.width, orr.height, orr.xoffset, orr.yoffset, (unsigned long)out.width, (unsigned long)out.height,
                             (unsigned long)out.pixelFormat, direct ? ", straight" : srgb ? ", through RGBA16F, decoded from sRGB" : root ? ", squared into RGBA16F" : ", through RGBA16F");
     return 1;
+}
+// ---------- The movie library's enhancement network (DM_MOVIE_NETWORK) ----------
+// Ocarina of Time plays its AV1 movies through nn::ndve: the picture is run through a video-enhancement network, a chain of compute dispatches (22 shaders from /Movie/Ndve/Ndve-Nvn2-vid_seq5.dat.zs, 20 tagged NDVE and
+// 2 NDSR). On an A15 GPU it costs about 90 ms a frame (an Apple TV 4K, 3rd generation), 15 ms on an M6, so a movie plays in slow motion there. DM_MOVIE_NETWORK=trace logs the first dispatches of those shaders
+// (bindings, formats, sizes, push constants); DM_MOVIE_NETWORK=bypass skips them.
+static int up_movie_mode(void) {
+    static int v = -1;
+    if (v >= 0) return v;
+    const char *e = getenv("DM_MOVIE_NETWORK"); v = e && !strcmp(e, "bypass") ? 1 : e && !strcmp(e, "trace") ? 2 : 0;
+    if (e && *e && strcmp(e, "bypass") && strcmp(e, "trace") && strcmp(e, "game")) MLOG("[RED] DM_MOVIE_NETWORK=%s: bypass, trace or game; keeping the game's network", e);
+    if (v && !DM_GAME_MOVIE_N) { MLOG("movie network (DM_MOVIE_NETWORK): this game has none in its shader map"); v = 0; }
+    if (v) MLOG("movie network (DM_MOVIE_NETWORK): %s, the %d enhancement shaders of the shader map", v == 1 ? "bypass" : "trace", DM_GAME_MOVIE_N);
+    return v;
+}
+static int up_movie_named(NvShader *cs) {
+    if (cs->movie) return cs->movie == 1;
+    cs->movie = 2;
+    for (const char *k = DM_GAME_MOVIE_KEYS; *k; k += k[16] == ',' ? 17 : 16) if (!strncmp(k, cs->key, 16)) { cs->movie = 1; break; }
+    return cs->movie == 1;
+}
+static void up_movie_trace(NvShader *cs, const p_dispatch *dp) {
+    static int n; if (n >= 400) return;
+    n++;
+    char line[1500]; int o = snprintf(line, sizeof line, "movie net #%d %s groups %d,%d,%d%s tg %u,%u,%u push1", n, cs->key, dp->x, dp->y, dp->z, dp->ind ? " (indirect)" : "", cs->rf.tg[0], cs->rf.tg[1], cs->rf.tg[2]);
+    for (int i = 0; i < 8; i++) o += snprintf(line + o, sizeof line - o, " %u", S.push[1][i]);
+    for (int i = 0; i < cs->rf.nb && o < (int)sizeof line - 160; i++) {
+        const nvn_rbind *b = &cs->rf.b[i]; int k = b->kind;
+        if (k == NVN_RB_TEX || k == NVN_RB_IMG) {
+            int tid = k == NVN_RB_TEX ? (int)(tex_slot_h(S.tex[5], S.img[5], b->reg) & 0xfffff) : b->reg < 32 ? (int)(S.img[5][b->reg] & 0xfffff) : 0;
+            os_unfair_lock_lock(&g_rmu);
+            id<MTLTexture> t = tid > 0 && tid < g_ntreg && g_treg[tid].ok ? tex_by_id(tid) : nil; uint64_t ser = t ? g_treg[tid].t.serial : 0;
+            os_unfair_lock_unlock(&g_rmu);
+            o += snprintf(line + o, sizeof line - o, " | %s%u tid %d ser %llu %lux%lu fmt %lu", k == NVN_RB_TEX ? "tex" : "img", b->reg, tid, (unsigned long long)ser, t ? (unsigned long)t.width : 0ul, t ? (unsigned long)t.height : 0ul, t ? (unsigned long)t.pixelFormat : 0ul);
+        } else if (k == NVN_RB_SBUFP || k == NVN_RB_SBUFU || k == NVN_RB_UBOP || k == NVN_RB_CBUF) {
+            const p_bind_buf *bb = k == NVN_RB_SBUFP || k == NVN_RB_SBUFU ? &S.ssbo[5][b->reg < 16 ? b->reg : 0] : &S.ubo[5][b->reg < 16 ? b->reg : 0];
+            o += snprintf(line + o, sizeof line - o, " | %s%u %#llx+%llu", k == NVN_RB_SBUFP || k == NVN_RB_SBUFU ? "ssbo" : "ubo", b->reg, (unsigned long long)bb->addr, (unsigned long long)bb->size);
+        }
+    }
+    MLOG("%s", line);
+}
+// The network of Ocarina of Time's movies, per frame (traced on a Mac, 14 dispatches; the roles below are read from the shaders' bindings and code, Ndve-Nvn2-vid_seq5.dat.zs):
+//   49dff010  the decoded picture's Y plane (R8, 1920x1080) and UV plane (RG8, 960x540) → an RGBA8 picture, with the 3x4 YUV matrix of c[24]     role MV_YUV  (runs: it is the picture)
+//   ba079f68 ... 5a7d69b0  the layers: each reads and writes storage buffers only, the first reads that RGBA8 picture, the last reads it again and writes the network's
+//             1920x1080 result (RGB10A2); nothing else reads those buffers or that result                                                       role MV_LAYER (skipped)
+//   4f41ccf2  the NDSR stage: reads the result and a 512x512 table, writes the 2560x1440 RGBA8 image the game draws from                          role MV_OUT  (a plain scale of the picture)
+// Colour: no stage has a transfer curve in its code (no pow, exp2, log2, sqrt), so the picture, the result and the output are one encoding. A variant that starts from an RGB picture (8e98d86c reads
+// it and writes the network's Y and UV images) is MV_RGB: the picture is its texture, and it is skipped; c2fc2ddd is the same NDSR stage for the other path and writes its image slot 0.
+enum { MV_NONE, MV_LAYER, MV_YUV, MV_RGB, MV_OUT };
+static const struct { const char *key; int role; } k_movie_roles[] = {
+    {"49dff010b9832251", MV_YUV}, {"8e98d86c0e4a7b53", MV_RGB}, {"4f41ccf24f163e0d", MV_OUT}, {"c2fc2ddd604c25e7", MV_OUT}};
+static int up_movie_role(const char *key) {   // every other shader of the movie library is a layer (the profile's list says which keys are the library's)
+    for (size_t i = 0; i < sizeof k_movie_roles / sizeof *k_movie_roles; i++) if (!strncmp(k_movie_roles[i].key, key, 16)) return k_movie_roles[i].role;
+    return MV_LAYER;
+}
+static int g_movie_src_tid;   // the picture of this frame (the texture ID the last MV_YUV wrote, or the last MV_RGB read)
+static uint64_t g_movie_skipped, g_movie_scaled, g_movie_nosrc;
+void mtl_movie_stats(uint64_t *skipped, uint64_t *scaled) { *skipped = g_movie_skipped; *scaled = g_movie_scaled; }
+static int up_movie_tid(NvShader *cs, int kind) {   // the texture ID bound at the shader's first binding of this kind (NVN_RB_TEX or NVN_RB_IMG)
+    for (int i = 0; i < cs->rf.nb; i++) if (cs->rf.b[i].kind == kind) {
+        unsigned reg = cs->rf.b[i].reg;
+        return kind == NVN_RB_TEX ? (int)(tex_slot_h(S.tex[5], S.img[5], reg) & 0xfffff) : reg < 32 ? (int)(S.img[5][reg] & 0xfffff) : 0;
+    }
+    return 0;
+}
+// A plain scale of rectangle sr of in into rectangle dr of out (bilinear, nothing but Metal's own render pass: no MetalFX): what replaces a named network. 1 when drawn
+// square: each channel as c * |c| on the way (a root-encoded input into linear colour, up_mfx_encode)
+static int up_plain_scale(id<MTLTexture> in, id<MTLTexture> out, const NVNcopyRegion *sr, const NVNcopyRegion *dr, int square) {
+    rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    ubd_land_compute();
+    return copy_t2t_draw_sq(in, out, 0, 0, 0, 0, sr, dr, 1, 0, square);
+}
+// One dispatch of a movie network shader with the bypass on, given its role: 1 when the dispatch is not to run (skipped, or drawn as the plain scale), 0 to let it run
+static int up_movie_step(NvShader *cs, int role) {
+    switch (role) {
+    case MV_YUV: g_movie_src_tid = up_movie_tid(cs, NVN_RB_IMG); return 0;
+    case MV_RGB: g_movie_src_tid = up_movie_tid(cs, NVN_RB_TEX); g_movie_skipped++; return 1;
+    case MV_OUT: {
+        int tin = g_movie_src_tid, tout = up_movie_tid(cs, NVN_RB_IMG), oi = -1;
+        for (int i = 0; i < cs->rf.nb; i++) if (cs->rf.b[i].kind == NVN_RB_IMG) { oi = i; break; }
+        id<MTLTexture> in = nil, out = nil; uint64_t rid = 0; int real = 0; tex_t dout = {0};
+        os_unfair_lock_lock(&g_rmu);
+        if (tin > 0 && tin < g_ntreg && g_treg[tin].ok) in = tex_by_id(tin);
+        if (oi >= 0 && tout > 0 && tout < g_ntreg && g_treg[tout].ok) { dout = g_treg[tout].t; out = img_binding(tout, &cs->rf.b[oi], &rid, &real); if (!real) out = nil; }
+        os_unfair_lock_unlock(&g_rmu);
+        NVNcopyRegion sr = {0, 0, 0, in ? (int)in.width : 0, in ? (int)in.height : 0, 1}, dr = {0, 0, 0, out ? (int)out.width : 0, out ? (int)out.height : 0, 1};
+        if (!in || !out || in == out || in.textureType != MTLTextureType2D || out.textureType != MTLTextureType2D || fmt_int_or_ds(in.pixelFormat) || fmt_int_or_ds(out.pixelFormat)) { RED_ONCE(160, "movie network bypass: no picture to scale for %s (picture texture %d, output texture %d); the output is left as it was", cs->key, tin, tout); g_movie_nosrc++; return 1; }
+        zskip_del(dout.serial);
+        if (!up_plain_scale(in, out, &sr, &dr, 0)) { RED_ONCE(161, "movie network bypass: the plain scale of %s was refused (output format %lu, usage %#lx); the output is left as it was", cs->key, (unsigned long)out.pixelFormat, (unsigned long)out.usage); g_movie_nosrc++; return 1; }
+        if (!g_movie_scaled++) MLOG("movie network (DM_MOVIE_NETWORK=bypass): first frame, the picture %dx%d (format %lu) scaled to the output %dx%d (format %lu); %llu layer dispatches skipped before it", sr.width, sr.height, (unsigned long)in.pixelFormat, dr.width, dr.height, (unsigned long)out.pixelFormat, (unsigned long long)g_movie_skipped);
+        return 1;
+    }
+    default: g_movie_skipped++; return 1;   // a layer
+    }
+}
+// Whether the dispatch of cs was handled here (a traced shader still runs: 0)
+static int up_movie(NvShader *cs, const p_dispatch *dp) {
+    int m = up_movie_mode(); if (!m || !up_movie_named(cs)) return 0;
+    if (m == 2) { up_movie_trace(cs, dp); return 0; }
+    if (dp->ind) return 0;
+    return up_movie_step(cs, up_movie_role(cs->key));
 }
 // The present pass: src's valid rectangle drawn into dst (the drawable, or a screenshot's texture) as present_encode draws it, through MetalFX first where fx_encode takes it
 // (fx: the scaler state to use, nil = bilinear). uvb: the pass's crop constants (one buffer per present allocator, written by the CPU)
