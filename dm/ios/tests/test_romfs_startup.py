@@ -32,8 +32,13 @@ class Startup(unittest.TestCase):
                           'fixture_doc = @(argv[1]); fixture_tmp = @(argv[2]); fixture_bundle = argc > 3 ? @(argv[3]) : @"/nonexistent-fixture"; NSString *p = romfs_locate(nil);\n'
                           'if (!p) return 1; puts(p.fileSystemRepresentation); return 0; }}\n')
         cls.locator = root / 'locator'
+        # romfs_sparse.h inflates DMSPARS1 v2 extents with the vendored zstd decoder: its decoder sources, built with the host Makefile's flags (ZSTD_SRC there)
+        zstd = REPO / 'dm/third_party/zstd'; zobj = []
+        for c in sorted([*zstd.glob('common/*.c'), *zstd.glob('decompress/*.c')]):
+            o = root / f'zstd_{c.parent.name}_{c.stem}.o'; zobj.append(str(o))
+            subprocess.run(['clang', '-O2', '-DNDEBUG', '-DZSTD_DISABLE_ASM', '-DZSTD_MULTITHREAD=0', '-I', str(zstd), '-c', str(c), '-o', str(o)], check=True)
         subprocess.run(['clang', '-fobjc-arc', '-Wall', '-Werror', '-I', str(REPO / 'dm/host'),
-                        str(source), '-framework', 'Foundation', '-o', str(cls.locator)], check=True)
+                        str(source), *zobj, '-framework', 'Foundation', '-o', str(cls.locator)], check=True)
 
     def test_invalid_image_preserves_working_folder_and_valid_image_replaces_it(self):
         with tempfile.TemporaryDirectory() as temporary:

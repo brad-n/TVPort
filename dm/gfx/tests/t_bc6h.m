@@ -88,7 +88,11 @@ static void test_cpu_decode(void) {
     nvn_bc6h_r11g11b10_set(1);
     CHECK(nvn_bc_unpacked(0x50, &pf, &bpp) && pf == MTLPixelFormatRG11B10Float && bpp == 4, "unsigned BC6H decodes to RG11B10Float, 4 bytes");
     CHECK(nvn_bc_unpacked(0x4f, &pf, &bpp) && pf == MTLPixelFormatRGBA16Float && bpp == 8, "signed BC6H stays RGBA16Float, 8 bytes");
-    CHECK(!nvn_bc_astc_format(0x50, 4, NULL) && !nvn_bc_astc_format(0x4f, 4, NULL) && nvn_bc_astc_format(0x4d, 4, NULL), "BC6H (4 bytes now) is still not an ASTC format; BC7 is");
+    // fork (brad-n/TVPort, 7f353199): unsigned BC6H has an ASTC HDR encoding in the texture cache (the runtime takes it only when the cache holds every plane, astc_block_for /
+    // astc_decision in nvn_mtl.m; a miss decodes to RG11B10Float as above). Signed BC6H has none: no ASTC encoding of negative texels
+    { uint32_t apf = 0;
+      CHECK(nvn_bc_astc_format(0x50, 4, &apf) && apf == MTLPixelFormatASTC_4x4_HDR && !nvn_bc_astc_format(0x4f, 4, NULL) && nvn_bc_astc_format(0x4d, 4, NULL),
+            "unsigned BC6H maps to ASTC HDR, signed BC6H to no ASTC format; BC7 maps to ASTC"); }
     nvn_bc6h_r11g11b10_set(0);
     CHECK(nvn_bc_unpacked(0x50, &pf, &bpp) && pf == MTLPixelFormatRGBA16Float && bpp == 8, "with the switch off unsigned BC6H is RGBA16Float again");
     nvn_bc6h_r11g11b10_set(1);

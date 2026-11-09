@@ -19,7 +19,7 @@ static void romfs_image_close(romfs_img *m) {
     if (m) { close(m->fd); romfs_src_free(&m->src); free(m->e); free(m); }
 }
 // Reads [off, off + size) of the image's LOGICAL bytes (a DMSPARS1's holes read as zero); 0 with errno set when the range cannot be read in full
-static int romfs_image_read(const romfs_img *m, void *buf, size_t size, uint64_t off) { return romfs_src_read(&m->src, buf, size, off); }
+static inline int romfs_image_read(const romfs_img *m, void *buf, size_t size, uint64_t off) { return romfs_src_read(&m->src, buf, size, off); }
 // NULL for an incomplete or invalid image (errno EINVAL), an I/O error, or allocation failure. The caller owns the descriptor and index on success.
 static romfs_img *romfs_image_open(const char *path) {
     int fd = open(path, O_RDONLY); uint8_t h[32]; romfs_img *m = NULL; uint64_t ioff, isz, n, size; romfs_src src;
