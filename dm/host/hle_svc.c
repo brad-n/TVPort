@@ -117,24 +117,35 @@ static double guest_file_dirty(char *vec, size_t pg) {
     return (double)all * pg;
 }
 // DM_GUEST_FILE_SCAN=1 (a diagnostic): every 30 s, the dirty pages by region and how many of them read all 0 (read with pread from the files, so a PROT_NONE page needs no access): a zero page
-// written by the game or the host takes a block for nothing
+// written by the game or the host takes a block for nothing. The dirty pages are also split by the graphics layer's memory pools (mtl_pool_ranges): in a pool the residency set holds now (its
+// pages wired for the GPU), in a pool it does not, and outside every pool; a page Metal wired for writing is dirty whether or not anything wrote it
+__attribute__((weak)) size_t mtl_pool_ranges(uint64_t *lo, uint64_t *hi, uint8_t *res, size_t cap) { (void)lo; (void)hi; (void)res; (void)cap; return 0; }   // nvn_mtl.m: the pools, which the host tests do not link
 static void guest_file_scan(const char *vec, size_t pg) {
     const double M = 1048576.0; enum { R_HEAP, R_ALIAS, R_STACK, R_OTHER, NR }; static const char *nm[NR] = {"heap", "alias", "stack", "other"};
-    double dirty[NR] = {0}, zero[NR] = {0}; uint64_t *buf = malloc(pg); struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
-    if (!buf) return;
-    for (size_t i = 0, np = g_reserve / pg; i < np; i++) {
+    double dirty[NR] = {0}, zero[NR] = {0}, pd[3] = {0}, pz[3] = {0}; uint64_t *buf = malloc(pg); struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+    size_t np = g_reserve / pg, cap = 1 << 16, nr; uint64_t *plo = malloc(cap * 8), *phi = malloc(cap * 8); uint8_t *pres = malloc(cap), *pc = calloc(np, 1);   // pc: per page 0 outside pools, 1 a pool, 2 a resident pool
+    if (!buf || !plo || !phi || !pres || !pc) { free(buf); free(plo); free(phi); free(pres); free(pc); return; }
+    nr = mtl_pool_ranges(plo, phi, pres, cap);
+    for (size_t j = 0; j < nr; j++) {
+        if (plo[j] < (uint64_t)(uintptr_t)g_as || phi[j] <= plo[j]) continue;
+        size_t a = (size_t)(plo[j] - (uint64_t)(uintptr_t)g_as) / pg, b = (size_t)(phi[j] - (uint64_t)(uintptr_t)g_as + pg - 1) / pg; if (b > np) b = np;
+        for (size_t i = a; i < b; i++) if (pc[i] < 1 + pres[j]) pc[i] = (uint8_t)(1 + pres[j]);
+    }
+    for (size_t i = 0; i < np; i++) {
         if (!(vec[i] & MINCORE_MODIFIED)) continue;
         uint8_t *a = g_as + i * pg; size_t off = i * pg, k = off / g_gf_chunk;
         int r = a >= g_heap && a < g_heap + g_heap_cap ? R_HEAP : a >= g_alias && a < g_alias + g_alias_cap ? R_ALIAS : a >= g_stack && a < g_stack + g_stack_cap ? R_STACK : R_OTHER;
-        dirty[r] += pg;
+        int c = pc[i] == 2 ? 0 : pc[i] == 1 ? 1 : 2;
+        dirty[r] += pg; pd[c] += pg;
         if (pread(g_gf_tab[k], buf, pg, (off_t)(off - k * g_gf_chunk)) != (ssize_t)pg) continue;
         uint64_t any = 0; for (size_t j = 0; j < pg / 8 && !any; j++) any = buf[j];
-        if (!any) zero[r] += pg;
+        if (!any) { zero[r] += pg; pz[c] += pg; }
     }
-    free(buf); clock_gettime(CLOCK_MONOTONIC, &t1);
+    free(buf); free(plo); free(phi); free(pres); free(pc); clock_gettime(CLOCK_MONOTONIC, &t1);
     char line[256]; int at = 0;
     for (int r = 0; r < NR; r++) at += snprintf(line + at, sizeof line - at, "%s%s %.0f (%.0f)", r ? ", " : "", nm[r], dirty[r] / M, zero[r] / M);
-    LOG("[mem] guest file scan: dirty MB (of them all 0): %s; %.0f ms", line, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+    LOG("[mem] guest file scan: dirty MB (of them all 0): %s; by memory pool: resident pools %.0f (%.0f), other pools %.0f (%.0f), outside pools %.0f (%.0f) of %zu pool ranges; %.0f ms", line,
+        pd[0] / M, pz[0] / M, pd[1] / M, pz[1] / M, pd[2] / M, pz[2] / M, nr, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
 }
 
 static void guest_file_sweep(void);

@@ -1030,6 +1030,12 @@ static int pool_find(uint64_t addr, uint64_t len) {
 // Whether [addr, addr + len) lies in a pool, with no side effect: mtl_addr makes the pool resident, for a GPU use to follow. A large pool is answered from its range, since its lookup
 // (big_lookup) makes the chunk that holds the range. hle_nvn.c keys_hash asks this whether a shader's code is mapped: through mtl_addr every pool holding shader code went into the
 // residency set, though the GPU never reads it (the shaders run translated): The Great Ace Attorney Chronicles' three chunks, about 5 MB
+// The registered pools' ranges (a large pool's chunks among them) and whether the residency set holds each, at most cap; how many. For the guest file scan (hle_svc.c DM_GUEST_FILE_SCAN)
+size_t mtl_pool_ranges(uint64_t *lo, uint64_t *hi, uint8_t *res, size_t cap) {
+    pthread_mutex_lock(&g_mu); size_t n = 0;
+    for (int i = 0; i < g_npool && n < cap; i++, n++) { lo[n] = g_pools[i].lo; hi[n] = g_pools[i].buf ? g_pools[i].base + g_pools[i].buf.length : g_pools[i].hi; res[n] = g_pools[i].res != 0; }
+    pthread_mutex_unlock(&g_mu); return n;
+}
 int mtl_addr_known(uint64_t addr, uint64_t len) {
     pthread_mutex_lock(&g_mu); int b = big_of(addr), ok = b >= 0 ? addr + len <= g_big[b].hi : pool_find(addr, len) >= 0; pthread_mutex_unlock(&g_mu);
     return ok;
@@ -1573,6 +1579,66 @@ enum { GSR_N = 16384 };
 static struct { uint64_t fence, lo, hi; } g_gsr[GSR_N]; static uint64_t g_gsr_n; static int g_gml_on;
 static pthread_mutex_t g_gsr_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_alloc_fence[ALLOC_MAX]; static uint64_t g_alloc_waits, g_alloc_grown;
+// Which command allocator a submission takes (DM_NVN_ALLOC_FIT=0: the first free one, as before). A Metal 4 allocator keeps the memory of the largest submission it ever encoded, across
+// resets, and every one of the 8 came to hold the largest the game ever submitted: on a Mac mini with the Apple TV's settings, in Link's house, 185 MB of command memory (the largest
+// allocator 70 MB) where 81% of the submissions take under 4 MB, 19% 4-16 MB and only two ever took more, 32-68 MB, while a save loaded (DM_NVN_ALLOCPROF=2, a fresh allocator per
+// submission, 18,706 of them). The game submits in the same order every frame, so a submission's place in its frame says how much it takes: one that once grew the allocator it took
+// is remembered with that size (for 30 s, then learned again); it takes the smallest free allocator that holds it, the others the smallest free one, so the small ones stay small.
+// And once a second the largest free allocator is made again, empty, when it holds more than a quarter over what any remembered submission takes (what a loading screen left).
+// There: 200 → 79-96 MB of command memory, the largest allocator 10-13 MB
+enum { ORD_MAX = 128 };
+static _Atomic uint64_t g_cur_frame;   // the frame counter (with the replay's statistics below)
+static _Atomic uint64_t g_alloc_pub_b, g_alloc_pub_max;   // the main allocators' memory and the largest, as the submit thread last saw them (the ledger's line: only that thread swaps them)
+static int alloc_fit_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_ALLOC_FIT"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_ALLOC_FIT=0: a submission takes the first free command allocator, as before"); } return v; }
+static uint64_t g_ord_need[ORD_MAX], g_ord_need_ns[ORD_MAX], g_ord_frame, g_alloc_pre[ALLOC_MAX], g_alloc_trim_ns, g_alloc_trims, g_alloc_trim_b; static int g_ord, g_alloc_ordof[ALLOC_MAX] = {-1, -1, -1, -1, -1, -1, -1, -1};
+// The allocator a submission that takes need bytes (0: a small one, or not known) gets among the free ones (fr): the smallest free, or for a known need the smallest free that holds it,
+// else the largest free; -1 when none is free
+static int alloc_choose(const uint64_t *sz, const uint8_t *fr, int n, uint64_t need) {
+    int pick = -1, fit = -1, big = -1;
+    for (int i = 0; i < n; i++) {
+        if (!fr[i]) continue;
+        if (pick < 0 || sz[i] < sz[pick]) pick = i;
+        if (big < 0 || sz[i] > sz[big]) big = i;
+        if (need && sz[i] >= need && (fit < 0 || sz[i] < sz[fit])) fit = i;
+    }
+    return need && pick >= 0 ? (fit >= 0 ? fit : big) : pick;
+}
+// The free allocator to make again empty: the largest, when it holds over 4 MB and over a quarter more than any remembered submission takes (M); -1 for none
+static int alloc_trim_victim(const uint64_t *sz, const uint8_t *fr, int n, uint64_t M) {
+    int big = -1;
+    for (int i = 0; i < n; i++) if (fr[i] && (big < 0 || sz[i] > sz[big])) big = i;
+    return big >= 0 && sz[big] > (4u << 20) && sz[big] > M + M / 4 ? big : -1;
+}
+static int alloc_pick(uint64_t done) {
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed), sz[ALLOC_MAX] = {0}, M = 0;
+    if (f != g_ord_frame) { g_ord_frame = f; g_ord = 0; }
+    int ord = g_ord < ORD_MAX ? g_ord : ORD_MAX - 1, nfree = 0; uint8_t fr[ALLOC_MAX] = {0}; g_ord++;
+    for (int i = 0; i < g_alloc_n; i++) {
+        if (g_alloc_fence[i] > done) continue;
+        nfree++; fr[i] = 1; sz[i] = g_alloc4[i].allocatedSize;
+        int o = g_alloc_ordof[i];   // the GPU is done with the submission it encoded: grown past its size when picked, it took that much
+        if (o >= 0) { if (sz[i] > g_alloc_pre[i]) { g_ord_need[o] = sz[i]; g_ord_need_ns[o] = now; } g_alloc_ordof[i] = -1; }
+    }
+    if (!nfree) return -1;
+    for (int o = 0; o < ORD_MAX; o++) if (g_ord_need[o] && now - g_ord_need_ns[o] > 30000000000ull) g_ord_need[o] = 0; else if (g_ord_need[o] > M) M = g_ord_need[o];
+    if (now - g_alloc_trim_ns >= 1000000000ull) {
+        g_alloc_trim_ns = now; int big = alloc_trim_victim(sz, fr, g_alloc_n, M);
+        if (big >= 0) {
+            NSError *ae = nil; id<MTL4CommandAllocator> a = [g_dev newCommandAllocatorWithDescriptor:[MTL4CommandAllocatorDescriptor new] error:&ae];
+            if (a) { g_alloc4[big] = a; g_alloc_trims++; g_alloc_trim_b += sz[big];
+                if (g_alloc_trims <= 4 || !(g_alloc_trims & (g_alloc_trims - 1))) MLOG("command allocators: #%d made again empty, it held %llu MB (the submissions remembered take up to %llu MB); %llu so far, %llu MB (DM_NVN_ALLOC_FIT)",
+                    big, (unsigned long long)(sz[big] >> 20), (unsigned long long)(M >> 20), (unsigned long long)g_alloc_trims, (unsigned long long)(g_alloc_trim_b >> 20));
+                sz[big] = 0; }
+        }
+    }
+    return alloc_choose(sz, fr, g_alloc_n, g_ord_need[ord]);
+}
+// The allocator the submission takes (picked, made, or waited for): what it encoded before is learned from first, then it is noted with this submission's place and its size now
+static void alloc_note(int i) {
+    uint64_t z = g_alloc4[i].allocatedSize, now = clock_gettime_nsec_np(CLOCK_MONOTONIC); int o = g_alloc_ordof[i];
+    if (o >= 0 && z > g_alloc_pre[i]) { g_ord_need[o] = z; g_ord_need_ns[o] = now; }
+    g_alloc_ordof[i] = g_ord ? (g_ord - 1 < ORD_MAX ? g_ord - 1 : ORD_MAX - 1) : 0; g_alloc_pre[i] = z;
+}
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);
 static int mtl_wait_at(uint64_t fence, uint64_t timeout_ns, int site);
 static void up_flush(void);
@@ -1609,6 +1675,7 @@ void mtl_prepare(void) {
     if (!g_warm_started && prepare_on()) { mtl_init(); shmap_load(); }
 }
 static void pu_step(void);   // DM_NVN_TEX_PURGE: purgeable reloadable textures
+static void spare_sweep(void);   // DM_NVN_PKG_SPARE_FRAMES: re-upload spares nothing took
 static void sub_cut_begin(void); static void ts_sub_begin(void), ts_boundary(void); static int ts_on(void);
 static void gpc_sub_begin(void);   // the command buffer timeline of DM_NVN_GPUPROF (gpc_commit)
 static void sub_cut(void); static int cut_dispatch_on(void);   // segment boundaries (DM_NVN_CUT, DM_NVN_CUT_DISPATCH)
@@ -1620,7 +1687,7 @@ void mtl_sub_origin(uint64_t queue, unsigned idx, unsigned prev_kind) { g_so_que
 static void sub_origin_pd(void);
 static void alias_sweep(void);   // the sharing table's unreferenced textures past DM_NVN_ALIAS_SWEEP_MB (below alias_take_over)
 void mtl_sub_begin(void) {
-    mtl_init(); g_sub_serial++; spin_sub_begin(); pool_age(); res_budget_step(); pu_step(); g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL;
+    mtl_init(); g_sub_serial++; spin_sub_begin(); pool_age(); res_budget_step(); pu_step(); spare_sweep(); g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL;
     g_fence_ns[(g_fence + 1) % FENCE_NS] = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     gpc_sub_begin();
     sub_cut_begin();
@@ -1643,11 +1710,13 @@ void mtl_sub_begin(void) {
     // Do not wait for the GPU mid-frame (hot real device: with a fixed rotation of 3, when the GPU cannot keep up every frame blocks here, and the submit thread runs at low frequency after waking, instruction count −18% but CPU time +49%):
     // pick an allocator the GPU has finished with; if all are in use create a new one; only at the cap wait for the oldest one. How far ahead it runs is bounded by the wait where the game acquires the swapchain texture, same as the old interface.
     int alloc_i = -1; uint64_t done = g_done;
-    for (int i = 0; i < g_alloc_n; i++) if (g_alloc_fence[i] <= done) { alloc_i = i; break; }
+    if (alloc_fit_on() && allocprof_level() != 2) alloc_i = alloc_pick(done);
+    else for (int i = 0; i < g_alloc_n; i++) if (g_alloc_fence[i] <= done) { alloc_i = i; break; }
     if (alloc_i < 0 && g_alloc_n < ALLOC_MAX) { NSError *ae = nil; MTL4CommandAllocatorDescriptor *ad = [MTL4CommandAllocatorDescriptor new];
         g_alloc4[g_alloc_n] = [g_dev newCommandAllocatorWithDescriptor:ad error:&ae]; if (!g_alloc4[g_alloc_n]) MDIE("failed to create a new MTL4CommandAllocator: %s", ae.localizedDescription.UTF8String);
         alloc_i = g_alloc_n++; g_alloc_grown++; }
     if (alloc_i < 0) { alloc_i = 0; for (int i = 1; i < g_alloc_n; i++) if (g_alloc_fence[i] < g_alloc_fence[alloc_i]) alloc_i = i; g_alloc_waits++; mtl_wait_at(g_alloc_fence[alloc_i], UINT64_MAX, WS_ALLOC); }
+    if (alloc_fit_on() && allocprof_level() != 2) alloc_note(alloc_i);
     if (allocprof_level() == 2) {   // the GPU is done with this allocator (picked free, or waited for): what it holds is the last submission encoded with it
         if (g_alloc4[alloc_i].allocatedSize) { uint64_t z = g_alloc4[alloc_i].allocatedSize; g_cm_sub_n++; g_cm_sub_sum += z; if (z > g_cm_sub_max) g_cm_sub_max = z;
             int hb = 0; while (hb < 6 && z >= (4ull << 20) << hb) hb++; g_cm_hist[hb]++; }
@@ -1656,6 +1725,7 @@ void mtl_sub_begin(void) {
         g_alloc4[alloc_i] = [g_dev newCommandAllocatorWithDescriptor:[MTL4CommandAllocatorDescriptor new] error:nil]; g_cm_last = 0;
     }
     g_alloc_cur = alloc_i;
+    { uint64_t t = 0, mx = 0; for (int i = 0; i < g_alloc_n; i++) { uint64_t z = g_alloc4[i].allocatedSize; t += z; if (z > mx) mx = z; } atomic_store(&g_alloc_pub_b, t); atomic_store(&g_alloc_pub_max, mx); }
     [g_alloc4[alloc_i] reset];
     [g_cb beginCommandBufferWithAllocator:g_alloc4[alloc_i]];
 begun:
@@ -3116,7 +3186,7 @@ static void tex_put(uint64_t k, id o) {   // serials from 2^62 up are external t
 // Host record of a packaged texture: the current MTLTexture, the upload stamp, and the global write generation at the last check
 // spare: the texture the last re-upload replaced, kept resident and written by the next re-upload once the GPU has passed spare_fence (a texture the CPU rewrites every frame, a movie frame,
 // alternates between two textures instead of allocating one per frame: Link's Awakening's title movie made and freed an 8 MB texture a frame)
-@interface NvPkg : NSObject { @public id<MTLTexture> tex, spare, view; uint64_t stamp, seen, hash, spare_fence, vgen, vseen, sub; const void *span; int sparse, vbase; uint8_t *edge[2]; uint32_t edge_n[2]; id ps, pu; } @end   // hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK; span: its tracked range (nvn_dirty_span, NULL = untracked);
+@interface NvPkg : NSObject { @public id<MTLTexture> tex, spare, view; uint64_t stamp, seen, hash, spare_fence, spare_frame, vgen, vseen, sub; const void *span; int sparse, vbase; uint8_t *edge[2]; uint32_t edge_n[2]; id ps, pu; } @end   // hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK; span: its tracked range (nvn_dirty_span, NULL = untracked);
 // sparse: in a sparse virtual pool, read through its page table (hle_nvn.c nvn_sparse_*), vgen the page table's generation at the upload and vseen at the last look; view: what it is bound as (sparse_view)
 // ps: its placement sparse texture (NvSparse, sparse_make), which tex is: mapped and uploaded tile by tile (sparse_sync)
 // edge: the uploaded bytes of the storage's first and last host pages where other data shares them (pkg_edges_take)
@@ -3129,6 +3199,27 @@ static void tex_put(uint64_t k, id o) {   // serials from 2^62 up are external t
 // nvnMemoryPoolFinalize before the magic is cleared, on another thread), and the view code then sent it texture messages: "-[NvPkg buffer]: unrecognized selector" in tex_by_id, Ocarina of
 // Time as a song is learned on the ocarina (found by the ninboy-hat-for-macos fork; t_pkg_unwrap). No forwarding on NvPkg: an entry that reaches texture code unwrapped is a bug to find
 static inline id pkg_tex(id o) { if ([o isKindOfClass:[NvPkg class]]) { NvPkg *pk = o; return pk->view ? pk->view : pk->tex; } return o; }
+// A spare nothing takes goes (DM_NVN_PKG_SPARE_FRAMES=<n>, default 120; 0 keeps every spare for good, as before): once n frames have passed since the re-upload that made it, with no re-upload
+// since, the texture's next clean lookup releases it (after the GPU is done with it, and not while a serial still draws it). A spare serves a texture rewritten every frame or so (a movie);
+// one the game rewrote once, or every few seconds (streamed terrain and its array textures), kept a second copy of the whole texture resident between its rewrites: in Link's house 39 of
+// them, 62 MB (two 22 MB R16 1360x1000x8 arrays among them). A rewrite after the spare went makes a new texture, as one without a spare does
+static int64_t g_spare_frames = -1; static _Atomic uint64_t g_spare_drops, g_spare_drop_b;
+static uint64_t spare_frames(void) { if (g_spare_frames < 0) { const char *e = getenv("DM_NVN_PKG_SPARE_FRAMES"); g_spare_frames = e && *e ? atoll(e) : 120; if (g_spare_frames < 0) g_spare_frames = 0; } return (uint64_t)g_spare_frames; }
+static void pkg_spare_idle(NvPkg *pk) {
+    uint64_t f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed), keep = spare_frames();
+    if (!pk->spare || !keep || f - pk->spare_frame < keep) return;
+    if (pk->spare_fence > atomic_load(&g_done)) return;   // the GPU still reads it (no g_mu: the sweep holds g_rmu)
+    pthread_mutex_lock(&g_smu); int held = entry_holds((__bridge void *)pk->spare); pthread_mutex_unlock(&g_smu);
+    if (held) { pk->spare_frame = f; return; }   // a serial took it over (cpu_unc_drop) and draws it: looked at again n frames on
+    uint64_t z = pk->spare.allocatedSize, n = atomic_fetch_add(&g_spare_drops, 1) + 1; atomic_fetch_add(&g_spare_drop_b, z);
+    if (n <= 3 || !(n & (n - 1))) MLOG("re-upload spares: one unused for %llu frames released, %llu KB (%llu so far, %llu MB; DM_NVN_PKG_SPARE_FRAMES)", (unsigned long long)keep, (unsigned long long)(z >> 10),
+                                       (unsigned long long)n, (unsigned long long)(atomic_load(&g_spare_drop_b) >> 20));
+    defer_obj_release(pk->spare); pk->spare = nil;
+}
+// The packages holding a spare (weak), so the spares no clean lookup reaches go too: a texture the pool table walk resolves from its cached view, or that nothing draws, is not looked up.
+// Every 60 frames at a submission's start (the submit thread, where re-uploads make spares), under g_rmu as the purge's sweep
+static NSHashTable *g_spare_pkgs;
+static void spare_note(NvPkg *pk) { if (!g_spare_pkgs) g_spare_pkgs = [NSHashTable weakObjectsHashTable]; [g_spare_pkgs addObject:pk]; }
 // Packaged textures by storage and description. Engines make many texture objects over one texture's bytes, each with a serial of its own: Ocarina of Time's 32,768 registered IDs name 3,607 storages,
 // 2.0 GB, and an upload per serial took 6 GB, past what a 16 GB Mac can keep wired once the pools are added. A new serial with the same storage and description takes the same NvPkg, so its
 // dirty-page checks and re-uploads are one. Weak: the serials' entries own it, and a table entry never keeps one alive. Under g_smu; a pool's entries go when it is finalized (mtl_alias_drop_pool)
@@ -4656,9 +4747,13 @@ static size_t mtl_pf_bytes(MTLPixelFormat pf) {
     }
     return 0;
 }
-// Shared all-zero buffer (for zeroing new textures and scissored zero clears): replaced by a bigger one when too small; the old one is released after in-flight submissions finish
+// Shared all-zero buffer (for zeroing new textures and scissored zero clears): replaced by a bigger one when too small; the old one is released after in-flight submissions finish.
+// At most ZERO_BUF_MAX: a larger region is zeroed in bands of rows (zero_bands), so the buffer no longer grows to the largest level ever zeroed. It did: Ocarina of Time's 4096x4096
+// R32Float target made it 64 MB of shared memory, written once, charged to the footprint for good (the Apple TV ends the app at about 2 GB)
+enum { ZERO_BUF_MAX = 4 << 20 };
 static id<MTLBuffer> zero_buf(size_t need) {
     static id<MTLBuffer> zb; static size_t zn;
+    if (need > ZERO_BUF_MAX) need = ZERO_BUF_MAX;
     if (need > zn) {
         size_t n = MAX(need, (size_t)4 << 20);
         id<MTLBuffer> b = [g_dev newBufferWithLength:n options:MTLResourceStorageModeShared];
@@ -4668,6 +4763,20 @@ static id<MTLBuffer> zero_buf(size_t need) {
         zb = b; zn = n;
     }
     return zb;
+}
+// The copies that zero a w x h x z region of a level from a zero buffer of zn bytes: whole images when they fit, else bands of rows (a row is at most 16,384 texels of 16 bytes, 256 KB).
+// emit(size, origin, bytes per image) is called once per copy; how many copies
+static unsigned zero_bands(size_t row, NSUInteger w, NSUInteger h, NSUInteger z, NSUInteger x0, NSUInteger y0, size_t zn, void (^emit)(MTLSize, MTLOrigin, size_t)) {
+    unsigned n = 0; size_t img = row * h;
+    if (!row || !h || !z || row > zn) return 0;
+    if (img <= zn) {   // whole images, as many as fit
+        NSUInteger per = (NSUInteger)(zn / img); if (per < 1) per = 1;
+        for (NSUInteger z0 = 0; z0 < z; z0 += per, n++) emit(MTLSizeMake(w, h, MIN(per, z - z0)), MTLOriginMake(x0, y0, z0), img);
+        return n;
+    }
+    NSUInteger rows = (NSUInteger)(zn / row);
+    for (NSUInteger z0 = 0; z0 < z; z0++) for (NSUInteger r = 0; r < h; r += rows, n++) { NSUInteger hc = MIN(rows, h - r); emit(MTLSizeMake(w, hc, 1), MTLOriginMake(x0, y0 + r, z0), row * hc); }
+    return n;
 }
 static uint64_t g_tex_zeroed;
 // DM_NVN_BC_ASTC: a new BC texture reads the zero blocks of new Switch memory. An all-zero ASTC block is the error colour (magenta), so each level is filled with the void-extent blocks of the colour
@@ -4726,10 +4835,11 @@ static void tex_zero_fill(id<MTLTexture> mt) {
     size_t need = (size_t)mt.width * bpp * mt.height * mt.depth;   // level 0, one slice is the largest
     if (need > (64u << 20)) { static int big; if (!big++) MLOG("new-texture zeroing: %lux%lux%lu exceeds 64 MB, not cleared", (unsigned long)mt.width, (unsigned long)mt.height, (unsigned long)mt.depth); return; }
     id<MTLBuffer> zb = zero_buf(need); if (!zb) return;
+    size_t zn = zb.length;
     up_begin();
     for (NSUInteger l = 0; l < mt.mipmapLevelCount; l++) {
         NSUInteger w = MAX(mt.width >> l, 1u), h = MAX(mt.height >> l, 1u), z = tt == MTLTextureType3D ? MAX(mt.depth >> l, 1u) : 1;
-        for (NSUInteger y = 0; y < slices; y++) up_blit_add(zb, 0, w * bpp, w * bpp * h, MTLSizeMake(w, h, z), mt, y, l);
+        for (NSUInteger y = 0; y < slices; y++) zero_bands(w * bpp, w, h, z, 0, 0, zn, ^(MTLSize sz, MTLOrigin at, size_t image) { up_blit_add_at(zb, 0, w * bpp, image, sz, mt, y, l, at); });
     }
     [g_up_texs addObject:mt];
     if (!g_cb) up_flush();
@@ -5401,9 +5511,10 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
             if (clean) {
                 if (dirtycheck() && !pk->sparse && full_hash(t->mem, t->L.size) != pk->hash && !g_pkg_miss++)
                     MLOG("[RED] dirty-page miss: texture ser=%llu pool content changed but was not detected", t->serial);
+                if (pk->spare) pkg_spare_idle(pk);
                 return pk->view ? pk->view : pk->tex;
             }
-            if (!pk->sparse && pkg_edges_clean(pk, t)) return pk->view ? pk->view : pk->tex;   // only the pages it shares with other data were written
+            if (!pk->sparse && pkg_edges_clean(pk, t)) { if (pk->spare) pkg_spare_idle(pk); return pk->view ? pk->view : pk->tex; }   // only the pages it shares with other data were written
             // Pool content changed (streamed assets written into the same storage, a movie frame): switch to another texture, as in-flight draws still read the old one. That is the spare
             // when the GPU is done with it (see NvPkg), else a new one; the old one becomes the spare (pkg_upload_ made nt resident)
             id<MTLTexture> reuse = nil;
@@ -5414,7 +5525,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
                 if (pk->spare && pk->spare != nt) defer_obj_release(pk->spare);   // still in use, or of another shape: retired as before
                 if (pk->sparse) sparse_view(pk, t);
                 zb_report(t, pk->sparse ? (unsigned)pk->vbase : 0, "re-upload");
-                pk->spare = old; pk->spare_fence = g_fence + 1; ser_note(t->serial); pk->stamp = st; pk->vgen = pk->vseen = vg; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = st; g_pkg_reuploads++; if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size); pkg_edges_take(pk, t); }
+                pk->spare = old; pk->spare_fence = g_fence + 1; pk->spare_frame = atomic_load_explicit(&g_cur_frame, memory_order_relaxed); if (old) spare_note(pk); ser_note(t->serial); pk->stamp = st; pk->vgen = pk->vseen = vg; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = st; g_pkg_reuploads++; if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size); pkg_edges_take(pk, t); }
             return pk->view ? pk->view : pk->tex;
         }
         pk = [NvPkg new];
@@ -6561,7 +6672,8 @@ static int clear_rect_zero(int i) {
     size_t row = (size_t)(x1 - x0) * bpp, img = row * (size_t)(y1 - y0);
     id<MTLBuffer> zb = zero_buf(img); if (!zb) return 0;
     rp_flush();   // a pending full clear on the same attachment must land first, or it would overwrite this one
-    enc_b_copy_buffer_texture(blit(), zb, 0, row, img, MTLSizeMake((NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0), 1), mt, sl, lv, MTLOriginMake((NSUInteger)x0, (NSUInteger)y0, 0));
+    zero_bands(row, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0), 1, (NSUInteger)x0, (NSUInteger)y0, zb.length, ^(MTLSize sz, MTLOrigin at, size_t image) {
+        enc_b_copy_buffer_texture(blit(), zb, 0, row, image, sz, mt, sl, lv, at); });
     static uint64_t n; if (!n++) MLOG("scissored clear: first case %ldx%ld @%ld,%ld (target %lux%lu level %lu)", x1 - x0, y1 - y0, x0, y0, (unsigned long)mt.width, (unsigned long)mt.height, (unsigned long)lv);
     return 1;
 }
@@ -6611,7 +6723,9 @@ static NSString *exe_rel(const char *rel) {
 static void shmap_read(void);
 static void warm_start(void);
 // The shader map, the library directory and its tables, read once from any thread (the prefetch, mtl_prog_prefetch, runs on the game's threads)
-static void shmap_read_once(void) { static dispatch_once_t once; dispatch_once(&once, ^{ shmap_read(); }); }
+// Its own autorelease pool: the first caller is often a game thread (mtl_prog_prefetch), whose pool never drains, and the parse's temporaries stayed for good, 257,202 objects, 24 MB
+// of malloc (the whole file as one string, an array of its 42,851 lines, each line's array of columns) where the map itself needs about 4 (a Mac mini, Ocarina of Time)
+static void shmap_read_once(void) { static dispatch_once_t once; dispatch_once(&once, ^{ @autoreleasepool { shmap_read(); } }); }
 // That, then the prewarm (warm_start) once: the submit thread and the tools only. The flag is set before warm_start runs, so a call from inside it (pso_prebuild) returns at
 // once; inside the dispatch_once that call re-entered it and libdispatch aborted (Tears of the Kingdom and Pokémon Scarlet at boot, chain d0e99bd4b2fe)
 static void shmap_load(void) { shmap_read_once(); static int warmed; if (!warmed) { warmed = 1; warm_start(); } }
@@ -6879,25 +6993,50 @@ static MTL4FunctionDescriptor *fn4_of(id<MTLFunction> f) {
 // builds after all (pso_build's fallback) takes the function fn_dev specializes from the descriptor
 static int pso4_compiler(void);
 static os_unfair_lock g_fn_dev_lock = OS_UNFAIR_LOCK_INIT;
-@interface FnDev : NSObject { @public id<MTLFunction> fn; } @end
+@interface FnDev : NSObject { @public id<MTLFunction> fn; id<MTLLibrary> lib; NSString *name; MTLFunctionConstantValues *cv; int64_t key; } @end   // lib, name, cv: what fn_spec was asked (the MTLDevice path; fn_dev specializes from them); key: which values (fn_spec_k)
 @implementation FnDev @end
 static NSMapTable *g_fn_dev;   // a function fn_spec left unspecialized → its stable specialization record (fn filled by fn_dev)
 static id<MTLFunction> fn_lib_spec(id<MTLLibrary> lib, NSString *name, MTLFunctionConstantValues *cv, NSError **e) {
     if (!lib || !name || !cv) return nil;
     return fn4_note([lib newFunctionWithName:name constantValues:cv error:e], lib, name, cv);
 }
-static id<MTLFunction> fn_spec(id<MTLLibrary> lib, NSString *name, MTLFunctionConstantValues *cv, NSError **e) {
+// Without the Metal 4 compiler (iOS and tvOS unless the profile sets pso_mtl4 on, DM_PSO_MTL4=0) every pipeline is built through the MTLDevice, and fn_spec specialized each function
+// with constants as its shader loaded: the prewarm loads every shader of the manifest (Ocarina of Time 8,376, for 1,154 render pipelines), and each vertex shader's geometry capture
+// entry and each fragment shader's integer-output variants were specialized beside it, though few of them ever go into a pipeline. A specialized function keeps its compiled module in
+// the process's own memory: on a Mac mini with the TV's settings 4,396 of them held 139 MB of malloc (MTLCompilerFSCache::getElementImpl), charged to the footprint the Apple TV ends
+// the app at, and each specialization was a synchronous compile on a cold start. So by default the function stays unspecialized there too, as on the Metal 4 path, and fn_dev
+// specializes it when an MTLDevice pipeline is first built from it (pso_build_dev, mtk_build, the geometry pipelines): only the functions some pipeline uses take that memory.
+// Link's house there: the host's malloc 461 → 285 MB in use, the footprint 2,104 → 1,905 MB. DM_NVN_SPEC_LAZY=0 specializes every one at load, as before
+static int spec_lazy(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_NVN_SPEC_LAZY"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_SPEC_LAZY=0: functions with constants are specialized as their shader loads (MTLDevice pipelines)"); }
+    return v;
+}
+static _Atomic uint64_t g_fn_again_shared, g_fn_again_spec;   // second requests for a name: the same values (one lazy function), other values (specialized at once)
+// key names the constant values cv holds, so a second request for a name with the same values takes the first one's function (0: the empty set, every caller but nf_fn; nf_fn 1 + its mask)
+static id<MTLFunction> fn_spec_k(id<MTLLibrary> lib, NSString *name, MTLFunctionConstantValues *cv, int64_t key, NSError **e) {
     if (!lib || !name) return nil;
-    if (!pso4_compiler()) return fn_lib_spec(lib, name, cv, e);
+    int dev = !pso4_compiler();
+    if (dev && (!cv || !spec_lazy())) return fn_lib_spec(lib, name, cv, e);
     id<MTLFunction> f = [lib newFunctionWithName:name];
     if (!f) { if (e) *e = [NSError errorWithDomain:@"dm" code:1 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"no function %@ in the library", name]}]; return nil; }
     if (!f.functionConstantsDictionary.count) return fn4_note(f, lib, name, nil);
     os_unfair_lock_lock(&g_fn_dev_lock);
     if (!g_fn_dev) g_fn_dev = [[NSMapTable alloc] initWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory capacity:0];
-    if (![g_fn_dev objectForKey:f]) [g_fn_dev setObject:[FnDev new] forKey:f];
+    FnDev *rec = [g_fn_dev objectForKey:f]; int had = rec != nil, same = had && rec->key == key;
+    if (!had) { rec = [FnDev new]; rec->key = key; if (dev) { rec->lib = lib; rec->name = name; rec->cv = cv; } [g_fn_dev setObject:rec forKey:f]; }
     os_unfair_lock_unlock(&g_fn_dev_lock);
+    if (dev && had) { uint64_t n = atomic_fetch_add(same ? &g_fn_again_shared : &g_fn_again_spec, 1) + 1;
+        if (n == 1 || n == 1000) MLOG("functions asked for again (a name the library handed out before): %llu with the same values share the first one, %llu with other values specialized at once", (unsigned long long)atomic_load(&g_fn_again_shared), (unsigned long long)atomic_load(&g_fn_again_spec)); }
+    if (dev && same) return f;   // the same values: the first request's function, specialized once by fn_dev
+    // A library hands out one function object per name, and Metal hands out one library for the same data: a second request for a name takes the first one's function when its values
+    // are the same (key), and with other values (nf_fn's non-finite variants) would note them over the first's, and both would be specialized alike: without the Metal 4 compiler that
+    // one is specialized through the library at once, a function of its own. The first keeps what it asked in its record, which fn_dev specializes from, whatever is noted later.
+    // Measured with the TV's settings on the Mac: without the shared case 6,093 functions were specialized, 186 MB of malloc, more than the 4,396 (139 MB) of specializing at load
+    if (dev && had) return fn_lib_spec(lib, name, cv, e);
     return fn4_note(f, lib, name, cv);
 }
+static id<MTLFunction> fn_spec(id<MTLLibrary> lib, NSString *name, MTLFunctionConstantValues *cv, NSError **e) { return fn_spec_k(lib, name, cv, 0, e); }   // the empty set of values (every caller but nf_fn)
 // The function an MTLDevice pipeline is built from: f specialized through its library (once) when fn_spec left it unspecialized, else f itself
 static id<MTLFunction> fn_dev(id<MTLFunction> f) {
     if (!f) return f;
@@ -6906,8 +7045,12 @@ static id<MTLFunction> fn_dev(id<MTLFunction> f) {
     // Only callers of this function wait for its compilation; the map lock never covers a library/compiler call.
     @synchronized(dev) {
         if (dev->fn) return dev->fn;
-        MTL4SpecializedFunctionDescriptor *sd = (MTL4SpecializedFunctionDescriptor *)fn4_of(f); MTL4LibraryFunctionDescriptor *ld = (MTL4LibraryFunctionDescriptor *)sd.functionDescriptor;
-        id<MTLLibrary> lib = ld.library; NSString *name = ld.name; MTLFunctionConstantValues *cv = sd.constantValues;
+        id<MTLLibrary> lib = dev->lib; NSString *name = dev->name; MTLFunctionConstantValues *cv = dev->cv;
+        if (!lib) {   // the Metal 4 path's record: what is noted on the function
+            MTL4FunctionDescriptor *d = fn4_of(f); if (![d isKindOfClass:[MTL4SpecializedFunctionDescriptor class]]) return f;
+            MTL4SpecializedFunctionDescriptor *sd = (MTL4SpecializedFunctionDescriptor *)d; MTL4LibraryFunctionDescriptor *ld = (MTL4LibraryFunctionDescriptor *)sd.functionDescriptor;
+            if (![ld isKindOfClass:[MTL4LibraryFunctionDescriptor class]]) return f;
+            lib = ld.library; name = ld.name; cv = sd.constantValues; }
         if (!lib || !name || !cv) return f;   // fn_spec notes all three
         NSError *e = nil; dev->fn = fn_lib_spec(lib, name, cv, &e);
         if (!dev->fn) { MLOG("[RED] function %s: specializing its function constants for an MTLDevice pipeline failed: %s", f.name.UTF8String, e.localizedDescription.UTF8String); return f; }
@@ -7860,6 +8003,16 @@ static void pu_finish(uint64_t frame, uint64_t done, int pressure) {
         MLOG("texture purge at frame %llu: %llu made volatile (%llu MB), %llu empty (%llu MB); in all volatile %llu MB, empty %llu MB, restored %llu MB (%llu re-uploaded, %llu cancelled while pending), %llu still pending, available %llu MB",
              (unsigned long long)frame, (unsigned long long)nv, (unsigned long long)(bv >> 20), (unsigned long long)ne, (unsigned long long)(be >> 20), (unsigned long long)(g_pu_vol_b >> 20), (unsigned long long)(g_pu_empty_b >> 20),
              (unsigned long long)(g_pu_back_b >> 20), (unsigned long long)g_pu_reload_n, (unsigned long long)g_pu_cancel_n, (unsigned long long)left, (unsigned long long)pu_avail_mb());
+}
+// The spares sweep (spare_note, DM_NVN_PKG_SPARE_FRAMES): here, where g_rmu is known
+static void spare_sweep(void) {
+    static uint64_t last; uint64_t frame = atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
+    if (!spare_frames() || !g_spare_pkgs.count || frame < last + 60) return;
+    last = frame;
+    NSArray<NvPkg *> *list = g_spare_pkgs.allObjects;
+    os_unfair_lock_lock(&g_rmu);
+    for (NvPkg *pk in list) { pkg_spare_idle(pk); if (!pk->spare) [g_spare_pkgs removeObject:pk]; }
+    os_unfair_lock_unlock(&g_rmu);
 }
 // The submit thread, at a submission's start (after res_budget_step). Phase 1, every PU_EVERY frames while the process is short of memory: the textures nothing has used for PU_IDLE frames, but the
 // most recent ones that fit DM_NVN_TEX_PURGE_KEEP_MB, are marked pending and the pool tables go back to the dummy for them (an epoch bump). Phase 2 is pu_finish
@@ -9007,7 +9160,7 @@ static id<MTLFunction> nf_fn(NvShader *fs, id<MTLFunction> base, uint32_t mask) 
     if (!f) {
         NSError *e = nil; MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new]; uint32_t m = mask & 0xff;
         [cv setConstantValue:&m type:MTLDataTypeUInt atIndex:DMSH_FINITE_FC];
-        f = fn_spec(lib, name, cv, &e);
+        f = fn_spec_k(lib, name, cv, 1 + (int64_t)m, &e);
         if (!f) { static int n; if (n++ < 8) MLOG("[RED] shader %s: the non-finite output entry point %s (mask %02x) failed: %s", fs->key, name.UTF8String, m, e.localizedDescription.UTF8String); f = base; }
         else if (atomic_fetch_add(&g_nf_variants, 1) < 3) MLOG("non-finite colour outputs to R11G11B10F targets: %s entry %s specialized for outputs 0x%02x", fs->key, name.UTF8String, m);
         if (!fs->nffn) fs->nffn = [NSMutableDictionary dictionary];
@@ -14942,7 +15095,7 @@ static void warm_claim(void) {
 // with the drive idle and up to 4 s with it busy. A draw that comes before its library has loaded loads it itself, as before. DM_NVN_PREFETCH=0 turns it off
 static _Atomic uint64_t g_progpf_loaded;
 static int prefetch_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_PREFETCH"); v = !(e && !strcmp(e, "0")); } return v; }
-void mtl_prog_prefetch(const prog_t *cp) {
+void mtl_prog_prefetch(const prog_t *cp) { @autoreleasepool {   // a game thread's: its pool never drains, and each program's key strings stayed there
     prog_t *p = (prog_t *)cp;
     if (!g_dev || !prefetch_on()) return;
     shmap_read_once();   // the map only: the prewarm starts on the submit thread (shmap_load)
@@ -14961,7 +15114,7 @@ void mtl_prog_prefetch(const prog_t *cp) {
             if (!g_progpf_loaded++) MLOG("shader prefetch at program creation: first library %s loaded in the background (DM_NVN_PREFETCH=0 turns it off)", pc.UTF8String);
         } });
     }
-}
+} }
 // Dispatches share the open copy encoder (a Metal 4 compute encoder) with the copies and dispatches around them, each ordered after everything the encoder already holds by a barrier inside it,
 // as a texture copy is (blit). An encoder of their own, with full queue barriers on both sides, cost the GPU a drain per dispatch: Hyrule Warriors: Age of Calamity's battles after the first cutscene
 // run about 1,060 small dispatches a frame, and the Mac GPU went from 6.7 to 16 ms a frame at the same draws, the iPhone's from 15 to about 50 (17 fps).

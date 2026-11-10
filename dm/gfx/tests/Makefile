@@ -568,6 +568,21 @@ t_c1_lazy: t_c1_lazy.m $(MTL_T_DEP)
 check_t_c1_lazy: t_c1_lazy
 	./t_c1_lazy
 	DM_NVN_C1_LAZY=0 ./t_c1_lazy
+t_alloc_fit: t_alloc_fit.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_alloc_fit.m $(MTL_T_SRC) $(FW)
+check_t_alloc_fit: RUN_ENV = MTL_DEBUG_LAYER=1
+t_pkg_spare: t_pkg_spare.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_pkg_spare.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_pkg_spare
+check_t_pkg_spare: t_pkg_spare
+	MTL_DEBUG_LAYER=1 ./t_pkg_spare
+	DM_NVN_PKG_SPARE_FRAMES=0 MTL_DEBUG_LAYER=1 ./t_pkg_spare
+t_spec_lazy: t_spec_lazy.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_spec_lazy.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_spec_lazy
+check_t_spec_lazy: t_spec_lazy
+	MTL_DEBUG_LAYER=1 ./t_spec_lazy
+	DM_NVN_SPEC_LAZY=0 MTL_DEBUG_LAYER=1 ./t_spec_lazy
 t_alias_sweep: t_alias_sweep.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_alias_sweep.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_alias_sweep

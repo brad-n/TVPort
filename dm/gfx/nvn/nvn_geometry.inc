@@ -95,7 +95,7 @@ static id<MTLRenderPipelineState> geo_capture_pso(NvShader *vs) {
     id<MTLRenderPipelineState> ps = hm_get_id(&g_pso, &k);
     if (ps || hm_get_id(&g_pso_fail, &k)) return ps;
     NSError *e = nil;
-    ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, nil, nil, 0) error:&e];
+    ps = pso_build_dev(pso_desc(&k, vs, nil, nil, 0), &e);   // through fn_dev: the capture entry may still be unspecialized (fn_spec)
     if (ps) hm_put_id(&g_pso, &k, ps);
     else { hm_put_id(&g_pso_fail, &k, NSNull.null); MLOG("[RED] geometry vertex capture %s: %s", vs->key, e.localizedDescription.UTF8String); }
     return ps;
@@ -425,7 +425,7 @@ static id<MTLRenderPipelineState> geo_mesh_pso_for(NvProg *pr, id<MTLFunction> f
     if (!ps) {
         MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, nil, 0);
         MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
-        m.meshFunction = fn; m.fragmentFunction = d.fragmentFunction;
+        m.meshFunction = fn_dev(fn); m.fragmentFunction = fn_dev(d.fragmentFunction);   // specialized when fn_spec left them unspecialized (fn_dev)
         m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageEnabled = d.alphaToCoverageEnabled;
         for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
         m.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
