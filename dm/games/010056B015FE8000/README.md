@@ -103,7 +103,7 @@ The objects in `data000.cpk/shader.dat` decode as follows:
 
 ## Open
 
-- Conditional rendering is still drawn unconditionally (`SetRenderEnableConditional` is the route's only `[RED]` warning); no visible fault was found from it in this route.
+- Conditional rendering is still drawn unconditionally (`SetRenderEnableConditional` is the route's only `[RED]` warning); no visible fault was found from it in this route. Since 2026-11-09 `render_cond` is automatic for every game (on from its first render-enable call), so these conditions are evaluated now; not re-checked in a run since.
 - iPhone performance remains scene-dependent; a constant 60 FPS across the full game has not been established. The current reconciliation's regression coverage is recorded in the geometry optimization review above.
 
 

@@ -24,7 +24,7 @@ Tested on the Mac: the opening, the title, every tile with its movie; A on Super
 
 | Setting | Where | Why |
 |---|---|---|
-| `render_cond on` | [`game.tsv`](game.tsv) | the menu wraps its clears in conditional rendering; without evaluating it every frame is black ([Conditional rendering evaluated at replay](../../../docs/reference/rendering.md#conditional-rendering-evaluated-at-replay)) |
+| `render_cond` (automatic, the default for every game) | — | the menu wraps its clears in conditional rendering; without evaluating it every frame is black ([Conditional rendering evaluated at replay](../../../docs/reference/rendering.md#conditional-rendering-evaluated-at-replay)) |
 | 4 GB layout: `mem_reserve 0x100000000`, `mem_alias 0x10000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000`, `sys_resource 0x0` | `game.tsv` | what the survey's rules give for a game with no system resource; `main` sets a heap of the pool − 64 MB |
 | `modules main subsdk0 sdk` | `game.tsv` | `subsdk0` plays the menu's movies |
 

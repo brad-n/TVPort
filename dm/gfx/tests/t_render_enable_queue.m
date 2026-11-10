@@ -4,7 +4,10 @@
 // without it the host draws every render-enable block and posts no pending counter values.
 #include "game_profile.h"
 #undef DM_GAME_RENDER_COND
-#define DM_GAME_RENDER_COND 1
+#ifndef T_RENDER_COND
+#define T_RENDER_COND 1   // on; t_render_enable_queue_auto is built with 2, auto (the default), which must turn on at the first render-enable call and pass every check alike
+#endif
+#define DM_GAME_RENDER_COND T_RENDER_COND
 #define nvn_game_fps nvn_game_fps_mtl_default
 #include "../nvn/nvn_mtl.m"
 #undef nvn_game_fps
@@ -99,6 +102,7 @@ int main(void) { @autoreleasepool {
     const NVNtexture *colors[] = {&target}; const float viewport[] = {0,0,W,H}, blue[] = {0,0,1,1};
     const char *names[] = {"unsplit disabled control", "disabled across WaitEvent", "disabled across SignalEvent", "disabled across WaitSync", "disabled across FenceSync", "conditional false across WaitEvent"};
     NVNsync split_sync; P(nvnSyncInitialize)(&split_sync, &device);
+    CHECK(mtl_render_cond() == (T_RENDER_COND == 1), "render_cond: on before any render-enable call only when the profile says on");
     for (int k=0;k<6;k++) {
         P(nvnCommandBufferBeginRecording)(&command);
         P(nvnCommandBufferSetRenderEnable)(&command,1);
@@ -180,6 +184,26 @@ int main(void) { @autoreleasepool {
     submit(0,P(nvnCommandBufferEndRecording)(&command),&sync);finish(&sync);
     CHECK(pixels(0,255,0,0),"CPU counter write after completed report replaces pending zero");
 
+    // The samples-passed counter is one running total in queue order. A game that never resets it reads
+    // end - begin of two reports (Red Dead Redemption); this is the process's first samples-passed command.
+    // Slots left at a submission's end are read at its own completion, before a later submission reuses
+    // the visibility buffer (the half-scissored second draw lands in the same slot of the same buffer).
+    uint64_t *r0=(uint64_t *)(memory+EVENT+384),*r1=(uint64_t *)(memory+EVENT+448),*r2=(uint64_t *)(memory+EVENT+512);
+    r0[0]=r1[0]=r2[0]=7;
+    for (int k=0;k<4;k++) {
+        P(nvnCommandBufferBeginRecording)(&command);
+        P(nvnCommandBufferSetRenderTargets)(&command,1,colors,NULL,NULL,NULL);
+        P(nvnCommandBufferSetViewports)(&command,0,1,viewport); P(nvnCommandBufferSetScissor)(&command,0,0,k&1 ? W/2 : W,H);
+        if (k==0) P(nvnCommandBufferReportCounter)(&command,NVN_COUNTER_TYPE_SAMPLES_PASSED,(NVNbufferAddress)(uintptr_t)r0);   // no reset before it
+        if (k==2) P(nvnCommandBufferResetCounter)(&command,NVN_COUNTER_TYPE_SAMPLES_PASSED);
+        P(nvnCommandBufferBindProgram)(&command,&stable_red,3);
+        P(nvnCommandBufferDrawArrays)(&command,NVN_DRAW_PRIMITIVE_TRIANGLES,0,3);
+        if (k&1) P(nvnCommandBufferReportCounter)(&command,NVN_COUNTER_TYPE_SAMPLES_PASSED,(NVNbufferAddress)(uintptr_t)(k==1 ? r1 : r2));
+        submit(0,P(nvnCommandBufferEndRecording)(&command),&sync);finish(&sync);
+    }
+    CHECK(r0[0]!=7 && r1[0]-r0[0]==W*H+W*H/2,"with no reset, end - begin of two reports counts the samples between them, across submissions");
+    CHECK(r2[0]==W*H+W*H/2,"after a reset, the total counts the samples of every submission up to the report");
+
     // Occlusion conditions: a samples-passed report that has landed decides the
     // block as the GPU would; one still in flight keeps the block drawing.
     uint64_t *empty=(uint64_t *)(memory+EVENT+256),*seen=(uint64_t *)(memory+EVENT+320);
@@ -224,5 +248,6 @@ int main(void) { @autoreleasepool {
     P(nvnTextureFinalize)(&target); P(nvnTextureFinalize)(&replacement); P(nvnCommandBufferFinalize)(&command);
     P(nvnBufferFinalize)(&buffer); P(nvnEventFinalize)(&event); P(nvnMemoryPoolFinalize)(&pool);
     P(nvnQueueFinalize)(&queues[0]); P(nvnQueueFinalize)(&queues[1]); P(nvnDeviceFinalize)(&device); free(memory);
-    printf("render enable continuation: %d checks, %d failed\n", checks, failures); return failures != 0;
+    CHECK(mtl_render_cond(), "render_cond on after the game's render-enable calls (auto turns on at the first)");
+    printf("render enable continuation (render_cond %s): %d checks, %d failed\n", T_RENDER_COND == 2 ? "auto" : "on", checks, failures); return failures != 0;
 } }

@@ -118,10 +118,45 @@ int main(void) {
         mtl_tex_release(&upper);
         teardown(&f);
 
+        // A span's sliver inside a texture (gws_sliver): less than a page of it, not covering it. Ocarina of Time's terrain tiles, GitHub issue #1566
+        setup(&f, 7040, CACHED, NVN_FORMAT_RGBA8, 0);
+        tex_t drawn = texture_at(&f, 7041, 0x40000, 68, NVN_FORMAT_RGBA8, 0);   // 40,960 bytes: it ends 8 KB into its third page
+        uintptr_t pg = (uintptr_t)getpagesize(), drawn_end = (uintptr_t)drawn.mem + drawn.L.size, shared = drawn_end & ~(pg - 1);
+        CHECK("fixture: the drawn texture ends inside a page", drawn_end != shared && drawn_end - shared < pg);
+        tex_t filled = texture_at(&f, 7042, shared - (uintptr_t)f.mem, 68, NVN_FORMAT_RGBA8, 0);   // begins in that page: the drawn texture's span reaches 8 KB into it
+        mtl_tex_gpu_written(&drawn);
+        dm_guest_write_prepare(filled.mem, filled.L.size); fill(&filled, filled.mem, 40);
+        CHECK("a neighbour's span reaching less than a page into a texture does not make it the GPU's", !gws_owned((uintptr_t)filled.mem, (uintptr_t)filled.mem + filled.L.size));
+        CHECK("and the texture is taken from its storage", tex_cpu_content(&filled));
+        CHECK("while the drawn texture stays the GPU's", gws_owned((uintptr_t)drawn.mem, drawn_end));
+        mtl_tex_release(&filled); mtl_tex_release(&drawn);
+        teardown(&f);
+
+        setup(&f, 7043, CACHED, NVN_FORMAT_RGBA8, 0);   // a remnant of an old span between two newer ones (gws_set keeps the parts outside a new span), inside a texture the CPU then filled
+        large = texture_at(&f, 7044, 0x40000, LARGE, NVN_FORMAT_RGBA8, 0);
+        uintptr_t lo = (uintptr_t)large.mem, hi = lo + large.L.size, cut = lo + large.L.size / 2;
+        mtl_tex_gpu_written(&large);
+        pthread_mutex_lock(&g_gws_mu); gws_set(lo, cut); gws_set(cut + 2560, hi); pthread_mutex_unlock(&g_gws_mu);
+        CHECK("fixture: three spans, the middle one 2,560 bytes", g_ngws >= 3 && g_gws[gws_find(cut)].lo == cut && g_gws[gws_find(cut)].hi == cut + 2560);
+        dm_guest_write_prepare(large.mem, large.L.size); fill(&large, large.mem, 40);
+        CHECK("a sub-page remnant of an old span inside a texture the CPU rewrote does not keep it the GPU's", !gws_owned(lo, hi));
+        CHECK("and the texture is taken from its storage", tex_cpu_content(&large));
+        mtl_tex_release(&large);
+        teardown(&f);
+
+        setup(&f, 7045, CACHED, NVN_FORMAT_RGBA8, 0);   // a texture smaller than a page over storage the GPU wrote stays the GPU's: the span covers it, and a neighbour's CPU write in its page is not its
+        tex_t beside = texture_at(&f, 7046, f.t.L.size, SIZE, NVN_FORMAT_RGBA8, 0);
+        mtl_tex_gpu_written(&f.t);
+        dm_guest_write_prepare(beside.mem, beside.L.size); fill(&beside, beside.mem, 40);
+        CHECK("a texture smaller than a page over storage the GPU wrote stays the GPU's", gws_owned((uintptr_t)f.t.mem, (uintptr_t)f.t.mem + f.t.L.size));
+        CHECK("though a neighbour in its page is CPU-written", !tex_cpu_content(&f.t) && tex_cpu_content(&beside));
+        mtl_tex_release(&beside);
+        teardown(&f);
+
         // A streamed height tile reuses several GPU spans. Cutting a span leaves a
         // 0xa00-byte remnant inside a page that was originally protected in full.
-        setup(&f, 7040, CACHED, NVN_FORMAT_RGBA8, 0);
-        tex_t terrain = texture_at(&f, 7041, 0xd000, 260, NVN_FORMAT_RGBA8, 0);
+        setup(&f, 7050, CACHED, NVN_FORMAT_RGBA8, 0);
+        tex_t terrain = texture_at(&f, 7051, 0xd000, 260, NVN_FORMAT_RGBA8, 0);
         uintptr_t base = (uintptr_t)f.mem;
         pthread_mutex_lock(&g_gws_mu);
         gws_set(base + 0xd000, base + 0x80000);
@@ -132,7 +167,7 @@ int main(void) {
         // Creating a shared pool buffer must re-protect the inherited page too.
         id<MTLBuffer> terrain_pool = pool_buf(base, base + POOL);
         CHECK("split terrain pool buffer is created", terrain_pool != nil);
-        tex_t edge = texture_at(&f, 7042, 0x5f600, SIZE, NVN_FORMAT_RGBA8, 0);
+        tex_t edge = texture_at(&f, 7052, 0x5f600, SIZE, NVN_FORMAT_RGBA8, 0);
         dm_guest_write_prepare((uint8_t *)f.mem + 0x5c000, 4);
         memset((uint8_t *)f.mem + 0x5c000, 1, 4);
         CHECK("a partial-page texture does not inherit a neighbour's CPU write", gws_owned((uintptr_t)edge.mem, (uintptr_t)edge.mem + edge.L.size));

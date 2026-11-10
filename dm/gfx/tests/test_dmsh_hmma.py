@@ -154,6 +154,7 @@ HALF = r'''#import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 static float h2f(uint16_t h) { __fp16 v; memcpy(&v, &h, 2); return (float)v; }
 static uint16_t f2h(float f) { __fp16 v = (__fp16)f; uint16_t h; memcpy(&h, &v, 2); return h; }
+static float r16(float f) { return h2f(f2h(f)); }   // one rounding to f16 (RNE)
 static id<MTLComputePipelineState> pipeline(id<MTLDevice> dev, const char *path, NSString *name) {
     NSError *e = nil; NSData *lib_data = [NSData dataWithContentsOfFile:@(path)];
     id<MTLLibrary> lib = [dev newLibraryWithData:dispatch_data_create(lib_data.bytes, lib_data.length, nil, DISPATCH_DATA_DESTRUCTOR_DEFAULT) error:&e];
@@ -168,8 +169,8 @@ static void run(id<MTLDevice> dev, id<MTLComputePipelineState> ps, id<MTLBuffer>
     [ce dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)]; [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
 }
 '''
-# The GPU check: 64 threadgroups of 128 lanes, random halves in [-1, 1]; the reference sums in float and rounds once; the matrix hardware rounds the f16 accumulator as
-# it goes, as Ampere's f16 accumulator does, so the tolerance is 0.01 + 0.4 % of the value
+# The GPU check: 64 threadgroups of 128 lanes, random halves in [-1, 1]; the reference is Ampere's: C, then k 0-7 summed in float in order and rounded once to f16,
+# then k 8-15 the same way (dmsh_build.py HMMA_BODY), and every output must match it bit for bit
 RUNNER = HALF + r'''
 int main(int argc, char **argv) {
     @autoreleasepool {
@@ -194,19 +195,19 @@ int main(int argc, char **argv) {
                 int g = L / 4, t = L % 4; const uint32_t *r = o + (warp * 32 + L) * 2;
                 for (int q2 = 0; q2 < 2; q2++) for (int j = 0; j < 2; j++) {
                     int row = g + 8 * q2, col = 2 * t + j; float ref = C[row][col];
-                    for (int k = 0; k < 16; k++) ref += A[row][k] * B[k][col];
+                    for (int k = 0; k < 16; k++) { ref = fmaf(A[row][k], B[k][col], ref); if (k == 7 || k == 15) ref = r16(ref); }
                     double d = fabs(h2f((r[q2] >> (16 * j)) & 0xffff) - ref);
                     if (d > worst) worst = d;
-                    bad += d > 0.01 + fabs(ref) * 0.004;
+                    bad += (r[q2] >> (16 * j) & 0xffff) != f2h(ref);
                 }
             }
         }
-        printf("%d SIMD-groups, max abs error %.4g, %ld outputs over tolerance\n", n / 32, worst, bad);
+        printf("%d SIMD-groups, max abs error %.4g, %ld outputs that differ from Ampere's\n", n / 32, worst, bad);
         return bad != 0;
     }
 }
 '''
-# The run of calls: E0 = A0 (B0 + B1) + C and E1 = A1 (B2 + B3), each two HMMAs with an f16 accumulator in between: the tolerance is twice the single call's
+# The run of calls: E0 = A0 B0 + A0 B1 + C and E1 = A1 B2 + A1 B3, each two HMMAs with an f16 accumulator in between, bit for bit against the same reference
 SEQ_RUNNER = HALF + r'''
 int main(int argc, char **argv) {
     @autoreleasepool {
@@ -227,14 +228,16 @@ int main(int argc, char **argv) {
                     int row = g + 8 * q2, col = 2 * t + j;
                     const uint16_t *A = x + 256 * e, *Ba = x + 512 + 256 * e, *Bb = Ba + 128;
                     float ref = e == 0 ? h2f(x[1024 + row * 8 + col]) : 0;
-                    for (int k = 0; k < 16; k++) ref += h2f(A[row * 16 + k]) * (h2f(Ba[k * 8 + col]) + h2f(Bb[k * 8 + col]));
+                    for (int c = 0; c < 2; c++) for (int k = 0; k < 16; k++) {   // two calls, B0 then B1: their k 0-7 and k 8-15 each rounded once
+                        ref = fmaf(h2f(A[row * 16 + k]), h2f((c ? Bb : Ba)[k * 8 + col]), ref); if (k == 7 || k == 15) ref = r16(ref);
+                    }
                     double d = fabs(h2f((r[e * 2 + q2] >> (16 * j)) & 0xffff) - ref);
                     if (d > worst) worst = d;
-                    bad += d > 0.02 + fabs(ref) * 0.008;
+                    bad += (r[e * 2 + q2] >> (16 * j) & 0xffff) != f2h(ref);
                 }
             }
         }
-        printf("%d SIMD-groups, max abs error %.4g, %ld outputs over tolerance\n", warps, worst, bad);
+        printf("%d SIMD-groups, max abs error %.4g, %ld outputs that differ from Ampere's\n", warps, worst, bad);
         return bad != 0;
     }
 }
@@ -258,7 +261,8 @@ class HmmaRewrite(unittest.TestCase):
     def test_body_replaced_with_its_arguments(self):
         out = hmma_msl(HEAD + HELPER + KERNEL)
         body = out[out.index('int dmsh_hmma16816_f16('):out.index('kernel void check')]
-        self.assertEqual(body.count('simdgroup_multiply_accumulate('), 4)
+        self.assertEqual(body.count('simdgroup_multiply_accumulate('), 8)   # two blocks of two products, each block rounded by one more (-0 x +0 onto it)
+        self.assertNotIn('.thread_elements()[', body)   # no lane conversions left
         self.assertIn('threadgroup uint* s = &_34[uint(_11)];', body)        # the scratch array at the block offset
         self.assertIn('uint g = uint(_10) >> 2', body)                        # the lane
         self.assertIn('s[g * 8 + t] = uint(_12)', body)                       # A0
@@ -373,6 +377,81 @@ class TranslatorFlags(unittest.TestCase):
         root = lambda a: root(copies[a]) if a in copies else a
         self.assertEqual(root(calls[0][11]), root(calls[1][11]))                                                        # the LDSM's row address
         self.assertRegex(msl, r'int %s = as_type<int>\(\w+\) \* 16;' % root(calls[0][11]))                              # R2
+
+
+# The rounding step alone (HMMA_BODY): a multiply-accumulate of -0 x +0 products onto a float matrix into a half one against converting each lane's
+# thread_elements() to half (the form before), over every f16 value, the f32 midpoints between neighbours and an ulp either side, f32 denormals, signed zeros,
+# infinities, NaNs, values past 65504 and random bit patterns, in the Mac's math mode and the iPhone / Apple TV one: every result the same bits
+ROUND_KERNEL = r'''#include <metal_stdlib>
+using namespace metal;
+// Each SIMD-group: 64 floats as an 8x8 float matrix, rounded to f16 two ways: a lane's elements converted (thread_elements, upstream's HMMA body) and a
+// multiply-accumulate of -0 x +0 products onto it into a half result (every product -0, and x + -0 is x for every x, signed zeros included)
+kernel void round2(const device float* in [[buffer(0)]], device half* a [[buffer(1)]], device half* b [[buffer(2)]], uint gid [[threadgroup_position_in_grid]]) {
+    simdgroup_float8x8 f; simdgroup_load(f, in + gid * 64, 8);
+    simdgroup_half8x8 ca = make_filled_simdgroup_matrix<half, 8, 8>(0.0h), cb;
+    for (int i = 0; i < 2; i++) ca.thread_elements()[i] = half(f.thread_elements()[i]);
+    const simdgroup_half8x8 nz = make_filled_simdgroup_matrix<half, 8, 8>(-0.0h), pz = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+    simdgroup_multiply_accumulate(cb, nz, pz, f);
+    simdgroup_store(ca, a + gid * 64, 8); simdgroup_store(cb, b + gid * 64, 8);
+}
+'''
+ROUND_RUNNER = r'''// rr <metallib>: the two f16 roundings of round2 over every f16 value, the f32 midpoints between neighbours and one f32 ulp either side, f32 denormals, signed zeros,
+// infinities, NaNs, values past 65504, and 1M random f32 bit patterns; prints how many results differ in any bit
+#import <Metal/Metal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+static float h2f(uint16_t h) { _Float16 x; memcpy(&x, &h, 2); return (float)x; }
+static uint32_t fb(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static float bf(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+int main(int argc, char **argv) { @autoreleasepool {
+    id<MTLDevice> d = MTLCreateSystemDefaultDevice(); NSError *e = nil;
+    id<MTLLibrary> lib = [d newLibraryWithURL:[NSURL fileURLWithPath:@(argv[1])] error:&e]; if (!lib) { puts(e.description.UTF8String); return 2; }
+    id<MTLComputePipelineState> ps = [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"round2"] error:&e];
+    size_t cap = 4 << 20, n = 0; float *v = malloc(cap * 4);
+    for (uint32_t h = 0; h < 65536; h++) {
+        float x = h2f(h); v[n++] = x;
+        if (isnan(x) || isinf(x)) continue;
+        uint16_t hn = (h & 0x7fff) == 0x7bff ? 0 : h + 1; if ((h & 0x7fff) == 0x7bff) { v[n++] = bf(fb(x) + 1); v[n++] = copysignf(65520.0f, x); v[n++] = bf(fb(copysignf(65520.0f, x)) - 1); continue; }
+        float y = h2f(hn); if (isnan(y) || isinf(y)) continue;
+        float m = (float)(((double)x + (double)y) / 2); v[n++] = m; v[n++] = bf(fb(m) + 1); v[n++] = bf(fb(m) - 1);
+    }
+    for (uint32_t u = 0; u < 0x00800000; u += 4099) { v[n++] = bf(u); v[n++] = bf(u | 0x80000000u); }   // f32 denormals
+    const float sp[] = {0.0f, -0.0f, INFINITY, -INFINITY, NAN, -NAN, 65504.0f, 65519.99f, 65520.0f, 1e10f, -1e10f, 5.96e-8f, 2.98e-8f, 2.99e-8f, -2.98e-8f, 6.1e-5f};
+    for (int i = 0; i < 16; i++) v[n++] = sp[i];
+    srand(7); while (n < cap - 64) { uint32_t u = (uint32_t)rand() << 1 ^ (uint32_t)rand(); v[n++] = bf(u); }
+    n &= ~(size_t)63;
+    id<MTLBuffer> in = [d newBufferWithBytes:v length:n * 4 options:MTLResourceStorageModeShared], a = [d newBufferWithLength:n * 2 options:MTLResourceStorageModeShared], b = [d newBufferWithLength:n * 2 options:MTLResourceStorageModeShared];
+    id<MTLCommandQueue> q = [d newCommandQueue]; id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    [ce setComputePipelineState:ps]; [ce setBuffer:in offset:0 atIndex:0]; [ce setBuffer:a offset:0 atIndex:1]; [ce setBuffer:b offset:0 atIndex:2];
+    [ce dispatchThreadgroups:MTLSizeMake(n / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    const uint16_t *A = a.contents, *B = b.contents; long bad = 0, nanbad = 0, zero_neg = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (((A[i] & 0x7c00) == 0x7c00 && (A[i] & 0x3ff)) && ((B[i] & 0x7c00) == 0x7c00 && (B[i] & 0x3ff))) { nanbad += A[i] != B[i]; continue; }   // both NaN: payloads apart
+        if (A[i] != B[i]) { if (bad < 8) printf("differ: in %08x (%g) thread_elements %04x mma %04x\n", fb(v[i]), v[i], A[i], B[i]); bad++; }
+        zero_neg += A[i] == 0x8000;
+    }
+    printf("%zu values, %ld differ (NaN payloads apart %ld), -0 results %ld\n", n, bad, nanbad, zero_neg);
+    return bad != 0;
+} return 0; }
+'''
+
+
+@unittest.skipUnless(shutil.which('xcrun') and shutil.which('clang'), 'needs Xcode')
+class RoundingByProduct(unittest.TestCase):
+    def test_same_bits_as_the_conversion(self):
+        self.assertIn('simdgroup_multiply_accumulate(c0, nz, pz, f0)', scope['HMMA_BODY'])   # the form checked here is the body's
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d); (d / 'r.metal').write_text(ROUND_KERNEL); (d / 'rr.m').write_text(ROUND_RUNNER)
+            subprocess.run(['clang', '-fobjc-arc', '-O1', str(d / 'rr.m'), '-framework', 'Metal', '-framework', 'Foundation', '-o', str(d / 'rr')], check=True)
+            for mode in ([], ['-fmetal-math-mode=relaxed']):
+                subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', '-O1'] + mode + ['-fpreserve-invariance', '-fwrapv', str(d / 'r.metal'), '-o', str(d / 'r.air')], check=True)
+                subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', str(d / 'r.air'), '-o', str(d / 'r.metallib')], check=True)
+                r = subprocess.run([str(d / 'rr'), str(d / 'r.metallib')], capture_output=True, text=True)
+                if r.returncode == 2: self.skipTest(r.stdout.strip())
+                self.assertEqual(r.returncode, 0, f'{mode}: {r.stdout}{r.stderr}')
+                self.assertIn(' 0 differ', r.stdout)
 
 
 if __name__ == '__main__':

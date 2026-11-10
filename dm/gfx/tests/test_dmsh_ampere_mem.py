@@ -427,7 +427,7 @@ class Shared(Translated):
         self.assertTrue(reads and barriers[0] < reads[0] and reads[-1] < barriers[1] < store, msl)
 
 
-class Pokopia(Translated):
+class Pokopia(Translated):   # c3 is a game uniform slot: each read is bounded by its size in bank 25 (TranslationFlags.MetalUniformBounds, 26062f9e)
     """Pokemon Pokopia's encodings, on the register the atomic reads: F2FP.MERGE_C (22,886 shaders), F2I from a half (1,067), MEMBAR with ERRBAR (144)"""
     MERGE_FIRST = (0x000fe200000040ff, 0x00c00600ff0c7a3e)   # F2FP.MERGE_C R12, RZ, c[3][word 6], RZ
     MERGE_SECOND = (0x000fe4000000400c, 0x00c00500ff0c7a3e)   # F2FP.MERGE_C R12, RZ, c[3][word 5], R12
@@ -445,8 +445,8 @@ class Pokopia(Translated):
 
     def test_merge_shifts_c_into_the_high_half(self):   # word 6, converted first, ends in the high half; word 5 in the low one
         msl = self.msl(self.MERGE_FIRST, self.MERGE_SECOND)
-        high = re.search(r'uint (_\d+) = as_type<uint>\(half2\(float2\(\(\*spvDescriptorSet0\.cp_c3\)\._m0\[1\]\.z, 0\.0\)\)\);', msl)
-        low = re.search(r'uint (_\d+) = as_type<uint>\(half2\(float2\(\(\*spvDescriptorSet0\.cp_c3\)\._m0\[1\]\.y, 0\.0\)\)\);', msl)
+        high = re.search(r'uint (_\d+) = as_type<uint>\(half2\(float2\(\(6u < \(\(\*spvDescriptorSet0\.cp_c25\)\._m0\[0\]\.x >> 2u\)\) \? \(\*spvDescriptorSet0\.cp_c3\)\._m0\[1\]\.z : 0\.0, 0\.0\)\)\);', msl)
+        low = re.search(r'uint (_\d+) = as_type<uint>\(half2\(float2\(\(5u < \(\(\*spvDescriptorSet0\.cp_c25\)\._m0\[0\]\.x >> 2u\)\) \? \(\*spvDescriptorSet0\.cp_c3\)\._m0\[1\]\.y : 0\.0, 0\.0\)\)\);', msl)
         self.assertTrue(high and low, msl)
         shifted = re.search(rf'int (_\d+) = int\({high.group(1)}\) << 16;', msl)
         self.assertTrue(shifted, msl)
@@ -454,12 +454,12 @@ class Pokopia(Translated):
 
     def test_merge_with_rz_in_c_is_the_low_half_alone(self):
         msl = self.msl(self.MERGE_FIRST)
-        self.assertRegex(msl, r'as_type<uint>\(half2\(float2\(\(\*spvDescriptorSet0\.cp_c3\)\._m0\[1\]\.z, 0\.0\)\)\)')
+        self.assertRegex(msl, r'as_type<uint>\(half2\(float2\(\(6u < \(\(\*spvDescriptorSet0\.cp_c25\)\._m0\[0\]\.x >> 2u\)\) \? \(\*spvDescriptorSet0\.cp_c3\)\._m0\[1\]\.z : 0\.0, 0\.0\)\)\)')
         self.assertNotIn('<< 16', msl)
 
     def test_f2i_reads_the_selected_half(self):   # the merge left its float in the low half and zero in the high one; the translator folds the pack and unpack
         self.assertIn('trunc(0.0)', self.msl(self.MERGE_FIRST, self.F2I_HIGH))
-        self.assertRegex(self.msl(self.MERGE_FIRST, self.F2I_LOW), r'trunc\(\(\*spvDescriptorSet0\.cp_c3\)\._m0\[1\]\.z\)')
+        self.assertRegex(self.msl(self.MERGE_FIRST, self.F2I_LOW), r'trunc\(\(6u < \(\(\*spvDescriptorSet0\.cp_c25\)\._m0\[0\]\.x >> 2u\)\) \? \(\*spvDescriptorSet0\.cp_c3\)\._m0\[1\]\.z : 0\.0\)')
 
     def test_1d_fetch_wraps_into_rows(self):   # a texture buffer in the slot is bound as rows of 16384 texels (nvn_mtl.m tbuf_as_2d); a 1D texture, one row, reads the same texel
         msl = self.msl(self.MERGE_FIRST, self.TLD_1D)

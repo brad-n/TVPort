@@ -14,7 +14,7 @@ Update 2.0.2 (v393216) over the base game, SDK 19.3.11 (NVN 55). Game Freak's Tr
 | `pad_layout simple` | `game.tsv` | the 2D gamepad layout |
 | `depth_mode zero` | `game.tsv` | the game sets near = 0 with `nvnDeviceSetDepthMode`; see [Pipeline bases made before the game runs](#pipeline-bases-made-before-the-game-runs) |
 
-`render_cond` stays off: it changes nothing in this game.
+`render_cond` stays off: it changes nothing in this game. Since 2026-11-09 `render_cond` is automatic for every game (on from its first render-enable call), so these conditions are evaluated now; not re-checked in a run since.
 
 ## Memory
 
@@ -117,5 +117,5 @@ General host changes first needed here; each applies to every game:
 - The driver-segment word `0x640`, added to the vertex ID by 58 shaders, stays 0 until what the driver puts there is known.
 - Transform feedback: only plain array draws are captured; indexed, indirect or instanced ones give a red line. Feedback layouts other than one output per buffer from x on get a red line and no capture entry point.
 - `c85de3713170e519` ORs bit fields into output 0 and has not been seen with an integer attachment (no row).
-- The development notes list "the render condition the host does not evaluate" among the Mac route's red lines; `render_cond` changes nothing here and stays off.
+- The development notes list "the render condition the host does not evaluate" among the Mac route's red lines; `render_cond` changes nothing here and stays off. Since 2026-11-09 `render_cond` is automatic for every game (on from its first render-enable call), so these conditions are evaluated now; not re-checked in a run since.
 - `game.tsv`'s header says "Plays on the Mac"; AGENTS.md and the development notes say it is playable on the iPhone.

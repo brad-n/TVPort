@@ -36,5 +36,4 @@ shader_groups	/Shader/=shader /Effect/=effect /UI/=layout
 shader_note	Splatoon Raiders shaders
 
 # ---- Graphics ----
-# agl wraps its clears in render conditions on Donkey Kong Bananza; the same library here, to be confirmed on this game
-render_cond	on
+# render_cond: automatic for every game now (on from its first render-enable call), so no line here. Why it matters: agl wraps its clears in render conditions on Donkey Kong Bananza; the same library here, to be confirmed on this game

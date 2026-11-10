@@ -3,7 +3,7 @@
 x * gl_FragCoord.w and the shader multiplies it by 1 / gl_FragCoord.w with an FMUL of its own (InstEmitAmpereMem.AIpa), whose operands come in either order. Upstream's pass folds only
 the order (x * w) * (1 / w). Through the offline translator (dmsh_xlate, arch sm86): without the option the reciprocal-first product keeps both multiplies and the reciprocal; with it both
 products fold to the input, no multiply by gl_FragCoord.w and no reciprocal is left, and the shader still compiles. On this Mac's GPU the folded and the unfolded MSL draw the same colours
-(within 2 ulp) for a perspective-interpolated triangle.
+(no value more than 1 ulp apart; identical on an M2 Pro) for a perspective-interpolated triangle.
 Needs DMSH_TEST_XLATE (the translator) like the other translator tests."""
 import json
 import os
@@ -53,6 +53,8 @@ def w_products(msl):   # products with a value read from gl_FragCoord.w, directl
 # Draws one triangle with very different w at its corners into a 64x64 RGBA32F target; the four colour outputs are the attribute's components, so both shaders should agree
 RUNNER = r'''#import <Metal/Metal.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <math.h>
 static const char *VS = "#include <metal_stdlib>\nusing namespace metal;\nstruct V { float4 p [[position]]; float4 a [[user(locn0)]]; };\n"
   "vertex V vmain(uint i [[vertex_id]]) { float4 P[3] = { float4(-1, -1, 0.1, 1), float4(3, -1, 0.5, 4), float4(-1, 3, 2.9, 7) }; float4 A[3] = { float4(0.1, 2, -3, 40), float4(5, 0.25, 7, -1), float4(-2, 9, 0.5, 3) };\n"
@@ -74,13 +76,15 @@ int main(int ac, char **av) { @autoreleasepool {
         [re setRenderPipelineState:ps]; [re setFragmentBuffer:ab offset:0 atIndex:0]; [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [re endEncoding]; [c commit]; [c waitUntilCompleted];
         img[k] = malloc(W * W * 16); [t getBytes:img[k] bytesPerRow:W * 16 fromRegion:MTLRegionMake2D(0, 0, W, W) mipmapLevel:0];
     }
-    int bad = 0, n = 0; double worst = 0;
+    int bad = 0, n = 0, ulp = 0, off = 0; double worst = 0;
     for (int i = 0; i < W * W * 4; i++) {
         float a = img[0][i], b = img[1][i]; if (a == 0 && b == 0) continue; n++;
         double r = fabs((double)a - b) / fmax(fabs(a), 1e-30); if (r > worst) worst = r;
-        if (r > 2.5e-7) bad++;
+        int32_t ia, ib; memcpy(&ia, &a, 4); memcpy(&ib, &b, 4);   // units in the last place: same-sign floats are ordered as their bit patterns
+        int u = (ia < 0) != (ib < 0) ? 1 << 30 : abs(ia - ib); if (u > ulp) ulp = u; off += u != 0;
+        if (u > 1) bad++;
     }
-    printf("compared %d, differ %d, worst relative %.3g\n", n, bad, worst); return 0;
+    printf("compared %d, differ %d, worst relative %.3g, max ulp %d, values not identical %d\n", n, bad, worst, ulp, off); return 0;
 } }
 '''
 
@@ -116,7 +120,7 @@ class FragW(unittest.TestCase):
             m = re.search(r'compared (\d+), differ (\d+)', out.stdout)
             self.assertTrue(m, out.stdout + out.stderr)
             self.assertGreater(int(m.group(1)), 4000, out.stdout)   # most of the 64x64x4 values are covered
-            self.assertEqual(int(m.group(2)), 0, out.stdout)
+            self.assertEqual(int(m.group(2)), 0, out.stdout)   # no value more than 1 ulp apart (the key is on by default: the M2 Pro draws them identical)
 
 
 @unittest.skipUnless(os.environ.get('DMSH_TEST_XLATE'), 'set DMSH_TEST_XLATE to the offline translator')

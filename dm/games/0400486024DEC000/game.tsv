@@ -39,11 +39,8 @@ shader_note	Ocarina of Time shaders
 shader_raw_read_log	1
 # Border colours Metal lacks are corrected in the shaders through twin samplers (docs: dm/games/README.md shader_border_emu). Ocarina of Time never needed one in seven Apple TV runs (the host logs "which Metal lacks" zero times), so the ~86k dm_bs sites in its shaders are compiled out
 shader_border_emu	0
-# Raw global memory lookups keep the last entry's range in registers (docs/reference/shaders.md, Raw global memory lookups: the search at every lookup, the table at every hit).
-# The ground mist pass (5ad65c0eefd09c7f, 43 lookups a pixel) went from 2.12 to 1.72 ms a frame on the Mac mini (M2 Pro, TV-like settings). shader_raw_loop measured no gain: off
-shader_raw_regs	1
-# Whole-record reads of the storage buffers a shader with a raw load never writes, which the read log above had turned back into word reads (shaders.md, The read log turned storage buffers back into word reads)
-shader_wide_device	1
+# shader_raw_regs and shader_wide_device are on for every game now (dm/games/README.md): measured here first, the ground mist pass (5ad65c0eefd09c7f, 43 lookups a pixel)
+# went from 2.12 to 1.72 ms a frame on the Mac mini (M2 Pro, TV-like settings). shader_raw_loop measured no gain: off
 
 # ---- Frame rate ----
 # The game steps its time by a frame ratio, its base rate / its frame rate, whatever the frame took: frames longer than a vsync played in slow motion. The ratio takes the host's
@@ -51,8 +48,7 @@ shader_wide_device	1
 fps_target	60
 
 # ---- Graphics ----
-# agl wraps its clears in render conditions on Donkey Kong Bananza and Splatoon Raiders; the same library here
-render_cond	on
+# render_cond: automatic for every game now (on from its first render-enable call), so no line here. Why it matters: agl wraps its clears in render conditions on Donkey Kong Bananza and Splatoon Raiders; the same library here
 gpu_timestamps	segment
 draw_barriers	game
 # As Tears of the Kingdom: the terrain's height, blend and hole maps are written by the CPU into textures after they are created. Without these keys they stay zero: holes in the ground and the wrong materials

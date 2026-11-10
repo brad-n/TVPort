@@ -5,7 +5,7 @@
 - shader_unord_cmp (the job's unord_cmp, InstEmit.GetFPComparison): an unordered comparison is the negation of the ordered opposite (LTU: !(a >= b)), one comparison where
   a cmp b || isnan(a) || isnan(b) took three and two ORs. EQU keeps its form.
 Through the offline translator (dmsh_xlate, arch sm86): without the options the MSL is what it was; with them the forms above. On this Mac's GPU, with the iPhone / Apple TV math mode
-(relaxed) and the Mac's, every form gives the old form's result for every predicate over values that matter (denormals of both signs, +-0, +-FLT_MIN, normals, +-infinity, NaN).
+(relaxed) and the Mac's (fast), every form gives the old form's result for every predicate over values that matter (denormals of both signs, +-0, +-FLT_MIN, normals, +-infinity, NaN).
 Needs DMSH_TEST_XLATE (the translator) like the other translator tests."""
 import os
 from pathlib import Path
@@ -128,8 +128,9 @@ class FormsOnGpu(unittest.TestCase):
                 self.assertEqual(r.returncode, 0, r.stderr[-2000:])
                 subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', str(w / f'{name}.air'), '-o', str(w / f'{name}.metallib')], check=True)
                 out = subprocess.run([str(w / 'r'), str(w / f'{name}.metallib')], capture_output=True, text=True).stdout
-                if name == 'relaxed': self.assertIn('ftz mismatches 0, unordered mismatches 0', out, out)
-                else: self.assertRegex(out, r'ftz mismatches 0,', out)   # fast math may treat NaN as absent in the unordered forms; the flush forms hold there too
+                # both modes, since shader_unord_cmp is on for every game: under the Mac's fast math the compiler may assume no NaN, and then makes isnan false and the
+                # unordered predicate the ordered one, so the old and the new form become the same comparison; a compiler that treated them apart would fail here
+                self.assertIn('ftz mismatches 0, unordered mismatches 0', out, f'{name}: {out}')
 
 
 if __name__ == '__main__':

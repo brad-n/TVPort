@@ -209,8 +209,8 @@ def header_one(g):
     if sks and (not m or not 0x30 <= int(m[1], 0) or not 0 < int(m[2], 0) or int(m[1], 0) + int(m[2], 0) > 0x880 or (int(m[1], 0) < 0x760 and int(m[1], 0) + int(m[2], 0) > 0x700)):   # not over +0x700..+0x75f, the code area and compute fields the tools read
         sys.exit(f'{g.id}: shader_key_skip takes <offset>+<length> within the first 0x880 bytes of the control section, past its header (+0x30) and clear of +0x700..+0x75f: {sks}')
     sko, skl = (int(m[1], 0), int(m[2], 0)) if m else (0, 0)
-    rcd = g.get('render_cond', 'off')   # NVN conditional rendering evaluated at replay, timestamp reports with counter 0 (nvn_mtl.m OP_RENDER_COND): on / off
-    if rcd not in ('on', 'off'): sys.exit(f'{g.id}: render_cond must be on or off: {rcd}')
+    rcd = g.get('render_cond', 'auto')   # NVN conditional rendering evaluated at replay, timestamp reports with counter 0 (nvn_mtl.m OP_RENDER_COND): on / off / auto = on from the game's first render-enable call
+    if rcd not in ('on', 'off', 'auto'): sys.exit(f'{g.id}: render_cond must be on, off or auto: {rcd}')
     dov = g.get('dispatch_overlap', 'off')   # the game's dispatches with no barrier of its between them run side by side in the copy encoder (nvn_mtl.m dispatch_enc; DM_NVN_DISPATCH_OVERLAP overrides): on / off
     if dov not in ('on', 'off'): sys.exit(f'{g.id}: dispatch_overlap must be on or off: {dov}')
     tfu = g.get('tex_flush_upload', 'off')   # textures written by the CPU into a pool and published with nvnMemoryPoolFlushMappedRange are uploaded like packaged ones (hle_nvn.c): on / off
@@ -229,8 +229,8 @@ def header_one(g):
     if rrl not in ('0', '1'): sys.exit(f'{g.id}: shader_raw_read_log must be 0 or 1: {rrl}')
     sbe = g.get('shader_border_emu', '1')   # border colours Metal lacks corrected in the shaders through twin samplers (dmsh_build.py border_emu); 0 compiles the correction out: nvn_mtl.m then makes no twin and logs the samplers that would have needed one
     if sbe not in ('0', '1'): sys.exit(f'{g.id}: shader_border_emu must be 0 or 1: {sbe}')
-    for k in ('shader_fragw_fold', 'shader_ftz_cmp', 'shader_unord_cmp', 'shader_raw_loop', 'shader_raw_regs', 'shader_wide_device', 'shader_no_rescale'):   # translator options (dmsh_build.py XLATE_KEYS): build-only keys, no host define
-        if g.get(k, '0') not in ('0', '1'): sys.exit(f'{g.id}: {k} must be 0 or 1: {g.get(k)}')
+    for k in ('shader_fragw_fold', 'shader_ftz_cmp', 'shader_unord_cmp', 'shader_raw_loop', 'shader_raw_regs', 'shader_wide_device', 'shader_no_rescale'):   # translator options (dmsh_build.py XLATE_KEYS): build-only keys, no host define; defaults in dmsh_build.py XLATE_DEFAULT (all 1 but shader_raw_loop)
+        if g.get(k, '1') not in ('0', '1'): sys.exit(f'{g.id}: {k} must be 0 or 1: {g.get(k)}')
     dbr = g.get('draw_barriers', 'full')   # how draw passes are ordered (nvn_mtl.m barrier_game): full = each waits for all earlier GPU work, game = by the game's own barriers, so vertex work overlaps the previous pass's fragments
     if dbr not in ('full', 'game'): sys.exit(f'{g.id}: draw_barriers must be full or game: {dbr}')
     gts = g.get('gpu_timestamps', 'submission')   # counter timestamps (nvn_mtl.m rep_ticks): submission = one time per submission, segment = the GPU start / end of the segment holding the report
@@ -285,7 +285,7 @@ def header_one(g):
          f'#define DM_GAME_PERF_BOOST {int(pm == "boost")}',
          f'#define DM_GAME_TEX_FLUSH_UPLOAD {int(tfu == "on")}',
          f'#define DM_GAME_SHADER_KEY_SKIP_OFF {sko:#x}', f'#define DM_GAME_SHADER_KEY_SKIP_LEN {skl:#x}',
-         f'#define DM_GAME_RENDER_COND {int(rcd == "on")}',
+         f'#define DM_GAME_RENDER_COND {("off", "on", "auto").index(rcd)}',   # 0 off, 1 on, 2 auto (nvn_mtl.m mtl_render_cond)
          f'#define DM_GAME_DISPATCH_OVERLAP {int(dov == "on")}',
          f'#define DM_GAME_TEX_DIRTY_UPLOAD {int(tdu == "on")}',
          f'#define DM_GAME_TEX_DYN_SLOTS {int(tds == "on")}',
