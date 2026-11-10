@@ -713,3 +713,12 @@ t_tg_spill: t_tg_spill.m $(MTL_T_DEP)
 check_t_tg_spill: t_tg_spill
 	MTL_DEBUG_LAYER=1 DM_NVN_DISPATCH_OWN=0 ./$<
 	MTL_DEBUG_LAYER=1 DM_NVN_DISPATCH_OWN=1 ./$<
+# A window texture's corner area (DM_NVN_WINDOW_AREA) through the replay, pixels read back: the corner drawn, the rest kept, a draw that leaves the corner, a scissor too large for an area;
+# elide: with DM_NVN_LOAD_ELIDE=1 the corner pass still loads (the GPU stores whole tiles); off: DM_NVN_WINDOW_AREA=0
+t_window_area: t_window_area.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_window_area.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+.PHONY: check_t_window_area
+check_t_window_area: t_window_area
+	MTL_DEBUG_LAYER=1 ./t_window_area
+	MTL_DEBUG_LAYER=1 ./t_window_area elide
+	MTL_DEBUG_LAYER=1 ./t_window_area off
