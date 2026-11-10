@@ -558,10 +558,11 @@ class StripTests(unittest.TestCase):
         lib = self.lib
         ts = [T.Texture(0x2001, 64, 40, mips=4, pkg=2), T.Texture(0x1a06, 128, 64, mips=4, pkg=0), T.Texture(0x1a01, 64, 64, mips=3, layers=3, dim=5, pkg=1),
               T.Texture(0x1c01, 128, 64, mips=5, pkg=3), T.Texture(0x1b01, 64, 64, mips=2), T.Texture(0x2006, 64, 64, mips=3, layers=6, dim=3, pkg=1),
-              T.Texture(0x1a01, 4, 4, mips=1, pkg=0)]          # the last: one 8-byte plane, under the 16-byte tag size
+              T.Texture(0x1a01, 4, 4, mips=2, pkg=0),          # one 8-byte plane, under the 16-byte tag size, and its 2x2 level
+              T.Texture(0x1e01, 64, 32, mips=1, pkg=1)]        # the last: no mip chain, a lightmap's shape: left as it is (tex_once SINGLE_LEVEL)
         d = self.root / name
         (d / 'Model').mkdir(parents=True)
-        (d / 'plain.bntx').write_bytes(T.bntx(lib, [ts[0], ts[6]]))
+        (d / 'plain.bntx').write_bytes(T.bntx(lib, [ts[0], ts[6], ts[7]]))
         blob = b'FRES    ' + bytes(0x40) + T.bntx(lib, [ts[1], ts[2]]) + bytes(100)
         inner = T.sarc([('a.bfres', blob), ('notes.txt', b'hello')])
         raw_szs = T.sarc([('kart.bfres', blob), ('inner.sarc', inner)])
@@ -638,7 +639,8 @@ class StripTests(unittest.TestCase):
         self.assertGreaterEqual(c['recompressed:yaz0'], 1); self.assertGreaterEqual(c['recompressed:zstd'], 2)
         self.assertEqual(rep['planes']['untouched_under_16_bytes'], 0)             # even the one-block 4x4 BC1 plane has a stored length of whole GOBs
         self.assertGreater(rep['planes']['tagged'], 20)
-        self.assertEqual(rep['planes']['skipped'], {})
+        self.assertEqual(rep['planes']['skipped'], {'single_level': 1})                 # the one texture with no mip chain stays as it is
+        self.assertEqual(rep['textures']['skipped'], {'single_level': 1})
         # romfs.py reads the stripped image like a plain one: same listing, sizes, untouched files
         import romfs
         a, b = str(img), str(out / 'romfs.img')
@@ -683,6 +685,23 @@ class StripTests(unittest.TestCase):
         self.assertEqual(bytes(expect), bytes(got))                        # every other byte is the original's
         # the one-block BC1 texture (second): its single plane has whole GOBs of storage, so it is tagged too
         self.assertEqual(new[t6['start'] + 8:t6['start'] + 512], bytes(504))
+        # the texture with no mip chain (third) is the original, byte for byte (the comparison above covers it): a game may read such data from its memory
+        t7 = B.bntx_textures(orig, 0)[2]
+        self.assertEqual(t7['mips'], 1)
+        self.assertEqual(new[t7['start']:t7['start'] + t7['size']], orig[t7['start']:t7['start'] + t7['size']])
+
+    def test_single_level_textures_are_left_as_they_are(self):
+        """tex_once SINGLE_LEVEL: a BC texture with one level is skipped whatever its size (Ocarina of Time's baked lighting, 2840x3072 BC5 and 1420x1536x3 BC7 / BC6H arrays,
+        is read from the game's memory: stripped, the house's cloth was lit from zeros); its planes count as skipped, and a mipped texture of the same format is still planned"""
+        lib = self.lib
+        w = tool.Walker(self.libpath, tool.build_native(str(self.root / 'nlib')), 4, 256, None, {})
+        for tex, planes in ((T.Texture(0x1e01, 600, 520, mips=1, pkg=1), 1), (T.Texture(0x2001, 300, 260, mips=1, layers=3, dim=5, pkg=1), 3), (T.Texture(0x1f0a, 64, 64, mips=1), 1)):
+            data = T.bntx(lib, [tex])
+            t = B.bntx_textures(data, 0)[0]
+            self.assertEqual(w.plan(data, t), ('skip', 'single_level', planes))
+        w.pack = type('NoPack', (), {'keys': {}, 'resolves': lambda self, *a: False})()   # an empty pack: a planned texture stops at its first plane
+        data = T.bntx(lib, [T.Texture(0x1e01, 64, 32, mips=2, pkg=1)])
+        self.assertEqual(w.plan(data, B.bntx_textures(data, 0)[0])[:2], ('skip', 'not_in_pack'))
 
 
     def test_zeroed_range_is_the_runtime_plane_storage(self):
