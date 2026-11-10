@@ -1133,8 +1133,23 @@ def pool_arrays(src):
     # a test before it would get wrong (then it stays late, and only costs the shading)
     own = src.replace(POOL_MARK, '')   # what the shader does itself: a store of its own keeps the test where the game's own shader has it
     if marked and not re.search(r'\bdiscard_fragment\b|\[\[\s*depth\(|\[\[\s*sample_mask\s*\]\]|\[\[\s*stencil\s*\]\]|\.write\(|\batomic_\w+_explicit\b|^\s*device\s', own, re.M):
-        src = re.sub(r'^(?<!\]\] )fragment\s', '[[early_fragment_tests]] fragment ', src, flags=re.M)
+        src = dmsh_side.dmsh_alpha.HOST_EARLY + re.sub(r'^(?<!\]\] )fragment\s', '[[early_fragment_tests]] fragment ', src, flags=re.M)   # the first line tells the alpha-test entries (dmsh_side.dmsh_alpha.HOST_EARLY)
     return src
+
+def ps_host_early(src, binds):
+    """A pixel shader whose loads through global memory go through the pool table logs each table entry it reads (the raw memory read log, kind gmem_log: the host keeps resident what
+    shaders read, DM_NVN_GMEM_MODE=learned). The log is an atomic or, a store, so Metal tests the shader against depth after running it: every covered fragment of every draw is shaded, no
+    hidden surface removal. The log is the engine's own, as the texture pool marks are (pool_arrays): the game's shader stores nothing and is tested early on the Switch. Tested early here
+    too, unless the shader discards, writes depth, stencil or the sample mask, writes an image, a storage buffer or the pool table (its reflection's rw), or makes an atomic of its own. A
+    fragment that fails the depth test no longer logs its reads: a pool only hidden fragments read is made resident when one that shows reads it (that frame reads it as the stub's zeros).
+    Ocarina of Time's reflection probe faces (eac11c81, 199 draws at 128x128): 2.03 -> 0.96 ms a face on a Mac mini M2 Pro, the same picture; 415 of the TV library's pixel shaders"""
+    if re.search(r'\[\[\s*early_fragment_tests\s*\]\]', src): return src
+    logs = [b['msl_name'] for b in binds if b.get('kind') == abi.KIND_GMEM_LOG]
+    if not logs or any(b.get('rw') for b in binds if b.get('kind') != abi.KIND_GMEM_LOG): return src
+    own = src.replace(POOL_MARK, '')
+    for nm in logs: own = re.sub(r'atomic_fetch_or_explicit\(\(device atomic_uint\*\)&%s\._m0\[' % re.escape(nm), '(', own)   # the log's own ors
+    if re.search(r'\bdiscard_fragment\b|\[\[\s*depth\(|\[\[\s*sample_mask\s*\]\]|\[\[\s*stencil\s*\]\]|\.write\(|access::(read_)?write\b|\batomic_\w+_explicit\b', own): return src
+    return dmsh_side.dmsh_alpha.HOST_EARLY + re.sub(r'^(?<!\]\] )fragment\s', '[[early_fragment_tests]] fragment ', src, flags=re.M)
 
 def reflect(key, stage, msl, res):
     """MSL argument buffer struct member → replay reflection: kind (same as nvn_refl.h) + NVN slot number + argument buffer member index"""
@@ -1743,6 +1758,11 @@ def finish(key, w, j, c1):
     else: fu = fd = None
     try: binds = reflect(key, mesh['kind'] if mesh else j['stage'], src, res)   # before the compile: a pixel shader's readable-tile version needs its texture slots (ps_libraries)
     except ValueError as e: return 'reflection failed', str(e)[:160], None
+    if j['stage'] == 'ps' and not mesh:   # tested early when its only stores are the raw memory read log's (see ps_host_early); every entry point, as the pool marks' rule does
+        early = ps_host_early(open(msl).read(), binds)
+        if early.startswith(dmsh_side.dmsh_alpha.HOST_EARLY) and not open(msl).read().startswith(dmsh_side.dmsh_alpha.HOST_EARLY):
+            open(msl, 'w').write(early); src = ps_host_early(src, binds)
+            if shared: plain = src
     side, lost = {}, []
     def compile_targets():   # the selected targets from the same MSL (MSL identical to one compiled before takes that library, dmsh_mtlcache.py)
         if j['stage'] == 'ps': side.clear(); side.update(ps_libraries(key, msl, open(msl).read(), binds)); return

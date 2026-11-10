@@ -85,6 +85,14 @@ class AlphaVariant(unittest.TestCase):
                 self.assertIn(attr + ' fragment main0_out main0(float4 gl_FragCoord [[position]])', v)
                 self.assertNotIn(attr + ' static', v)
 
+    def test_host_early_alpha_entry_late(self):   # made early only for the engine's stores (dmsh_alpha.HOST_EARLY): the alpha-test entries are tested after the test, as on the Switch
+        v, entries = variant(dmsh_alpha.HOST_EARLY + BASE.replace('fragment main0_out', '[[early_fragment_tests]] fragment main0_out'))
+        self.assertEqual(entries, ['main0_a', 'main0_u_a'])
+        self.assertIn('\nfragment main0_out main0_a(float4 gl_FragCoord [[position]], ' + PARAM + ')', v)
+        self.assertIn('\nfragment main0_out_u main0_u_a(float4 gl_FragCoord [[position]], ' + PARAM + ')', v)
+        self.assertIn('[[early_fragment_tests]] fragment main0_out main0(float4 gl_FragCoord [[position]])', v)   # the shader itself stays early
+        self.assertTrue(v.startswith(dmsh_alpha.HOST_EARLY))
+
     def test_half_alpha(self):
         v, _ = variant(BASE.replace('float4 m_0 [[color(0)]]', 'half4 m_0 [[color(0)]]', 1))
         self.assertIn(TEST, v)
@@ -102,7 +110,8 @@ class AlphaVariant(unittest.TestCase):
     @unittest.skipUnless(shutil.which('xcrun'), 'requires Metal compilers')
     def test_compiles_on_both_platforms(self):
         with tempfile.TemporaryDirectory() as d:
-            for name, src in (('base', BASE), ('args', ARGS), ('early', BASE.replace('fragment main0_out main0(', '[[ early_fragment_tests ]] fragment main0_out main0('))):
+            for name, src in (('base', BASE), ('args', ARGS), ('early', BASE.replace('fragment main0_out main0(', '[[ early_fragment_tests ]] fragment main0_out main0(')),
+                              ('host_early', dmsh_alpha.HOST_EARLY + BASE.replace('fragment main0_out', '[[early_fragment_tests]] fragment main0_out'))):
                 for sdk in ('macosx', 'iphoneos'):
                     with self.subTest(shader=name, sdk=sdk):
                         try: compile_lib(variant(src)[0], pathlib.Path(d), name + '_' + sdk, sdk)

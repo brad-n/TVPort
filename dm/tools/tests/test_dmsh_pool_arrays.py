@@ -11,8 +11,9 @@ import unittest
 TOOLS = Path(__file__).resolve().parents[2] / 'gfx/tools'
 sys.path.insert(0, str(TOOLS))
 import dmsh_abi as abi   # noqa: E402
+import dmsh_alpha   # noqa: E402
 
-FUNCS = {'decode_tex', 'const_sampler', 'decode_ubo_tex', 'decode_ubo_img', 'c2_array', 'pool_arrays', 'reflect', 'has_word', 'in_word'}
+FUNCS = {'decode_tex', 'const_sampler', 'decode_ubo_tex', 'decode_ubo_img', 'c2_array', 'pool_arrays', 'ps_host_early', 'reflect', 'has_word', 'in_word'}
 NAMES = {'POOL_MIN', 'POOL_MARK', 'TEX_BASE', 'SSBO'}
 
 
@@ -20,7 +21,7 @@ def load():
     tree = ast.parse((TOOLS / 'dmsh_build.py').read_text())
     nodes: list[ast.stmt] = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in FUNCS)
              or (isinstance(n, ast.Assign) and any(isinstance(t, (ast.Name, ast.Tuple)) and {getattr(e, 'id', None) for e in (t.elts if isinstance(t, ast.Tuple) else [t])} & NAMES for t in n.targets))]
-    ns = {'re': re, 'abi': abi, 'dmsh_geometry': types.SimpleNamespace(HELPERS={})}
+    ns = {'re': re, 'abi': abi, 'dmsh_side': types.SimpleNamespace(dmsh_alpha=dmsh_alpha), 'dmsh_geometry': types.SimpleNamespace(HELPERS={})}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(TOOLS / 'dmsh_build.py'), 'exec'), ns)
     assert FUNCS <= set(ns), FUNCS - set(ns)
     return ns
@@ -63,10 +64,31 @@ class PoolArrays(unittest.TestCase):
         use = 'fragment main0_out main0(constant spvDescriptorSetBuffer0& d [[buffer(0)]])\n{\n    float4 c = d.fp_t_cb0_40000000[i].sample(s, u);%s\n}\n'
         out = NS['pool_arrays'](pool + use % '')
         self.assertIn('[[early_fragment_tests]] fragment main0_out main0(', out)   # the mark is its only store
+        self.assertTrue(out.startswith(dmsh_alpha.HOST_EARLY))   # the alpha-test entries are not early (dmsh_alpha.HOST_EARLY)
         for keeps_late in (' discard_fragment();', ' out.gl_FragDepth [[depth(any)]];', ' d.img.write(c, p);', ' atomic_fetch_add_explicit(q, 1u, memory_order_relaxed);', '\n    device uint* q [[id(9)]];'):
             self.assertNotIn('early_fragment_tests', NS['pool_arrays'](pool + use % keeps_late))
         twice = NS['pool_arrays'](pool + '[[early_fragment_tests]] ' + use % '')
         self.assertEqual(twice.count('early_fragment_tests'), 1)
+
+    def test_read_log_keeps_depth_test_early(self):   # ps_host_early: the raw memory read log's ors are the engine's, as the pool marks are
+        args = 'struct spvDescriptorSetBuffer0\n{\n    device _31* fp_s0 [[id(6)]];\n    device _31* fp_s1 [[id(7)]];\n    device _31* fp_s2 [[id(8)]];\n};\n'
+        body = ('fragment main0_out main0(constant spvDescriptorSetBuffer0& d [[buffer(0)]])\n{\n    uint v = d.fp_s1->_m0[i];\n'
+                '    if (!(d.fp_s2->_m0[k] & b)) { uint o = atomic_fetch_or_explicit((device atomic_uint*)&fp_s2._m0[k], b, memory_order_relaxed); }%s\n}\n')
+        binds = [{'msl_name': 'fp_s0', 'kind': abi.KIND_SBUF, 'rw': False}, {'msl_name': 'fp_s1', 'kind': abi.KIND_GMEM_MAP, 'rw': False}, {'msl_name': 'fp_s2', 'kind': abi.KIND_GMEM_LOG, 'rw': True}]
+        out = NS['ps_host_early'](args + body % '', binds)
+        self.assertTrue(out.startswith(dmsh_alpha.HOST_EARLY))
+        self.assertIn('[[early_fragment_tests]] fragment main0_out main0(', out)
+        self.assertEqual(NS['ps_host_early'](out, binds), out)   # once
+        for keeps_late in (' discard_fragment();', ' out.gl_FragDepth [[depth(any)]];', ' d.img.write(c, p);', ' atomic_fetch_add_explicit(q, 1u, memory_order_relaxed);',
+                           ' atomic_fetch_or_explicit((device atomic_uint*)&fp_s0._m0[k], b, memory_order_relaxed);', ' texture2d<float, access::read_write> t;'):
+            with self.subTest(late=keeps_late):
+                self.assertEqual(NS['ps_host_early'](args + body % keeps_late, binds), args + body % keeps_late)
+        written = [dict(b, rw=True) if b['msl_name'] == 'fp_s0' else b for b in binds]   # the game's own storage buffer written
+        self.assertEqual(NS['ps_host_early'](args + body % '', written), args + body % '')
+        no_log = [b for b in binds if b['kind'] != abi.KIND_GMEM_LOG]   # nothing of the engine's: the test stays where Metal puts it
+        self.assertEqual(NS['ps_host_early'](args + body % '', no_log), args + body % '')
+        early = args + body.replace('fragment', '[[early_fragment_tests]] fragment') % ''   # the game's own early test: as it is, without the line
+        self.assertEqual(NS['ps_host_early'](early, binds), early)
 
     def test_slot_arrays_stay(self):
         src = MSL.replace('1048576', '32').replace('4096', '32')

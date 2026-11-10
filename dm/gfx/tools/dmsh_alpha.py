@@ -4,10 +4,15 @@
 # runs the shader's body, then takes the test's function and reference from a constant buffer at fragment buffer DMSH_ALPHA_BUFFER and tests colour 0's alpha.
 # The function and reference are data, not part of the code: one pipeline serves every function, and a reference that changes every draw (a dissolve) keeps it. The host takes these
 # entry points only for pipelines drawn with an alpha function other than ALWAYS (nvn_mtl.m at_fn), so draws without the test keep the base library as it was.
-# [[early_fragment_tests]] stays: a shader that forces early depth tests has its depth written before the alpha test, on Maxwell too.
+# [[early_fragment_tests]] stays: a shader that forces early depth tests has its depth written before the alpha test, on Maxwell too. A shader the build made early only because its stores
+# are the engine's own bookkeeping (HOST_EARLY, dmsh_build.py pool_arrays / ps_host_early) does not force them: the game's shader is tested after it runs on the Switch once the alpha test can drop
+# fragments, so its alpha-test entry points are not early (tested early, a dropped fragment's depth would already be written).
 # Usage: refused(msl) → why the shader gets none, or None; entry(msl, e) → the entry point's text, e from dmsh_side.entries
 import re
 import dmsh_abi
+
+# The first line of a pixel shader the build tests early only because its stores are the engine's own (dmsh_build.py): the test before the shader is the build's, not the game's
+HOST_EARLY = '// dm: depth tested before the shader, which stores only the engine\'s own bookkeeping (texture pool marks, the raw memory read log)\n'
 
 HELPER = '''
 struct dm_alpha_state { uint func; float ref; };   // NVN_ALPHA_FUNC_* and the reference (dmsh_alpha.py)
@@ -49,5 +54,6 @@ def entry(msl, e):
     # main0_u and main0_m write colour 0 as the integer vector of the float's bits: the test reads the float
     alpha = f'as_type<float>(dm_r.{name}.w)' if ty == 'uint4' else f'float(dm_r.{name}.w)'
     params = ', '.join(e['params'] + [f'constant dm_alpha_state& dm_alpha [[buffer({dmsh_abi.ALPHA_BUFFER})]]'])
-    return (f'{e["attr"]}fragment {e["ret"]} {e["name"]}_a({params})\n{{\n    {e["ret"]} dm_r = dm_body_{e["name"]}({e["args"]});\n'
+    attr = re.sub(r'\[\[\s*early_fragment_tests\s*\]\]\s*', '', e['attr']) if msl.startswith(HOST_EARLY) else e['attr']   # tested after the alpha test, as on the Switch (see the top)
+    return (f'{attr}fragment {e["ret"]} {e["name"]}_a({params})\n{{\n    {e["ret"]} dm_r = dm_body_{e["name"]}({e["args"]});\n'
             f'    if (!dm_alpha_pass({alpha}, dm_alpha)) discard_fragment();\n    return dm_r;\n}}\n')
