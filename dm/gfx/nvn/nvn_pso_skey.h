@@ -11,8 +11,8 @@ typedef struct {
     uint32_t atest, logic;   // atest: 1 = drawn with the alpha test, the fragment from the shader's side library <key>_bx (nvn_mtl.m atest_key); last, so a prewarm row written before it reads as 0
                              // logic: 1 = drawn with a logic operation, the fragment from the side library <key>_bx (lop_key); in what was padding (0 in older rows)
     va_st attr_hi[16];       // NVN2's attributes 16 to 31 (pso_key_attr); last, so a prewarm row written before them reads as 0
-    uint32_t ubc, ubc_pad;   // ubc: 1 = the fragment shader keeps its fixed-offset uniform bounds tests (nvn_mtl.m ubx_want: a slot is bound shorter than they need, or DM_NVN_UBX=0);
-                             // 0 = a shader with such tests (ub_fixed) draws without them. Last, so a prewarm row written before it reads as 0; ubc_pad stays 0
+    uint32_t ubc, ubc_pad;   // ubc bit 0: the fragment shader keeps its fixed-offset uniform bounds tests (nvn_mtl.m ubx_want: a slot is bound shorter than they need, or DM_NVN_UBX=0), bit 1:
+                             // the vertex shader; a clear bit = a shader with such tests (ub_fixed) draws without them. Last, so a prewarm row written before it reads as 0; ubc_pad stays 0
 } pso_key;
 static inline va_st pso_key_attr(const pso_key *k, int a) { return a < 16 ? k->attr[a] : k->attr_hi[a - 16]; }
 

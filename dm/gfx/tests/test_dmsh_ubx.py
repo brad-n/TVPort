@@ -1,4 +1,4 @@
-"""dmsh_build.py ub_fixed on synthetic MSL in the translator's shapes (TranslationFlags.MetalUniformBounds, upstream 26062f9e): each test of a fixed word w of a game uniform slot,
+"""dmsh_build.py ub_fixed on synthetic MSL in the translator's shapes (a pixel and a vertex shader) (TranslationFlags.MetalUniformBounds, upstream 26062f9e): each test of a fixed word w of a game uniform slot,
 (w < (size >> 2)) with the size from the table of bank DMSH_CBSIZE_BANK, becomes (dmsh_ubx || test), dmsh_ubx the function constant DMSH_UBX_FC (false unless a pipeline sets it), the
 declarations come once after `using namespace metal;`, and the needs are 4 (w + 1) bytes for the highest w of each slot. A test of a computed word stays as it is, a source without a
 fixed test or already rewritten stays as it is, and dmsh_fetch.unguard reads both forms alike (the analyses that look for a uniform word). The rewritten source compiles where xcrun is.
@@ -39,11 +39,11 @@ def test(w, row, comp):   # the translator's test of fixed word w against the si
     return '(%du < ((*spvDescriptorSet0.fp_c%d)._m0[%d].%s >> 2u))' % (w, BANK, row, comp)
 
 
-def read(slot, w, kind='float'):   # a guarded read of word w of uniform slot c[slot] (its table entry slot - 3), as the translator writes a fixed-offset one
+def read(slot, w, kind='float', pre='fp'):   # a guarded read of word w of uniform slot c[slot] (its table entry slot - 3), as the translator writes a fixed-offset one
     i = slot - 3
     zero = {'float': '0.0', 'uint': '0u', 'int': '0'}[kind]
-    member = '(*spvDescriptorSet0.fp_c%d)._m0[%d].%s' % (slot, w // 4, 'xyzw'[w % 4])
-    return '(%s ? %s : %s)' % (test(w, i // 4, 'xyzw'[i % 4]), member, zero)
+    member = '(*spvDescriptorSet0.%s_c%d)._m0[%d].%s' % (pre, slot, w // 4, 'xyzw'[w % 4])
+    return '(%s ? %s : %s)' % (test(w, i // 4, 'xyzw'[i % 4]).replace('fp_c', pre + '_c'), member, zero)
 
 
 # A pixel shader in the translator's shape: c[3] read at words 5, 17, 63 and 1023 (row 255 .w), c[4] at words 0 and 6, and c[3] at a computed word (its own test, and row 0 when out of
@@ -96,6 +96,34 @@ fragment main0_out main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[b
 ''' % {'bank': BANK, 'r5': read(3, 5), 'r17': read(3, 17), 'r63': read(3, 63), 'r1023': read(3, 1023), 'c0': read(4, 0), 'c6': read(4, 6)}
 
 
+# The same reads in a vertex shader (vp_ names), every value as its bits in two flat outputs; the computed word is 4 (instance + 2) + 1
+VS_SHADER = SHADER.split('struct main0_out')[0].replace('fp_c', 'vp_c') + """struct main0_out
+{
+    uint4 m_0 [[user(locn0)]];
+    uint4 m_1 [[user(locn1)]];
+    float4 gl_Position [[position]];
+};
+
+vertex main0_out main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]], uint gl_VertexIndex [[vertex_id]], uint gl_InstanceIndex [[instance_id]])
+{
+    main0_out out = {};
+    float _10 = %(r5)s;
+    float _11 = %(r17)s * 1.0;
+    uint _12 = as_type<uint>(%(r63)s);
+    float _13 = fma(%(r1023)s, 1.0, 0.0);
+    int _14 = as_type<int>(%(c0)s);
+    float _15 = %(c6)s;
+    int _3 = int(gl_InstanceIndex) + 2;
+    int _4 = 1;
+    bool _5 = ((uint(_3) << 2u) | uint(_4)) < ((*spvDescriptorSet0.vp_c%(bank)d)._m0[0].x >> 2u);
+    float _6 = _5 ? (*spvDescriptorSet0.vp_c3)._m0[_5 ? _3 : 0][_4] : 0.0;
+    out.gl_Position = float4(float(gl_VertexIndex & 1u) * 4.0 - 1.0, float(gl_VertexIndex >> 1u) * 4.0 - 1.0, 0.0, 1.0);
+    out.m_0 = uint4(as_type<uint>(_10), as_type<uint>(_11), _12, as_type<uint>(_13));
+    out.m_1 = uint4(uint(_14), as_type<uint>(_15), as_type<uint>(_6), 4660u);
+    return out;
+}
+""" % {'bank': BANK, 'r5': read(3, 5, pre='vp'), 'r17': read(3, 17, pre='vp'), 'r63': read(3, 63, pre='vp'), 'r1023': read(3, 1023, pre='vp'), 'c0': read(4, 0, pre='vp'), 'c6': read(4, 6, pre='vp')}
+
 def compile_lib(msl, d, name, sdk):
     p = d / (name + '.metal'); p.write_text(msl)
     air = d / (name + '.air')
@@ -113,6 +141,12 @@ class UbFixed(unittest.TestCase):
         self.assertEqual(out.count(NS['UBX_DECL']), 1)
         self.assertIn('using namespace metal;\n\n' + NS['UBX_DECL'], out)
         self.assertIn('[[function_constant(%d)]]' % dmsh_abi.UBX_FC, out)
+
+    def test_vertex_shader(self):   # the same rewrite for a vertex shader's tests (vp_ names)
+        out, need = ub_fixed(VS_SHADER)
+        self.assertEqual(need, {0: 4096, 1: 28})
+        self.assertEqual(out.count('(dmsh_ubx || ('), 6)
+        self.assertIn('bool _5 = ((uint(_3) << 2u) | uint(_4)) < ((*spvDescriptorSet0.vp_c%d)._m0[0].x >> 2u);' % BANK, out)
 
     def test_a_computed_word_keeps_its_test(self):
         out, _ = ub_fixed(SHADER)
@@ -146,7 +180,7 @@ class UbFixed(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             for sdk in ('macosx', 'iphoneos'):
                 with self.subTest(sdk=sdk):
-                    try: compile_lib(out, Path(d), 'ubx_' + sdk, sdk)
+                    try: compile_lib(out, Path(d), 'ubx_' + sdk, sdk); compile_lib(ub_fixed(VS_SHADER)[0], Path(d), 'ubx_vs_' + sdk, sdk)
                     except subprocess.CalledProcessError as e: self.fail(e.stderr)
 
 
@@ -155,6 +189,9 @@ def fixture(d):
     d = Path(d); d.mkdir(parents=True, exist_ok=True)
     (d / 'ubx.metal').write_text(out)
     (d / 'ubx.json').write_text(json.dumps({'ub_fixed': {str(r): n for r, n in sorted(need.items())}}))
+    out, need = ub_fixed(VS_SHADER)
+    (d / 'ubx_vs.metal').write_text(out)
+    (d / 'ubx_vs.json').write_text(json.dumps({'ub_fixed': {str(r): n for r, n in sorted(need.items())}}))
 
 
 if __name__ == '__main__':

@@ -1,4 +1,4 @@
-// A pixel shader's fixed-offset uniform reads without their bounds tests (dmsh_build.py ub_fixed, nvn_mtl.m ubx_want / ubx_fn), on the GPU. With the directory test_dmsh_ubx.py --fixture
+// A pixel or vertex shader's fixed-offset uniform reads without their bounds tests (dmsh_build.py ub_fixed, nvn_mtl.m ubx_want / ubx_fn), on the GPU (the vertex shader's words go to a flat pass-through). With the directory test_dmsh_ubx.py --fixture
 // writes (ubx.metal: a shader in the translator's shape whose tests are behind DMSH_UBX_FC; ubx.json: the bytes each slot's tests need), the host loads it as a shader (shader_load: ub_need),
 // decides from the fragment stage's bindings when the variant may draw (every slot bound at least as long as its tests need, measured as the size table holds it: min(size, 64 KiB), 0
 // unbound), and pso_desc gives a pipeline with ubc 0 the specialization with DMSH_UBX_FC true and one with ubc 1 the shader as it is. The variant and the shader with its tests then draw
@@ -16,7 +16,9 @@ static int checks, failed;
 enum { W = 4, H = 4, C3_WORDS = 8192, C4_WORDS = 16 };
 
 static const char *VS = "#include <metal_stdlib>\nusing namespace metal;\nstruct V { float4 p [[position]]; };\n"
-    "vertex V ubx_vs(uint i [[vertex_id]]) { float2 q[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)}; V o; o.p = float4(q[i], 0, 1); return o; }\n";
+    "vertex V ubx_vs(uint i [[vertex_id]]) { float2 q[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)}; V o; o.p = float4(q[i], 0, 1); return o; }\n"
+    "struct I { uint4 m_0 [[user(locn0), flat]]; uint4 m_1 [[user(locn1), flat]]; };\nstruct O { uint4 a [[color(0)]]; uint4 b [[color(1)]]; };\n"
+    "fragment O ubx_fs(I in [[stage_in]]) { O o; o.a = in.m_0; o.b = in.m_1; return o; }\n";
 
 static int fixture(NSString *dir) {
     NSTask *t = [NSTask new]; t.executableURL = [NSURL fileURLWithPath:@"/usr/bin/xcrun"];
@@ -30,15 +32,27 @@ static int fixture(NSString *dir) {
                        @{@"msl_name": [NSString stringWithFormat:@"fp_c%d", DMSH_CBSIZE_BANK], @"msl_type": @"constant _23*", @"arg_id": @1, @"kind": @DMSH_KIND_CBSIZE},
                        @{@"msl_name": @"fp_c4", @"msl_type": @"constant _16*", @"arg_id": @2, @"kind": @DMSH_KIND_CBUF, @"reg": @1}]};
     if (![[NSJSONSerialization dataWithJSONObject:refl options:0 error:nil] writeToFile:[dir stringByAppendingPathComponent:@"ubx-fs.json"] atomically:YES]) return 0;
+    NSTask *v = [NSTask new]; v.executableURL = [NSURL fileURLWithPath:@"/usr/bin/xcrun"];
+    v.arguments = @[@"-sdk", @"macosx", @"metal", @"-O1", @"-fpreserve-invariance", @"-fwrapv", [dir stringByAppendingPathComponent:@"ubx_vs.metal"], @"-o", [dir stringByAppendingPathComponent:@"ubx-vs.metallib"]];
+    if (![v launchAndReturnError:&e]) return 0;
+    [v waitUntilExit]; if (v.terminationStatus) return 0;
+    NSDictionary *vx = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:@"ubx_vs.json"]] options:0 error:nil];
+    if (![vx[@"ub_fixed"] isKindOfClass:NSDictionary.class]) return 0;
+    NSDictionary *vr = @{@"chain": @DMSH_CHAIN, @"route": @"B", @"stage": @"vs", @"entry": @"main0", @"entry_z": @"main0", @"vertex_inputs": @[], @"ub_fixed": vx[@"ub_fixed"],
+        @"bindings": @[@{@"msl_name": @"vp_c3", @"msl_type": @"constant _16*", @"arg_id": @0, @"kind": @DMSH_KIND_CBUF, @"reg": @0},
+                       @{@"msl_name": [NSString stringWithFormat:@"vp_c%d", DMSH_CBSIZE_BANK], @"msl_type": @"constant _23*", @"arg_id": @1, @"kind": @DMSH_KIND_CBSIZE},
+                       @{@"msl_name": @"vp_c4", @"msl_type": @"constant _16*", @"arg_id": @2, @"kind": @DMSH_KIND_CBUF, @"reg": @1}]};
+    if (![[NSJSONSerialization dataWithJSONObject:vr options:0 error:nil] writeToFile:[dir stringByAppendingPathComponent:@"ubx-vs.json"] atomically:YES]) return 0;
     g_msl_dir = dir; return 1;
 }
 
 // Draws fs with the bindings the size table describes: c[3] and c[4] from their buffers, the table's entries as the host encodes them; *out: the two RGBA32Uint targets, 2 x W x H x 4 words
-static void ubx_draw(id<MTLFunction> fs, id<MTLBuffer> c3, id<MTLBuffer> c4, const uint32_t table[DMSH_CBSIZE_SLOTS], uint32_t *out) {
-    static id<MTLFunction> vs; static id<MTLCommandQueue> q;
+// fs: the pixel shader under test (the bindings go to the fragment stage), or nil with vfn, the vertex shader under test (the bindings go to the vertex stage, a flat pass-through writes its outputs)
+static void ubx_draw2(id<MTLFunction> fs, id<MTLFunction> vfn, id<MTLBuffer> c3, id<MTLBuffer> c4, const uint32_t table[DMSH_CBSIZE_SLOTS], uint32_t *out) {
+    static id<MTLFunction> vs, pt; static id<MTLCommandQueue> q;
     NSError *e = nil;
-    if (!vs) { vs = [[g_dev newLibraryWithSource:@(VS) options:nil error:&e] newFunctionWithName:@"ubx_vs"]; q = [g_dev newCommandQueue]; }
-    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new]; d.vertexFunction = vs; d.fragmentFunction = fs;
+    if (!vs) { id<MTLLibrary> l = [g_dev newLibraryWithSource:@(VS) options:nil error:&e]; vs = [l newFunctionWithName:@"ubx_vs"]; pt = [l newFunctionWithName:@"ubx_fs"]; q = [g_dev newCommandQueue]; }
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new]; d.vertexFunction = vfn ? vfn : vs; d.fragmentFunction = vfn ? pt : fs;
     d.colorAttachments[0].pixelFormat = d.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;
     id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
     if (!p) { CHECK(0, "pipeline: %s", e.localizedDescription.UTF8String); return; }
@@ -52,18 +66,22 @@ static void ubx_draw(id<MTLFunction> fs, id<MTLBuffer> c3, id<MTLBuffer> c4, con
         rp.colorAttachments[i].texture = t[i]; rp.colorAttachments[i].loadAction = MTLLoadActionClear; rp.colorAttachments[i].clearColor = MTLClearColorMake(7, 7, 7, 7); rp.colorAttachments[i].storeAction = MTLStoreActionStore;
     }
     id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
-    [en setRenderPipelineState:p]; [en setFragmentBuffer:ab offset:0 atIndex:0];
-    [en useResource:c3 usage:MTLResourceUsageRead stages:MTLRenderStageFragment]; [en useResource:c4 usage:MTLResourceUsageRead stages:MTLRenderStageFragment]; [en useResource:tb usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+    MTLRenderStages st = vfn ? MTLRenderStageVertex : MTLRenderStageFragment;
+    [en setRenderPipelineState:p]; if (vfn) [en setVertexBuffer:ab offset:0 atIndex:0]; else [en setFragmentBuffer:ab offset:0 atIndex:0];
+    [en useResource:c3 usage:MTLResourceUsageRead stages:st]; [en useResource:c4 usage:MTLResourceUsageRead stages:st]; [en useResource:tb usage:MTLResourceUsageRead stages:st];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding]; [cb commit]; [cb waitUntilCompleted];
     CHECK(cb.status == MTLCommandBufferStatusCompleted, "draw completed");
     for (int i = 0; i < 2; i++) [t[i] getBytes:out + i * W * H * 4 bytesPerRow:W * 16 fromRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0];
 }
+static void ubx_draw(id<MTLFunction> fs, id<MTLBuffer> c3, id<MTLBuffer> c4, const uint32_t table[DMSH_CBSIZE_SLOTS], uint32_t *out) { ubx_draw2(fs, nil, c3, c4, table, out); }
 
 // What the shader with its tests writes: c[3] words 5, 17, 63, 1023, c[4] words 0 and 6, c[3] word 4 (y + 2) + (x & 3), each 0 past its slot's size in words (table >> 2)
-static void ubx_expect(const uint32_t *w3, const uint32_t *w4, const uint32_t table[DMSH_CBSIZE_SLOTS], uint32_t *out) {
+static void ubx_expect2(const uint32_t *w3, const uint32_t *w4, const uint32_t table[DMSH_CBSIZE_SLOTS], uint32_t *out, int vertex);
+static void ubx_expect(const uint32_t *w3, const uint32_t *w4, const uint32_t table[DMSH_CBSIZE_SLOTS], uint32_t *out) { ubx_expect2(w3, w4, table, out, 0); }
+static void ubx_expect2(const uint32_t *w3, const uint32_t *w4, const uint32_t table[DMSH_CBSIZE_SLOTS], uint32_t *out, int vertex) {
     uint32_t n3 = table[0] >> 2, n4 = table[1] >> 2;
     for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
-        uint32_t *a = out + (y * W + x) * 4, *b = out + W * H * 4 + (y * W + x) * 4, cw = 4u * (uint32_t)(y + 2) + (uint32_t)(x & 3);
+        uint32_t *a = out + (y * W + x) * 4, *b = out + W * H * 4 + (y * W + x) * 4, cw = vertex ? 9u : 4u * (uint32_t)(y + 2) + (uint32_t)(x & 3);
         a[0] = 5 < n3 ? w3[5] : 0; a[1] = 17 < n3 ? w3[17] : 0; a[2] = 63 < n3 ? w3[63] : 0; a[3] = 1023 < n3 ? w3[1023] : 0;
         b[0] = 0 < n4 ? w4[0] : 0; b[1] = 6 < n4 ? w4[6] : 0; b[2] = cw < n3 ? w3[cw] : 0; b[3] = 4660;
     }
@@ -118,6 +136,30 @@ int main(int argc, char **argv) { @autoreleasepool {
         ubx_draw(without, c3, c4, table, b);
         if (cases[c].want) CHECK(!memcmp(a, b, sizeof a), "%s: the variant writes the same words as the shader with its tests, at every pixel", cases[c].what);
         else CHECK(memcmp(a, b, sizeof a) != 0, "%s: the variant would read past the size (so the host must not take it, and does not)", cases[c].what);
+    }
+    // The vertex shader: the same cases through the vertex stage's bindings (S.ubo[0]); pso_desc gives ubc bit 1 the vertex function with its tests, a clear bit the variant
+    NvShader *vsh = shader_load(@"ubx-vs", 0, 0);
+    CHECK(vsh && vsh->ub_any && vsh->ub_need[0] == 4096 && vsh->ub_need[1] == 28, "the vertex shader's tests are known (ub_fixed)");
+    if (vsh && vsh->ub_any) {
+        k.ubc = 2; id<MTLFunction> vwith = fn_dev(pso_desc(&k, vsh, fs, nil, 0).vertexFunction);
+        k.ubc = 0; id<MTLFunction> vwithout = fn_dev(pso_desc(&k, vsh, fs, nil, 0).vertexFunction);
+        CHECK(vwith && vwithout && vwith != vwithout, "ubc bit 1 clear takes another vertex function than bit 1 set");
+        for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {
+            memset(S.ubo[0], 0, sizeof S.ubo[0]);
+            S.ubo[0][0] = (p_bind_buf){.stage = 0, .index = 0, .addr = cases[c].a3 ? 0x10000000 : 0, .size = cases[c].s3};
+            S.ubo[0][1] = (p_bind_buf){.stage = 0, .index = 1, .addr = cases[c].a4 ? 0x20000000 : 0, .size = cases[c].s4};
+            int want = ubx_want(vsh);
+            CHECK(want == cases[c].want, "vertex, %s: the host %s the variant", cases[c].what, want ? "takes" : "does not take");
+            uint32_t table[DMSH_CBSIZE_SLOTS] = {0};
+            for (int r = 0; r < 2; r++) { const p_bind_buf *u = &S.ubo[0][r]; if (u->addr) table[r] = u->size < 65536 ? (uint32_t)u->size : 65536; }
+            static uint32_t a[2 * W * H * 4], b[2 * W * H * 4], x[2 * W * H * 4];
+            ubx_expect2(w3, w4, table, x, 1);
+            ubx_draw2(nil, vwith, c3, c4, table, a);
+            CHECK(!memcmp(a, x, sizeof a), "vertex, %s: the shader with its tests writes the words of the bindings, 0 past their sizes", cases[c].what);
+            ubx_draw2(nil, vwithout, c3, c4, table, b);
+            if (cases[c].want) CHECK(!memcmp(a, b, sizeof a), "vertex, %s: the variant writes the same words as the shader with its tests", cases[c].what);
+            else CHECK(memcmp(a, b, sizeof a) != 0, "vertex, %s: the variant would read past the size (so the host must not take it, and does not)", cases[c].what);
+        }
     }
     // DM_NVN_UBX=0: never
     memset(S.ubo[1], 0, sizeof S.ubo[1]); S.ubo[1][0] = (p_bind_buf){.addr = 0x10000000, .size = 4096}; S.ubo[1][1] = (p_bind_buf){.addr = 0x20000000, .size = 28};

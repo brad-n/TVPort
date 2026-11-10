@@ -466,7 +466,7 @@ def finite_rg11(msl):
     if not k: return msl
     msl = msl[:brace] + body + msl[end:]
     return msl.replace('using namespace metal;\n', 'using namespace metal;\n\n' + FINITE_DECL, 1)
-# A pixel shader's uniform reads at fixed offsets without their bounds tests, where the host knows every one is in bounds (upstream 26062f9e, GitHub issue #1860). The translator
+# A vertex or pixel shader's uniform reads at fixed offsets without their bounds tests, where the host knows every one is in bounds (upstream 26062f9e, GitHub issue #1860). The translator
 # gives each read of a game uniform slot past the size the game bound 0, as Maxwell does: (w < (size >> 2)) ? read : 0, the size from the table of bank DMSH_CBSIZE_BANK, which the
 # host fills from the draw's bindings (nvn_mtl.m NVN_RB_CBSIZE). Those tests cost Ocarina of Time's lit pixel shaders about a tenth of their instructions and some of their spills
 # (e2f868a2799ed178: 5,314 -> 4,662 instructions, 176 -> 112 bytes spilled), while the game binds every slot at least as long as the shader reads it. So each test of a fixed word w
@@ -1789,7 +1789,7 @@ def finish(key, w, j, c1):
     src = dmsh_wide.wide_loads(src, WIDE_DEVICE)   # storage words the translator split, read whole again (see dmsh_wide.py)
     src = border_emu(src, BORDER_EMU)   # border colours Metal lacks (see border_emu)
     if j['stage'] == 'ps': src = finite_rg11(frag_z_snap(src)[0])   # gl_FragCoord.z against a depth of its own surface (see frag_z_snap); a non-finite colour output of an R11G11B10F target (see finite_rg11)
-    src, ubfix = ub_fixed(src) if j['stage'] == 'ps' else (src, {})   # fixed-offset uniform reads without their bounds tests where the host finds them in bounds (see ub_fixed)
+    src, ubfix = ub_fixed(src) if j['stage'] == 'ps' or (j['stage'] == 'vs' and not j.get('tf')) else (src, {})   # fixed-offset uniform reads without their bounds tests where the host finds them in bounds (see ub_fixed; a transform feedback entry is not specialized)
     open(msl, 'w').write(src)
     first, spill = [], 0
     mesh = j.get('mesh_stage')
