@@ -1,3 +1,4 @@
+#include <malloc/malloc.h>   // malloc_zone_statistics (the host malloc line)
 // DM_NVN_LEDGER=<seconds> (included by nvn_mtl.m; off by default): every <seconds> a thread logs where the graphics ledger (Metal's currentAllocatedSize) goes, in `[ledger]` lines:
 // render targets by size and format, sampled textures (ASTC, BC and other, with the largest formats), buffers (pool buffers resident, other buffers), heaps, the recycled render-target heaps
 // waiting (RH), the upload staging blocks kept, pool buffers freed but alive, and what is not in the residency set. It reads the residency set (g_res_objects, the same view as
@@ -12,9 +13,10 @@ static void lg_add(lg_group *g, int *ng, uint64_t key, uint64_t bytes) {
 }
 static const char *lg_fmt(uint32_t f, char *buf, size_t n) {
     switch (f) {
-    case 10: return "R8"; case 25: return "RG8"; case 55: return "R16F"; case 65: return "RG16F"; case 70: return "RGBA8"; case 71: return "RGBA8s"; case 80: return "BGRA8";
-    case 81: return "BGRA8s"; case 90: return "RGB10A2"; case 92: return "RG11B10F"; case 105: return "R32F"; case 115: return "RGBA16F"; case 125: return "RG32F"; case 124: return "RGBA16";
-    case 252: return "D32F"; case 253: return "S8"; case 260: return "D32FS8";
+    case 10: return "R8"; case 20: return "R16"; case 25: return "R16F"; case 30: return "RG8"; case 53: return "R32U"; case 55: return "R32F"; case 60: return "RG16"; case 65: return "RG16F";
+    case 70: return "RGBA8"; case 71: return "RGBA8s"; case 72: return "RGBA8sn"; case 80: return "BGRA8"; case 81: return "BGRA8s"; case 90: return "RGB10A2"; case 92: return "RG11B10F"; case 93: return "RGB9E5";
+    case 105: return "RG32F"; case 110: return "RGBA16"; case 115: return "RGBA16F"; case 123: return "RGBA32U"; case 124: return "RGBA32I"; case 125: return "RGBA32F";
+    case 250: return "D16"; case 252: return "D32F"; case 253: return "S8"; case 260: return "D32FS8";
     default: if (f >= 186 && f <= 225) snprintf(buf, n, "ASTC%u", f); else if (f >= 130 && f <= 153) snprintf(buf, n, "BC%u", f); else snprintf(buf, n, "fmt%u", f); return buf; }
 }
 static int lg_cmp(const void *a, const void *b) { const lg_group *x = a, *y = b; return x->bytes < y->bytes ? 1 : x->bytes > y->bytes ? -1 : 0; }
@@ -132,10 +134,79 @@ static void lg_dump(void) { @autoreleasepool {
         MLOG("[ledger]   render targets %llux%llu x%llu %s%s: %u, %.0f MB", (unsigned long long)(k >> 48), (unsigned long long)(k >> 32 & 0xffff), (unsigned long long)(k >> 24 & 0xff), lg_fmt((uint32_t)(k & 0xffff), fb, sizeof fb), (k >> 16 & 0xff) > 1 ? " (multisampled)" : "", rt[i].n, rt[i].bytes / M); }
     for (int i = 0; i < nsm && i < 6; i++) { char fb[16]; MLOG("[ledger]   sampled textures %s: %u, %.0f MB", lg_fmt((uint32_t)sm[i].key, fb, sizeof fb), sm[i].n, sm[i].bytes / M); }
     lg_shared();
+    {   // the Metal 4 command allocators: each keeps the memory of the largest submission it encoded since it was made (its high water), across resets
+        uint64_t am = atomic_load(&g_alloc_pub_b), au = 0, ap = 0, amx = atomic_load(&g_alloc_pub_max); int an = g_alloc_n;   // the submit thread's snapshot: it alone replaces them
+        for (int i = 0; i < 3; i++) { au += g_up_alloc4[i] ? g_up_alloc4[i].allocatedSize : 0; ap += g_present_alloc4[i] ? g_present_alloc4[i].allocatedSize : 0; }
+        malloc_statistics_t ms; malloc_zone_statistics(NULL, &ms);
+        MLOG("[ledger]   command allocators: main %d, %.0f MB (largest %.0f MB; made again empty %llu times, %.0f MB); upload 3, %.0f MB; present 3, %.0f MB; host malloc: %.0f MB in use of %.0f MB the zones hold",
+             an, am / M, amx / M, (unsigned long long)g_alloc_trims, g_alloc_trim_b / M, au / M, ap / M, ms.size_in_use / M, ms.size_allocated / M);
+    }
+} }
+// DM_NVN_LEDGER_TSV=<path> (diagnostic, with DM_NVN_LEDGER): every ledger round rewrites <path> with one line per Metal texture, heap and buffer the host holds: the residency set's objects, every
+// texture the serial table, the finalized ring and the sharing table hold (a packaged texture's current one and its spare), each once. A texture placed in a heap of its own (a recycled render
+// target, dm.rt) counts its heap's size and the heap no more; a view or a texture over a buffer counts 0. Columns: where it was found, kind, in the residency set, bytes, size, mips, Metal format
+// and type, usage, storage, purgeable state, heap label, and the storage (pool object + offset) of a texture the sharing table holds, else its label. So a run tells which objects make the graphics part of the footprint, ranked, beside the grouped [ledger] lines
+int dm_guest_as_contains(uintptr_t a);   // hle_svc.c: a pool buffer is guest memory (no copy), which the footprint does not charge
+static NSMapTable *g_lg_store;   // lg_inventory: a texture of the sharing table → its storage (the pool object and offset), so textures over the same storage show as such
+static void lg_inv_line(FILE *f, CFMutableSetRef seen, CFSetRef inset, id o, const char *src) {
+    if (!o || CFSetContainsValue(seen, (__bridge const void *)o)) return;
+    CFSetAddValue(seen, (__bridge const void *)o);
+    int in = CFSetContainsValue(inset, (__bridge const void *)o) != 0;
+    if ([o conformsToProtocol:@protocol(MTLTexture)]) { id<MTLTexture> t = o; id<MTLHeap> h = t.heap; uint64_t b; const char *kind = "texture"; NSString *hl = h.label;
+        if (t.buffer) { b = 0; kind = "texture-over-buffer"; } else if (t.parentTexture) { b = 0; kind = "view"; }
+        else if (h && [hl isEqualToString:@"dm.rt"]) { b = h.size; kind = "texture-in-rt-heap"; CFSetAddValue(seen, (__bridge const void *)h); in = CFSetContainsValue(inset, (__bridge const void *)h) != 0; }
+        else b = h ? 0 : t.allocatedSize;   // in a shared heap: the heap's own line counts it
+        if (h && b == 0 && !t.buffer && !t.parentTexture) kind = "texture-in-heap";
+        int pst = h || t.buffer || t.parentTexture ? 0 : (int)[t setPurgeableState:MTLPurgeableStateKeepCurrent];
+        NSString *st = [g_lg_store objectForKey:o];
+        fprintf(f, "%s\t%s\t%d\t%llu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%d\t%s\t%s\n", src, kind, in, (unsigned long long)b, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth,
+                (unsigned long)t.arrayLength, (unsigned long)t.mipmapLevelCount, (unsigned long)t.pixelFormat, (unsigned long)t.textureType, (unsigned long)t.usage, (unsigned long)t.storageMode, pst,
+                hl ? hl.UTF8String : "-", st ? st.UTF8String : t.label ? t.label.UTF8String : "-");
+        return; }
+    if ([o conformsToProtocol:@protocol(MTLHeap)]) { id<MTLHeap> h = o;
+        fprintf(f, "%s\theap\t%d\t%llu\t%llu\t%llu\t0\t0\t0\t0\t0\t0\t%lu\t%d\t%s\t-\n", src, in, (unsigned long long)h.size, (unsigned long long)h.usedSize, (unsigned long long)h.currentAllocatedSize,
+                (unsigned long)h.storageMode, (int)[h setPurgeableState:MTLPurgeableStateKeepCurrent], h.label ? h.label.UTF8String : "-");
+        return; }
+    if ([o conformsToProtocol:@protocol(MTLBuffer)]) { id<MTLBuffer> b = o;
+        fprintf(f, "%s\tbuffer\t%d\t%llu\t%lu\t0\t0\t0\t0\t0\t0\t0\t%lu\t%d\t%s\t%s\n", src, in, (unsigned long long)b.allocatedSize, (unsigned long)b.length, (unsigned long)b.storageMode,
+                b.heap ? 0 : (int)[b setPurgeableState:MTLPurgeableStateKeepCurrent], b.heap.label ? b.heap.label.UTF8String : "-",
+                b.storageMode == MTLStorageModeShared && dm_guest_as_contains((uintptr_t)b.contents) ? "guest-pool" : b.label ? b.label.UTF8String : "-");
+        return; }
+}
+static void lg_inventory(const char *path) { @autoreleasepool {
+    char tmp[1100]; snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "w"); if (!f) return;
+    fprintf(f, "src\tkind\tin_set\tbytes\tw_or_len\th_or_used\td_or_alloc\tlayers\tmips\tfmt\ttype\tusage\tstorage\tpurgeable\theap\tlabel\n");
+    NSMutableArray *tex = [NSMutableArray array], *src = [NSMutableArray array];
+    g_lg_store = [NSMapTable strongToStrongObjectsMapTable];
+    pthread_mutex_lock(&g_smu);   // the tables' objects, retained here (+1 each), read below without the lock
+    for (uint32_t i = 0; i < g_alias.cap; i++) { void *v = g_alias.vals[i]; if (!v) continue; alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
+        [g_lg_store setObject:[NSString stringWithFormat:@"storage %llx+%llx", (unsigned long long)k.pool, (unsigned long long)k.off] forKey:(__bridge id)v]; }
+    nvn_hmap *maps[3] = {&g_by_serial, &g_ghost, &g_alias}; const char *names[3] = {"serial", "ghost", "shared"};
+    for (int m = 0; m < 3; m++) for (uint32_t i = 0; i < maps[m]->cap; i++) { void *v = maps[m]->vals[i]; if (!v) continue; id o = (__bridge id)v;
+        if ([o isKindOfClass:[NvPkg class]]) { NvPkg *pk = o; if (pk->tex) { [tex addObject:pk->tex]; [src addObject:@"pkg"]; } if (pk->spare) { [tex addObject:pk->spare]; [src addObject:@"pkg-spare"]; } continue; }
+        if ([o conformsToProtocol:@protocol(MTLTexture)]) { [tex addObject:o]; [src addObject:@(names[m])]; } }
+    pthread_mutex_unlock(&g_smu);
+    pthread_mutex_lock(&g_res_mu); NSArray *live = g_res_objects.allObjects; pthread_mutex_unlock(&g_res_mu);
+    CFMutableSetRef seen = CFSetCreateMutable(NULL, 0, NULL), inset = CFSetCreateMutable(NULL, 0, NULL);
+    for (id a in live) CFSetAddValue(inset, (__bridge const void *)a);
+    for (NSUInteger i = 0; i < tex.count; i++) lg_inv_line(f, seen, inset, tex[i], [src[i] UTF8String]);
+    for (id a in live) lg_inv_line(f, seen, inset, a, "set");
+    CFRelease(seen); CFRelease(inset); g_lg_store = nil;
+    fclose(f); rename(tmp, path);
 } }
 static void *lg_thread(void *arg) {
     double sec = *(double *)arg; pthread_setname_np("dm-ledger");
-    for (;;) { usleep((useconds_t)(sec * 1e6)); lg_dump(); }
+    const char *tsv = getenv("DM_NVN_LEDGER_TSV"); char tp[1100];
+#if TARGET_OS_IPHONE
+    if (tsv && *tsv && *tsv != '/') {   // a relative name goes in the app's data directory, as DM_MEMSTAT's (Library/Caches on tvOS, Documents on iOS: dm/ios/Sources/main.m)
+        NSString *dir = NSSearchPathForDirectoriesInDomains(TARGET_OS_TV ? NSCachesDirectory : NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        if (dir) { snprintf(tp, sizeof tp, "%s/%s", dir.fileSystemRepresentation, tsv); tsv = tp; }
+    }
+#else
+    (void)tp;
+#endif
+    for (;;) { usleep((useconds_t)(sec * 1e6)); lg_dump(); if (tsv && *tsv) lg_inventory(tsv); }
     return NULL;
 }
 // Started by the first call (the frame hook's memory readout); DM_NVN_LEDGER=<seconds>, nothing when unset or 0
