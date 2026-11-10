@@ -5776,6 +5776,12 @@ static uint64_t att_bytes(id<MTLTexture> t, NSUInteger level) {
                      t.pixelFormat == MTLPixelFormatRG8Unorm || t.pixelFormat == MTLPixelFormatR16Float ? 2 : 4;
     return (uint64_t)w * h * bpp * t.sampleCount;
 }
+// The part of an attachment's bytes inside a pass's render area (aw x ah from the origin; 0 = the whole level): what the pass loads and stores of it
+static uint64_t att_in_area(uint64_t b, id<MTLTexture> t, NSUInteger level, NSUInteger aw, NSUInteger ah) {
+    if (!aw || !ah || !t) return b;
+    NSUInteger w = MAX(t.width >> level, 1), h = MAX(t.height >> level, 1);
+    return b * MIN(aw, w) * MIN(ah, h) / ((uint64_t)w * h);
+}
 // The render attachment selects a particular mip, while MTLTexture.width/height still describe the base level. Empty attachments do not take part in the bounds.
 static NSUInteger mip_extent(NSUInteger size, NSUInteger level) {
     return level < sizeof(size) * 8 ? MAX(size >> level, 1) : 1;
@@ -5935,6 +5941,7 @@ static int tbdr_on(void) { static int v = -1; if (v < 0) { const char *e = geten
 // attachment's Load into DontCare when the pass's first draw covers the whole attachment, without TBDR
 static int store_elide_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_STORE_ELIDE"); v = e && !strcmp(e, "1"); if (v) MLOG("DM_NVN_STORE_ELIDE=1: attachments cleared whole before their next use in the submission are not stored (the lookahead runs without DM_NVN_TBDR)"); } return v; }
 static int load_elide_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_LOAD_ELIDE"); v = e && !strcmp(e, "1"); if (v) MLOG("DM_NVN_LOAD_ELIDE=1: a colour attachment the pass's first draw covers whole is not loaded (no DM_NVN_TBDR needed)"); } return v; }
+static uint64_t g_win_n, g_win_bytes;   // window passes in a corner area (DM_NVN_WINDOW_AREA), and the load and store bytes outside the corner they did not move
 static uint64_t g_el_store_n, g_el_store_bytes, g_el_load_n, g_el_load_bytes, g_el_kept[10];   // elided stores / their bytes, elided loads / their bytes; stores kept by the verdict's reason (index: why, 8 redundant but the attachment is not eligible, 9 a bindless draw may read it)
 static int rt_range_on(void) { static int v = -1; if (v < 0) { const char *e=getenv("DM_NVN_RT_RANGE"); v=e && !strcmp(e,"1"); } return v; }   // Narrow candidate, off by default
 // ---------- In-process A/B phases (DM_AB, measurement) ----------
@@ -6092,6 +6099,12 @@ static int g_rt_range_active, g_rt_range_pending;
 static NSUInteger g_rp_aw, g_rp_ah; static void rt_dims(NSUInteger *tw, NSUInteger *th);
 static int rpa_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RP_AREA"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_RP_AREA=0: passes on very large targets cover the whole target"); } return v; }
 static int g_rp_whole;   // the pass about to open must cover the whole target (rp_begin)
+// DM_NVN_WINDOW_AREA (on by default; 0 off, ab alternates it with DM_AB): a draw pass into the window (swapchain) textures only gets the render area too, at any size, when its scissor's far corner leaves out a
+// quarter of the target or more. Ocarina of Time draws its last pass, a 1920x1080 picture, into the top-left corner of a 2560x1440 swapchain texture (the window crop is 1920x1080): the whole texture was
+// loaded and stored, 28 MB a frame, for 15.8 MB inside the corner. What lies outside keeps its memory, as it would have with the load and the store; a draw that leaves the area ends the pass first (draw_),
+// as for DM_NVN_RP_AREA. Window textures only: a game's last pass draws them once, so the pass is not split again. The pass still loads what it keeps: the GPU stores whole tiles, so a corner that does
+// not end on a tile boundary writes back the loaded pixels of the tiles it cuts (a skipped load there would write undefined ones outside the corner; t_window_area elide)
+static int win_area_on(void) { static int m = -1; if (m < 0) { m = sw_mode("DM_NVN_WINDOW_AREA", 1); if (!m) MLOG("DM_NVN_WINDOW_AREA=0: draw passes into the window textures cover the whole texture"); } return sw_on(m); }
 static int g_rt_merged;         // The current pass has already been continued (at least one same-target SetRenderTargets was merged in)
 static uint64_t g_rt_merge_n;   // Cumulative continuation count
 static int g_defer_replaying;
@@ -6311,6 +6324,14 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
     if (rt_range_on()) dirty0=nvn_dirty_now();
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     MTL4RenderPassDescriptor *pd = [MTL4RenderPassDescriptor new];
+    NSUInteger win_w = 0, win_h = 0;   // the render area of a pass into the window textures (DM_NVN_WINDOW_AREA; applied with the other render area below)
+    if (rpa_on() && !g_rp_whole && !clear_only && R.has_sc && !g_rp_layered && !g_sm_plan.on && !tbdr_on() && !R.clear_d && !R.clear_s && win_area_on()) {
+        int win = 0, other = 0, cl = 0;
+        for (int i = 0; i < R.rt.n && i < 8; i++) { cl |= R.clear_c[i]; if (R.rt.color[i]) { if (xv_present(R.rt.color[i]->serial)) win = 1; else other = 1; } }
+        NSUInteger tw = 0, th = 0; if (win && !other && !cl) rt_dims(&tw, &th);
+        if (tw && th) { NSUInteger w = MIN(tw, (NSUInteger)MAX((long)R.sc.x + R.sc.w, 1)), h = MIN(th, (NSUInteger)MAX((long)R.sc.y + R.sc.h, 1));
+            if (w * h * 4 <= tw * th * 3) { win_w = w; win_h = h; } }
+    }
     int any = 0;
     for (int i = 0; i < R.rt.n; i++) {
         if (!R.rt.color[i] || (clear_only == 1 && !R.clear_c[i]) || (g_geo_omit_colors && !R.clear_c[i])) continue;
@@ -6395,7 +6416,12 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
         return nil;
     }
     g_rp_aw = g_rp_ah = 0;
-    if (rpa_on() && !g_rp_whole && !clear_only && R.has_sc && !g_rp_layered && !tbdr_on() && !R.clear_d && !R.clear_s) {
+    if (win_w) { pd.renderTargetWidth = win_w; pd.renderTargetHeight = win_h; g_rp_aw = win_w; g_rp_ah = win_h; g_win_n++;
+        for (int i = 0; i < R.rt.n && i < 8; i++) { MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[i]; if (!c.texture) continue;
+            uint64_t b = att_bytes(c.texture, c.level); g_win_bytes += 2 * (b - att_in_area(b, c.texture, c.level, win_w, win_h)); }
+        static int once; if (!once++) MLOG("window area: a draw pass into the window texture covers %lux%lu of it, the far corner of its scissor (first case pass %llu; DM_NVN_WINDOW_AREA)", (unsigned long)win_w, (unsigned long)win_h, g_stat_pass + 1);
+        PD("A %llu window area %lux%lu", g_stat_pass + 1, (unsigned long)win_w, (unsigned long)win_h); }
+    else if (rpa_on() && !g_rp_whole && !clear_only && R.has_sc && !g_rp_layered && !tbdr_on() && !R.clear_d && !R.clear_s) {
         int cl = 0; for (int i = 0; i < 8; i++) cl |= R.clear_c[i];
         NSUInteger tw = 0, th = 0; if (!cl) rt_dims(&tw, &th);
         if (tw * th >= (1u << 24)) { NSUInteger w = MIN(tw, (NSUInteger)MAX((long)R.sc.x + R.sc.w, 1)), h = MIN(th, (NSUInteger)MAX((long)R.sc.y + R.sc.h, 1));
@@ -6437,7 +6463,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
     for (int i = 0; i < R.rt.n; i++) {
         MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[i];
         if (!c.texture) continue;
-        uint64_t b = att_bytes(c.texture, c.level); natt++; g_bw_store += b; if (c.loadAction == MTLLoadActionLoad) { g_bw_load += b; nload++; }
+        uint64_t b = att_in_area(att_bytes(c.texture, c.level), c.texture, c.level, g_rp_aw, g_rp_ah); natt++; g_bw_store += b; if (c.loadAction == MTLLoadActionLoad) { g_bw_load += b; nload++; }
         if (R.rt.has_cview[i] && R.rt.cview[i].set_format) PD("V %llu c%d view format %#x (base texture NVN format %#x)", g_stat_pass + 1, i, R.rt.cview[i].format, R.rt.color[i]->d.format);
         PD("P %llu c%d ser=%llu fmt=%lu %lux%lu ms%lu lv%lu sl%lu %s mtl=%p", g_stat_pass + 1, i, R.rt.color[i]->serial, (unsigned long)c.texture.pixelFormat,
            (unsigned long)c.texture.width, (unsigned long)c.texture.height, (unsigned long)c.texture.sampleCount, (unsigned long)c.level, (unsigned long)c.slice,
@@ -6445,7 +6471,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
     }
     {   // Depth and stencil planes are counted separately (combined format 5 bytes = depth 4 + stencil 1; when only one is attached only that one is counted)
         id<MTLTexture> dt = pd.depthAttachment.texture, stt = pd.stencilAttachment.texture;
-        uint64_t whole = att_bytes(dt ? dt : stt, dt ? pd.depthAttachment.level : pd.stencilAttachment.level);
+        uint64_t whole = att_in_area(att_bytes(dt ? dt : stt, dt ? pd.depthAttachment.level : pd.stencilAttachment.level), dt ? dt : stt, dt ? pd.depthAttachment.level : pd.stencilAttachment.level, g_rp_aw, g_rp_ah);
         int comb = (dt ? dt : stt).pixelFormat == MTLPixelFormatDepth32Float_Stencil8;
         uint64_t db = dt ? (comb ? whole / 5 * 4 : whole) : 0, sb = stt && stt != dt ? (comb ? whole / 5 : whole) : stt ? whole - db : 0;
         if (dt) { natt++; g_bw_store += db; if (pd.depthAttachment.loadAction == MTLLoadActionLoad) { g_bw_load += db; nload++; } }
@@ -6460,11 +6486,11 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
     {
         // A standalone clear has already stored before this pass; only a clear load action here writes this pass's tiles.
         for (int i = 0; i < R.rt.n && i < 8; i++) { MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[i]; if (!c.texture || bcrt_is(c.texture)) continue;
-            g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.color[i]->serial; g_sd[g_nsd].bytes = att_bytes(c.texture, c.level); g_sd[g_nsd].lv = (uint32_t)c.level; g_sd[g_nsd].sl = (uint32_t)(c.texture.textureType == MTLTextureType3D ? c.depthPlane : c.slice); g_sd[g_nsd].idx = i; g_sd[g_nsd].load = c.loadAction == MTLLoadActionLoad; g_sd[g_nsd].wrote = R.clear_c[i] != 0; g_sd[g_nsd].rast = c.loadAction == MTLLoadActionClear; g_nsd++;
+            g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.color[i]->serial; g_sd[g_nsd].bytes = att_in_area(att_bytes(c.texture, c.level), c.texture, c.level, g_rp_aw, g_rp_ah); g_sd[g_nsd].lv = (uint32_t)c.level; g_sd[g_nsd].sl = (uint32_t)(c.texture.textureType == MTLTextureType3D ? c.depthPlane : c.slice); g_sd[g_nsd].idx = i; g_sd[g_nsd].load = c.loadAction == MTLLoadActionLoad; g_sd[g_nsd].wrote = R.clear_c[i] != 0; g_sd[g_nsd].rast = c.loadAction == MTLLoadActionClear; g_nsd++;
             c.storeAction = MTLStoreActionUnknown; }
         id<MTLTexture> dt = pd.depthAttachment.texture, stt = pd.stencilAttachment.texture;
-        uint64_t db = att_bytes(dt, pd.depthAttachment.level), sb = 0;
-        if (stt) { int comb = stt.pixelFormat == MTLPixelFormatDepth32Float_Stencil8; sb = att_bytes(stt, pd.stencilAttachment.level) / (comb ? 5 : 1); if (stt == dt) db -= sb; }   // Combined format 5 bytes = depth 4 + stencil 1 (when only stencil is attached, only 1 is counted)
+        uint64_t db = att_in_area(att_bytes(dt, pd.depthAttachment.level), dt, pd.depthAttachment.level, g_rp_aw, g_rp_ah), sb = 0;
+        if (stt) { int comb = stt.pixelFormat == MTLPixelFormatDepth32Float_Stencil8; sb = att_in_area(att_bytes(stt, pd.stencilAttachment.level), stt, pd.stencilAttachment.level, g_rp_aw, g_rp_ah) / (comb ? 5 : 1); if (stt == dt) db -= sb; }   // Combined format 5 bytes = depth 4 + stencil 1 (when only stencil is attached, only 1 is counted)
         if (dt) { g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.depth->serial; g_sd[g_nsd].bytes = db; g_sd[g_nsd].lv = (uint32_t)pd.depthAttachment.level; g_sd[g_nsd].sl = (uint32_t)pd.depthAttachment.slice; g_sd[g_nsd].idx = -1; g_sd[g_nsd].depth = 1; g_sd[g_nsd].load = pd.depthAttachment.loadAction == MTLLoadActionLoad; g_sd[g_nsd].wrote = R.clear_d != 0; g_nsd++;
                   pd.depthAttachment.storeAction = MTLStoreActionUnknown; }
         if (stt) { g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.depth->serial; g_sd[g_nsd].bytes = sb; g_sd[g_nsd].lv = (uint32_t)pd.stencilAttachment.level; g_sd[g_nsd].sl = (uint32_t)pd.stencilAttachment.slice; g_sd[g_nsd].idx = -1; g_sd[g_nsd].depth = 2; g_sd[g_nsd].load = pd.stencilAttachment.loadAction == MTLLoadActionLoad; g_sd[g_nsd].wrote = R.clear_s != 0; g_nsd++;
@@ -17900,8 +17926,8 @@ void mem_census(const char *why) { @autoreleasepool {
 #include "nvn_ledger.inc"   // DM_NVN_LEDGER=<seconds>: where the graphics ledger goes, logged periodically
 #include "nvn_capture.inc"   // DM_NVN_CAPTURE (one frame for dm/gfx/tests/nvn_replay)
 #pragma clang attribute pop
-void mtl_gpupass_stats(uint64_t *o) {   // 0 store elided n, 1 bytes, 2 load elided n, 3 bytes, 4..13 stores kept by reason, 14..21 clear-only passes by reason
-    o[0] = g_el_store_n; o[1] = g_el_store_bytes; o[2] = g_el_load_n; o[3] = g_el_load_bytes;
+void mtl_gpupass_stats(uint64_t *o) {   // 0 store elided n, 1 bytes, 2 load elided n, 3 bytes, 4..13 stores kept by reason, 14..21 clear-only passes by reason, 22 window passes in a corner area, 23 their bytes saved
+    o[0] = g_el_store_n; o[1] = g_el_store_bytes; o[2] = g_el_load_n; o[3] = g_el_load_bytes; o[22] = g_win_n; o[23] = g_win_bytes;
     for (int i = 0; i < 10; i++) o[4 + i] = g_el_kept[i];
     for (int i = 0; i < 8; i++) o[14 + i] = g_lc_why[i];
 }
