@@ -2,7 +2,8 @@
 """Store textures once (docs/texture_once.md): turn a RomFS image and the ASTC pack built from it into ONE sparse image that carries both.
 
 Every plane the pack covers is overwritten in place in the game's files by a tag (the first 8 bytes of the plane's pack key) and zeros: sizes and offsets never change. Compressed
-containers are recompressed into their own slot (Yaz0: zero tail; zstd: the rest of the slot is one zstd skippable frame of zeros; Smash's data.arc: the entry's stored size in the
+containers are recompressed into their own slot (Yaz0: zero tail; zstd: one frame that fills the slot, its head compressed and its tail stored in raw blocks (tex_once_zstd.fill_frame),
+as a game may read the file in pieces and decode to its end; Smash's data.arc: the entry's stored size in the
 archive's table is updated and the table is rewritten into its own slot the same way). The result is written as a DMSPARS1 file (sparse_image.py): zero runs are not stored, and the
 pack is embedded unchanged. The runtime resolves a tagged plane straight to its pack entry; anything else behaves as before.
 
@@ -116,13 +117,27 @@ def zstd_stream(data, slot, zd=None, like=None):
     return None
 
 
-def zstd_slot(data, slot, zd=None, min_tail=0, levels=None, like=None):
-    """`data` compressed into exactly `slot` bytes: the stream, then one skippable frame of zeros to the slot's end. None when it does not fit, or leaves a tail of 1..7 bytes (no room for the frame's header)"""
+FILL_HEAD_LEVELS = (3, 19)   # the encoder levels of a filled frame's compressed head (fill_slot): a fast one, and a strong one for a slot the stripped stream barely fits
+
+
+def fill_slot(data, slot, comp, zd=None, like=None):
+    """`data` as one zstd frame of exactly `slot` bytes with the header of `comp` (a frame of all of it), nothing after it (tex_once_zstd.fill_frame), or None.
+    It used to be `comp` and a skippable frame of zeros to the slot's end. Ocarina of Time reads its files in 902,912-byte pieces and decodes as it reads: each stripped file larger than
+    one piece whose new frame ended in an earlier piece was read again and again and never loaded (31 GB read in 100 s), Link's house's inside-wall textures among them, so the house had no
+    inside on the Apple TV. Every original file is one frame that ends where the file ends"""
+    for level in FILL_HEAD_LEVELS:
+        new = Z.fill_frame(data, slot, comp, lambda x: zstd_compress(x, level, zd, like or comp))
+        if new is not None: return new
+    return None
+
+
+def zstd_slot(data, slot, zd=None, levels=None, like=None):
+    """`data` compressed into exactly `slot` bytes: one frame that fills the slot (fill_slot). None when it does not fit"""
     for level in levels or ZSTD_LEVELS[:2 if len(data) > (32 << 20) else 3]:
         comp = zstd_compress(data, level, zd, like)
-        tail = slot - len(comp)
-        if tail == 0 and not min_tail: return comp
-        if tail >= max(8, min_tail): return comp + skippable_frame(tail)
+        if len(comp) > slot: continue
+        new = fill_slot(data, slot, comp, zd, like)
+        if new is not None: return new
     return None
 
 
@@ -339,12 +354,13 @@ class Walker:
             return self.zdicts[did]
         return None
 
-    def pad_exact(self, comp, slot, top):
-        """The exact encoder's frame `comp` as the slot's new bytes: a data.arc entry gets a zero tail, any other zstd file a skippable frame of zeros (or nothing, when it fills the slot). None when it does not fit"""
+    def pad_exact(self, comp, slot, top, data):
+        """The exact encoder's frame `comp` of `data` as the slot's new bytes: a data.arc entry gets a zero tail (the table records its stored size), any other zstd file one frame
+        that fills the slot, with comp's header and its head compressed (fill_slot). None when it does not fit"""
         if len(comp) > slot: return None
         tail = slot - len(comp)
         if top == 'arc' or tail == 0: return comp + bytes(tail)
-        return comp + skippable_frame(tail) if tail >= 8 else None
+        return fill_slot(data, slot, comp)
 
     def exact_slot(self, data, orig, dec, top, level=None):
         """`data` re-packed with the encoder the game's own frames came from (zstd v1.3.5 streaming) into the slot of `orig`, whose content is `dec`: -> (the slot's new bytes, the level used, the level
@@ -356,7 +372,7 @@ class Walker:
         for use in Z.same_window_levels(lv, one) if len(data) < (8 << 20) else [lv]:
             comp = Z.exact_compress(data, use, one)
             if one and Z.frame_header(comp) != Z.frame_header(orig): continue   # a level whose window does not cover the content is no longer Single_Segment: not the original layout
-            new = self.pad_exact(comp, len(orig), top)
+            new = self.pad_exact(comp, len(orig), top, data)
             if new is not None and not Z.forbidden(comp, rle_literals=not one):   # Smash's originals hold RLE literals; no Ocarina frame is known to hold RLE anything, and the stripped (zero-rich) content would get RLE blocks from v1.4.4: such a frame takes the no-RLE path
                 if top == 'arc': self.new_csz = len(comp)
                 return new, use, lv
@@ -373,8 +389,8 @@ class Walker:
         return new
 
     def fit_zstd(self, data, orig, top, dec=None):
-        """`data` compressed into the slot of `orig`: the stream and one skippable frame of zeros to the slot's end (a data.arc entry whose size the table records: the stream and a zero tail).
-        None when it does not fit (or leaves a tail under 8 bytes, too short for the frame's header)"""
+        """`data` compressed into the slot of `orig`: one frame that fills the slot (fill_slot; a data.arc entry whose size the table records: the stream and a zero tail).
+        None when it does not fit"""
         if dec is not None and self.zdict(orig) is None:
             new = self.exact_fit(data, orig, dec, top)
             if new is not None: return new
@@ -475,7 +491,7 @@ class Walker:
                 nn = n[:top_csz]
             if nn[:4] != ZSTD_MAGIC and not (len(nn) >= 4 and struct.unpack('<I', nn[:4])[0] in B.SKIPPABLE): raise Mismatch(f'{name}: no zstd frame')
             if o != n:
-                try: bad = Z.forbidden(nn, o, skippable_ok=top_csz is None, rle_literals=not Z.is_oneshot(o) and Z.match_level(o, B.unzstd(o, self.dicts)) is not None)   # a data.arc entry never gets a skippable frame (zero tail); other zstd files are padded with one to fill their slot
+                try: bad = Z.forbidden(nn, o, rle_literals=not Z.is_oneshot(o) and Z.match_level(o, B.unzstd(o, self.dicts)) is not None)   # no skippable frame where the original has none: a frame that ends before its file does is read again and again by a game that decodes in pieces (fill_slot)
                 except (ValueError, IndexError) as e: raise Mismatch(f'{name}: the new zstd data is not a readable frame run ({e})')
                 if bad: raise Mismatch(f'{name}: the new zstd frame uses {bad}, which the original does not; the game decodes only the original archive\'s features')
             ho, hn = zstd_header(o), zstd_header(nn)

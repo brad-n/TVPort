@@ -162,6 +162,87 @@ def frame_features(buf, max_frames=1 << 20, zero_tail=False):
     return res
 
 
+RAW_BLOCK_MAX = 128 << 10   # Block_Maximum_Size: no block holds more than this, nor more than the frame's window
+
+
+def frame_split(f):
+    """(header bytes, [block bytes, each with its 3-byte header], checksum bytes) of the one zstd frame that is all of f. Raises ValueError otherwise"""
+    f = bytes(f)
+    if f[:4] != ZSTD_MAGIC or len(f) < 6: raise ValueError('not a zstd frame')
+    fhd = f[4]
+    p = 5 + (0 if (fhd >> 5) & 1 else 1) + (0, 1, 2, 4)[fhd & 3] + ((0, 2, 4, 8)[fhd >> 6] if fhd >> 6 else (1 if (fhd >> 5) & 1 else 0))
+    head, blocks = f[:p], []
+    while True:
+        if p + 3 > len(f): raise ValueError('frame cut off')
+        h = int.from_bytes(f[p:p + 3], 'little'); typ, size = (h >> 1) & 3, h >> 3
+        if typ == 3: raise ValueError('reserved block type')
+        n = 3 + (1 if typ == 1 else size)
+        blocks.append(f[p:p + n]); p += n
+        if h & 1: break
+    tail = f[p:p + 4] if (fhd >> 2) & 1 else b''
+    if p + len(tail) != len(f): raise ValueError('bytes after the frame')
+    return head, blocks, tail
+
+
+def frame_window(header, content):
+    """The window of a frame with this header whose content is `content` bytes: the content itself for Single_Segment, else what the window descriptor says"""
+    fhd = header[4]
+    if (fhd >> 5) & 1: return content
+    wd = header[5]; base = 1 << (10 + (wd >> 3))
+    return base + (base >> 3) * (wd & 7)
+
+
+def fill_frame(data, slot, whole, head):
+    """`data` as ONE zstd frame of exactly `slot` bytes with nothing after it in the slot: the start of the content as compressed blocks, the rest as raw blocks, as many as make
+    the size come out exact. A game reads its file to the end and may decode it in pieces: Ocarina of Time reads a file in 902,912-byte pieces, and every stripped file larger than one
+    piece whose new frame ended early and was padded with a skippable frame was read again and again (31 GB in 100 s on a Mac mini, the same on the Apple TV) and never loaded: the
+    textures of Link's house, its inside walls among them, so the house had none. A frame that ends where the slot ends is what every original file is.
+    whole: a frame of all of `data` with the header the result carries (the original's layout and the content's size), from the encoder the caller chose; head(bytes) -> a frame of a
+    prefix with the same layout (the raw tail needs no history, so any encoder of that layout will do). None when the layout has a checksum (not written here), when even `whole` does not
+    fit, or when no split gives the exact size"""
+    data = bytes(data)
+    hdr, wblocks, wsum = frame_split(whole)
+    if wsum: return None
+    n = len(data)
+    if len(whole) == slot: return bytes(whole)
+    if len(whole) > slot: return None
+    bmax = max(1, min(RAW_BLOCK_MAX, frame_window(hdr, n)))
+    memo = {}
+
+    def head_body(k):   # the blocks of the first k bytes, the last of them no longer the frame's last
+        if k not in memo:
+            if k == 0: memo[k] = b''
+            else:
+                _, bl, _ = frame_split(head(data[:k]))
+                h = int.from_bytes(bl[-1][:3], 'little') & ~1
+                memo[k] = b''.join(bl[:-1]) + h.to_bytes(3, 'little') + bl[-1][3:]
+        return memo[k]
+
+    def total(k):
+        r = n - k
+        return len(hdr) + len(head_body(k)) + r + 3 * -(-r // bmax)
+
+    if n == 0: return None
+    lo, hi = 0, n - 1          # the smallest prefix whose frame, with its raw tail, fits (sizes fall as the prefix grows, compressed bytes being fewer than raw ones)
+    if total(hi) > slot: return None
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if total(mid) <= slot: hi = mid
+        else: lo = mid + 1
+    for k in range(lo, min(n - 1, lo + 4096) + 1):   # each extra raw block adds its 3-byte header: a gap that is a multiple of 3 closes exactly
+        gap = slot - total(k)
+        if gap < 0 or gap % 3: continue
+        r = n - k; nb = -(-r // bmax) + gap // 3
+        if nb > r: continue
+        q, rem = divmod(r, nb)
+        out = bytearray(hdr) + head_body(k); p = k
+        for i in range(nb):
+            size = q + (1 if i < rem else 0)
+            out += ((1 if i == nb - 1 else 0) | size << 3).to_bytes(3, 'little') + data[p:p + size]; p += size
+        if len(out) == slot and p == n: return bytes(out)
+    return None
+
+
 def forbidden(new, orig=None, skippable_ok=False, rle_literals=False):
     """Reasons a frame `new` uses a zstd feature that the archive's own frames (`orig`, when given) do not: block types outside raw/compressed, literal types outside raw/Huffman/treeless,
     a skippable frame where the original has none (unless skippable_ok). -> list of strings"""
