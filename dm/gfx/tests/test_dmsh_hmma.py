@@ -441,7 +441,7 @@ int main(int argc, char **argv) { @autoreleasepool {
 @unittest.skipUnless(shutil.which('xcrun') and shutil.which('clang'), 'needs Xcode')
 class RoundingByProduct(unittest.TestCase):
     def test_same_bits_as_the_conversion(self):
-        self.assertIn('simdgroup_multiply_accumulate(c0, nz, pz, f0)', scope['HMMA_BODY'])   # the form checked here is the body's
+        # the rounding of a float result by -0 x +0 products into half, which the body before rounded each block with (OneRoundingPerBlock compares the body with it)
         with tempfile.TemporaryDirectory() as d:
             d = Path(d); (d / 'r.metal').write_text(ROUND_KERNEL); (d / 'rr.m').write_text(ROUND_RUNNER)
             subprocess.run(['clang', '-fobjc-arc', '-O1', str(d / 'rr.m'), '-framework', 'Metal', '-framework', 'Foundation', '-o', str(d / 'rr')], check=True)
@@ -452,6 +452,121 @@ class RoundingByProduct(unittest.TestCase):
                 if r.returncode == 2: self.skipTest(r.stdout.strip())
                 self.assertEqual(r.returncode, 0, f'{mode}: {r.stdout}{r.stderr}')
                 self.assertIn(' 0 differ', r.stdout)
+
+
+# Each block as one multiply-accumulate into half from a float C (HMMA_BODY): against the body before (each block into float, then rounded by -0 x +0 products into half)
+# and Ampere's model, with C from the input and C = 0 (FlagCZero), and through the rewrite itself on inputs past [-1, 1]
+BLOCK_KERNEL = r"""#include <metal_stdlib>
+using namespace metal;
+// One HMMA.16816 a SIMD-group: A 16x16, B 16x8, C 16x8 halves (row-major); D 16x8. mode bit 0: the body before; else the body's form. mode bit 1: C = +0
+kernel void hm(device const half *in [[buffer(0)]], device half *out [[buffer(1)]], constant uint &mode [[buffer(2)]],
+               uint sg [[simdgroup_index_in_threadgroup]], uint tg [[threadgroup_position_in_grid]], uint nsg [[simdgroups_per_threadgroup]]) {
+    uint w = tg * nsg + sg;
+    device const half *A = in + w * 512, *B = A + 256, *C = A + 384;
+    simdgroup_half8x8 am[4], b0, b1, c0, c1;
+    simdgroup_load(am[0], A, 16, ulong2(0, 0)); simdgroup_load(am[1], A, 16, ulong2(8, 0)); simdgroup_load(am[2], A, 16, ulong2(0, 8)); simdgroup_load(am[3], A, 16, ulong2(8, 8));
+    simdgroup_load(b0, B, 8, ulong2(0, 0)); simdgroup_load(b1, B, 8, ulong2(0, 8));
+    const bool czero = mode & 2;
+    simdgroup_float8x8 f0, f1;
+    const simdgroup_half8x8 nz = make_filled_simdgroup_matrix<half, 8, 8>(-0.0h), pz = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+    if (!(mode & 1)) {
+        if (czero) { f0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); f1 = f0; }
+        else { simdgroup_load(c0, C, 8, ulong2(0, 0)); simdgroup_load(c1, C, 8, ulong2(0, 8)); simdgroup_multiply_accumulate(f0, nz, pz, c0); simdgroup_multiply_accumulate(f1, nz, pz, c1); }
+        simdgroup_multiply_accumulate(c0, am[0], b0, f0); simdgroup_multiply_accumulate(c1, am[2], b0, f1);
+        simdgroup_multiply_accumulate(f0, nz, pz, c0); simdgroup_multiply_accumulate(f1, nz, pz, c1);
+        simdgroup_multiply_accumulate(c0, am[1], b1, f0); simdgroup_multiply_accumulate(c1, am[3], b1, f1);
+    } else {
+        if (czero) { c0 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h); c1 = c0; }
+        else { simdgroup_load(c0, C, 8, ulong2(0, 0)); simdgroup_load(c1, C, 8, ulong2(0, 8)); }
+        simdgroup_multiply_accumulate(f0, am[0], b0, c0); simdgroup_multiply_accumulate(f1, am[2], b0, c1);
+        simdgroup_multiply_accumulate(c0, nz, pz, f0); simdgroup_multiply_accumulate(c1, nz, pz, f1);
+        simdgroup_multiply_accumulate(f0, am[1], b1, c0); simdgroup_multiply_accumulate(f1, am[3], b1, c1);
+        simdgroup_multiply_accumulate(c0, nz, pz, f0); simdgroup_multiply_accumulate(c1, nz, pz, f1);
+    }
+    simdgroup_store(c0, out + w * 128, 8, ulong2(0, 0)); simdgroup_store(c1, out + w * 128, 8, ulong2(0, 8));
+}
+"""
+# Inputs (argv[3]): 0 halves in [-1, 1], 1 every finite f16 bit pattern, 2 [-1, 1] times 2^-6 .. 2^6 (cancellation, carries), 3 signed zeros, infinities, NaNs, the largest and smallest
+# normal and subnormal values mixed with [-1, 1]. A NaN result counts as matching a NaN of the model's; otherwise every bit, and the body and the body before must agree in every bit
+SPECIALS = r"""
+static uint16_t rnd(int dist) {
+    if (dist == 0) return f2h((rand() % 2001 - 1000) / 1000.0f);
+    if (dist == 1) { uint16_t h; do h = (uint16_t)(rand() & 0xffff); while ((h & 0x7c00) == 0x7c00); return h; }
+    if (dist == 2) return f2h(ldexpf((rand() % 2001 - 1000) / 1000.0f, rand() % 13 - 6));
+    static const uint16_t sp[] = {0x0000, 0x8000, 0x7c00, 0xfc00, 0x7e00, 0x7bff, 0xfbff, 0x0001, 0x8001, 0x0400, 0x8400, 0x3c00, 0xbc00, 0x3555, 0x5bff};
+    return rand() % 3 ? sp[rand() % 15] : f2h((rand() % 2001 - 1000) / 1000.0f);
+}
+static int nan16(uint16_t h) { return (h & 0x7c00) == 0x7c00 && (h & 0x3ff); }
+"""
+BLOCK_RUNNER = HALF.replace('#import <Metal/Metal.h>\n', '#import <Metal/Metal.h>\n#include <math.h>\n', 1) + SPECIALS + r"""
+int main(int argc, char **argv) {
+    @autoreleasepool {
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        if (!dev) { printf("no Metal device\n"); return 2; }
+        id<MTLComputePipelineState> ps = pipeline(dev, argv[1], @"hm");
+        srand(atoi(argv[2])); int dist = atoi(argv[3]);
+        const int groups = 256, n = groups * 4;
+        id<MTLBuffer> in = [dev newBufferWithLength:n * 512 * 2 options:MTLResourceStorageModeShared], out[4];
+        uint16_t *x = in.contents; for (int i = 0; i < n * 512; i++) x[i] = rnd(dist);
+        id<MTLCommandQueue> q = [dev newCommandQueue];
+        for (uint32_t m = 0; m < 4; m++) {
+            out[m] = [dev newBufferWithLength:n * 128 * 2 options:MTLResourceStorageModeShared];
+            id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            [ce setComputePipelineState:ps]; [ce setBuffer:in offset:0 atIndex:0]; [ce setBuffer:out[m] offset:0 atIndex:1]; [ce setBytes:&m length:4 atIndex:2];
+            [ce dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)]; [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        }
+        long bad = 0, apart = 0, tot = 0;
+        for (int w = 0; w < n; w++) {
+            const uint16_t *A = x + w * 512, *B = A + 256, *C = A + 384;
+            for (int r = 0; r < 16; r++) for (int c = 0; c < 8; c++) for (int z = 0; z < 2; z++) {
+                float ref = z ? 0.0f : h2f(C[r * 8 + c]);
+                for (int k = 0; k < 16; k++) { ref = fmaf(h2f(A[r * 16 + k]), h2f(B[k * 8 + c]), ref); if (k == 7 || k == 15) ref = r16(ref); }
+                uint16_t want = f2h(ref), got = ((uint16_t *)out[z * 2].contents)[w * 128 + r * 8 + c], before = ((uint16_t *)out[z * 2 + 1].contents)[w * 128 + r * 8 + c];
+                bad += got != want && !(isnan(ref) && nan16(got)); apart += got != before; tot++;
+            }
+        }
+        printf("%ld outputs: %ld differ from Ampere's model, %ld from the body before\n", tot, bad, apart);
+        return bad || apart;
+    }
+}
+"""
+# The same inputs through the rewrite (KERNEL: one call, C from the input); RUNNER's check, with NaN results matched as NaNs
+SPECIAL_RUNNER = RUNNER.replace('#import <Metal/Metal.h>\n', '#import <Metal/Metal.h>\n#include <math.h>\n', 1).replace('static id<MTLComputePipelineState> pipeline', SPECIALS + 'static id<MTLComputePipelineState> pipeline', 1) \
+    .replace('uint32_t *w = in.contents; srand(11);', 'uint32_t *w = in.contents; srand(atoi(argv[2])); int dist = atoi(argv[3]);') \
+    .replace('w[i] = f2h((rand() % 2001 - 1000) / 1000.0f) | (uint32_t)f2h((rand() % 2001 - 1000) / 1000.0f) << 16;', 'w[i] = rnd(dist) | (uint32_t)rnd(dist) << 16;') \
+    .replace('bad += (r[q2] >> (16 * j) & 0xffff) != f2h(ref);', 'bad += (r[q2] >> (16 * j) & 0xffff) != f2h(ref) && !(isnan(ref) && nan16(r[q2] >> (16 * j) & 0xffff));')
+
+
+@unittest.skipUnless(shutil.which('xcrun') and shutil.which('clang'), 'needs Xcode')
+class OneRoundingPerBlock(unittest.TestCase):
+    MODES = ([], ['-fmetal-math-mode=relaxed'])   # the Mac's math mode and the iPhone / Apple TV one
+
+    def test_the_body_is_the_form_checked(self):
+        body = scope['HMMA_BODY']
+        for line in ('if (czero) { f0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); f1 = f0; }', 'simdgroup_multiply_accumulate(f0, nz, pz, c0); simdgroup_multiply_accumulate(f1, nz, pz, c1);',
+                     'simdgroup_multiply_accumulate(c0, am[0], b0, f0); simdgroup_multiply_accumulate(c1, am[2], b0, f1);',
+                     'simdgroup_multiply_accumulate(c0, am[1], b1, f0); simdgroup_multiply_accumulate(c1, am[3], b1, f1);'):
+            self.assertIn(line, body); self.assertIn(line, BLOCK_KERNEL)
+        self.assertNotIn('simdgroup_multiply_accumulate(c0, nz, pz, f0)', body, 'no block result rounded by a product of its own')
+
+    def runs(self, msl, runner, name, seeds):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d); (d / 'k.metal').write_text(msl); (d / 'run.m').write_text(runner)
+            subprocess.run(['clang', '-fobjc-arc', '-O1', str(d / 'run.m'), '-framework', 'Metal', '-framework', 'Foundation', '-o', str(d / 'run')], check=True)
+            for mode in self.MODES:
+                subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', '-O1'] + mode + ['-fpreserve-invariance', '-fwrapv', str(d / 'k.metal'), '-o', str(d / 'k.air')], check=True)
+                subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', str(d / 'k.air'), '-o', str(d / 'k.metallib')], check=True)
+                for dist, seed in seeds:
+                    with self.subTest(mode=mode, dist=dist, seed=seed):
+                        r = subprocess.run([str(d / 'run'), str(d / 'k.metallib'), str(seed), str(dist)], capture_output=True, text=True)
+                        if r.returncode == 2: self.skipTest(r.stdout.strip())
+                        self.assertEqual(r.returncode, 0, f'{name}: {r.stdout}{r.stderr}')
+
+    def test_against_the_body_before_and_ampere(self):
+        self.runs(BLOCK_KERNEL, BLOCK_RUNNER, 'blocks', [(d, s) for d in range(4) for s in (1, 2)])
+
+    def test_specials_through_the_rewrite(self):
+        self.runs(hmma_msl(HEAD + HELPER + KERNEL), SPECIAL_RUNNER, 'rewrite', [(d, 5) for d in (1, 2, 3)])
 
 
 if __name__ == '__main__':

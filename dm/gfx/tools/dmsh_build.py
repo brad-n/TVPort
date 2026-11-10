@@ -121,23 +121,27 @@ HMMA_BODY = '''{
     // Ampere adds each 8 products to the accumulator and rounds once to f16, k 0-7 then k 8-15 (N_FMA 8 in Khattak and Mikaitis's A100 model, which matches recorded
     // A100 output in 5,000 of 5,000 cases), where simdgroup_half8x8 rounds after every product (2,420 of them). So each block runs in f32 (each product of two halves
     // exact, the sum in order) and its result is rounded to f16 (RNE): an f16 C, the first block's result and D are the only roundings
-    // simdgroup_multiply_accumulate takes a float result from half operands and a half C. The rounding is one more multiply-accumulate onto that float result
-    // into a half one, with A all -0 and B all +0: every product is -0, and x + -0 is x for every x, signed zeros, infinities and NaNs included, so the half result
-    // is the float one rounded to f16 (RNE), bit for bit what converting a lane's thread_elements() gives (4.2M values: every f16, the midpoints between
-    // neighbours and an ulp either side, f32 denormals, random bit patterns; both math modes; test_dmsh_hmma.py RoundingByProduct). The conversions cost on Apple8
-    // GPUs: NDSR's 04135bb812a0d66e came to 20,777 instructions against 5,940 with the old per-product body, its pass 3.3 ms against 1.0 on an M2 Pro (Ocarina of
-    // Time's balcony); with the products 8,630 instructions. (+0 x +0 would turn a -0 result into +0.) dm/gfx/msl/ndve_engine.metal's hmma() rounds through conversions
+    // A multiply-accumulate with half A and B, a float C and a half result sums in f32 and rounds once (RNE): each block is one, onto its C as a float matrix, and
+    // that C is the previous half result (or the call's C) made float by one more multiply-accumulate with A all -0 and B all +0: every product is -0, and x + -0 is
+    // x for every x, signed zeros, infinities and NaNs included (+0 x +0 would turn a -0 into +0); C = 0 (FlagCZero) is a float +0 matrix. The same bits as a float
+    // result rounded by such a product into half (the body before, test_dmsh_hmma.py RoundingByProduct) and as converting a lane's thread_elements(), which Apple8 GPUs
+    // compile badly (NDSR's 04135bb812a0d66e: 20,777 instructions against 5,940 with the old per-product body, its pass 3.3 ms against 1.0 on an M2 Pro, Ocarina of
+    // Time's balcony); test_dmsh_hmma.py OneRoundingPerBlock checks it against Ampere's model and the body before on 16.8M outputs (C random and 0, signed zeros,
+    // infinities, NaNs, every finite f16, both math modes). 8,147 instructions against 8,596 a block into float and a rounding product each.
+    // dm/gfx/msl/ndve_engine.metal's hmma() rounds through conversions
     simdgroup_half8x8 b0, b1, c0, c1;
     simdgroup_float8x8 f0, f1;
     const simdgroup_half8x8 nz = make_filled_simdgroup_matrix<half, 8, 8>(-0.0h), pz = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
     simdgroup_load(b0, h + 256, 16, ulong2(0, 0), true); simdgroup_load(b1, h + 256, 16, ulong2(8, 0), true);
-    if (czero) { c0 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h); c1 = c0; }
-    else if (cslot) { c0 = acc[k]; c1 = acc[k + 1]; }
-    else { simdgroup_load(c0, h + 384, 8, ulong2(0, 0)); simdgroup_load(c1, h + 384, 8, ulong2(0, 8)); }
-    simdgroup_multiply_accumulate(f0, am[0], b0, c0); simdgroup_multiply_accumulate(f1, am[2], b0, c1);
-    simdgroup_multiply_accumulate(c0, nz, pz, f0); simdgroup_multiply_accumulate(c1, nz, pz, f1);   // the first block's rounding
-    simdgroup_multiply_accumulate(f0, am[1], b1, c0); simdgroup_multiply_accumulate(f1, am[3], b1, c1);
-    simdgroup_multiply_accumulate(c0, nz, pz, f0); simdgroup_multiply_accumulate(c1, nz, pz, f1);
+    if (czero) { f0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); f1 = f0; }
+    else {
+        if (cslot) { c0 = acc[k]; c1 = acc[k + 1]; }
+        else { simdgroup_load(c0, h + 384, 8, ulong2(0, 0)); simdgroup_load(c1, h + 384, 8, ulong2(0, 8)); }
+        simdgroup_multiply_accumulate(f0, nz, pz, c0); simdgroup_multiply_accumulate(f1, nz, pz, c1);   // C as float
+    }
+    simdgroup_multiply_accumulate(c0, am[0], b0, f0); simdgroup_multiply_accumulate(c1, am[2], b0, f1);   // the first block, rounded once
+    simdgroup_multiply_accumulate(f0, nz, pz, c0); simdgroup_multiply_accumulate(f1, nz, pz, c1);
+    simdgroup_multiply_accumulate(c0, am[1], b1, f0); simdgroup_multiply_accumulate(c1, am[3], b1, f1);   // the second
     if (dslot) { acc[k] = c0; acc[k + 1] = c1; simdgroup_barrier(mem_flags::mem_threadgroup); %(d1)s = 0; return 0; }
     simdgroup_store(c0, h + 384, 8, ulong2(0, 0)); simdgroup_store(c1, h + 384, 8, ulong2(0, 8));
     simdgroup_barrier(mem_flags::mem_threadgroup);
