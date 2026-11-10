@@ -2899,7 +2899,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); snap_dra
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[169];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
+static int g_red_once[170];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
 #define RED_ONCE(k, ...) do { _Static_assert((k) < sizeof g_red_once / sizeof *g_red_once, "a RED_ONCE key past g_red_once: raise its size"); if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -6905,6 +6905,7 @@ static void shmap_read(void) {
 @interface NvShader : NSObject { @public id<MTLFunction> fn, tf_fn, discard_fn, fn_u, fn_m, fn_d, geo_fn; int nf_ok; NSMutableDictionary<NSNumber *, id<MTLFunction>> *nffn;   /* nf_ok: the library's entry points carry the non-finite colour output rewrite (dmsh_build.py finite_rg11, function constant DMSH_FINITE_FC); nffn: their specializations (nf_fn) */ uint8_t mask_m;   // fn_u: the integer-output entry point (dmsh_build.py fs_uint), for pipelines whose colour attachments are all unsigned integer (pso_desc); fn_m: the mixed one, its outputs in mask_m unsigned integer; fn_d: the dual-source one (dmsh_build.py fs_dual)
     uint16_t tf_stride[4]; uint32_t cb_ext[16], cb_fix[16], sb_ro; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, layer_out; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off; int c1_ready;
     uint32_t geo_vertices, geo_invocations, geo_output, geo_stride, geo_index_stride;
+    uint32_t ub_need[DMSH_CBSIZE_SLOTS]; uint8_t ub_any; NSMapTable *ubxfn;   // a pixel shader's fixed-offset uniform bounds tests (reflection ub_fixed): the bytes each slot must be bound for, any; its functions without them (ubx_fn)
     uint8_t mesh_kind, mesh_notask; uint16_t mesh_threads, mesh_payload;   // an NVN2 task (1) or mesh (2) shader, a mesh shader with no task, its workgroup's threads, its payload's bytes (dmsh_meshstage.py)
     id<MTLFunction> mesh_obj;   // a mesh shader with no task: the object function that launches its workgroups in blocks of DMSH_MESH_GRID (dmsh_meshstage.py main0_o)
     id<MTLComputePipelineState> geo_pso; int geo_pso_failed, cps_failed;   // cps_failed: Metal refused this compute shader's pipeline (dispatch): its dispatches are skipped without asking again
@@ -7265,6 +7266,12 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
         if (!o->fn_m) MLOG("[RED] shader %s: no mixed integer-output entry point %s in its library", pc.UTF8String, [j[@"entry_m"] UTF8String]); }
     if (stage == 1 && j[@"entry_d"]) { o->fn_d = fn4_note([lib newFunctionWithName:j[@"entry_d"]], lib, j[@"entry_d"], nil); if (!o->fn_d) MLOG("[RED] shader %s: no dual-source entry point %s in its library", pc.UTF8String, [j[@"entry_d"] UTF8String]); }
     if (stage == 1) o->nf_ok = o->fn.functionConstantsDictionary[@"dm_nf_fc"] != nil;
+    if (stage == 1 && [j[@"ub_fixed"] isKindOfClass:NSDictionary.class] && o->fn.functionConstantsDictionary[@"dmsh_ubx_fc"]) {   // its fixed-offset bounds tests behind DMSH_UBX_FC (dmsh_build.py ub_fixed)
+        NSDictionary *u = j[@"ub_fixed"]; int bad = 0;
+        for (NSString *r in u) { int reg = [r intValue]; uint32_t n = [u[r] unsignedIntValue]; if (reg < 0 || reg >= DMSH_CBSIZE_SLOTS || !n || n > 65536) bad = 1; else o->ub_need[reg] = n; }
+        o->ub_any = !bad && u.count;   // a table it cannot read keeps every test
+        if (bad) { memset(o->ub_need, 0, sizeof o->ub_need); RED_ONCE(169, "shader %s: its reflection's ub_fixed is not a table of slots and sizes: its uniform bounds tests stay", pc.UTF8String); }
+    }
     if (o->fn.functionConstantsDictionary.count) {   // a compute shader with constants has MTLDevice pipelines (cps_new): it is specialized through its library (fn_spec otherwise)
         NSError *fe = nil; MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new]; id<MTLFunction> (*spec)(id<MTLLibrary>, NSString *, MTLFunctionConstantValues *, NSError **) = stage == 5 ? fn_lib_spec : fn_spec;
         id<MTLFunction> f = spec(lib, entry, cv, &fe);
@@ -9305,6 +9312,53 @@ static id<MTLFunction> nf_fn(NvShader *fs, id<MTLFunction> base, uint32_t mask) 
     os_unfair_lock_unlock(&g_nf_lock);
     return f;
 }
+// ---- Uniform reads without their bounds tests (dmsh_build.py ub_fixed) ----
+// A pixel shader's reads of a game uniform slot at fixed offsets each test the word against the size the slot is bound with, which the host puts in the size table (NVN_RB_CBSIZE:
+// min(size, 64 KiB), 0 unbound), and give 0 past it, as Maxwell does (upstream 26062f9e). The build puts each test behind the function constant DMSH_UBX_FC and lists, per slot, the
+// bytes its tests need (ub_need: 4 (w + 1) for its highest word w). When the draw binds every such slot at least that long, every one of those tests is true, so the function
+// specialized with DMSH_UBX_FC true (the tests compiled out) computes what the function with the tests does, value for value; otherwise the pipeline keeps the tests (pso_key.ubc).
+// Ocarina of Time binds every slot long enough: its lit pixel shaders lose about a tenth of their instructions (e2f868a2799ed178: 5,206 -> 4,580, spills 176 -> 112 bytes).
+// DM_NVN_UBX=0 keeps the tests everywhere; ab alternates with DM_AB
+static int g_ubx_m = -1; static _Atomic uint64_t g_ubx_fns, g_ubx_short;
+static int ubx_mode(void) { if (g_ubx_m < 0) { g_ubx_m = sw_mode("DM_NVN_UBX", 1); if (!g_ubx_m) MLOG("DM_NVN_UBX=0: pixel shaders keep their fixed-offset uniform bounds tests"); } return g_ubx_m; }
+// Does this draw's pixel shader go without its tests: every slot they read is bound at least as long as they need, measured as the size table holds it (encode_args_)
+static int ubx_want(NvShader *fs) {
+    if (!fs || !fs->ub_any || !sw_on(ubx_mode())) return 0;
+    for (int r = 0; r < DMSH_CBSIZE_SLOTS; r++) {
+        uint32_t need = fs->ub_need[r]; if (!need) continue;
+        const p_bind_buf *u = &S.ubo[1][r]; uint64_t table = u->addr ? (u->size < 65536 ? u->size : 65536) : 0;
+        if (table < need) { uint64_t n = atomic_fetch_add(&g_ubx_short, 1) + 1;
+            if (n == 1 || n == 1000 || n % 1000000 == 0) MLOG("uniform bounds tests kept: shader %s binds slot %d with %llu bytes, its fixed-offset reads need %u (%llu such draws)", fs->key, r, (unsigned long long)table, need, (unsigned long long)n);
+            return 0; }
+    }
+    return 1;
+}
+// The function f (a pipeline's fragment function, any of its shader's entry points and specializations) with DMSH_UBX_FC true besides the values f has: specialized through its library,
+// a function of its own (a library hands out one function object per name), noted for the Metal 4 compiler as any other (fn4_note). nil when f has no library note or the
+// specialization fails: the pipeline keeps the tests. Kept per shader by f's note, so another specialization of the same name gets its own
+static os_unfair_lock g_ubx_lock = OS_UNFAIR_LOCK_INIT;
+static id<MTLFunction> ubx_fn(NvShader *fs, id<MTLFunction> f) {
+    MTL4FunctionDescriptor *d = fn4_of(f), *note = d; MTLFunctionConstantValues *cv0 = nil;
+    if ([d isKindOfClass:[MTL4SpecializedFunctionDescriptor class]]) { cv0 = ((MTL4SpecializedFunctionDescriptor *)d).constantValues; d = ((MTL4SpecializedFunctionDescriptor *)d).functionDescriptor; }
+    if (![d isKindOfClass:[MTL4LibraryFunctionDescriptor class]]) return nil;
+    id<MTLLibrary> lib = ((MTL4LibraryFunctionDescriptor *)d).library; NSString *name = ((MTL4LibraryFunctionDescriptor *)d).name;
+    if (!lib || !name) return nil;
+    os_unfair_lock_lock(&g_ubx_lock);
+    if (!fs->ubxfn) fs->ubxfn = [[NSMapTable alloc] initWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory capacity:0];
+    id<MTLFunction> u = [fs->ubxfn objectForKey:note];
+    os_unfair_lock_unlock(&g_ubx_lock);
+    if (u) return u == (id)NSNull.null ? nil : u;
+    MTLFunctionConstantValues *cv = cv0 ? [cv0 copy] : [MTLFunctionConstantValues new]; bool on = true;
+    [cv setConstantValue:&on type:MTLDataTypeBool atIndex:DMSH_UBX_FC];
+    NSError *e = nil; u = fn_lib_spec(lib, name, cv, &e);
+    if (!u) { static int n; if (n++ < 8) MLOG("[RED] shader %s: %s without its uniform bounds tests failed to specialize (%s): its pipelines keep them", fs->key, name.UTF8String, e.localizedDescription.UTF8String); }
+    else { uint64_t k = atomic_fetch_add(&g_ubx_fns, 1) + 1; if (k == 1 || k == 100 || k == 1000) MLOG("uniform bounds tests compiled out: %llu fragment functions so far (shader %s entry %s)", (unsigned long long)k, fs->key, name.UTF8String); }
+    os_unfair_lock_lock(&g_ubx_lock);
+    id<MTLFunction> had = [fs->ubxfn objectForKey:note];
+    if (had) u = had == (id)NSNull.null ? nil : had; else [fs->ubxfn setObject:u ?: (id)NSNull.null forKey:note];
+    os_unfair_lock_unlock(&g_ubx_lock);
+    return u;
+}
 #define PSO_WHOLE @"built whole"   // pso_desc's label for pso_build_ex: no base, see there
 static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged) {
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
@@ -9354,6 +9408,7 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
         uint32_t nfm = 0; for (int i = 0; i < 8; i++) if (k->cfmt[i] == MTLPixelFormatRG11B10Float) nfm |= 1u << i;
         if (nfm) d.fragmentFunction = nf_fn(fs, d.fragmentFunction, nfm);
     }
+    if (fs && fs->ub_any && !k->ubc && d.fragmentFunction) { id<MTLFunction> u = ubx_fn(fs, d.fragmentFunction); if (u) d.fragmentFunction = u; }   // its fixed-offset uniform bounds tests compiled out (ubx_want)
     if (vs && (k->fsfn == TF_MARK || k->fsfn == GEO_MARK || k->fsfn == DISCARD_MARK)) { d.fragmentFunction = nil; d.rasterizationEnabled = NO; }
     d.rasterSampleCount = k->samples ? k->samples : 1;
     d.alphaToCoverageEnabled = k->a2c;
@@ -10223,6 +10278,7 @@ static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t 
     k->blend_en = S.color.blend_en; k->chmask = S.chmask.mask; k->a2c = S.ms.a2c; k->atest = atest_key(fs, cfmt, lmap ? g_pso_lmap : NULL);
     for (int i = 0; i < 8; i++) if (k->cfmt[i] || lmap) k->blend[i] = S.blend[i];
     k->logic = lop_key(k, fs, lmap);
+    k->ubc = fs && fs->ub_any && !ubx_want(fs);   // the pixel shader keeps its uniform bounds tests (ubx_want)
     const nvn_refl *rf = &vs->rf;
     for (int v = 0; v < rf->nv; v++) { int a = rf->v[v].nvn; if (a < 32 && a < S.nattr) { if (a < 16) k->attr[a] = S.attr[a]; else k->attr_hi[a - 16] = S.attr[a]; int st = S.attr[a].stream; if (st < 16) k->stream[st] = S.stream[st]; } }
     pso_key_norm(k, lmap);
@@ -14207,8 +14263,8 @@ static int fb_texu_reads(NvShader *fs, uint64_t ser, int texa) {
 // through an image slot or a handle by a draw that also writes depth stays in the pass: no copy can stand in for those. DM_NVN_FB_DEPTH=0 reads the attachment directly, as before
 static uint64_t g_fb_dsnaps, g_fb_dsnap_reuse, g_fb_dsplit; static int g_fb_depth_m = -1;
 static int fb_depth_on(void) {
-    if (g_fb_depth_m < 0) { const char *e = getenv("DM_NVN_FB_DEPTH"); g_fb_depth_m = !(e && !strcmp(e, "0")); if (!g_fb_depth_m) MLOG("same-pass depth sampling: draws read their depth attachment in the pass (DM_NVN_FB_DEPTH=0)"); }
-    return g_fb_depth_m;
+    if (g_fb_depth_m < 0) { g_fb_depth_m = sw_mode("DM_NVN_FB_DEPTH", 1); if (!g_fb_depth_m) MLOG("same-pass depth sampling: draws read their depth attachment in the pass (DM_NVN_FB_DEPTH=0)"); }
+    return sw_on(g_fb_depth_m);   // ab: alternates with the DM_AB phases (each draw decides, so a phase may change inside a pass)
 }
 // This draw's texture slot b, texture tid of serial ser, the depth attachment: substitute a copy of its level and layer; 0 when that cannot be (not a single-level 2D view of it)
 static int fb_depth_snap(NvShader *fs, const nvn_rbind *b, int tid, uint64_t ser) {

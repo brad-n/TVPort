@@ -115,6 +115,8 @@
 #define DMSH_LOGIC_FC 200
 // The pixel shaders' non-finite colour output rewrite (dmsh_build.py finite_rg11): a uint function constant, bit n set = colour output n is an R11G11B10F attachment (nvn_mtl.m nf_fn)
 #define DMSH_FINITE_FC 230
+// Pixel shaders' fixed-offset uniform reads without their bounds tests (dmsh_build.py ub_fixed): a bool function constant, true only where every slot is bound as long as the tests need (nvn_mtl.m ubx_want)
+#define DMSH_UBX_FC 231
 // Compute shared memory past Metal's limit (dm/gfx/tools/dmsh_build.py tg_spill): a kernel whose threadgroup arrays exceed DMSH_TG_MAX bytes takes them from a device buffer at this compute
 // buffer index, one slice of the reflection's tg_spill bytes per workgroup, at the workgroup's index in the whole grid (nvn_mtl.m dispatch binds a slice for every workgroup of the dispatch)
 #define DMSH_TG_SLOT 30

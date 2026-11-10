@@ -462,6 +462,29 @@ def finite_rg11(msl):
     if not k: return msl
     msl = msl[:brace] + body + msl[end:]
     return msl.replace('using namespace metal;\n', 'using namespace metal;\n\n' + FINITE_DECL, 1)
+# A pixel shader's uniform reads at fixed offsets without their bounds tests, where the host knows every one is in bounds (upstream 26062f9e, GitHub issue #1860). The translator
+# gives each read of a game uniform slot past the size the game bound 0, as Maxwell does: (w < (size >> 2)) ? read : 0, the size from the table of bank DMSH_CBSIZE_BANK, which the
+# host fills from the draw's bindings (nvn_mtl.m NVN_RB_CBSIZE). Those tests cost Ocarina of Time's lit pixel shaders about a tenth of their instructions and some of their spills
+# (e2f868a2799ed178: 5,314 -> 4,662 instructions, 176 -> 112 bytes spilled), while the game binds every slot at least as long as the shader reads it. So each test of a fixed word w
+# becomes (dmsh_ubx || w < (size >> 2)), dmsh_ubx a function constant (DMSH_UBX_FC, default false: the shader as the translator wrote it), and the reflection's ub_fixed gives, per slot,
+# the bytes the tests need, 4 (w + 1) for its highest w. The host specializes dmsh_ubx true for a pipeline only when every such slot is bound at least that long (nvn_mtl.m ubx_want):
+# then every test it replaces is true in the shader as written, so both compute the same values, read for read. A read at a computed offset keeps its test, and a draw whose slot is
+# bound shorter, or not bound, draws with the tests. DM_NVN_UBX=0 never takes the variant
+UB_TEST = re.compile(r'\((\d+)u < \(\(\*spvDescriptorSet0\.[a-z]+_c%d\)\._m0\[([0-3])\]\.([xyzw]) >> 2u\)\)' % abi.CBSIZE_BANK)
+UBX_DECL = ('constant bool dmsh_ubx_fc [[function_constant(%d)]];   // see ub_fixed\n'
+            'constant bool dmsh_ubx = is_function_constant_defined(dmsh_ubx_fc) && dmsh_ubx_fc;\n') % abi.UBX_FC
+def ub_fixed(msl):
+    """→ (msl with each fixed-offset bounds test of a uniform slot as (dmsh_ubx || test) and the declarations after `using namespace metal;`, {slot reg: bytes its tests need}).
+    A source without such a test, or without `using namespace metal;`, stays as it is ({})"""
+    need = {}
+    def sub(m):
+        reg = 4 * int(m.group(2)) + 'xyzw'.index(m.group(3))
+        need[reg] = max(need.get(reg, 0), 4 * (int(m.group(1)) + 1))
+        return '(dmsh_ubx || %s)' % m.group(0)
+    if 'dmsh_ubx' in msl or 'using namespace metal;\n' not in msl: return msl, {}
+    out = UB_TEST.sub(sub, msl)
+    if not need: return msl, {}
+    return out.replace('using namespace metal;\n', 'using namespace metal;\n\n' + UBX_DECL, 1), need
 def frag_z_snap(msl):
     """→ (msl with each paired gl_FragCoord.z read in main0 as dm_zsnap(gl_FragCoord.z, <texture value>, dm_zw) and dm_zw = fwidth(gl_FragCoord.z) first in main0's body, the number of reads).
     main0's body is dm_body_main0's when it has one (dmsh_side.shared_body: a library's sources), the build's rewrite comes before that"""
@@ -1762,6 +1785,7 @@ def finish(key, w, j, c1):
     src = dmsh_wide.wide_loads(src, WIDE_DEVICE)   # storage words the translator split, read whole again (see dmsh_wide.py)
     src = border_emu(src, BORDER_EMU)   # border colours Metal lacks (see border_emu)
     if j['stage'] == 'ps': src = finite_rg11(frag_z_snap(src)[0])   # gl_FragCoord.z against a depth of its own surface (see frag_z_snap); a non-finite colour output of an R11G11B10F target (see finite_rg11)
+    src, ubfix = ub_fixed(src) if j['stage'] == 'ps' else (src, {})   # fixed-offset uniform reads without their bounds tests where the host finds them in bounds (see ub_fixed)
     open(msl, 'w').write(src)
     first, spill = [], 0
     mesh = j.get('mesh_stage')
@@ -1826,7 +1850,7 @@ def finish(key, w, j, c1):
             'entry': entry.group(2) if entry else 'main0', 'msl_entry_kind': entry.group(1) if entry else None, **({'entry_z': 'main0_z', 'entry_geometry_capture': 'main0_gs'} if j['stage'] == 'vs' else {}),
             **({'entry_discard': 'main0_discard'} if discard else {}),
             **({'entry_tf': 'main0_tf', 'tf_strides': [e['stride'] if e else 0 for e in j['tf']]} if j.get('tf') else {}),
-            **({'entry_layer': 'main0_l', 'entry_layer_z': 'main0_lz', 'layer_from': lay} if lay else {}), **({'entry_u': 'main0_u'} if fu else {}), **({'entry_m': 'main0_m', 'uint_mask_m': fmask} if fu and fmask else {}), **({'entry_d': 'main0_d'} if fd else {}), **({'entries_lost': lost} if lost else {}),
+            **({'entry_layer': 'main0_l', 'entry_layer_z': 'main0_lz', 'layer_from': lay} if lay else {}), **({'entry_u': 'main0_u'} if fu else {}), **({'entry_m': 'main0_m', 'uint_mask_m': fmask} if fu and fmask else {}), **({'entry_d': 'main0_d'} if fd else {}), **({'ub_fixed': {str(r): n for r, n in sorted(ubfix.items())}} if ubfix else {}), **({'entries_lost': lost} if lost else {}),
             **({'first_store': [{'reg': next(b['reg'] for b in binds if b['msl_name'] == n), 'word': w, 'value': v} for n, w, v in first]} if first else {}),
             **({'tg_spill': spill} if spill else {}),
             'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['not in the answer table, queries use defaults'] if j.get('no_facts') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr, mesh['kind'] if mesh else j['stage']),

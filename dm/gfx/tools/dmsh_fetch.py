@@ -48,7 +48,8 @@ _UNI = re.compile(r'\(\*spvDescriptorSet0\.fp_c(\d+)\)\._m0\[(\d+)\]\.([xyzw])')
 # table, bank DMSH_CBSIZE_BANK) holds it, else 0, wrapped in parentheses or not as the expression around it needs. unguard gives back the bare read for the analyses that look for a
 # uniform's word (_frag_pos below, dmsh_build.py raster_facts and int_outputs): the host takes such a word's value only from inside the binding (nvn_mtl.m ubo_float refuses a word
 # past its size), where the guard chooses the read. Only for analysis: never in source that is compiled
-_GCOND = r'\(\d+u < \(\(\*spvDescriptorSet0\.[a-z]+_c%d\)\._m0\[\d\]\.[xyzw] >> 2u\)\)' % abi.CBSIZE_BANK
+_GTEST = r'\(\d+u < \(\(\*spvDescriptorSet0\.[a-z]+_c%d\)\._m0\[\d\]\.[xyzw] >> 2u\)\)' % abi.CBSIZE_BANK
+_GCOND = r'(?:\(dmsh_ubx \|\| %s\)|%s)' % (_GTEST, _GTEST)   # or as dmsh_build.py ub_fixed writes it, behind the function constant that takes the test away
 _GREAD = r'(\(\*spvDescriptorSet0\.[a-z]+_c\d+\)\._m0\[\d+\]\.[xyzw])'
 _GUARDED = re.compile(r'(?<![\w>])\(%s \? %s : 0(?:\.0|u)?\)|%s \? %s : 0(?:\.0|u)?(?![\w.])' % (_GCOND, _GREAD, _GCOND, _GREAD))   # parentheses after a name or > are a call's
 

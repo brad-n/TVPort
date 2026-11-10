@@ -673,6 +673,11 @@ t_finite_rg11: t_finite_rg11.m
 	clang -O1 -g -Wall -fobjc-arc -o $@ t_finite_rg11.m -framework Metal -framework Foundation
 check_t_finite_rg11: t_finite_rg11
 	@set -e; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; python3 test_dmsh_finite_rg11.py --fixture "$$work"; MTL_DEBUG_LAYER=1 ./t_finite_rg11 "$$work"
+t_ubx: t_ubx.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_ubx.m $(MTL_T_SRC) $(FW)
+# a pixel shader's fixed-offset uniform reads without their bounds tests, both compiler paths (the fixture from test_dmsh_ubx.py --fixture)
+check_t_ubx: t_ubx
+	@set -e; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; python3 test_dmsh_ubx.py --fixture "$$work"; DM_PSO_MTL4=0 MTL_DEBUG_LAYER=1 ./t_ubx "$$work"; DM_PSO_MTL4=1 MTL_DEBUG_LAYER=1 ./t_ubx "$$work"
 # MUFU.SIN / COS lowered from turns through the fraction (InstEmitAmpereAlu.cs ATurnsToRadians), on the GPU against a double-precision reference
 t_mufu_turns: t_mufu_turns.m
 	clang -O1 -g -Wall -fobjc-arc -o $@ t_mufu_turns.m -framework Metal -framework Foundation
