@@ -5,6 +5,7 @@ the BNTX header fields, the pack (layout, shared payloads, incremental runs) and
 runtime's plane walk, with the blocks the runtime's encoder makes.
 """
 import ctypes
+import hashlib
 import importlib.util
 import os
 import random
@@ -156,6 +157,18 @@ class Config(ctypes.Structure):   # nvn_astc_bg_config
 
 
 @unittest.skipUnless(sys.platform == 'darwin', 'builds the engine\'s Objective-C texture code')
+def nso_with(ro):
+    """An NSO (uncompressed, hashes checked) whose ro segment is ro: the sdk module of a game, as far as its build spec string goes"""
+    segs, hdr, body, mo = (b'\x1f\x20\x03\xd5' * 0x40, ro, bytes(0x40)), bytearray(0x100), b'', 0
+    hdr[:4] = b'NSO0'; hdr[0x40:0x60] = bytes(range(0x20))
+    for i, seg in enumerate(segs):
+        struct.pack_into('<III', hdr, 0x10 + i * 0x10, 0x100 + len(body), mo, len(seg)); struct.pack_into('<I', hdr, 0x60 + 4 * i, len(seg))
+        hdr[0xa0 + 0x20 * i:0xc0 + 0x20 * i] = hashlib.sha256(seg).digest()
+        body += seg; mo = (mo + len(seg) + 0xfff) & ~0xfff
+    struct.pack_into('<I', hdr, 0xc, 0x38)
+    return bytes(hdr + body)
+
+
 class PrebuildTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -425,6 +438,39 @@ class PrebuildTests(unittest.TestCase):
         rep = tool.prebuild(str(d), str(self.root / 'out4'), 4, workers=1, scan_only=True, log=lambda *_: None)
         self.assertEqual(rep['converted_textures'] + rep['repeated_textures'], 8)
         self.assertFalse((self.root / 'out4' / 'astc-ro.pack').exists())
+
+    def test_a_switch2_game_is_keyed_in_the_switch2_gob_order(self):
+        # The Switch 2 orders a GOB's 16-byte pieces otherwise than the Switch (nvn_deswizzle.h nvn_gob_switch2); the runtime takes the order from the sdk module ("spec: Ounce",
+        # loader.c dm_sdk_ounce). A pack keyed in the other order holds the keys of a shuffled image, which the runtime never asks for: Ocarina of Time (Switch 2) missed most of its
+        # prebuilt planes, and with Store textures once their tags drew woven lamps and leaves with holes
+        ts = [Texture(0x1c01, 64, 64, mips=3, pkg=2), Texture(0x1a06, 48, 40, mips=2, pkg=1), Texture(0x1d01, 64, 32, mips=2, pkg=0)]
+        build = self.root / 's2build'; v = build / 'extract' / 'v1'
+        (v / 'ExeFS').mkdir(parents=True); (v / 'RomFS').mkdir()
+        (v / 'ExeFS' / 'sdk').write_bytes(nso_with(b'FS_ACCESS: { sdk_version: 20.5.19, spec: Ounce }\0'))
+        romfs = tool.find_romfs(str(build))
+        try:
+            tool.lib_open(self.libpath, 1)   # the game tiled its textures in the Switch 2's order, and the runtime reads them so
+            (v / 'RomFS' / 't.bntx').write_bytes(bntx(self.lib, ts, platform=b'Ounc'))
+            self.assertEqual(tool.gob_switch2(romfs), 1)
+            rep = tool.prebuild(str(build), str(self.root / 's2out'), 4, workers=2, log=lambda *_: None)
+            self.assertEqual(rep['gob'], 'switch2')
+            found = self.runtime_finds(ts, self.root / 's2out' / 'astc-ro.pack')
+            self.assertTrue(found and all(found), 'a plane the runtime reads in the Switch 2 order is missing from the pack')
+            # keyed in the Switch's order (what the tools did before): the runtime misses the planes past two block rows, and the pack's fingerprint differs
+            rep1 = tool.prebuild(str(build), str(self.root / 's1out'), 4, workers=2, log=lambda *_: None, gob=0)
+            self.assertEqual(rep1['gob'], 'switch')
+            tool.lib_open(self.libpath, 1)
+            self.assertIn(False, self.runtime_finds(ts, self.root / 's1out' / 'astc-ro.pack'))
+            self.assertNotEqual(tool.read_pack_header(str(self.root / 's1out' / 'astc-ro.pack'))['fingerprint'],
+                                tool.read_pack_header(str(self.root / 's2out' / 'astc-ro.pack'))['fingerprint'])
+            self.assertNotEqual(tool.fingerprint(romfs, 4, gob=0), tool.fingerprint(romfs, 4))
+        finally:
+            tool.lib_open(self.libpath, 0)
+        # a Switch 1 SDK, and a RomFS with no ExeFS beside it: the Switch's order
+        (v / 'ExeFS' / 'sdk').write_bytes(nso_with(b'FS_ACCESS: { sdk_version: 17.5.0, spec: NX }\0'))
+        self.assertEqual(tool.gob_switch2(romfs), 0)
+        self.assertEqual(tool.gob_switch2(str(self.root / 'nowhere' / 'RomFS.img')), 0)
+        self.assertEqual(tool.gob_of('switch2', romfs), 1)
 
     def test_build_folder_and_image_are_found(self):
         b = self.root / 'build' / 'extract' / 'v7'

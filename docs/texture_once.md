@@ -79,7 +79,9 @@ Counters join the existing ASTC counters line after each `memory up to frame` li
   ends where the file ends, as every original does. It used to be the new stream plus a skippable frame of zeros to the slot's end: Ocarina of Time reads a file in
   902,912-byte pieces and decodes as it reads, and every stripped file larger than one piece was read again and again and never loaded (Link's house had no inside
   walls on the Apple TV, 31 GB read in 100 s). A container no split fits keeps its original stream. A BC texture with no mip chain is never stripped (tex_once SINGLE_LEVEL,
-  counted as skipped single_level): such textures are data a game may read from its memory beside the texture (Ocarina of Time's baked lighting lit the house's cloth from zeros); Smash data.arc -> recompress entries, update each entry's stored size in the zstd-compressed table, rewrite the
+  counted as skipped single_level): Ocarina of Time's baked lighting lit the house's cloth wrongly when stripped (no game code read it from memory under a CPU read trap; its pack
+  entries were made in the wrong GOB order, so the rule may go once packs are rebuilt). A Switch 2 game's planes are keyed and encoded in the Switch 2's GOB order (bntx_astc.gob_switch2,
+  from the sdk module as the runtime decides; --gob sets it), and the pack's fingerprint holds the order, so a pack of the other order is refused; Smash data.arc -> recompress entries, update each entry's stored size in the zstd-compressed table, rewrite the
   table into its own slot the same way. Anything else holding covered planes: leave untouched and report it.
 - Self-check before exit 0: re-walk the logical image with the prebuild's walker; every tagged plane reads tag+zeros and its tag resolves in the
   pack; every other decompressed byte equals the original; every container parses; the DMROMFS1 index is byte-identical.

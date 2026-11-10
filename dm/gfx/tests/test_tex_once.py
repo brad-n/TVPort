@@ -620,6 +620,7 @@ class StripTests(unittest.TestCase):
             elif k in ('--bc4-block', '--bc5-block', '--bc6h-block'): setattr(ns, k[2:].replace('-', '_'), int(argv[i + 1])); i += 2
             elif k == '--compress': ns.compress = argv[i + 1]; i += 2
             elif k == '--zlevel': ns.zlevel = int(argv[i + 1]); i += 2
+            elif k == '--gob': ns.gob = argv[i + 1]; i += 2
             else: i += 1
         return ns
 
@@ -870,6 +871,9 @@ class StripTests(unittest.TestCase):
         other = self.root / 't4_work' / 'Other.img'
         other.write_bytes(img.read_bytes() + b'')
         self.assertEqual(self.run_tool(other, pack, self.root / 'out_other'), 2)
+        # a game read in the Switch 2's GOB order: this pack was keyed in the Switch's (no ExeFS beside the image), so it is refused
+        self.assertEqual(self.run_tool(img, pack, self.root / 'out_gob', 0, '--gob', 'switch2'), 2)
+        self.assertFalse((self.root / 'out_gob' / 'romfs.img').exists())
 
     def test_self_check_catches_a_damaged_strip(self):
         d, img, pack, out = self.make('t5')
