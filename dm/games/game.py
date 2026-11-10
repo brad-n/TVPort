@@ -227,7 +227,7 @@ def header_one(g):
     ups = upscaler_keys(g)   # the game's own upscaler shaders, which DM_UPSCALER=metalfx (the launcher's Game's upscaler) replaces with MetalFX's spatial scaler (nvn_mtl.m up_mfx_encode)
     rrl = g.get('shader_raw_read_log', '0')   # raw global loads log the pool table entry they read (dmsh_build.py raw_read_log): nvn_mtl.m DM_NVN_GMEM_MODE=learned needs it
     if rrl not in ('0', '1'): sys.exit(f'{g.id}: shader_raw_read_log must be 0 or 1: {rrl}')
-    sbe = g.get('shader_border_emu', '1')   # border colours Metal lacks corrected in the shaders through twin samplers (dmsh_build.py border_emu); 0 compiles the correction out: nvn_mtl.m then makes no twin and logs the samplers that would have needed one
+    sbe = g.get('shader_border_emu', '1')   # border colours Metal lacks corrected in the shaders through twin samplers (dmsh_rewrite.py border_emu); 0 compiles the correction out: nvn_mtl.m then makes no twin and logs the samplers that would have needed one
     if sbe not in ('0', '1'): sys.exit(f'{g.id}: shader_border_emu must be 0 or 1: {sbe}')
     for k in ('shader_fragw_fold', 'shader_ftz_cmp', 'shader_unord_cmp', 'shader_raw_loop', 'shader_raw_regs', 'shader_wide_device', 'shader_no_rescale'):   # translator options (dmsh_build.py XLATE_KEYS): build-only keys, no host define; defaults in dmsh_build.py XLATE_DEFAULT (all 1 but shader_raw_loop)
         if g.get(k, '1') not in ('0', '1'): sys.exit(f'{g.id}: {k} must be 0 or 1: {g.get(k)}')

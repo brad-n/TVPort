@@ -1,4 +1,4 @@
-// A non-finite colour output stored to an R11G11B10F target (dmsh_build.py finite_rg11, from test_dmsh_finite_rg11.py --fixture; make check_t_finite_rg11). The shader divides 1 by an
+// A non-finite colour output stored to an R11G11B10F target (dmsh_rewrite.py finite_rg11, from test_dmsh_finite_rg11.py --fixture; make check_t_finite_rg11). The shader divides 1 by an
 // exact 0, writes a NaN it reads and 2.0 to blue, as Ocarina of Time's ground mist does (issue #1839). With the function constant dm_nf_fc (DMSH_FINITE_FC) set to 1, as nvn_mtl.m nf_fn does for
 // a pipeline with an R11G11B10F target 0, the target must hold 0, 0 and 2: Maxwell stores a non-finite value there as black. With it unset the pipeline keeps Metal's own result (printed), and an RGBA16F target keeps the infinity and the NaN with the constant unset. Fails when the constant leaves the sanitized value non-zero or touches a finite one.
 #import <Metal/Metal.h>

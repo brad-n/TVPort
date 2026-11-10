@@ -6,7 +6,7 @@
 
 Changes in this fork that the TVPort and nxnative releases don't have yet, in plain terms. This fork's TVPort shows **Version 1.3.0** in About, with a build number that goes up with every change, so you can tell which build you're running. Upstream fixes we brought in early are listed with their pull request numbers, so they're easy to drop once upstream accepts them.
 
-**Synced to upstream:** nxnative `main` at commit `dbf84998` (41 more Ocarina of Time prewarm pipelines; earlier syncs `04811a63`, `2ae28018`, `143c0d09`) (2026-11-09; 4 commits past the previous sync: texture gathers whose four offsets form a square read as one gather, compute threads that return before a barrier checked on an Apple M6, a snapshot of an attachment that lands a clear still waiting first, and 41 more Ocarina of Time pipelines built while the game prepares, so a cold first start on Death Mountain Trail no longer stalls on them; the sync before brought 30 commits, including Ocarina of Time's movie network run as the host's own Metal kernels, terrain tiles that no longer vanish after walking, uncompressed textures for render targets that change size, the depth sampled in its own pass, guest files that give disk space back, the present path, dirty pages that are opened instead of counted as written, an index beside each pipeline archive file, and 60 fps on ProMotion screens). #1492 is in upstream now and was dropped from the list below.
+**Synced to upstream:** nxnative `main` at commit `ced36121` (earlier syncs `dbf84998`, `04811a63`, `2ae28018`, `143c0d09`) (2026-11-10; 41 commits past the previous sync, among them: building a game needs no .NET any more, as the game extractor and the shader translator come as ready-made Mac programs (the translator is rebuilt here from upstream's source with this fork's changes in it); uniform reads at fixed places checked once per binding instead of at every read; Switch 2 shaders that ask for early depth tests get them; one block of command memory for a whole frame's GPU work; Ocarina of Time's streamed scenery no longer flashes dark or black for a frame, and its camera-turn hitch in Hyrule Field went from 230 to 39 ms; Red Dead Redemption, both Ori games, TUNIC and Hades II's update; Re:ZERO's black 3D picture through upstream's Vulkan layer).
 
 **Engine fixes reach games you already built**
 - **Patch changes re-apply:** when the engine's code patches for a game change (its patches, the code rewriter, or its game profile), TVPort now notices on the next build and rewrites that game's code again, instead of reusing the old result. It re-uses everything else already built (the extracted files and shaders), so this is much quicker than a first build. It needs your prod.keys file, as a first build does.
@@ -163,7 +163,7 @@ These screenshots use fictional games, dummy artwork and sample save records.
 - **"Who's playing?"** Each player on a shared TV gets their own saves. For a game with one save per console, such as Animal Crossing: New Horizons' island, each name is a resident of the same island instead.
 - **The TVPort Mac app.** Pick a folder holding your game's NSP or XCI files and your `prod.keys`, pick your Apple TV, and press **Build & Install**. Settings for render mode, texture detail, 3D resolution, frame rate and heat appear when the game supports them. **Last Run** reads the TV's log and memory reports and says what went wrong in plain words.
 - **Engine fixes found on the TV**, which help every game:
-  - a leak of render-pass readback buffers on game threads;
+  - a leak of render-pass readback buffers on game threads (upstream has since removed those buffers);
   - normal speed for game versions the profile was not made for;
   - memory pools the GPU stops using are unwired, so tvOS can page them out;
   - new memory, paging and stall diagnostics.
@@ -184,7 +184,7 @@ Many more games run on iPhone and iPad with nxnative; see the [games table](dm/g
 2. **The Apple TV:** an Apple TV 4K with tvOS 26 or later, in developer mode and paired with Xcode (**Window > Devices and Simulators**).
 3. **An Apple ID signed in to Xcode** (**Settings > Accounts**). A free one works, but its installs stop opening after 7 days. **Build & Install** renews them.
 4. **TVPort:** download `TVPort-1.2.zip` from [this fork’s releases](https://github.com/0to101/TVPort/releases), unzip it and open TVPort.app. It is signed ad hoc and not notarized, so the first time macOS refuses it: open **System Settings > Privacy & Security** and press **Open Anyway**.
-5. **First run:** TVPort sets itself up and lists anything else the Mac needs in **Setup** (Homebrew packages and the .NET SDK).
+5. **First run:** TVPort sets itself up and lists anything else the Mac needs in **Setup** (Homebrew packages; no .NET any more).
 6. **Build your game:** add your game's folder and press **Build & Install**. A game's first build takes 30 to 60 minutes. After that a build takes a few minutes.
 
 [tvport/README.md](tvport/README.md) has the details: the design, the memory and save mechanisms, the settings, and the limits.

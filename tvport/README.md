@@ -112,7 +112,7 @@ It cannot carry these, so **Setup** checks each and gives the command or the pla
 
 - **Xcode** with its tvOS and iOS platforms and the Metal toolchain. The shaders are iOS Metal libraries, so a tvOS build needs the iOS platform too.
 - **An Apple ID** signed in to Xcode (Settings > Accounts). A free one works, and TVPort finds its personal team itself.
-- **xcodegen, zstd and glslang** from Homebrew, and the **.NET SDK 10**, which builds the game extractor and runs the shader translator.
+- **xcodegen, zstd and glslang** from Homebrew. No .NET: the game extractor and the shader translator come as ready-made Mac programs.
 - **Your own game dumps and `prod.keys`.** They stay in the folders you choose. TVPort reads the keys only during a first build.
 
 **Updates:** a new TVPort.app carries a new engine. Its first start unpacks that engine, and its first build removes the engines of earlier releases. The Python is made again only when `requirements.txt` changes. Games already built keep their `<title ID>_build`. A new shader chain rebuilds a game's shaders at its next build, which then needs `prod.keys` again. The app does not look for updates itself.

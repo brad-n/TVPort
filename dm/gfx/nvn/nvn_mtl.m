@@ -8466,7 +8466,7 @@ static id<MTLSamplerState> samp_make(samp_par p, void **view, uint64_t *rid, voi
         if (t) { *view_w = (void *)CFBridgingRetain(t); *rid_w = t.gpuResourceID._impl; memcpy(bk, k, sizeof k); }
         static int nlog; if (nlog++ < 16) MLOG("sampler ID %d: border colour %g,%g,%g,%g, which Metal lacks: Metal colour %d, corrected in the shaders through a twin of colour %d", sid, p.border[0], p.border[1], p.border[2], p.border[3], bn, bw);
     }
-    else if (s && twin) {   // the profile's shader_border_emu is 0: the shaders have no twin members and no border block (dmsh_build.py border_emu), so no twin is made; say so, once per sampler, in case a scene does need it
+    else if (s && twin) {   // the profile's shader_border_emu is 0: the shaders have no twin members and no border block (dmsh_rewrite.py border_emu), so no twin is made; say so, once per sampler, in case a scene does need it
         static int nlog_off; if (nlog_off++ < 16) MLOG("sampler ID %d: border colour %g,%g,%g,%g, which Metal lacks: NOT corrected, the profile's shader_border_emu is 0 (Metal colour %d is used; set the key to 1 and rebuild the shaders if this scene shows a wrong border)", sid, p.border[0], p.border[1], p.border[2], p.border[3], bn);
     }
     return s;

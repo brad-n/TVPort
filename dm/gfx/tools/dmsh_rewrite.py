@@ -472,7 +472,9 @@ def finite_rg11(msl):
     declarations after `using namespace metal;` once. A main0 whose outputs are all integer, with no `return out;` line or already rewritten stays as it is"""
     if 'dm_nf_fix' in msl or 'using namespace metal;\n' not in msl: return msl
     st = re.search(r'struct main0_out\s*\{(.*?)\};', msl, re.S)
-    e = re.search(r'^fragment\s+main0_out\s+main0\s*\(', msl, re.M)
+    # the translator's early-tests attribute may come first (spirv-cross writes [[ early_fragment_tests ]] for a Switch 2 shader the game flags, upstream a888e668); the pool marks'
+    # own [[early_fragment_tests]] (pool_arrays, before this rewrite) is matched no more than before
+    e = re.search(r'^(?:\[\[ early_fragment_tests \]\] )?fragment\s+main0_out\s+main0\s*\(', msl, re.M)
     if not st or not e: return msl
     outs = re.findall(r'^\s*(?:float|half)[234]?\s+(\w+)\s*\[\[\s*color\((\d+)\)\s*\]\]\s*;', st.group(1), re.M)
     brace = msl.find('{', e.end())

@@ -41,7 +41,7 @@ class AddonsMainUsesPackageReader(unittest.TestCase):
             yield FakeReader(answers)
         argv = ['inspect_game_addons.py', str(self.dir), '--keys', str(self.dir / 'prod.keys'), '--source', str(self.dir / 'DLC')]
         out = io.StringIO()
-        with patch.object(sys, 'argv', argv), patch.object(nsp, 'package_reader', reader), patch.object(nsp, 'configure_dotnet', lambda env: None), \
+        with patch.object(sys, 'argv', argv), patch.object(nsp, 'package_reader', reader), \
                 contextlib.redirect_stdout(out):
             code = addons.main()
         return code, json.loads(out.getvalue())

@@ -58,7 +58,6 @@ def main():
         repo = Path(__file__).resolve().parents[1]
         env = dict(os.environ)
         env['PATH'] = os.pathsep.join(nsp.TOOL_PATHS + [env.get('PATH', '')])
-        nsp.configure_dotnet(env)
         bases, extras = source_files([args.folder]), source_files(args.source)
         # Extractor progress belongs on stderr; stdout is one JSON response.
         # One nx_extract run reads every package's content metas: {path: [(type, title ID, version)]}, or {path: why} for one it cannot read

@@ -38,7 +38,7 @@ SUPPORT = Path.home() / 'Library/Application Support'
 DATA = Path(os.environ.get('TVPORT_DATA') or SUPPORT / 'TVPort')   # the app's library, the build lock, and the app's engine and Python; TVPORT_DATA moves it, for a test run
 PYTHON_VERSION = '3.14'
 REQUIREMENTS = HERE / 'requirements.txt'
-TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/local/share/dotnet', str(Path.home() / '.dotnet')]   # where the NSP script looks too
+TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin']   # where the NSP script looks too (no .NET folders since upstream 641636e2)
 TEXTURE_CAPS = (0, 1024, 512, 256)
 UPSCALER_ENV = {'game': None, 'metalfx': 'metalfx', 'off': 'bilinear'}   # --upscaler to DM_UPSCALER; the game's own leaves it unset
 
@@ -515,10 +515,6 @@ def checks() -> list:
     brew = shutil.which('brew', path=path)
     check('Build tools', not missing, 'xcodegen, zstd and glslang' if not missing else 'Missing: ' + ', '.join(missing),
           'In Terminal:' if brew else 'Install Homebrew from brew.sh, then in Terminal:', 'brew install ' + ' '.join(missing))
-    dotnet = shutil.which('dotnet', path=path)
-    sdks = run([dotnet, '--list-sdks']).stdout.split('\n') if dotnet else []
-    check('.NET SDK 10', any(line.startswith('10.') for line in sdks), next((line.split(' ')[0] for line in sdks if line.startswith('10.')), 'Not installed'),
-          'It builds the game extractor and runs the shader translator. In Terminal:', 'brew install --cask dotnet-sdk')
     python = venv_ready() and str(DATA / 'venv/bin/python3') or borrowed_python()
     check('Python', python, f'Python {PYTHON_VERSION} in TVPort\'s folder' if venv_ready() else f'Borrowing {python}' if python else 'Not set up yet',
           'Press Set Up: TVPort downloads its own Python once.' if uv_tool() else 'TVPort makes its own Python with uv. In Terminal:', '' if uv_tool() else 'brew install uv')

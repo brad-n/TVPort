@@ -1,12 +1,10 @@
-"""dmsh_build.py finite_rg11 on synthetic MSL in the translator's shapes: before each `return out;` of main0 (or its dm_body_main0) every float / half colour output n is made
+"""dmsh_rewrite.py finite_rg11 on synthetic MSL in the translator's shapes: before each `return out;` of main0 (or its dm_body_main0) every float / half colour output n is made
 `if (dm_nf_mask & <1 << n>u) out.<member> = dm_nf_fix(out.<member>);`, the declarations come once after `using namespace metal;`, integer outputs are left alone, and a source with no such
 output or already rewritten stays as it is. dm_nf_mask is the function constant dm_nf_fc (DMSH_FINITE_FC), 0 unless the pipeline sets it, so no other pipeline's code changes. The rewritten
 source compiles where xcrun is. With --fixture <dir>, writes the rewritten shader (a division by 0 and a 0 / 0 written to a colour output) as finite.metal for t_finite_rg11.m
 (make check_t_finite_rg11), which draws it into an R11G11B10F target with the constant set and unset."""
-import ast
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
@@ -19,13 +17,9 @@ import dmsh_abi   # noqa: E402
 import dmsh_side  # noqa: E402
 
 
-def load():
-    tree = ast.parse((TOOLS / 'dmsh_build.py').read_text())
-    nodes: list[ast.stmt] = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in ('finite_rg11', 'block_end'))
-                             or (isinstance(n, ast.Assign) and any(getattr(t, 'id', None) in ('FINITE_DECL', 'BRACE') for t in n.targets))]
-    ns = {'re': re, 'dmsh_side': dmsh_side, 'abi': dmsh_abi}
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(TOOLS / 'dmsh_build.py'), 'exec'), ns)
-    return ns
+def load():   # finite_rg11 and its declarations are dmsh_rewrite.py's since upstream's 80fc2ecb (the shader build's rewrites as a module)
+    import dmsh_rewrite
+    return vars(dmsh_rewrite)
 
 
 NS = load()
@@ -76,6 +70,11 @@ fragment main0_out main0(constant float4* c [[buffer(0)]])
 
 
 class FiniteRg11(unittest.TestCase):
+    def test_entry_with_attribute(self):   # Switch 2 shaders the game flags get [[ early_fragment_tests ]] before the entry (upstream a888e668): Ocarina of Time's 5ad65c0eefd09c7f is one
+        out = NS['finite_rg11'](SHADER.replace('\nfragment main0_out main0(', '\n[[ early_fragment_tests ]] fragment main0_out main0('))
+        self.assertEqual(out, NS['finite_rg11'](SHADER).replace('\nfragment main0_out main0(', '\n[[ early_fragment_tests ]] fragment main0_out main0('))
+        self.assertIn('dm_nf_fix(out.m_16)', out)
+
     def test_every_return_and_float_output(self):
         out = NS['finite_rg11'](SHADER)
         self.assertEqual(out.count('using namespace metal;'), 1)
