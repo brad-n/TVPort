@@ -422,19 +422,69 @@ class NativeYaz0Tests(unittest.TestCase):
 
 
 class ZstdSlotTests(unittest.TestCase):
-    def test_slot_is_filled_with_a_skippable_frame(self):
+    def one_frame(self, r, slot, data):
+        z = B.zstd_module()
+        self.assertEqual(len(r), slot)
+        self.assertEqual(z.decompress(r), data)
+        f = tool.Z.frame_features(r)
+        self.assertEqual((f['frames'], f['skippable']), (1, 0))   # one frame to the slot's end: no skippable padding
+        self.assertLessEqual(f['blocks'], {'raw', 'compressed'})
+
+    def test_slot_is_filled_by_one_frame(self):
         z = B.zstd_module()
         data = random.Random(2).randbytes(3000) + bytes(40_000)
         comp = z.compress(data, level=3)
-        for slot in (len(comp) + 8, len(comp) + 1000, len(comp)):
-            r = tool.zstd_slot(data, slot)
-            self.assertEqual(len(r), slot)
-            self.assertEqual(z.decompress(r), data)
+        for slot in (len(comp) + 1000, len(comp) + 20_000, len(comp)):
+            self.one_frame(tool.zstd_slot(data, slot), slot, data)
         self.assertIsNone(tool.zstd_slot(data, len(comp) - 100))
-        r = tool.zstd_slot(data, len(comp) + 3)       # 3 bytes cannot hold a frame header: a stronger level may fit exactly, else None
-        self.assertTrue(r is None or (len(r) == len(comp) + 3 and z.decompress(r) == data))
+        for extra in (1, 2, 3, 8):   # a few bytes over the stream: an exact fill, or None (the container then keeps its original stream)
+            r = tool.zstd_slot(data, len(comp) + extra)
+            if r is not None: self.one_frame(r, len(comp) + extra, data)
         f = tool.skippable_frame(20)
         self.assertEqual((len(f), f[:4], f[4:8], f[8:]), (20, bytes.fromhex('502a4d18'), struct.pack('<I', 12), bytes(12)))
+
+    def test_fill_frame_sizes_layout_and_raw_blocks(self):
+        z = B.zstd_module()
+        data = random.Random(3).randbytes(70_000) + bytes(400_000) + random.Random(4).randbytes(9000)   # a stripped texture: data, zeroed planes, data
+        whole = tool.Z.exact_compress(data, 19, True)                                                   # Ocarina's layout: content size, Single_Segment
+        head = lambda x: tool.Z.compress(x, 3, None, whole)
+        rng = random.Random(5)
+        for slot in [len(whole) + d for d in (40, 41, 42, 1000, 4096)] + [rng.randrange(len(whole) + 64, len(data)) for _ in range(12)] + [len(data) + 3]:
+            r = tool.Z.fill_frame(data, slot, whole, head) or tool.fill_slot(data, slot, whole)   # a slot the fast head cannot reach takes the strong one
+            self.assertIsNotNone(r, slot)
+            self.one_frame(r, slot, data)
+            hdr, blocks, _ = tool.Z.frame_split(r)
+            self.assertEqual(hdr, tool.Z.frame_split(whole)[0])                                        # the original's header: same layout, same content size
+            for b in blocks: self.assertLessEqual(int.from_bytes(b[:3], 'little') >> 3, tool.Z.RAW_BLOCK_MAX)
+            self.assertEqual(int.from_bytes(blocks[-1][:3], 'little') & 7, 1)                          # the last block is a raw one
+        self.assertEqual(tool.Z.fill_frame(data, len(whole), whole, head), whole)
+        self.assertIsNone(tool.Z.fill_frame(data, len(whole) - 1, whole, head))
+        streamed = tool.Z.exact_compress(data, 9)                                                       # Smash's layout: a window descriptor, no content size
+        r = tool.Z.fill_frame(data, len(streamed) + 5000, streamed, lambda x: tool.Z.compress(x, 3, None, streamed))
+        self.one_frame(r, len(streamed) + 5000, data)
+        self.assertEqual(tool.zstd_header(r), tool.zstd_header(streamed))
+
+    def test_a_game_reading_in_pieces_meets_the_frame_end_at_the_file_end(self):
+        # Ocarina of Time reads a file in 902,912-byte pieces and decodes as it reads. The old layout (the short stripped stream, then a skippable frame to the slot's end) ended its
+        # frame in the first piece of a larger file, and the game read such files again and again without end (Link's house had no inside on the Apple TV); a filled frame ends with the file
+        z = B.zstd_module()
+        piece = 64 << 10
+        data = random.Random(6).randbytes(20_000) + bytes(600_000)
+        slot = len(z.compress(random.Random(7).randbytes(300_000), level=3))                                # the original file: far longer than the stripped stream
+        comp = tool.zstd_compress(data, 3)
+        self.assertGreater(slot - len(comp), piece)
+        def ends(blob):   # (index of the piece the frame ended in, pieces in the file, bytes left unread after the frame)
+            d = z.ZstdDecompressor(); out = b''
+            for i in range(0, len(blob), piece):
+                out += d.decompress(blob[i:i + piece])
+                if d.eof: return i // piece, -(-len(blob) // piece), len(d.unused_data) + max(0, len(blob) - i - piece), out
+            return None
+        old = comp + tool.skippable_frame(slot - len(comp))
+        at, n, left, out = ends(old)
+        self.assertEqual(out, data); self.assertLess(at, n - 1); self.assertGreater(left, 0)            # the frame ends early: pieces are left that hold no frame
+        new = tool.zstd_slot(data, slot)
+        at, n, left, out = ends(new)
+        self.assertEqual(out, data); self.assertEqual((at, left), (n - 1, 0))                           # the frame ends in the last piece, at the file's last byte
 
 
 def swizzled(lib, tex, pkg_block_h):
@@ -1061,13 +1111,14 @@ class ExactEncoderTests(unittest.TestCase):
             w = self.walker()
             orig = tool.Z.exact_compress(dec, level) + tool.skippable_frame(300)
             r = w.fit_zstd(new, orig, None, dec)
-            self.assertEqual(len(r), len(orig)); self.assertTrue(r.startswith(comp)); self.assertEqual(z.decompress(r[:len(comp)]), new)
-            self.assertEqual(tool.Z.frame_features(r)['skippable'], 1)
+            self.assertEqual(len(r), len(orig)); self.assertEqual(z.decompress(r), new)
+            self.assertEqual(tool.Z.frame_split(r)[0], tool.Z.frame_split(comp)[0])                   # the exact encoder's header, one frame that fills the slot
+            self.assertEqual((tool.Z.frame_features(r)['frames'], tool.Z.frame_features(r)['skippable']), (1, 0))
             w.kind = lambda o, name, hint: 'zstd'
             inner = w.check; w.check = lambda o, n, name, depth=0, *a, **k: inner(o, n, name, depth, *a, **k) if depth == 0 else None   # the synthetic content holds no texture: only the zstd layer is checked
             w.check(orig, r, 'x')                                                                      # the self-check's identity proof accepts it
             self.assertEqual(w.c['encoder_identity_checked'], 1)
-            bad = bytearray(r); bad[len(comp) - 1] ^= 1
+            bad = bytearray(r); bad[len(tool.Z.frame_split(r)[0])] ^= 0x10                          # the first block header: its size no longer matches its bytes
             with self.assertRaises(Exception): w.check(orig, bytes(bad), 'x')
         # an original from another encoder: the header-copying no-RLE path, counted
         other = z.compress(dec, options={P.compression_level: 3, P.content_size_flag: 0, P.window_log: 17}); other += bytes(400)
@@ -1169,7 +1220,8 @@ class SingleSegmentFrameTests(unittest.TestCase):
         w = self.walker()
         r = w.fit_zstd(new, orig, None, dec)
         comp = tool.Z.exact_compress(new, 19, True)
-        self.assertIsNotNone(r); self.assertTrue(r.startswith(comp)); self.assertEqual(len(r), len(orig))
+        self.assertIsNotNone(r); self.assertEqual(len(r), len(orig)); self.assertEqual(tool.B.zstd_module().decompress(r), new)
+        self.assertEqual(tool.Z.frame_split(r)[0], tool.Z.frame_split(comp)[0]); self.assertEqual(tool.Z.frame_features(r)['skippable'], 0)
         self.assertEqual(tool.zstd_header(r), tool.zstd_header(orig))
         self.assertEqual((w.c['encoder_matched'], w.c['encoder_unmatched']), (1, 0))
         w.kind = lambda o, name, hint: 'zstd'

@@ -75,8 +75,10 @@ Counters join the existing ASTC counters line after each `memory up to frame` li
 - Writes `<dir>/romfs.img` (DMSPARS1, pack embedded) and `<dir>/report.json`; exit 0 only when the self-check passed.
 - Skips (exit 0, nothing rewritten) when `<dir>/report.json` records the same input fingerprint (RomFS size+index hash, pack fingerprint, cap, block).
 - Container rules (spike section C): loose/uncompressed -> in place; Yaz0 -> recompress, zero tail in the slot (header keeps the decompressed size);
-  zstd -> recompress, pad the rest of the slot with one zstd skippable frame (zero content); a tail under 8 bytes cannot hold the frame's header,
-  so that container keeps its original stream; Smash data.arc -> recompress entries, update each entry's stored size in the zstd-compressed table, rewrite the
+  zstd -> recompress into ONE frame that fills the slot exactly: its head compressed, its tail stored in raw blocks (tex_once_zstd.fill_frame), so the frame
+  ends where the file ends, as every original does. It used to be the new stream plus a skippable frame of zeros to the slot's end: Ocarina of Time reads a file in
+  902,912-byte pieces and decodes as it reads, and every stripped file larger than one piece was read again and again and never loaded (Link's house had no inside
+  walls on the Apple TV, 31 GB read in 100 s). A container no split fits keeps its original stream; Smash data.arc -> recompress entries, update each entry's stored size in the zstd-compressed table, rewrite the
   table into its own slot the same way. Anything else holding covered planes: leave untouched and report it.
 - Self-check before exit 0: re-walk the logical image with the prebuild's walker; every tagged plane reads tag+zeros and its tag resolves in the
   pack; every other decompressed byte equals the original; every container parses; the DMROMFS1 index is byte-identical.
