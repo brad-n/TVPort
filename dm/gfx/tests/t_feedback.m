@@ -472,6 +472,10 @@ static void cut_boundary_case(void) {
     tex_t colour; target(&colour, 99810);
     id<MTLBuffer> rep = [g_dev newBufferWithLength:64 options:MTLResourceStorageModeShared]; res_add(rep);
     CHECK(ts_on(), "segment mode has a timestamp heap");
+    // The earlier cases' command buffers have completed (mtl_wait), but their feedback handlers, which take them off g_seg_inflight, may not have run yet: this case counts its own
+    // running work by hand, so it starts with none of theirs (upstream's copy failed "with nothing running: a commit" 2 of 3 times on a Mac mini under load)
+    for (int i = 0; i < 2000 && atomic_load(&g_seg_inflight) > 0; i++) usleep(1000);
+    CHECK(atomic_load(&g_seg_inflight) == 0, "the earlier cases' command buffers reported back");
     state_reset(); memset(&R, 0, sizeof R); mtl_sub_begin();
     R.has_rt = 1; R.rt.n = 1; R.rt.color[0] = &colour;
     clear(MTLClearColorMake(0, 0, 0, 1)); rp_end();
