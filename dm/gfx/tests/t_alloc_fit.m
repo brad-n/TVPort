@@ -24,12 +24,15 @@ int main(void) { @autoreleasepool {
     CHECK(alloc_trim_victim(sz, all, 5, 60 * MB) == -1, "not when one takes 60 MB (a quarter more is 75)");
     uint64_t small[8] = {1 * MB, 3 * MB, 2 * MB}; CHECK(alloc_trim_victim(small, all, 3, 0) == -1, "nor at 4 MB or less");
     uint8_t busy[8] = {1, 1, 1, 0, 1}; CHECK(alloc_trim_victim(sz, busy, 5, 0) == 1, "a busy allocator is never made again: the largest free one");
-    // real submissions through the choice, frame after frame: they complete, and each allocator taken is noted with its submission's place
+    // real submissions through the choice, frame after frame: they complete; a frame's first submission takes an allocator, noted with its place (0), and the others share it
+    // (upstream fd8188c9: the submissions of one frame share an allocator)
     mtl_init();
     CHECK(alloc_fit_on(), "on by default");
     for (uint64_t f = 1; f <= 40; f++) {
-        atomic_store(&g_cur_frame, f);
-        for (int k = 0; k < 4; k++) { mtl_sub_begin(); CHECK(g_alloc_cur >= 0 && g_alloc_cur < g_alloc_n && g_alloc_ordof[g_alloc_cur] == k, "the allocator taken is noted with the submission's place in its frame");
+        atomic_store(&g_cur_frame, f); int first = -1;
+        for (int k = 0; k < 4; k++) { mtl_sub_begin(); if (!k) first = g_alloc_cur;
+            CHECK(g_alloc_cur >= 0 && g_alloc_cur < g_alloc_n && g_alloc_ordof[g_alloc_cur] == 0, "the frame's allocator is noted with the place of the submission that took it");
+            CHECK(g_alloc_cur == first, "the frame's later submissions share its allocator");
             uint64_t fence = mtl_sub_commit(); if (k == 3 || f == 40) CHECK(mtl_wait(fence, 5000000000ull), "the submissions complete"); }
     }
     CHECK(g_alloc_n >= 1 && g_alloc_n <= ALLOC_MAX, "within the allocator cap");

@@ -30,7 +30,7 @@ static void copy_sub(void *cmd_mem, const uint8_t *src, uint8_t *dst) {
     NVNsync sync; h_nvnSyncInitialize(&sync, NULL);
     h_nvnCommandBufferFenceSync(&cmd, &sync, NVN_SYNC_CONDITION_ALL_GPU_COMMANDS_COMPLETE, 0);
     NVNcommandHandle h = h_nvnCommandBufferEndRecording(&cmd);
-    state_reset(); memset(&R, 0, sizeof R); mtl_sub_begin(); mtl_exec((const uint8_t *)h); mtl_sub_commit();
+    state_reset(); memset(&R, 0, sizeof R); mtl_sub_begin(); mtl_exec(nvn_rec_linear(h, NULL)); mtl_sub_commit();
     h_nvnSyncWait(&sync, 5000000000ull);
 }
 static uint64_t pool_bytes(void *mem) { pthread_mutex_lock(&g_mu); int i = pool_find((uint64_t)(uintptr_t)mem, 1); uint64_t z = i >= 0 ? g_pools[i].buf.allocatedSize : 0; pthread_mutex_unlock(&g_mu); return z; }

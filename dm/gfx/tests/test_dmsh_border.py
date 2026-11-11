@@ -188,7 +188,7 @@ class KeyOn(unittest.TestCase):
 
     def test_build_reads_the_key_with_default_one(self):
         self.assertRegex(BUILD_SRC, r"(?m)^BORDER_EMU = GAME\.get\('shader_border_emu', '1'\) == '1'")
-        self.assertIn('src = border_emu(src, BORDER_EMU)', BUILD_SRC)
+        self.assertIn('src = dmsh_rewrite.border_emu(src, BORDER_EMU)', BUILD_SRC)
 
 
 class KeyOff(unittest.TestCase):

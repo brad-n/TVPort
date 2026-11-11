@@ -18,13 +18,15 @@ void svc_thread_dump(void) {}
 uint64_t now_ns(void) { return bp_now(); }
 static int checks, fails;
 #define CHECK(c, label) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: %s\n", label); } } while (0)
-static uint8_t commands[8192]; static size_t used;
+static uint8_t commands[8192] __attribute__((aligned(8))); static size_t used;
 static void emit(unsigned op, const void *p, size_t n) {
     size_t size = (8 + n + 7) & ~7ull; op_hdr h = {op, (uint32_t)size};
     memcpy(commands + used, &h, 8); if (n) memcpy(commands + used + 8, p, n); used += size;
 }
 static NVNqueue queue; static prog_t pg = {.serial = 930001}; static void *vertices;
-static void submit(void) { emit(OP_END, NULL, 0); NVNcommandHandle hd = (NVNcommandHandle)commands; P(nvnQueueSubmitCommands)(&queue, 1, &hd); P(nvnQueueFinish)(&queue); used = 0; }
+static void submit(void) {   // the records' control list, one piece (nvn_obj.h ctl_e): a handle is a control list since upstream f02d0474
+    static uint64_t list; list = ctl_e(CTL_CHUNK, commands, used) | CTL_LAST; NVNcommandHandle hd = (NVNcommandHandle)&list;
+    P(nvnQueueSubmitCommands)(&queue, 1, &hd); P(nvnQueueFinish)(&queue); used = 0; }
 static void fill_blue(tex_t *t) {   // a clear with no draw after it lands in a pass of its own at the end of the command list; NVN clears within the scissor, so it covers the target first
     p_set_rt rt = {.n = 1}; rt.color[0] = t; emit(OP_SET_RT, &rt, sizeof rt);
     p_scissor sc = {0, 0, (int32_t)t->d.width, (int32_t)t->d.height}; emit(OP_SCISSOR, &sc, sizeof sc);

@@ -25,6 +25,8 @@ GAME = dmsh_chain.load_game()   # the current game profile (DM_GAME): the tables
 if f'"{CHAIN}"' not in open(dmsh_chain.HEADER).read(): sys.exit(f'[RED] {dmsh_chain.HEADER} does not hold the current translation chain version {CHAIN}: run dmsh_chain.py --header first and commit it (otherwise the host cannot find these libraries)')
 INPUTS = dmsh_chain.inputs(GAME)   # the digest of the profile's inputs, which a full build stamps on its libraries (b-<V>/inputs.tsv)
 RAW_READ_LOG = GAME.get('shader_raw_read_log', '0') == '1'   # raw global loads log the pool table entry they read (the job's raw_read_log): the host keeps resident what they read (nvn_mtl.m gmem_map, DM_NVN_GMEM_MODE=learned)
+SELECT_GUARDS = GAME.get('shader_select_guards', '1') == '1'   # 0: bounded uniform reads at computed offsets stay as spirv-cross writes them, a branch each (cond ? read : 0), not upstream's select (dmsh_fetch.select_guards, 918e9f34). Ocarina of Time's fluid volume compute 9ed48d1011f1b48b (the ground mist over Kokiri Forest) draws no mist on a Mac mini M2 Pro, the Apple TV's A15 GPU family, with its 195 computed-offset reads as selects, and the mist is there with them as branches; a select over the bits or with the row clamped to the array loses it too, so it is the load made unconditional, not the value chosen (which compiler step differs is not known; the same source is equivalent). In each shader's cache key and the library stamp, as the other shader_* keys
+def guards(msl): return dmsh_fetch.select_guards(msl) if SELECT_GUARDS else msl   # see SELECT_GUARDS
 BORDER_EMU = GAME.get('shader_border_emu', '1') == '1'   # 0: border_emu leaves every sample alone (no twin samplers, no border block, no dm_bs): for a game whose samplers never need a border colour Metal lacks (Ocarina of Time). The profile's shader_* keys are in each shader's cache key and the library stamp, so changing it rebuilds
 # Translator options a profile key turns on or off, each 0 (upstream's form) or 1, each with a job option of its own (dmsh_xlate Program.cs) and each its own rollback;
 # the default is XLATE_DEFAULT (below): every exact form on, shader_raw_loop off (no gain measured):
@@ -698,7 +700,7 @@ def geometry_finish(key, w, j, c1):
         dmsh_geometry.flatten_sets(spv)
         r = subprocess.run([SPIRV_CROSS, *dmsh_atomic.cross_args(XC, spv), spv], capture_output=True, text=True)
         if r.returncode: return 'geometry MSL failed', r.stderr.strip()[:160], None
-        try: selected = dmsh_fetch.select_guards(dmsh_rewrite.precise(dmsh_atomic.check_msl(r.stdout)))   # bounded uniform reads as selects (see dmsh_fetch.select_guards)
+        try: selected = guards(dmsh_rewrite.precise(dmsh_atomic.check_msl(r.stdout)))   # bounded uniform reads as selects (see dmsh_fetch.select_guards)
         except ValueError as e: return 'geometry MSL failed', str(e)[:160], None
         plain = dmsh_geometry.topology_pointer(dmsh_reflect.pool_arrays(selected))
         src = dmsh_geometry.capture_input(plain)
@@ -730,7 +732,7 @@ def geometry_finish(key, w, j, c1):
             spv = os.path.join(w, k + '.reader.spv'); dmsh_geometry.flatten_sets(spv)
             r = subprocess.run([SPIRV_CROSS, *dmsh_atomic.cross_args(XC, spv), spv], capture_output=True, text=True)
             if r.returncode: return 'geometry reader failed', r.stderr.strip()[:160], None
-            try: selected = dmsh_fetch.select_guards(dmsh_rewrite.precise(dmsh_atomic.check_msl(r.stdout)))
+            try: selected = guards(dmsh_rewrite.precise(dmsh_atomic.check_msl(r.stdout)))
             except ValueError as e: return 'geometry reader failed', str(e)[:160], None
             reader = dmsh_entry.vs_layer(dmsh_entry.vs_init(dmsh_geometry.reader(dmsh_reflect.pool_arrays(selected))))
             analysis, full = dmsh_entry.vs_depth(reader)
@@ -773,7 +775,7 @@ def finish(key, w, j, c1):
     try: src = dmsh_atomic.check_msl(src)
     except ValueError as e: return 'image atomic MSL failed', str(e), None
     src = dmsh_rewrite.precise(src)   # min / max / clamp with Maxwell's NaN results (see precise)
-    try: src = dmsh_fetch.select_guards(src)   # bounded uniform reads as a load and a select, as the translator means them, not a branch for each (see dmsh_fetch.select_guards)
+    try: src = guards(src)   # bounded uniform reads as a load and a select, as the translator means them, not a branch for each (see dmsh_fetch.select_guards)
     except ValueError as e: return 'uniform bounds rewrite failed', str(e)[:160], None
     src = dmsh_rewrite.mul_extended(src)   # scalar extended products without the optnone wrapper (see mul_extended)
     try: src = dmsh_rewrite.gather_offsets(src)   # four gathers instead of a wrapper's loop over their offsets (see gather_offsets)

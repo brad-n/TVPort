@@ -39,6 +39,9 @@ shader_note	Ocarina of Time shaders
 shader_raw_read_log	1
 # Border colours Metal lacks are corrected in the shaders through twin samplers (docs: dm/games/README.md shader_border_emu). Ocarina of Time never needed one in seven Apple TV runs (the host logs "which Metal lacks" zero times), so the ~86k dm_bs sites in its shaders are compiled out
 shader_border_emu	0
+# Bounded uniform reads at computed offsets stay branches (dm/games/README.md shader_select_guards): with upstream's selects the fluid volume compute 9ed48d1011f1b48b draws no
+# ground mist on Apple8 GPUs (Mac mini M2 Pro, as the Apple TV's A15), found when tv-all-sync3 took upstream 918e9f34 (gallery 140-149)
+shader_select_guards	0
 # shader_raw_regs and shader_wide_device are on for every game now (dm/games/README.md): measured here first, the ground mist pass (5ad65c0eefd09c7f, 43 lookups a pixel)
 # went from 2.12 to 1.72 ms a frame on the Mac mini (M2 Pro, TV-like settings). shader_raw_loop measured no gain: off
 
