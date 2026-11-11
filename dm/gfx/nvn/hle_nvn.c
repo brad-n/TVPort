@@ -248,6 +248,22 @@ NVN(nvnMemoryPoolBuilderSetDevice, void, NVNmemoryPoolBuilder *b, NVNdevice *d) 
 NVN(nvnMemoryPoolBuilderSetStorage, void, NVNmemoryPoolBuilder *b, void *m, size_t n) { ((pool_builder_t *)b)->mem = m; ((pool_builder_t *)b)->size = n; }
 NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) { ((pool_builder_t *)b)->flags = f; }
 static uint8_t *vpool_reserve(pool_t *o); static void vpool_release(pool_t *o);   // sparse virtual pools, see MapVirtual
+// Physical memory a sparse virtual pool's mapping has given a second address (vm_remap, MapVirtual): a write through that address passes by the dirty tracker's protection of the first, so
+// DM_GUEST_ZERO_PUNCH leaves such memory alone (nvn_mtl.m mtl_zero_punch). Ranges are only added, merged when they touch; never taken back, as the pages may still be mapped there
+static pthread_mutex_t g_premap_mu = PTHREAD_MUTEX_INITIALIZER; static uintptr_t (*g_premap)[2]; static int g_npremap, g_cpremap;
+void nvn_phys_remap_note(uintptr_t lo, uintptr_t hi) {
+    pthread_mutex_lock(&g_premap_mu);
+    int i = 0; for (; i < g_npremap; i++) if (g_premap[i][0] <= hi && lo <= g_premap[i][1]) { if (lo < g_premap[i][0]) g_premap[i][0] = lo; if (hi > g_premap[i][1]) g_premap[i][1] = hi; break; }
+    if (i == g_npremap) {
+        if (g_npremap == g_cpremap) { int c = g_cpremap ? 2 * g_cpremap : 64; void *n = realloc(g_premap, (size_t)c * sizeof *g_premap); if (!n) { pthread_mutex_unlock(&g_premap_mu); return; } g_premap = n; g_cpremap = c; }
+        g_premap[g_npremap][0] = lo; g_premap[g_npremap][1] = hi; g_npremap++;
+    }
+    pthread_mutex_unlock(&g_premap_mu);
+}
+int nvn_phys_remapped(uintptr_t lo, uintptr_t hi) {
+    pthread_mutex_lock(&g_premap_mu); int r = 0; for (int i = 0; i < g_npremap && !r; i++) r = g_premap[i][0] < hi && lo < g_premap[i][1]; pthread_mutex_unlock(&g_premap_mu);
+    return r;
+}
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size; o->vp = NULL; o->vmode = 0;
@@ -2436,6 +2452,7 @@ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp
         vrun_set(v, (uint64_t)r->voff, (uint64_t)r->voff + r->size, 0); return 1;
     }
     uintptr_t from = (uintptr_t)ph->mem + (uintptr_t)r->poff;
+    nvn_phys_remap_note(from, from + r->size);   // the physical pages have a second address now: their zero pages are not punched (DM_GUEST_ZERO_PUNCH)
     vm_prot_t cur, max;
     kern_return_t kr = vm_remap(mach_task_self(), &to, r->size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)from, FALSE, &cur, &max, VM_INHERIT_NONE);
     if (kr != KERN_SUCCESS || to != (vm_address_t)(v->base + r->voff)) { LOG("[RED] virtual pool remap %#lx → %p (%#llx bytes) failed: %d", (unsigned long)from, (void *)(v->base + r->voff), (unsigned long long)r->size, kr); return 0; }
