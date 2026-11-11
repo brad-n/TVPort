@@ -48,11 +48,6 @@ YAZ0_CHAIN = 64
 ZSTD_LEVELS = (3, 10, 19)
 TABLE_LEVELS = (22,)      # Smash's data.arc table is stored at the strongest level: a weaker one does not fit its slot (level 19: 142 KB too big, level 22: 146 KB to spare)
 MIN_PLANE = 16            # planes whose stored length (nvn_astc_plane_storage) is under this are never tagged (a tag is 8 bytes)
-# SINGLE_LEVEL: a BC texture with no mip chain is left as it is, its planes counted as skipped (single_level). Such a texture is data more often than a material: a lightmap, a lookup
-# table, a baked lighting volume. Ocarina of Time's baked lighting (RBake_*, BC5 / BC7 / BC6H with one level, 1,428 files) stripped lit the house's cloth wrongly (a striped curtain,
-# white specks on the bed); the originals of those files alone put it right. About 2 GB of Ocarina's image stays as BC for it. Not a game reading them: under a CPU read trap no game
-# code touched 53 single-level textures in Link's house, and their pack entries were made in the Switch's GOB order (bntx_astc.gob_switch2), shuffled; whether the rule is still needed with a
-# pack made in the game's order is open
 BC1_FORMATS = (0x1a01, 0x1a06)
 NATIVE_SOURCE = os.path.join(HERE, 'tex_once_native.c')
 
@@ -240,7 +235,6 @@ class Walker:
         if tg is None or t['samples'] > 1 or t['dimension'] == 2: return ('skip', 'ineligible_shape', 0)
         target, depth = tg
         if t['w'] == 0 or t['h'] == 0 or (not t['offs'] and not t.get('auto')) or t['w'] > 16384 or t['h'] > 16384: return ('skip', 'unparsed', 0)
-        if t['mips'] <= 1: return ('skip', 'single_level', depth if target in (4, 8, 9) else 1)   # SINGLE_LEVEL
         nvn, alt = eligible
         pkg = 0 if t.get('auto') else (t['layout'] & 0xff) + 1
         start, size, mips = t['start'], t['size'], t['mips']
