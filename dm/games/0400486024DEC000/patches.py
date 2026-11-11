@@ -46,6 +46,7 @@ def frame_step(ctx):
     shadow_map(ctx)
     probe_interval(ctx)
     ground_mist(ctx)
+    foliage(ctx)
 
 def render_scale(ctx):   # fork: v131072's own addresses (every site asserts its bytes); a rule's function at another offset (another build) gets none
     if ctx.base != 0x6e6be0: return
@@ -175,6 +176,45 @@ def ground_mist(ctx):
     ctx.capabilities.add('GROUND_MIST')
 
 
+# Foliage off (state +0xb0, u32 written by the loader: DM_FOLIAGE=off, 1; 0 = the game's): a quality trade for slower GPUs. Grass, ferns, clover, the moss fur on logs and the
+# other ground cover are game::foliage, one module (its singleton at main+0x4e22540 on v131072; Pack/Foliage.pack, a 248 MB "Foliage Scene Heap") with a class per model type
+# (Turf, Turf1, Moss, Frost, Forest, Stone, Leaf, Flower, impostors ...), whose slot 8 says whether that type is on: the module's per-frame calc, the render list, the draws and
+# the GPU calc node (main+0x2710a0, the FoliageShader compute) all ask it. The grass is drawn by the turf draw lists (main+0x2c022a0 / main+0x2c02820: task 99280b7b, mesh
+# eb021183, fragment 087ef21b) and per-draw callbacks of the generic model renderer. The game turns parts of it off itself: timeline commands set the module's bytes +0x141
+# (grass: the draw lists and the callbacks return before drawing) and +0x142 (the forest), and its debug word +0x2b0 has a hide bit per type in +0x2b1 (bit 0 Turf / Turf1,
+# 1 Moss / Frost, 2 Stone, 3 Forest; 0 in play, read and never written). The stub, at the entry of the module's per-frame calc (main+0x2c00a40, slot 6 of its vtable: x0 is the
+# module; x9..x11, x16 and x17 are free at a function's entry), sets both bytes and the four hide bits every frame while the option is on, so the game's own checks skip the
+# foliage draws, the per-type calc and the foliage compute (FoliageShader f85fe649 and its siblings) from then on, whatever its timelines set. 2 (diagnostics only; the loader
+# never writes it) clears them again, for an A/B inside one run. Nothing else reads the foliage outputs: the fluid simulation the grass samples runs on, and grass cutting is
+# its own module (main+0x563d90)
+def foliage(ctx):
+    base = ctx.others.get('foliage calc')
+    if base is None: return   # not found in this build: the game's foliage
+    here, emit = ctx.here, ctx.emit
+    ctx.site(base, '083040b9')   # ldr w8,[x0,#0x30]
+    start = here()
+    emit(0xb9403008)   # ldr w8,[x0,#0x30]      the original: the module's flags
+    emit(ADRP(16, here(), ctx.state))
+    emit(0xb940b211)   # ldr w17,[x16,#0xb0]    1 = off
+    back = here() + 4 * 11
+    emit(cbz_w(here(), back, 17))   # 0: the game's own
+    for w in (0x7100063f,   # cmp w17,#1
+              0x1a9f17e9,   # cset w9,eq           1 = off, 2 = on again (diagnostics)
+              0x39050409,   # strb w9,[x0,#0x141]  grass off (the game's own)
+              0x39050809,   # strb w9,[x0,#0x142]  forest off (the game's own)
+              0xb942b00a,   # ldr w10,[x0,#0x2b0]
+              0x12146d4a,   # and w10,w10,#0xfffff0ff
+              0x4b0903eb,   # neg w11,w9
+              0x12180d6b,   # and w11,w11,#0xf00   the hide bits of Turf / Turf1, Moss / Frost, Stone, Forest
+              0x2a0b014a,   # orr w10,w10,w11
+              0xb902b00a):  # str w10,[x0,#0x2b0]
+        emit(w)
+    assert here() == back
+    emit(B(here(), base + 4))
+    ctx.put(base, [B(base, start)], 'foliage off: the module\'s grass / forest disables and type hide bits set each frame (state +0xb0, DM_FOLIAGE=off; 0 = the game\'s)')
+    ctx.capabilities.add('FOLIAGE')
+
+
 # The game's dynamic resolution (game__gfx__DynamicResolutionParam: LoadThreshold, ReduceCounterMax, IncreaseCounterMax and a list of levels, each a ResolutionReduceScale and a
 # Priority; on v131072 levels 0..9 at 0.75..0.333 of 2048x1152, 1536x864 to 683x384). Its update (main+0x805aa0) reads the frame's GPU load (about 0.2 ms a unit) into +0x8, subtracts
 # its small model of the fixed costs and divides the rest by the square of the current scale: it takes the rest of the frame's cost to grow with the pixel count, as on the Switch 2
@@ -218,7 +258,8 @@ MATCH_FRAME_STEP = {'main': [
      'others': {'dynamic resolution': {'size': 0x294, 'fingerprints': ['7af6ceb0aedf8e0c17dc08ce17fcd6a7cba6d394a0d09e3b504c6d668dc418e7']},   # v131072 main+0x8065e0
                 'dynamic resolution update': {'size': 0xb24, 'fingerprints': ['5a423697838976baf286cffa5e2ceef0d4e037abbcd9d371e90e9e702d61b3d4']},   # main+0x805aa0
                 'probe scheduler': {'size': 0xa84, 'fingerprints': ['1cf03d90dce3429a92cc48b83ac150ef3dbe9cd4b00a4c494d1eb6a69086df6b']},   # main+0x33d6a0
-                'fluid draw': {'size': 0x13f8, 'fingerprints': ['c7b343dde31d4f1d1c315bdbb0db303d16282868356312ec51b2a83a83e6b3f8']}}},   # main+0x26b110
+                'fluid draw': {'size': 0x13f8, 'fingerprints': ['c7b343dde31d4f1d1c315bdbb0db303d16282868356312ec51b2a83a83e6b3f8']},   # main+0x26b110
+                'foliage calc': {'size': 0x6f8, 'fingerprints': ['34cac4f1d8c1a00d12efcb767c1213da3d6c5d692cb61254da2cb1b926d49891']}}},   # main+0x2c00a40
 ]}
 
 BINDING = [
@@ -234,6 +275,9 @@ BINDING = [
     {'what': 'ground mist off: the fluid volume draw skipped (DM_GROUND_MIST)', 'now': 'game', 'goal': 'game', 'purpose': 'rendering',
      'why': "the enabled byte of the game's fluid volume drawer, found by its function's fingerprint on any build that keeps it; switchable, off by default",
      'checked': 'v131072 main: one function with this fingerprint; the mist draw and the simulation dispatches traced to it in play (2026-11-09)'},
+    {'what': 'foliage off: the foliage module\'s grass / forest disables and type hide bits set each frame (DM_FOLIAGE)', 'now': 'game', 'goal': 'game', 'purpose': 'rendering',
+     'why': "the foliage module's per-frame calc, found by its function's fingerprint on any build that keeps it; the flags are the module's own (its timeline disables and debug hide bits); switchable, off by default",
+     'checked': 'v131072 main: one function with this fingerprint (slot 6 of the module vtable); the flags\' readers (turf draw lists, per-draw callbacks, the type classes\' slot 8, the GPU calc node) read by disassembly; each gate switched in play on the balcony with shots and the encoders per phase (2026-11-10)'},
     {'what': 'view scale = the host render scale (DM_RENDER_SCALE)', 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
      'why': "the 3D views' scale store and the dynamic-resolution status in the graphics module's frame update, at v131072's offsets (the match rule's function is at main+0x6e6be0 there)",
      'blocked': 'no function-matched form yet; sits beside the frame ratio stub, which is matched'},
