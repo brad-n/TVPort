@@ -1,4 +1,4 @@
-"""Execute Ocarina's render scale, static shadow map size, reflection probe interval and ground mist stubs (the 3D views' scale and the literal 12288 of the shadow texture from the host). The frame step is upstream's function-matched stub (MATCH_FRAME_STEP), which calls them; the real-speed stub it replaced is gone."""
+"""Execute Ocarina's render scale, static shadow map size, reflection probe interval, ground mist and foliage stubs (the 3D views' scale and the literal 12288 of the shadow texture from the host). The frame step is upstream's function-matched stub (MATCH_FRAME_STEP), which calls them; the real-speed stub it replaced is gone."""
 import importlib
 import importlib.util
 from pathlib import Path
@@ -275,6 +275,68 @@ class GroundMist(unittest.TestCase):
                 self.assertEqual(pc, BASE + MIST_SITE + 4)
 
 
+FOLIAGE_CALC, FOLIAGE_MODULE = 0x2c00a40, 0x3200000   # v131072: the foliage module's per-frame calc (another of the frame step rule); stands for x0 (the module)
+
+
+def foliage_flags(setting, grass=0, forest=0, word=0, flags=0x2008, canary=0x5a5a5a5a5a5a5a5a):
+    """Run the foliage stub from its site to the instruction after it: the module's grass and forest bytes (+0x141 / +0x142) and debug word (+0x2b0) it leaves, the flags in w8
+    (the original load), whether the registers it may not touch and the bytes around the fields kept their values, and where it goes on"""
+    assert unicorn is not None and arm is not None
+    machine = unicorn.Uc(unicorn.UC_ARCH_ARM64, unicorn.UC_MODE_ARM)
+    machine.mem_map(BASE, 0x3400000)
+    ctx = quality_ctx(machine)
+    ctx.others['foliage calc'] = FOLIAGE_CALC
+    profile.foliage(ctx)
+    m = BASE + FOLIAGE_MODULE
+    machine.mem_write(BASE + STATE + 0xb0, struct.pack('<I', setting))
+    machine.mem_write(m + 0x30, struct.pack('<I', flags))
+    machine.mem_write(m + 0x13c, bytes([0xa5] * 0x10))
+    machine.mem_write(m + 0x141, bytes([grass, forest]))
+    machine.mem_write(m + 0x2a8, bytes([0xa5] * 0x10))
+    machine.mem_write(m + 0x2b0, struct.pack('<I', word))
+    kept = [r for r in range(1, 29) if r not in (8, 9, 10, 11, 16, 17)]   # w8 is the original load's; x9..x11, x16 and x17 are free at the function's entry
+    for r in kept: machine.reg_write(arm.UC_ARM64_REG_X0 + r, canary + r)
+    machine.reg_write(arm.UC_ARM64_REG_X0, m)
+    machine.emu_start(BASE + FOLIAGE_CALC, BASE + FOLIAGE_CALC + 4, count=32)
+    ok = all(machine.reg_read(arm.UC_ARM64_REG_X0 + r) == canary + r for r in kept) and machine.reg_read(arm.UC_ARM64_REG_X0) == m
+    around = bytes(machine.mem_read(m + 0x13c, 5)) + bytes(machine.mem_read(m + 0x143, 9)) + bytes(machine.mem_read(m + 0x2a8, 8)) + bytes(machine.mem_read(m + 0x2b4, 4))
+    ok = ok and around == bytes([0xa5] * len(around))
+    g, f = machine.mem_read(m + 0x141, 2)
+    return g, f, struct.unpack('<I', machine.mem_read(m + 0x2b0, 4))[0], machine.reg_read(arm.UC_ARM64_REG_X8) & 0xffffffff, ok, ctx, machine.reg_read(arm.UC_ARM64_REG_PC)
+
+
+@unittest.skipIf(unicorn is None, 'optional ARM64 execution dependency: unicorn')
+class Foliage(unittest.TestCase):
+    def test_the_site_is_the_calcs_flags_load(self):
+        ctx = foliage_flags(0)[5]
+        self.assertEqual(ctx.sites[FOLIAGE_CALC], '083040b9')   # ldr w8,[x0,#0x30]
+        self.assertIn('FOLIAGE', ctx.capabilities)
+
+    def test_unset_leaves_the_games_flags(self):
+        for grass, forest, word in ((0, 0, 0), (1, 0, 0), (0, 1, 0x12345678), (1, 1, 0xffffffff)):
+            with self.subTest(grass=grass, forest=forest, word=word):
+                g, f, w, w8, ok, _, pc = foliage_flags(0, grass, forest, word)
+                self.assertEqual((g, f, w, w8), (grass, forest, word, 0x2008))
+                self.assertTrue(ok)
+                self.assertEqual(pc, BASE + FOLIAGE_CALC + 4)
+
+    def test_off_sets_the_grass_and_forest_disables_and_the_type_hide_bits(self):
+        for grass, forest, word in ((0, 0, 0), (1, 0, 0x12345678), (0, 1, 0xffffffff)):
+            with self.subTest(grass=grass, forest=forest, word=word):
+                g, f, w, w8, ok, _, pc = foliage_flags(1, grass, forest, word)
+                self.assertEqual((g, f, w, w8), (1, 1, word | 0xf00, 0x2008))
+                self.assertTrue(ok)
+                self.assertEqual(pc, BASE + FOLIAGE_CALC + 4)
+
+    def test_two_turns_them_back_on(self):   # diagnostics only: the loader writes 0 or 1
+        for grass, forest, word in ((1, 1, 0xf00), (1, 1, 0xffffffff)):
+            with self.subTest(grass=grass, forest=forest, word=word):
+                g, f, w, w8, ok, _, pc = foliage_flags(2, grass, forest, word)
+                self.assertEqual((g, f, w, w8), (0, 0, word & ~0xf00, 0x2008))
+                self.assertTrue(ok)
+                self.assertEqual(pc, BASE + FOLIAGE_CALC + 4)
+
+
 class MatchedFrameStep(unittest.TestCase):
     def test_render_scale_is_part_of_the_matched_stub_and_only_at_v131072_offsets(self):
         ctx = Ctx(None)
@@ -287,10 +349,10 @@ class MatchedFrameStep(unittest.TestCase):
         self.assertEqual(ctx.sites, {})
 
     def test_the_quality_stubs_need_their_functions(self):
-        for stub in (profile.probe_interval, profile.ground_mist):
+        for stub in (profile.probe_interval, profile.ground_mist, profile.foliage):
             with self.subTest(stub=stub.__name__):
                 ctx = Ctx(None)
-                ctx.others, ctx.capabilities = {'probe scheduler': None, 'fluid draw': None}, set()
+                ctx.others, ctx.capabilities = {'probe scheduler': None, 'fluid draw': None, 'foliage calc': None}, set()
                 stub(ctx)
                 self.assertEqual((ctx.sites, ctx.capabilities), ({}, set()))
 
@@ -298,6 +360,7 @@ class MatchedFrameStep(unittest.TestCase):
         others = profile.MATCH_FRAME_STEP['main'][0]['others']
         self.assertEqual(others['probe scheduler']['size'], 0xa84)
         self.assertEqual(others['fluid draw']['size'], 0x13f8)
+        self.assertEqual(others['foliage calc']['size'], 0x6f8)
 
     def test_the_frame_step_is_matched_not_build_bound(self):
         self.assertFalse(hasattr(profile, 'FRAME_STEP'))
