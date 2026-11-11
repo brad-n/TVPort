@@ -7,12 +7,13 @@ packs the entries into ONE file, astc-ro.pack, which the runtime reads as its re
 
 Identity with the runtime is by construction: the plane walk, the deswizzle, the key and the encoder are the engine's own C code (nvn_astc_planes.c, nvn_deswizzle.c, nvn_tex.c,
 nvn_astc_cache.m, nvn_astc.mm, the astc-encoder objects built with the host Makefile's flags), compiled into one small library (astc_prebuild.m) that this script loads with ctypes.
-Nothing in Python hashes or encodes a texel. The Python side only finds textures and tells the library what the game would tell NVN: target, format, size, levels, packaged layout byte.
+Nothing in Python hashes or encodes a texel. The Python side only finds textures and tells the library what the game would tell NVN: target, format, size, levels, packaged layout byte,
+and the order of the 16-byte pieces inside a GOB the runtime reads storage in: the Switch 2's for a game built for it (gob_switch2: the sdk module's "spec: Ounce", the runtime's own test).
 
 Texture sources (any RomFS image, `RomFS.img`, or an extracted folder): BNTX files and BNTX embedded in other files (BFRES), also inside zstd, Yaz0 and SARC containers, nested.
 Super Smash Bros. Ultimate keeps its textures as NUTEXB in data.arc (dm/gfx/tools/smash_arc.py): its current files are read from the archive, NUTEXB ones as textures.
 
-Usage: bntx_astc.py <RomFS.img | RomFS folder | build folder> --out DIR [--block 4|6] [--bc1-block 4|5|6] [--bc4-block 0|4|5|6] [--bc5-block 0|4|5|6] [--bc6h-block 0|4|5|6] [--max-dim N] [--workers N] [--scan-only] [--force]
+Usage: bntx_astc.py <RomFS.img | RomFS folder | build folder> --out DIR [--gob auto|switch|switch2] [--block 4|6] [--bc1-block 4|5|6] [--bc4-block 0|4|5|6] [--bc5-block 0|4|5|6] [--bc6h-block 0|4|5|6] [--max-dim N] [--workers N] [--scan-only] [--force]
 Output DIR: cache/<key>.astc (the entries), astc-ro.pack (the pack, with the input fingerprint in its header), report.json.
 """
 import argparse
@@ -119,9 +120,15 @@ def build_library(work):
 _LIB = None
 
 
-def lib_open(path):
+def _gob(L, gob):
+    if gob is not None: ctypes.c_int.in_dll(L, 'nvn_gob_switch2').value = int(gob)   # nvn_deswizzle.h: every walk, deswizzle and swizzle of this process
+    return L
+
+
+def lib_open(path, gob=None):
+    """The engine's texture code (build_library). gob: the GOB order it reads and writes storage in from now on in this process (1 the Switch 2's: gob_switch2); None leaves it"""
     global _LIB
-    if _LIB is not None and _LIB[0] == path: return _LIB[1]
+    if _LIB is not None and _LIB[0] == path: return _gob(_LIB[1], gob)
     L = ctypes.CDLL(path)
     L.dm_texture_planes.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint64,
                                     ctypes.c_uint, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(Plane), ctypes.c_uint32, ctypes.c_int]
@@ -137,7 +144,7 @@ def lib_open(path):
     L.dm_swizzle.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
     L.dm_swizzle.restype = ctypes.c_int
     _LIB = (path, L)
-    return L
+    return _gob(L, gob)
 
 
 def addr(b):
@@ -261,8 +268,8 @@ def nutexb_texture(d):
 
 class Job:
     """One worker's state: counters and the planes it keyed"""
-    def __init__(self, lib, block, cache, encode, dicts, max_dim=0, bc1_block=0, fmt_blocks=None):
-        self.L, self.block, self.cache, self.encode, self.dicts, self.max_dim = lib_open(lib), block, cache, encode, dicts, max_dim
+    def __init__(self, lib, block, cache, encode, dicts, max_dim=0, bc1_block=0, fmt_blocks=None, gob=0):
+        self.L, self.block, self.cache, self.encode, self.dicts, self.max_dim = lib_open(lib, gob), block, cache, encode, dicts, max_dim
         self.bc1_block = bc1_block or block
         self.fmt_blocks = norm_fmt_blocks(*(fmt_blocks or ()))
         self.c = collections.Counter(); self.planes = []; self.formats = collections.Counter(); self.seen = set(); self.errors = []
@@ -355,6 +362,24 @@ def find_romfs(path):
     raise SystemExit(f'no RomFS found under {path}')
 
 
+def gob_switch2(romfs):
+    """1 when the game's code is built for the Switch 2, 0 otherwise. The runtime then reads a texture's storage with the Switch 2's order of the 16-byte pieces inside a GOB
+    (nvn_deswizzle.h nvn_gob_switch2, set by hle_nvn.c from loader.c dm_sdk_ounce: "spec: Ounce" in the sdk module, where a Switch 1 SDK says "spec: NX"), and so must every tool that keys
+    or encodes its planes: in the Switch 1's order a plane larger than two block rows comes out as a weave of misplaced 4x4 blocks, under a key the runtime never asks for (Ocarina of Time,
+    Switch 2: woven lamps and leaves with holes with Store textures once, a prebuilt pack the runtime missed for 11,482 of 17,560 plane lookups in Link's house without it). The sdk module is the ExeFS's beside
+    the RomFS (a build folder's extract/<version>/ExeFS/sdk); a RomFS without one (a folder of files, the tests) reads as a Switch 1 game: bntx_astc.py / tex_once.py --gob sets it"""
+    base = os.path.dirname(os.path.abspath(romfs.rstrip('/')))
+    sdk = os.path.join(base, 'ExeFS', 'sdk')
+    if not os.path.isfile(sdk): return 0
+    import nso   # dm/tools: the one loader of code modules (its segments decompressed)
+    with open(sdk, 'rb') as f: return int(b'spec: Ounce' in bytes(nso.load(f.read(), sdk).image))
+
+
+def gob_of(arg, romfs):
+    """--gob: auto (gob_switch2), switch (0) or switch2 (1)"""
+    return gob_switch2(romfs) if arg in (None, 'auto') else int(arg == 'switch2')
+
+
 def image_files(path):
     """[(name, offset, size)] of an image's files"""
     import romfs
@@ -418,8 +443,9 @@ def block_of(nvn, block, bc1_block, fmt_blocks=None):
     return (bc1_block or block) if nvn in BC1_NVN else block
 
 
-def fingerprint(romfs, block, max_dim=0, bc1_block=0, fmt_blocks=None):
+def fingerprint(romfs, block, max_dim=0, bc1_block=0, fmt_blocks=None, gob=None):
     h = hashlib.sha256(); h.update(sources_hash().encode()); h.update(b'block %d\0max_dim %d\0' % (block, max_dim))
+    h.update(b'gob %d\0' % (gob_switch2(romfs) if gob is None else int(gob)))   # the GOB order the planes were read in: a pack of the other order holds other keys
     h.update(b'bc4 %d bc5 %d bc6h %d\0' % norm_fmt_blocks(*(fmt_blocks or ())))   # the blocks BC4 / BC5 / BC6H planes are keyed and encoded at
     h.update(b'bc1_block %d\0' % (bc1_block or block))   # BC1 planes are keyed and encoded at their own block   # the texture cap decides which levels the pack holds
     with open(os.path.abspath(__file__), 'rb') as f: h.update(f.read())   # the tool's own logic (what it finds and how it names it) is part of what the pack holds
@@ -435,13 +461,13 @@ def fingerprint(romfs, block, max_dim=0, bc1_block=0, fmt_blocks=None):
 _STATE = {}
 
 
-def init_worker(lib, block, cache, encode, romfs, dicts, max_dim=0, bc1_block=0, fmt_blocks=None):
-    _STATE.update(lib=lib, block=block, bc1_block=bc1_block, fmt_blocks=fmt_blocks, max_dim=max_dim, cache=cache, encode=encode, romfs=romfs, dicts=dicts, fd=os.open(romfs, os.O_RDONLY) if os.path.isfile(romfs) else None)
+def init_worker(lib, block, cache, encode, romfs, dicts, max_dim=0, bc1_block=0, fmt_blocks=None, gob=0):
+    _STATE.update(lib=lib, block=block, bc1_block=bc1_block, fmt_blocks=fmt_blocks, max_dim=max_dim, gob=gob, cache=cache, encode=encode, romfs=romfs, dicts=dicts, fd=os.open(romfs, os.O_RDONLY) if os.path.isfile(romfs) else None)
 
 
 def work(batch):
     s = _STATE
-    job = Job(s['lib'], s['block'], s['cache'], s['encode'], s['dicts'], s['max_dim'], s['bc1_block'], s['fmt_blocks'])
+    job = Job(s['lib'], s['block'], s['cache'], s['encode'], s['dicts'], s['max_dim'], s['bc1_block'], s['fmt_blocks'], s.get('gob', 0))
     for name, off, size in batch:
         if s['fd'] is not None: head = os.pread(s['fd'], 4, off)
         else:
@@ -521,16 +547,17 @@ def batches(files, n):
     if batch: yield batch
 
 
-def prebuild(inp, out, block=4, workers=None, scan_only=False, force=False, log=print, drop_cache=False, verbose=False, max_dim=0, bc1_block=0, fmt_blocks=None):
+def prebuild(inp, out, block=4, workers=None, scan_only=False, force=False, log=print, drop_cache=False, verbose=False, max_dim=0, bc1_block=0, fmt_blocks=None, gob=None):
     t0 = time.monotonic()
     fmt_blocks = norm_fmt_blocks(*(fmt_blocks or ()))
     block = int(block); max_dim = max(int(max_dim or 0), 0); bc1_block = int(bc1_block or block)
     if block not in (4, 6): raise SystemExit('--block must be 4 or 6')
     if bc1_block not in (4, 5, 6): raise SystemExit('--bc1-block must be 4, 5 or 6')
     romfs = find_romfs(inp)
+    gob = gob_switch2(romfs) if gob is None else int(gob)   # the order the runtime reads this game's textures in
     os.makedirs(out, exist_ok=True)
     pack, cache = os.path.join(out, 'astc-ro.pack'), os.path.join(out, 'cache')
-    fp = fingerprint(romfs, block, max_dim, bc1_block, fmt_blocks)
+    fp = fingerprint(romfs, block, max_dim, bc1_block, fmt_blocks, gob)
     have = read_pack_header(pack)
     if have and have['fingerprint'] == fp and not force and not scan_only:
         rep = {}
@@ -544,13 +571,13 @@ def prebuild(inp, out, block=4, workers=None, scan_only=False, force=False, log=
     files = image_files(romfs) if os.path.isfile(romfs) else folder_files(romfs)
     files = smash_arc_files(romfs, files)
     dicts = zs_dicts(romfs, files, lib)
-    log(f'astc: {romfs}: {len(files)} files, {sum(f[2] for f in files) / 2**30:.1f} GiB; ASTC {block}x{block}{f' (BC1 {bc1_block}x{bc1_block})' if bc1_block != block else ''}; BC4/BC5/BC6H blocks {'/'.join(str(b) for b in fmt_blocks)}; texture cap {max_dim or 'none'}; library {os.path.basename(lib)}')
+    log(f'astc: {romfs}: {len(files)} files, {sum(f[2] for f in files) / 2**30:.1f} GiB; {'Switch 2' if gob else 'Switch'} GOB order; ASTC {block}x{block}{f' (BC1 {bc1_block}x{bc1_block})' if bc1_block != block else ''}; BC4/BC5/BC6H blocks {'/'.join(str(b) for b in fmt_blocks)}; texture cap {max_dim or 'none'}; library {os.path.basename(lib)}')
     workers = workers or os.cpu_count() or 4
     total = collections.Counter(); formats = collections.Counter(); keys = {}; errors = []; plane_count = 0; hits = 0
     unique = {}
     scanned = 0; t1 = time.monotonic()
     chunks = list(batches(files, 64 << 20 if len(files) > workers * 8 else 1))
-    with cf.ProcessPoolExecutor(workers, initializer=init_worker, initargs=(lib, block, cache, not scan_only, romfs, dicts, max_dim, bc1_block, fmt_blocks)) as ex:
+    with cf.ProcessPoolExecutor(workers, initializer=init_worker, initargs=(lib, block, cache, not scan_only, romfs, dicts, max_dim, bc1_block, fmt_blocks, gob)) as ex:
         for r in ex.map(work, chunks):
             total.update(r['c']); formats.update(r['formats']); errors += r['errors']; total['n_errors'] += r['n_errors']
             for key, key2, w, h, astc, hit, bpp in r['planes']:
@@ -565,7 +592,7 @@ def prebuild(inp, out, block=4, workers=None, scan_only=False, force=False, log=
     rgba = sum(w * h * 4 for w, h, _, _ in unique.values())   # as RGBA8 (the pack's convention)
     decoded = sum(w * h * bpp for w, h, _, bpp in unique.values())   # in the storage the runtime uses without the pack (R8, RG8, RG11B10Float, RGBA8)
     digest = hashlib.sha256(b''.join(bytes.fromhex(k) for k in sorted(unique))).hexdigest()
-    rep = dict(input=romfs, block=block, bc1_block=bc1_block, max_dim=max_dim, files=len(files), textures_found=total['textures'], bntx_files=total['bntx'], eligible_textures=total['eligible'], converted_textures=total['converted'],
+    rep = dict(input=romfs, gob='switch2' if gob else 'switch', block=block, bc1_block=bc1_block, max_dim=max_dim, files=len(files), textures_found=total['textures'], bntx_files=total['bntx'], eligible_textures=total['eligible'], converted_textures=total['converted'],
                repeated_textures=total['repeat'], nutexb_files=total['nutexb'], layout_differs=total['layout_differs'], layout_failed=total['layout_failed'], unparsed=total['unparsed'], short=total['short'],
                ineligible_shape=total['ineligible_shape'], container_errors=total['container_errors'], plane_errors=total['plane_errors'], planes=plane_count, unique_planes=len(unique), keys_sha256=digest,
                decoded_rgba_bytes_covered=rgba, astc_bytes=sum(a for _, _, a, _ in unique.values()), decoded_bytes_covered=decoded, fmt_blocks=dict(zip(('bc4', 'bc5', 'bc6h'), fmt_blocks)),
@@ -594,6 +621,7 @@ def main():
         ap.add_argument('--%s-block' % nm, type=int, default=None, choices=(0, 4, 5, 6), help='ASTC block size of the %s textures (the runtime reads %s; default %d); 0 leaves the format out of the pack' % (nm.upper(), rt, dflt))
     ap.add_argument('--max-dim', type=int, default=0, help="the game's texture cap (DM_BC_MAX_DIM, 0 = none): only the mip levels the runtime keeps under it are packed")
     ap.add_argument('--workers', type=int, default=0, help='processes (default: every core)')
+    ap.add_argument('--gob', choices=('auto', 'switch', 'switch2'), default='auto', help="the order inside a GOB the textures are read in (default: the game's sdk module, as the runtime decides)")
     ap.add_argument('--scan-only', action='store_true', help='find and key the planes; encode and write nothing')
     ap.add_argument('--force', action='store_true', help='rebuild even if the pack is up to date')
     ap.add_argument('--drop-cache', action='store_true', help='delete the cache/ folder once the pack is written (it holds the same entries again)')
@@ -603,7 +631,7 @@ def main():
     if a.auto_layout:
         if not a.scan_only: ap.error('--auto-layout is a diagnostic: use it with --scan-only')
         os.environ['BNTX_ASTC_AUTO_LAYOUT'] = '1'
-    prebuild(a.input, a.out, a.block, a.workers or None, a.scan_only, a.force, drop_cache=a.drop_cache, verbose=a.json, max_dim=a.max_dim, bc1_block=a.bc1_block, fmt_blocks=(a.bc4_block, a.bc5_block, a.bc6h_block))
+    prebuild(a.input, a.out, a.block, a.workers or None, a.scan_only, a.force, drop_cache=a.drop_cache, verbose=a.json, max_dim=a.max_dim, bc1_block=a.bc1_block, fmt_blocks=(a.bc4_block, a.bc5_block, a.bc6h_block), gob=None if a.gob == 'auto' else int(a.gob == 'switch2'))
 
 
 if __name__ == '__main__':

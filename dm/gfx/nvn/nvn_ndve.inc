@@ -207,6 +207,9 @@ static void ndve_compare(id<MTLTexture> a, id<MTLTexture> b, int slot) {
 static int ndve_engine_dispatch(NvShader *cs, const p_dispatch *dp) {
     const int chk = ndve_check();
     if ((!ndve_mode() && !chk) || g_nd.off) return 0;
+    // DM_MOVIE_NETWORK=bypass (the Apple TV's setting) skips the network's layers before they reach the engine (up_movie), so the engine has nothing to compute: its colour conversion
+    // (49dff010) still came here and built the engine, whose tensors (private, kept for good) are 88 MB, made at the first movie frame and never read (Ocarina of Time's Link's house)
+    if (up_movie_mode() == 1) { static int said; if (!said++) MLOG("NDVE engine not built: DM_MOVIE_NETWORK=bypass skips the movie network it would compute"); return 0; }
     int i = ndve_index(cs, 0); if (i < 0) return 0;
     if (g_nd.state == 0) ndve_build();
     if (!chk && !g_nd.pos && !sw_on(ndve_mode())) return 0;   // an A/B phase changes only between sequences

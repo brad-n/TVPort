@@ -35,14 +35,23 @@ static int arr_len(NSString *ty, NSString **el) {
 
 // Whether a storage buffer binding may be written: current B reflection carries the translator's write flag ("rw"); old samples without it fall back to SPIRV-Cross's const device qualifier.
 static int sbuf_rw(NSDictionary *b) { id rw = b[@"rw"]; if (rw) return [rw boolValue]; id ty = b[@"msl_type"]; return !([ty isKindOfClass:[NSString class]] && [ty hasPrefix:@"const "]); }
+void nvn_refl_free(nvn_refl *r) { free(r->b); free(r->uv_aff); free(r->fc_scale); free(r->c1); r->b = NULL; r->uv_aff = NULL; r->fc_scale = NULL; r->c1 = NULL; }
+int nvn_refl_full(nvn_refl *r) {
+    if (!r->b) r->b = calloc(NVN_REFL_MAXB, sizeof *r->b);
+    if (!r->uv_aff) r->uv_aff = calloc(32, sizeof *r->uv_aff);
+    if (!r->fc_scale) r->fc_scale = calloc(32, sizeof *r->fc_scale);
+    return r->b && r->uv_aff && r->fc_scale;
+}
+// o is overwritten whole (what it pointed to is not freed: nvn_refl_free first)
 int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
     memset(o, 0, sizeof *o);
-    #define FAIL(...) do { free(o->c1); o->c1 = NULL; snprintf(err, errlen, __VA_ARGS__); return 1; } while (0)
+    #define FAIL(...) do { nvn_refl_free(o); snprintf(err, errlen, __VA_ARGS__); return 1; } while (0)
     if (![j[@"route"] isEqual:@"B"]) FAIL("not a B reflection (route ≠ B; route A / PC-chain reflection is retired)");
     {   // Translated original Switch shaders: kind and NVN slot number are already parsed from the MSL member names by dmsh_build.py
         NSArray *bs = j[@"bindings"];
         if (![bs isKindOfClass:[NSArray class]]) FAIL("missing bindings");
         if (bs.count > NVN_REFL_MAXB) FAIL("%lu bindings, over the limit %d", (unsigned long)bs.count, NVN_REFL_MAXB);
+        if (!(o->b = calloc(bs.count ? bs.count : 1, sizeof *o->b))) FAIL("binding allocation failed");
         o->route_b = 1; o->abi = 0;   // spirv-cross set 0 → [[buffer(0)]]
         for (NSDictionary *b in bs) {
             NSString *k = b[@"kind"]; nvn_rbind *r = &o->b[o->nb];
@@ -165,6 +174,7 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             NSArray *refs[4] = {e[@"sx"], e[@"ox"], e[@"sy"], e[@"oy"]}; int ok = 1;
             for (int q = 0; q < 4; q++) { NSArray *r = refs[q]; if (![r isKindOfClass:[NSArray class]] || r.count != 3) { ok = 0; break; }
                 int sl = [r[0] intValue], vec = [r[1] intValue], cmp = [r[2] intValue]; if (sl < 0 || sl > 15 || vec < 0 || vec > 4095 || cmp < 0 || cmp > 3) { ok = 0; break; }
+                if (!o->uv_aff && !(o->uv_aff = calloc(32, sizeof *o->uv_aff))) FAIL("affine output table allocation failed");
                 o->uv_aff[l][q] = (uint32_t)(sl << 16 | vec << 2 | cmp); }
             if (ok) o->uv_aff_attr[l] = (int8_t)a; }
         NSDictionary *uv = [ra isKindOfClass:[NSDictionary class]] ? ra[@"uv_from_attr"] : nil;
@@ -175,7 +185,8 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
         if ([fe isKindOfClass:[NSDictionary class]]) {
             for (NSDictionary *c in fe[@"calls"]) { int i = [c[@"fc"] intValue], r = [c[@"tex_reg"] intValue], l = [c[@"varying_locn"] intValue]; NSArray *fp = c[@"frag_pos"];
                 if ([fp isKindOfClass:[NSArray class]]) {   // a pixel-position sample: two uniform references, no interpolated output
-                    if (fp.count != 2 || i >= 32) FAIL("fetch call %d: frag_pos is not two uniform references", i);
+                    if (fp.count != 2 || i < 0 || i >= 32) FAIL("fetch call %d: frag_pos is not two uniform references", i);
+                    if (!o->fc_scale && !(o->fc_scale = calloc(32, sizeof *o->fc_scale))) FAIL("pixel-position table allocation failed");
                     for (int q = 0; q < 2; q++) { NSArray *x = fp[q]; int sl = [x isKindOfClass:[NSArray class]] && x.count == 3 ? [x[0] intValue] : -1, vec = sl >= 0 ? [x[1] intValue] : -1, cmp = sl >= 0 ? [x[2] intValue] : -1;
                         if (sl < 0 || sl > 15 || vec < 0 || vec > 4095 || cmp < 0 || cmp > 3) FAIL("fetch call %d: frag_pos uniform reference out of range", i);
                         o->fc_scale[i][q] = (uint32_t)(sl << 16 | vec << 2 | cmp); }

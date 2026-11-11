@@ -42,8 +42,8 @@ def sarc_members_off(d):
 
 
 class MJob(B.Job):
-    def __init__(self, lib, dicts):
-        super().__init__(lib, 4, None, False, dicts, 0)
+    def __init__(self, lib, dicts, gob=0):
+        super().__init__(lib, 4, None, False, dicts, 0, gob=gob)   # gob: the GOB order the runtime reads the game in (bntx_astc.gob_switch2)
         self.unique = {}          # key -> (w, h, in_cap512)
         self.alt = set()
         self.sigs = collections.Counter()      # chain -> texture bytes zeroed
@@ -183,14 +183,14 @@ class MJob(B.Job):
 
 
 def init(lib, romfs, attr):
-    B.init_worker(lib, 4, None, False, romfs, {}, 0)
+    B.init_worker(lib, 4, None, False, romfs, {}, 0, gob=B.gob_switch2(romfs))
     _X['attr'] = ctypes.CDLL(attr); _X['attr'].dm_yaz0_attr.restype = ctypes.c_double
     _X['attr'].dm_yaz0_attr.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
 
 
 def work(batch):
     s = B._STATE
-    job = MJob(s['lib'], {})
+    job = MJob(s['lib'], {}, s.get('gob', 0))
     files = []   # per top-level file: (name, off, slot, dominant sig, tex bytes, freed, after_est)
     zr = []
     for name, off, size in batch:
