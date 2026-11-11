@@ -59,6 +59,9 @@ Run time, per plane, before deswizzling and hashing: if length >= 16, bytes [0,8
 8-byte prefix up in the pack's sorted index. Exactly one entry whose ASTC payload size matches the plane's expected ASTC size -> use it
 (no deswizzle, no hash). Otherwise fall back to today's path (deswizzle + hash + lookup). Only if that also misses AND the plane looked
 tagged, log `[RED] ASTC: tagged plane unresolved` (once per texture, with format/size/level) and count it: such a plane would draw from zeros.
+Tags are only in a stripped image, the one that carries their pack: in any other image (a plain or compressed-only one, as a build whose pack could not be prepared
+installs) a plane that merely looks tagged (one 16-byte block, or two 8-byte ones whose second is zero) is the game's data, an ordinary miss, queued, with no red line
+(`astc_tag_missed`; docs/reference/rendering.md, "Planes that look tagged stayed decoded in an image that is not stripped").
 Any BC decode of plane bytes that look tagged (the decoded/CPU path, partial copies) logs `[RED] ASTC: tagged plane decoded` once and counts it.
 Counters join the existing ASTC counters line after each `memory up to frame` line: tagged hits, tagged unresolved, tagged decoded.
 

@@ -3821,6 +3821,11 @@ static int astc_content_present(const tex_t *t) {
 // The planes are enumerated by nvn_astc_walk_planes (tex/nvn_astc_planes.c), the function the offline prebuild (dm/gfx/tools/bntx_astc.py) keys its planes with
 // Tagged planes (docs/texture_once.md section 2): the first bytes of a stripped plane are a key prefix and the rest zeros, so it is looked up before any deswizzle or hash. A plane that looks tagged and
 // is found by neither the tag nor the hash would draw from zeros: "[RED] ASTC: tagged plane unresolved", once per texture, and counted; BC bytes that look tagged and are decoded: "... decoded"
+// Tags are only in a stripped image: tex_once.py writes them into the image that carries their pack (g_embedded). Anywhere else (a plain or compressed-only RomFS image, which is what a
+// build whose pack could not be prepared sends) bytes that look tagged are the game's own BC data: a plane of one 16-byte block, or of two 8-byte ones, whose second half is zero looks so.
+// Its miss is an ordinary miss, queued for the background encoder, with no red line; before, it was never queued, so its texture stayed decoded in every session (Ocarina of Time, Apple TV
+// run 17: 1,413 planes "unresolved"). A stripped overlay (DM_ROMFS_OVERLAY) over a plain image is not a stripped image
+static int astc_tag_missed(nvn_astc_tag_result r) { return r == NVN_TAG_MISS && g_embedded; }
 static void astc_tag_event(const tex_t *t, int kind, unsigned level, uint32_t w, uint32_t h) {
     nvn_bc_astc_tag_note(kind);
     unsigned bit = kind == NVN_TAG_NOTE_DECODED ? 16u : 8u;
@@ -3834,7 +3839,7 @@ static int astc_probe_raw(void *ctx, unsigned level, unsigned layer, uint32_t w,
     (void)level; (void)layer; astc_probe_ctx *c = ctx; c->tagged = 0;
     nvn_astc_tag_result r = nvn_bc_astc_tag_fetch(stored, len, astc_plane_bytes(w, h, c->block), NULL);   // the pack entry is only checked for here; the upload reads it
     if (r == NVN_TAG_HIT) return 1;
-    c->tagged = r == NVN_TAG_MISS;
+    c->tagged = astc_tag_missed(r);
     return 0;
 }
 static int astc_probe_plane(void *ctx, unsigned level, unsigned layer, uint32_t w, uint32_t h, const void *bc, size_t need) {
@@ -4657,7 +4662,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
                 uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC), po, pl;
                 if (!nvn_astc_plane_storage(&t->d, l + sk, y, &po, &pl) && po + pl <= t->L.size) {   // a stripped plane (a tag and zeros): its entry by the tag, no deswizzle, no hash
                     nvn_astc_tag_result tr = nvn_bc_astc_tag_fetch(src + po, (size_t)pl, apitch * arows, (uint8_t *)stg.contents + off);
-                    hit = tr == NVN_TAG_HIT; tagged = tr == NVN_TAG_MISS;
+                    hit = tr == NVN_TAG_HIT; tagged = astc_tag_missed(tr);
                 }
                 if (!hit) {
                     uint8_t *cb = malloc(pitch * rows);
@@ -11842,20 +11847,24 @@ static id<MTLTexture> stand_alloc(MTLTextureDescriptor *d) {
     return [h newTextureWithDescriptor:d];
 }
 // What a stand-in holds of a texture: its levels from l0 on as they are (n of them, the first of w x h texels), or, when it has no level of STAND_LEVEL bytes or less, its last level
-// cut down to nx x ny blocks, every step-th block of every step-th block row (nvn_deswizzle_pick). 0: none (a format without a block size, more levels than its size holds)
+// cut down to nx x ny blocks, every step-th block of every step-th block row (nvn_deswizzle_pick). 0: none (a format without a block size, more levels than its size holds).
+// The byte limits count the stand-in's own bytes: a block's, or on a GPU without BC its 4x4 texels decoded (stand_ubpp), so it takes no more memory there
 typedef struct { unsigned l0, n; uint32_t w, h, step, nx, ny; } stand_shape;
+// The bytes a texel of the stand-in takes when its BC blocks are decoded on the CPU into the format the texture itself is made in on a GPU without BC (bc_unpack, tex_desc); 0: the
+// stand-in holds the texture's own format (Metal has it). Metal aborts the process on a descriptor of a BC format such a GPU lacks (an Apple TV A15: BC4_RUnorm, pixel format 140)
+static int stand_ubpp(const tex_t *t) { uint32_t upf; int ubpp; return bc_unpack(t->d.format, &upf, &ubpp) ? ubpp : 0; }
 static int stand_shape_of(const tex_t *t, stand_shape *s) {
-    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh), ubpp = stand_ubpp(t), obpb = ubpp ? bw * bh * ubpp : bpb;   // obpb: what a block takes in the stand-in
     uint32_t W = MAX(t->d.width, 1u), H = MAX(t->d.height, 1u), levels = MAX(t->d.levels, 1u), fit = 1;
     while (MAX(W, H) >> fit) fit++;
     if (!bpb || levels > fit) return 0;
     memset(s, 0, sizeof *s);
     unsigned l = 0; uint32_t bx = 0, by = 0;
-    for (; l < levels; l++) { bx = (MAX(W >> l, 1u) + bw - 1) / bw; by = (MAX(H >> l, 1u) + bh - 1) / bh; if ((size_t)bx * by * bpb <= STAND_LEVEL) break; }
+    for (; l < levels; l++) { bx = (MAX(W >> l, 1u) + bw - 1) / bw; by = (MAX(H >> l, 1u) + bh - 1) / bh; if ((size_t)bx * by * obpb <= STAND_LEVEL) break; }
     if (l < levels) { s->l0 = l; s->n = levels - l; s->w = MAX(W >> l, 1u); s->h = MAX(H >> l, 1u); return 1; }
     if (bpb > 16 || (bpb & (bpb - 1))) return 0;   // (a block in one 16-byte piece of the storage, nvn_deswizzle_pick)
-    uint32_t step = (uint32_t)sqrt((double)bx * by * bpb / STAND_PICK); if (step < 2) step = 2;
-    while ((size_t)MAX(bx / step, 1u) * MAX(by / step, 1u) * bpb > STAND_PICK) step++;
+    uint32_t step = (uint32_t)sqrt((double)bx * by * obpb / STAND_PICK); if (step < 2) step = 2;
+    while ((size_t)MAX(bx / step, 1u) * MAX(by / step, 1u) * obpb > STAND_PICK) step++;
     s->l0 = levels - 1; s->n = 1; s->step = step; s->nx = MAX(bx / step, 1u); s->ny = MAX(by / step, 1u); s->w = s->nx * bw; s->h = s->ny * bh;
     return 1;
 }
@@ -11870,18 +11879,30 @@ static int stand_layers(const treg_t *r, unsigned *s0, unsigned *ns, MTLTextureT
     if (*tt == MTLTextureType2D) *ns = 1; else if (*tt != MTLTextureType2DArray) return 0;
     return *s0 + *ns <= depth && *ns <= STAND_LAYERS;
 }
-// The stand-in's bytes, read from the texture's storage: into the stand-in, and their hash when asked for (pool_first_read). 0 when the storage cannot be read so
+// The stand-in's bytes, read from the texture's storage: into the stand-in (BC blocks decoded first on a GPU without BC, stand_ubpp), and their hash when asked for (pool_first_read).
+// 0 when the storage cannot be read so
 static int stand_fill(const tex_t *t, const stand_shape *s, unsigned s0, unsigned ns, id<MTLTexture> into, uint64_t *sum) {
-    static uint8_t buf[STAND_PICK]; int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh); uint64_t h = 1469598103934665603ull;
+    static uint8_t buf[STAND_PICK], dec[STAND_PICK]; int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh), ubpp = stand_ubpp(t); uint64_t h = 1469598103934665603ull;
     for (unsigned y = 0; y < ns; y++) for (unsigned k = 0; k < s->n; k++) {
         uint32_t w = s->step ? s->w : MAX(s->w >> k, 1u), hh = s->step ? s->h : MAX(s->h >> k, 1u); size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (hh + bh - 1) / bh;
-        if (pitch * rows > sizeof buf) return 0;
+        if (pitch * rows > sizeof buf || (size_t)w * hh * ubpp > sizeof dec) return 0;
         if (s->step ? nvn_deswizzle_pick(&t->d, s->l0, s0 + y, t->mem, s->step, buf, s->nx, s->ny) : nvn_deswizzle(&t->d, s->l0 + k, s0 + y, t->mem, buf, pitch)) return 0;
-        if (into) [into replaceRegion:MTLRegionMake2D(0, 0, w, hh) mipmapLevel:k slice:y withBytes:buf bytesPerRow:pitch bytesPerImage:pitch * rows];
+        if (into && ubpp) {
+            if (nvn_bc_decode(t->d.format, buf, pitch, w, hh, dec, (size_t)w * ubpp)) return 0;
+            [into replaceRegion:MTLRegionMake2D(0, 0, w, hh) mipmapLevel:k slice:y withBytes:dec bytesPerRow:(size_t)w * ubpp bytesPerImage:(size_t)w * ubpp * hh];
+        } else if (into) [into replaceRegion:MTLRegionMake2D(0, 0, w, hh) mipmapLevel:k slice:y withBytes:buf bytesPerRow:pitch bytesPerImage:pitch * rows];
         if (sum) for (size_t i = 0; i < pitch * rows; i++) h = (h ^ buf[i]) * 1099511628211ull;
     }
     if (sum) *sum = h;
     return 1;
+}
+// Whether a plane the stand-in would read looks tagged (docs/texture_once.md section 2; only in a stripped image, which only a GPU without BC takes)
+static int stand_tagged(const tex_t *t, const stand_shape *s, unsigned s0, unsigned ns) {
+    for (unsigned y = 0; y < ns; y++) for (unsigned k = 0; k < s->n; k++) {
+        uint64_t off, len;
+        if (!nvn_astc_plane_storage(&t->d, s->l0 + k, s0 + y, &off, &len) && off + len <= t->L.size && nvn_bc_astc_looks_tagged((const uint8_t *)t->mem + off, (size_t)len)) return 1;
+    }
+    return 0;
 }
 static int pool_first_log(void) { static int v = -1; if (v < 0) v = getenv("DM_NVN_POOL_FIRST") != NULL; return v; }
 static int stand_make_(int id_);
@@ -11896,9 +11917,14 @@ static int stand_make_(int id_) {
         || (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE)) || (t->pool && nvn_sparse_pool(t->pool))) return 0;
     unsigned s0, ns; MTLTextureType tt; stand_shape sh;
     if (!stand_layers(r, &s0, &ns, &tt) || !stand_shape_of(t, &sh)) return 0;
-    uint32_t pf = 0, view_pf = 0; uint8_t sw[4];
+    uint32_t pf = 0, view_pf = 0, upf; uint8_t sw[4]; int ubpp = 0;
     if (!nvn_fmt_to_mtl(t->d.format, &pf, NULL) || !pf) return 0;
+    if (bc_unpack(t->d.format, &upf, &ubpp)) {   // a GPU without BC: the decoded format the texture is made in (tex_desc), whose view of a BC format is that format decoded (tex_by_id)
+        if (g_embedded && stand_tagged(t, &sh, s0, ns)) return 0;   // a stripped plane is a tag and zeros, not the texture's colours: the dummy, as before
+        pf = upf;
+    }
     int need_sw = treg_swizzle(r, (MTLPixelFormat)pf, 0, sw, &view_pf);
+    if (view_pf && ubpp) { int vbpp; if (!bc_unpack(r->v.format, &view_pf, &vbpp)) return 0; }   // (a view of BC blocks as an uncompressed format has no Metal view: tex_by_id leaves the slot empty)
     if (view_pf && view_pf != pf) { if (tex_need_pfv((MTLPixelFormat)pf, (MTLPixelFormat)view_pf)) return 0; pf = view_pf; }   // the sRGB or linear twin holds the same bytes; another format is a view the stand-in does not make
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
     d.textureType = tt; d.pixelFormat = (MTLPixelFormat)pf; d.width = sh.w; d.height = sh.h; d.mipmapLevelCount = sh.n; if (tt == MTLTextureType2DArray) d.arrayLength = ns;
@@ -16609,7 +16635,7 @@ static void astc_first_copy(const p_copy_b2t *c, uint32_t size) {
         if (packed) { for (size_t r = 0; r < rows; r++) memcpy(packed + r * tight, plane + r * row, tight); plane = packed; }
         nvn_astc_tag_result tr = nvn_bc_astc_tag_fetch(plane, tight * rows, astc_plane_bytes((uint32_t)c->r.width, (uint32_t)c->r.height, astc_block_for(t->d.format)), NULL);   // a stripped plane: its entry by the tag
         if (tr == NVN_TAG_HIT) continue;
-        if (tr == NVN_TAG_MISS) {   // a tag nothing resolves: the hash is the last chance, and nothing is queued (zeros)
+        if (astc_tag_missed(tr)) {   // a tag nothing resolves: the hash is the last chance, and nothing is queued (zeros)
             if (nvn_bc_astc_has_plane(t->d.format, plane, tight * rows, (uint32_t)c->r.width, (uint32_t)c->r.height, astc_block_for(t->d.format)) != 1) { all = 0; astc_tag_event(t, NVN_TAG_NOTE_UNRESOLVED, level, (uint32_t)c->r.width, (uint32_t)c->r.height); }
             continue;
         }
@@ -16661,12 +16687,12 @@ static void copy_b2t(const p_copy_b2t *c, uint32_t size) {
             if (tr == NVN_TAG_HIT) hit = 1;
             else if (astc_sync()) bad = nvn_bc_astc_encode(c->tex->d.format, plane, tight * rows, c->r.width, c->r.height, blk, (uint8_t *)tb.contents + z * aimg, aimg, cache, ro, &hit);
             else {   // background: a plane with no cache entry is filled with void blocks and queued, not encoded here (a tag with no entry is not queued: zeros)
-                hit = tr == NVN_TAG_MISS ? nvn_bc_astc_fetch_noqueue(c->tex->d.format, plane, tight * rows, c->r.width, c->r.height, blk, (uint8_t *)tb.contents + z * aimg, aimg)
+                hit = astc_tag_missed(tr) ? nvn_bc_astc_fetch_noqueue(c->tex->d.format, plane, tight * rows, c->r.width, c->r.height, blk, (uint8_t *)tb.contents + z * aimg, aimg)
                                          : nvn_bc_astc_fetch(c->tex->d.format, plane, tight * rows, c->r.width, c->r.height, blk, (uint8_t *)tb.contents + z * aimg, aimg);
                 bad = hit < 0;
                 if (hit == 0) { uint8_t vb[16]; astc_void_block(c->tex->d.format, vb); for (size_t i = 0; i < aimg; i += 16) memcpy((uint8_t *)tb.contents + z * aimg + i, vb, 16); }
             }
-            if (tr == NVN_TAG_MISS && hit != 1) astc_tag_event(c->tex, NVN_TAG_NOTE_UNRESOLVED, level + bc_skip(c->tex), (uint32_t)c->r.width, (uint32_t)c->r.height);
+            if (astc_tag_missed(tr) && hit != 1) astc_tag_event(c->tex, NVN_TAG_NOTE_UNRESOLVED, level + bc_skip(c->tex), (uint32_t)c->r.width, (uint32_t)c->r.height);
             if (bad) RED_ONCE(168, "ASTC transcode failed: format %#x %dx%d", c->tex->d.format, c->r.width, c->r.height);
         }
         free(packed);

@@ -1075,7 +1075,10 @@ def prebuild_astc(game: Game, block: int, python: str, texture_cap: int, bc1_blo
     try:
         stream([python, '-I', REPO / 'dm/gfx/tools/bntx_astc.py', game.romfs, '--out', out, '--block', str(block), '--bc1-block', str(bc1_block or block), '--max-dim', str(texture_cap), '--drop-cache'], cwd=REPO, log_filter=lambda line: line.startswith('astc'))
     except Failure as failure:
-        emit('log', line=f'Compressed textures could not be prepared ({str(failure).splitlines()[-1][:300] if str(failure) else "no reason given"}). The game prepares them while it runs instead.')
+        # The build goes on without a pack, and so without Store textures once: until the game has encoded a texture in the background it holds it decoded, several times its ASTC size
+        # (Ocarina of Time on the Apple TV, run 17: 600 more textures decoded, 455 MB against 188, and the app ran out of memory). The engine's log says so too ([RED] ASTC: no prebuilt texture pack)
+        emit('log', line=f'Compressed textures could not be prepared ({str(failure).splitlines()[-1][:300] if str(failure) else "no reason given"}). The game prepares them while it runs instead; '
+                         'until it has, its textures take several times the memory, which a large game may not have on the Apple TV. Build & Install again once the reason is fixed.')
         return None
     return pack if pack.is_file() else None
 

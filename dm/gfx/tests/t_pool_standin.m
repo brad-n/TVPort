@@ -1,7 +1,9 @@
 // A texture the pool walk leaves out for good (the budget is full, no shader has read its ID) holds a stand-in in the tables until its first read: its own smallest levels, or its
 // last level cut down to every n-th block when it has none that small (pool_stand, issue #1969). Below the budget the entry stays the dummy, as the walk goes on and makes the
 // texture; so does a texture of a type that has no stand-in and an unwritten render target. A read makes the texture and lets the stand-in go, as does another registration.
-// DM_NVN_POOL_STANDIN=0: the dummy everywhere, as before
+// DM_NVN_POOL_STANDIN=0: the dummy everywhere, as before. DM_TEST_NO_BC=1 (a GPU without BC, the Apple TV's A15): a BC texture's stand-in holds its blocks decoded into the format the
+// texture itself is made in there, under the same byte limits counted decoded, and no stand-in has a BC format (Metal aborts the process on one: run 17's first session, BC4_RUnorm);
+// in a stripped image a stand-in whose planes hold tags is not made
 #include "../nvn/nvn_mtl.m"
 void *front_metal_layer(void) { return NULL; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
@@ -65,9 +67,29 @@ static int picked_is(id<MTLTexture> t, uint32_t nx, uint32_t ny, uint32_t bpb, u
     return 1;
 }
 static id<MTLTexture> stand(int i) { return (__bridge id<MTLTexture>)g_treg[i].stand; }
+// No BC: whether level k of a stand-in holds level l (layer 0) of t, its blocks decoded on the CPU (RGBA8, 4 bytes a texel)
+static int decoded_is(id<MTLTexture> s, const tex_t *t, unsigned l, unsigned k) {
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh); uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u); size_t pitch = (size_t)((w + 3) / 4) * bpb, rows = (h + 3) / 4;
+    if (!s || MAX((uint32_t)s.width >> k, 1u) != w || MAX((uint32_t)s.height >> k, 1u) != h) return 0;
+    uint8_t *blk = malloc(pitch * rows), *want = malloc((size_t)w * h * 4); int ok = 0;
+    if (!nvn_deswizzle(&t->d, l, 0, t->mem, blk, pitch) && !nvn_bc_decode(t->d.format, blk, pitch, w, h, want, (size_t)w * 4)) {
+        id<MTLBuffer> b = level_of(s, k, 0, (size_t)w * h * 4, (size_t)w * 4); ok = b && !memcmp(b.contents, want, (size_t)w * h * 4);
+    }
+    free(blk); free(want); return ok;
+}
+// No BC: whether a stand-in's one level holds the pattern's blocks (step * i + step / 2, step * j + step / 2) decoded (nx x ny blocks of bpb bytes, RGBA8)
+static int picked_decoded_is(id<MTLTexture> t, uint32_t format, uint32_t nx, uint32_t ny, uint32_t bpb, uint32_t step) {
+    size_t pitch = (size_t)nx * bpb, w = nx * 4, h = ny * 4; uint8_t *blk = malloc(pitch * ny), *want = malloc(w * h * 4); int ok = 0;
+    for (uint32_t j = 0; j < ny; j++) for (uint32_t i = 0; i < nx; i++) for (uint32_t k = 0; k < bpb; k++) blk[j * pitch + i * bpb + k] = pat(step * i + step / 2, step * j + step / 2, k);
+    if (t && t.mipmapLevelCount == 1 && t.width == w && t.height == h && !nvn_bc_decode(format, blk, pitch, (uint32_t)w, (uint32_t)h, want, w * 4)) {
+        id<MTLBuffer> b = level_of(t, 0, 0, w * h * 4, w * 4); ok = b && !memcmp(b.contents, want, w * h * 4);
+    }
+    free(blk); free(want); return ok;
+}
+static int bc_pixel_format(MTLPixelFormat pf) { return pf >= MTLPixelFormatBC1_RGBA && pf <= MTLPixelFormatBC7_RGBAUnorm_sRGB; }
 int main(void) { @autoreleasepool {
     mtl_init();
-    const char *e = getenv("DM_NVN_POOL_STANDIN"); int on = !(e && !strcmp(e, "0"));
+    const char *e = getenv("DM_NVN_POOL_STANDIN"); int on = !(e && !strcmp(e, "0")), nobc = no_bc();
     enum { SLOT = 1 << 17, N = 10, LEN = N * SLOT, MANY = STAND_FRAME + 40 };
     uint8_t *mem = mmap(NULL, LEN, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (mem == MAP_FAILED) abort();
     pool_t p = {.magic = MAGIC('P', 'O', 'O', 'L'), .mem = mem, .size = LEN, .flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
@@ -114,8 +136,13 @@ int main(void) { @autoreleasepool {
         CHECK(level_is(s, 0, 16 * 16 * 4, 64, 0x12) && level_is(s, 1, 8 * 8 * 4, 32, 0x13) && level_is(s, 4, 4, 4, 0x16), "and holds those levels' bytes");
         id<MTLTexture> c = stand(12);
         CHECK(c && entry(b1, 12) == g_treg[12].stand_rid, "a compressed texture has one");
-        CHECK(c.width == 32 && c.height == 32 && c.mipmapLevelCount == 6 && c.pixelFormat == MTLPixelFormatBC1_RGBA, "from its 32x32 level on");
-        CHECK(level_is(c, 0, 8 * 8 * 8, 64, 0x41) && level_is(c, 5, 8, 8, 0x46), "with those levels' blocks");
+        if (!nobc) {
+            CHECK(c.width == 32 && c.height == 32 && c.mipmapLevelCount == 6 && c.pixelFormat == MTLPixelFormatBC1_RGBA, "from its 32x32 level on");
+            CHECK(level_is(c, 0, 8 * 8 * 8, 64, 0x41) && level_is(c, 5, 8, 8, 0x46), "with those levels' blocks");
+        } else {
+            CHECK(c.width == 16 && c.height == 16 && c.mipmapLevelCount == 5 && c.pixelFormat == MTLPixelFormatRGBA8Unorm, "no BC: the format the texture is made in, from its 16x16 level on (1 KB decoded)");
+            CHECK(decoded_is(c, &t[3], 2, 0) && decoded_is(c, &t[3], 3, 1) && decoded_is(c, &t[3], 6, 4), "with those levels' blocks decoded");
+        }
         id<MTLTexture> v = stand(15); MTLTextureSwizzleChannels sw = v.swizzle;
         CHECK(v && entry(b1, 15) == g_treg[15].stand_rid && v.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB, "a registration through an sRGB view has one of the view's format");
         CHECK(sw.red == MTLTextureSwizzleBlue && sw.green == MTLTextureSwizzleGreen && sw.blue == MTLTextureSwizzleRed && sw.alpha == MTLTextureSwizzleAlpha, "and the view's swizzle");
@@ -123,8 +150,15 @@ int main(void) { @autoreleasepool {
         CHECK(k && entry(b1, 11) == g_treg[11].stand_rid && k.width == 32 && k.height == 32 && k.mipmapLevelCount == 1, "a texture with no level small enough has its last level cut down: 32x32 of 64x64");
         CHECK(picked_is(k, 32, 32, 4, 2), "every 2nd texel of every 2nd row, from the middle of each cell");
         id<MTLTexture> k7 = stand(18);
-        CHECK(k7 && entry(b1, 18) == g_treg[18].stand_rid && k7.width == 64 && k7.height == 64 && k7.pixelFormat == MTLPixelFormatBC7_RGBAUnorm, "a compressed one keeps its format: 16x16 blocks of 64x64");
-        CHECK(picked_is(k7, 16, 16, 16, 4), "every 4th block of every 4th block row");
+        if (!nobc) {
+            CHECK(k7 && entry(b1, 18) == g_treg[18].stand_rid && k7.width == 64 && k7.height == 64 && k7.pixelFormat == MTLPixelFormatBC7_RGBAUnorm, "a compressed one keeps its format: 16x16 blocks of 64x64");
+            CHECK(picked_is(k7, 16, 16, 16, 4), "every 4th block of every 4th block row");
+        } else {
+            CHECK(k7 && entry(b1, 18) == g_treg[18].stand_rid && k7.width == 32 && k7.height == 32 && k7.pixelFormat == MTLPixelFormatRGBA8Unorm, "no BC: a compressed one cut down to 4 KB decoded: 8x8 blocks, 32x32 texels");
+            CHECK(picked_decoded_is(k7, NVN_FORMAT_BPTC_UNORM, 8, 8, 16, 8), "every 8th block of every 8th block row, decoded");
+        }
+        int bc = 0; for (int i = 10; i <= 18; i++) bc += stand(i) && bc_pixel_format(stand(i).pixelFormat);
+        CHECK(!nobc || !bc, "no BC: no stand-in has a BC format");
         id<MTLTexture> a = stand(13), a1 = stand(16);
         CHECK(a && a.textureType == MTLTextureType2DArray && a.arrayLength == 2 && layer_is(a, 0, 1, 16 * 16 * 4, 64, 0x5a), "a 2D array has a stand-in of its layers");
         CHECK(entry(b1, 13) == dummy(b1), "which a table of 2D textures does not take");
@@ -134,6 +168,16 @@ int main(void) { @autoreleasepool {
         CHECK(none && !g_stand_made, "DM_NVN_POOL_STANDIN=0: the dummy, and no stand-in is made");
     }
     CHECK(entry(b1, 17) == dummy(b1) && !g_treg[17].stand, "a 3D texture holds the dummy");
+    if (on && nobc) {   // a stripped image (docs/texture_once.md): a BC plane the pack holds is a tag and zeros. Its stand-in would draw them: the dummy, as before
+        tex_t ts = t[3]; ts.serial = 990300; ts.off = 7 * SLOT + SLOT / 2; ts.mem = mem + ts.off; if (ts.off + ts.L.size > LEN) abort();
+        memset(ts.mem, 0, ts.L.size);
+        for (unsigned l = 0; l < ts.d.levels; l++) { uint64_t off, len; if (!nvn_astc_plane_storage(&ts.d, l, 0, &off, &len) && len >= 16) memset((uint8_t *)ts.mem + off, 0x5a, 8); }
+        mtl_tex_init(&ts); g_embedded = 1;
+        mtl_reg_tex(19, &ts, NULL); atomic_fetch_add(&g_cur_frame, 1);
+        id<MTLBuffer> bs = table(0);
+        CHECK(entry(bs, 19) == dummy(bs) && !g_treg[19].stand, "no BC, a stripped image: a texture whose planes hold tags gets no stand-in");
+        g_embedded = 0; mtl_reg_tex(19, NULL, NULL); mtl_tex_release(&ts);
+    }
     CHECK(entry(b1, 14) == dummy(b1) && !g_treg[14].stand, "a render target no pass has written holds the dummy");
     atomic_fetch_add(&g_cur_frame, 1);
     id<MTLBuffer> b2 = table(0);

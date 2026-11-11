@@ -360,6 +360,27 @@ static void run_tagged(const char *dir) {
         free(expected);
     }
     g_embedded = 0;
+    // 7. an image that is not stripped (no pack embedded: what a build whose pack could not be prepared installs) and no read-only pack: a plane that looks tagged is the game's own BC
+    //    data. Its miss is an ordinary miss, queued for the background encoder, with no red line or count, and the next texture of its bytes is ASTC (Ocarina of Time, Apple TV run 17:
+    //    such planes were counted unresolved and never queued, so their textures were decoded in every session)
+    {
+        char rw3[512]; subdir(rw3, sizeof rw3, dir, "rw3"); configure(rw3, 64u << 20, 1ull << 30, 0, 1);
+        void *m7[2]; tex_t t7[2]; const uint8_t head[8] = {0x3c, 0x9a, 0x11, 0x42, 0x77, 0x05, 0xe8, 0x6d};
+        for (int v = 0; v < 2; v++) { t7[v] = empty_texture(d5, &m7[v], 7 + v); memcpy(t7[v].mem, head, 8); }
+        CHECK(nvn_bc_astc_looks_tagged(t7[0].mem, 512) && !g_embedded, "a genuine plane that looks tagged, in an image that is not stripped");
+        tag_counts(&h0, &u0, &d0); before = stats();
+        id<MTLTexture> mt = upload(&t7[0]);
+        tag_counts(&h1, &u1, &d1); after = stats();
+        CHECK(mt && mt.pixelFormat == MTLPixelFormatRGBA8Unorm, "it misses: decoded");
+        CHECK(h1 == h0 && u1 == u0 && d1 == d0, "and counts nothing as tagged (%llu unresolved)", (unsigned long long)(u1 - u0));
+        CHECK(after.queued == before.queued + 1, "its plane is queued for the background encoder (%llu)", (unsigned long long)(after.queued - before.queued));
+        CHECK(nvn_bc_astc_bg_wait(120) && cache_files(rw3) == 1, "and encoded into the writable cache");
+        id<MTLTexture> again = upload(&t7[1]);
+        CHECK(again && again.pixelFormat == MTLPixelFormatASTC_4x4_LDR, "the next texture of its bytes is ASTC");
+        uint8_t tight7[256]; CHECK(!nvn_deswizzle(&d5, 0, 0, t7[1].mem, tight7, pitch5), "its blocks");
+        CHECK(again && mean_err_vs_decode(again, 0, 0x4d, tight7, pitch5, 16, 16) < 0.04, "and samples like its BC decode");
+        defer_obj_release(mt); defer_obj_release(again); for (int v = 0; v < 2; v++) release_fixture(m7[v]);
+    }
     defer_obj_release(mt1); defer_obj_release(mt2); defer_obj_release(mt3);
     release_fixture(m1); release_fixture(m2); release_fixture(m3); release_fixture(smem); for (int v = 0; v < 2; v++) release_fixture(m5[v]);
     for (int i = 0; i < 4; i++) free(ref[i]);

@@ -25,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -41,6 +42,12 @@ LIB_HEADERS = ['gfx/tex/nvn_astc_cache.h', 'gfx/tex/nvn_astc.h', 'gfx/tex/nvn_bc
 # The zstd decoder nvn_astc_cache.m links for NXASTCPK v2 entries (dm/host/Makefile builds dm/third_party/zstd with these flags)
 ZSTD_FLAGS = ['-O2', '-g', '-DNDEBUG', '-DZSTD_DISABLE_ASM', '-DZSTD_MULTITHREAD=0']
 ASTC_FLAGS = ['-O3', '-g', '-DNDEBUG', '-std=c++14', '-ffp-contract=off', '-DASTCENC_BLOCK_MAX_TEXELS=36']
+# The library's own sources are compiled and linked in one clang run. No -g there: with it the driver runs dsymutil after the link, for a debug-symbol bundle nothing uses (ctypes loads
+# the library), and dsymutil hung in two TVPort builds of Ocarina of Time (2026-11-11, 3 hours each, its .dSYM an empty Info.plist): stopping it failed the prebuild, the build went on
+# without a pack, and the Apple TV held 600 more textures decoded (docs/reference/packing.md, "The compressed-texture prebuild hung in dsymutil"). The objects' -g (-c) runs no dsymutil
+LINK_FLAGS = ['-O2', '-fobjc-arc', '-dynamiclib']
+# A compiler run that has not finished in this many seconds is stopped with every process it started (build_library takes seconds; a hung tool would hold the build for hours)
+COMPILE_TIMEOUT_S = 900
 SKIPPABLE = range(0x184d2a50, 0x184d2a60)
 
 # BNTX format (type << 8 | data type) -> (NVN format, the second NVN format with the same blocks or 0). BC1 is RGB_DXT1 (0x41) or RGBA_DXT1 (0x42) in NVN: the blocks decode the same, the cache key
@@ -75,12 +82,22 @@ def sources_hash():
             if f.endswith(('.c', '.h')):
                 with open(os.path.join(root, f), 'rb') as fh: h.update(os.path.relpath(os.path.join(root, f), zdir).encode() + b'\0' + fh.read())
     h.update(' '.join(ASTC_FLAGS + ZSTD_FLAGS).encode())
+    h.update(b'\0link ' + ' '.join(LINK_FLAGS).encode())   # how the library's own sources are compiled: part of the library, so of the pack fingerprint (fingerprint)
     return h.hexdigest()
 
 
-def run(cmd, **kw):
-    r = subprocess.run(cmd, capture_output=True, text=True, **kw)
-    if r.returncode: raise RuntimeError(f'{cmd[0]} failed ({r.returncode}): {r.stderr[-2000:]}')
+def run(cmd, timeout=COMPILE_TIMEOUT_S, **kw):
+    """Run a compiler command; RuntimeError when it fails or has not finished in `timeout` seconds. It runs in a process group of its own, so a timeout stops what it started too
+    (clang's linker and dsymutil): stopping clang alone leaves them holding its output pipes"""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, **kw)
+    try:
+        _, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try: os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+        _, err = proc.communicate()
+        raise RuntimeError(f'{cmd[0]} did not finish in {timeout} s and was stopped with every process it started (a hung tool): {" ".join(map(str, cmd))[:300]}') from None
+    if proc.returncode: raise RuntimeError(f'{cmd[0]} failed ({proc.returncode}): {err[-2000:]}')
 
 
 def min_os():
@@ -111,10 +128,15 @@ def build_library(work):
                 if not os.path.exists(o): futs.append(ex.submit(run, ['clang'] + ZSTD_FLAGS + [mac, '-I' + zdir, '-c', os.path.join(root, f), '-o', o]))
         for fu in futs: fu.result()
     part = lib + f'.{os.getpid()}.part'
-    cmd = ['clang', '-O2', '-g', '-fobjc-arc', '-dynamiclib', mac, '-I' + os.path.join(DM, 'gfx/nvn/include'), '-o', part] + [os.path.join(DM, s) for s in LIB_SOURCES] + objs
-    run(cmd + ['-lc++', '-framework', 'Foundation', '-framework', 'Metal'])
+    run(library_link_command(part, mac, objs))
     os.replace(part, lib)
     return lib
+
+
+def library_link_command(out, mac, objs):
+    """The clang run that compiles the library's own sources (LINK_FLAGS: no -g, so no dsymutil) and links them with the objects into `out`"""
+    return (['clang'] + LINK_FLAGS + [mac, '-I' + os.path.join(DM, 'gfx/nvn/include'), '-o', out] + [os.path.join(DM, s) for s in LIB_SOURCES] + objs
+            + ['-lc++', '-framework', 'Foundation', '-framework', 'Metal'])
 
 
 _LIB = None

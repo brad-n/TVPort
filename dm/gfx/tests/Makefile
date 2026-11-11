@@ -67,6 +67,11 @@ t_astc_bench: t_astc_bench.m ../tex/nvn_astc_cache.m ../tex/nvn_astc_cache.h ../
 # DM_NVN_BC_ASTC on the GPU: uploads of BC1/2/3/7 as ASTC against the CPU decode (DM_TEST_NO_BC and the variable are set by the test)
 t_astc_upload: t_astc_upload.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_astc_upload.m $(MTL_T_SRC) $(FW)
+# the default run, and the stripped-plane paths (T_ASTC_MODE=tagged): a plane that looks tagged is a tag only in a stripped image
+.PHONY: check_t_astc_upload
+check_t_astc_upload: t_astc_upload
+	./t_astc_upload
+	T_ASTC_MODE=tagged ./t_astc_upload
 # BC6H on a GPU without BC: unsigned as RG11B10Float (DM_BC6H_R11G11B10), signed as RGBA16Float. Runs on the Mac GPU with DM_TEST_NO_BC=1
 t_bc6h: t_bc6h.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_bc6h.m $(MTL_T_SRC) $(FW)
@@ -791,3 +796,4 @@ check_t_pool_standin: t_pool_standin
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./t_pool_standin
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./t_pool_standin
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 DM_NVN_POOL_STANDIN=0 ./t_pool_standin
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 DM_TEST_NO_BC=1 ./t_pool_standin

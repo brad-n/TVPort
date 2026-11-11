@@ -14,6 +14,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -328,6 +329,47 @@ class PrebuildTests(unittest.TestCase):
         mk = (DM / 'host/Makefile').read_text()
         line = next(l for l in mk.splitlines() if 'clang++' in l and 'ASTCENC_BLOCK_MAX_TEXELS' in l)
         for flag in tool.ASTC_FLAGS: self.assertIn(flag, line.split())
+
+    def test_the_library_is_built_without_dsymutil(self):
+        # -g on the run that compiles the library's own sources makes clang run dsymutil after the link; it hung for hours in two TVPort builds and the game went without a pack
+        cmd = tool.library_link_command('/x/out.dylib', '-mmacosx-version-min=14.0', ['/x/a.o'])
+        self.assertNotIn('-g', cmd)
+        self.assertFalse(any(a.startswith(('-g', '-gdwarf', '-gfull')) for a in cmd), cmd)
+        self.assertEqual(cmd[1:1 + len(tool.LINK_FLAGS)], tool.LINK_FLAGS)
+        self.assertEqual([p for p in (self.root / 'lib').iterdir() if p.name.endswith(('.dSYM', '.part'))], [], 'no debug-symbol bundle and no unfinished library')
+
+    def test_the_link_flags_are_part_of_the_pack_fingerprint(self):
+        # the library is built from its sources and these flags: a change of either is another library, so another fingerprint, and a pack made before is rebuilt
+        romfs = tempfile.mkdtemp(dir=self.root)   # an empty RomFS folder
+        before_lib, before_fp = tool.sources_hash(), tool.fingerprint(romfs, 4)
+        saved = tool.LINK_FLAGS
+        try:
+            tool.LINK_FLAGS = saved + ['-DTVPORT_TEST_FLAG']
+            self.assertNotEqual(tool.sources_hash(), before_lib)
+            self.assertNotEqual(tool.fingerprint(romfs, 4), before_fp)
+        finally:
+            tool.LINK_FLAGS = saved
+        self.assertEqual(tool.sources_hash(), before_lib)
+
+    def test_a_hung_compiler_is_stopped_with_what_it_started(self):
+        # what a hung dsymutil under clang looks like: a child that holds the output pipes after its parent; the watchdog stops the whole group and says so
+        with tempfile.TemporaryDirectory() as d:
+            pidfile = Path(d) / 'child'
+            script = f'sleep 60 & echo $! > {pidfile}; wait'
+            t0 = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, 'did not finish in 1 s'):
+                tool.run(['/bin/sh', '-c', script], timeout=1)
+            self.assertLess(time.monotonic() - t0, 30)
+            child = int(pidfile.read_text())
+            for _ in range(50):
+                try: os.kill(child, 0)
+                except ProcessLookupError: break
+                time.sleep(0.1)
+            else:
+                self.fail('the child the command started is still running')
+        with self.assertRaisesRegex(RuntimeError, r'failed \(3\)'):
+            tool.run(['/bin/sh', '-c', 'echo oops >&2; exit 3'])
+        tool.run(['/bin/sh', '-c', 'exit 0'])
 
     def test_yaz0_decodes_the_formats_stream(self):
         rng = random.Random(5)

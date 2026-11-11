@@ -816,6 +816,9 @@ static void *bg_scan_main(void *unused) {
             "misses encode in the background (%u threads, queue cap %.0f MB); scan %.1f ms\n",
             cache ?: "none", (unsigned long long)ce, cb / 1048576.0, g_bg.cache_max / 1048576.0, cache && bg_free_bytes(cache) != UINT64_MAX ? bg_free_bytes(cache) / 1048576.0 : -1.0, g_bg.min_free / 1048576.0,
             ro ?: "none", (unsigned long long)re, rb / 1048576.0, g_bg.threads, g_bg.queue_cap / 1048576.0, (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1e6);
+    // Without a pack every BC texture whose planes the writable cache lacks is made decoded, several times its ASTC size, until the background encoder has them: on an Apple TV that is
+    // hundreds of MB (Ocarina of Time, run 17: a build whose pack could not be prepared installed none, and 600 more textures were held decoded, 455 MB against 188)
+    if (!re) fprintf(stderr, "[RED] ASTC: no prebuilt texture pack (read-only cache %s holds no entries): BC textures are held decoded until the background encoder has their planes\n", ro ?: "none");
     free(cache); free(ro);
     atomic_store(&g_scan_done, 1);
     return NULL;
