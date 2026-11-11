@@ -1,6 +1,7 @@
 // The movie library's enhancement network replaced by a plain scale (DM_MOVIE_NETWORK=bypass; nvn_mtl.m up_movie_step): Ocarina of Time's per-frame chain is 49dff010 (Y and UV planes into an RGBA8 picture),
 // a dozen layer shaders on storage buffers, and the NDSR stage 4f41ccf2 (the layers' result into the 2560x1440 RGBA8 image the game draws from). With the bypass the YUV stage runs, the layers do not, and the NDSR
 // stage's dispatch becomes a bilinear scale of the picture into its image, with no MetalFX anywhere. The shader roles are checked against the profile's 22 movie keys when it has them.
+// Under the bypass the host's NDVE engine (nvn_ndve.inc), which the YUV stage still reaches, is not built.
 #include "../nvn/nvn_mtl.m"
 void *front_metal_layer(void) { return NULL; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
@@ -68,6 +69,8 @@ int main(void) { @autoreleasepool {
         CHECK(g_movie_src_tid == 913, "the picture is the image the YUV stage wrote");
         CHECK(r_first == 1 && r_layer == 1 && g_movie_skipped == skipped0 + 2, "the layers are skipped");
         CHECK(r_out == 1 && g_movie_scaled == scaled0 + 1, "the NDSR stage is drawn as the plain scale");
+        // the YUV stage still reaches the host's NDVE engine (dispatch_), which has nothing to compute under the bypass: it is not built (its tensors are 88 MB of private memory)
+        CHECK(ndve_engine_dispatch(yuv, &dp) == 0 && atomic_load(&g_nd.state) == 0 && !g_nd.t[0], "under the bypass the NDVE engine is not built");
     }
     CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error(), "the submission completes");
     os_unfair_lock_lock(&g_rmu); id<MTLTexture> written = tex_by_id(915); os_unfair_lock_unlock(&g_rmu);

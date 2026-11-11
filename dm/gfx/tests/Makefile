@@ -459,6 +459,9 @@ check_t_pso_warm: t_pso_warm
 	DM_PSO_MTL4=1 MTL_DEBUG_LAYER=1 ./t_pso_warm
 t_pso_skey: t_pso_skey.m ../nvn/nvn_pso_skey.h ../nvn/nvn_obj.h
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_skey.m -framework Foundation
+t_depth_twin: t_depth_twin.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_depth_twin.m $(MTL_T_SRC) $(FW)
+check_t_depth_twin: RUN_ENV = MTL_DEBUG_LAYER=1
 t_view_swizzle: t_view_swizzle.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_view_swizzle.m $(MTL_T_SRC) $(FW)
 check_t_view_swizzle: RUN_ENV = MTL_DEBUG_LAYER=1

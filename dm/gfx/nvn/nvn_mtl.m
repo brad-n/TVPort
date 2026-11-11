@@ -6927,7 +6927,9 @@ static void shmap_read(void) {
     id<MTLFunction> afn[4]; int afn_state, has_alpha;
     id<MTLLibrary> llib; NSMutableDictionary<NSNumber *, id<MTLFunction>> *lfn; int lfn_state, has_logic; } @end   // llib: the side library <key>_bx for logic operations, lfn: its fn_u / fn_m specialized per set of targets (lo_fn; lfn_state as afn_state; has_logic: the reflection names its entry points, dmsh_logic.py)   // afn: the alpha test entry points of fn, fn_u, fn_m, fn_d in the side library <key>_bx (at_fn; afn_state 0 untried, 1 loaded, 2 failed; has_alpha: the reflection names them, dmsh_alpha.py)   // pfn: the same entry of the pulling library <key>_bp (pull_fn; has_pull: the reflection names one, dmsh_pull.py)   // vertex: the entry point loaded (by the depth mode); vfn: the same entry of the shadow-input library <key>_bv (vin_fn; state 0 untried, 1 loaded, 2 failed)
 @implementation NvShader
-- (void)dealloc { free(rf.c1); free(geo_slot); }
+// The reflection's bindings and tables at full size until a reflection replaces them (shader_load frees these first): builtins and tests fill them in place
+- (instancetype)init { if ((self = [super init]) && !nvn_refl_full(&rf)) return nil; return self; }
+- (void)dealloc { nvn_refl_free(&rf); free(geo_slot); }
 @end
 // One specialization of a shader's readable-tile version: what each sample reads from the tile (fx, -1 none; only the shader's nfc entries), the attachments read (fbmask) and the
 // attachment each colour output goes to (lmap); fn nil when Metal refused it (not asked again)
@@ -7205,6 +7207,7 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
     NvShader *o = [NvShader new]; o->gs_loc = o->lay_loc = -1;
     if (stage == 0 && [j[@"layer_from"] isKindOfClass:[NSDictionary class]]) { o->lay_loc = [j[@"layer_from"][@"loc"] intValue]; o->lay_comp = [[j[@"layer_from"][@"comp"] description] UTF8String][0]; }
     char err[160];
+    nvn_refl_free(&o->rf);   // init's full-size tables: the reflection allocates what this shader has
     if (nvn_refl_from_json(j, &o->rf, err, sizeof err)) { MLOG("[RED] shader %s reflection conversion failed: %s", pc.UTF8String, err); return nil; }
     if (o->rf.dyn && !DM_GAME_TEX_DYN_SLOTS) {   // dynamic texture handles (TEXD / SAMPD) only where the profile says the game picks them from c2's tables, as before otherwise
         // (rf.c1 is freed by dealloc when o goes: freeing it here too was a double free, which aborted FINAL FANTASY RESONANCE at its first such shader)
@@ -7822,7 +7825,44 @@ void mtl_set_origin_lower_left(int on) { if (atomic_exchange(&g_origin_ll, on) !
 static int g_queue_origin_ll;   // SET_WINDOW_ORIGIN's raster flip is queue state, independent of later device-origin changes.
 void mtl_set_queue_origin_lower_left(int on) { g_queue_origin_ll = on != 0; }
 void mtl_set_tex_pool_n(int n) { g_tpool_n = n; }
-static id<MTLTexture> treg_tex(const treg_t *r) { return r->gone ? tex_made(&r->t) : tex_mtl(&r->t); }   // Caller holds g_rmu
+// Depth / colour twins (DM_NVN_DEPTH_TWIN, on unless =0). An NVN R32F texture over the storage of a live GPU-only DEPTH32F texture of the same size and layout (R16 over DEPTH16 likewise)
+// reads the depth's bytes on the console: the two formats lay their texels out alike. As a Metal texture of its own it was a second allocation of the full size, which held zeros, as nothing
+// copies depth into it: Ocarina of Time's 4096x4096 R32F over its Depth32Float target, 64 MB for 64 MB of game memory. Sampled through a texture ID, such a texture is now the depth texture,
+// read through an (R, 0, 0, 1) view as an R32F view of a depth texture is (tex_by_id). Only a texture with no Metal texture of its own: a path that writes it (an attachment, a copy, a clear)
+// makes its own as before (tex_mtl), and its IDs then read that one (tex_put notes the serial, so their cached views go). Colour textures with the IMAGE flag, multisample, CPU-visible,
+// sparse or packaged ones, and IDs whose view names another format, are left alone. The depth texture is found among the live image descriptions (g_image_desc: a 2D single-level
+// compressible texture of a GPU-only pool) and made if nothing made it yet
+static uint64_t g_dtwin_n;   // ID resolutions served by a depth twin (the memory report)
+static int dtwin_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_DEPTH_TWIN"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_DEPTH_TWIN=0: a colour texture over a depth texture's storage is a Metal texture of its own"); } return v; }
+static id<MTLTexture> depth_twin(const tex_t *t) {
+    if (!dtwin_on() || !t->pool || !t->serial || t->pool->magic != MAGIC('P', 'O', 'O', 'L') || !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) || nvn_sparse_pool(t->pool)
+        || t->has_layout || t->d.samples > 1 || (t->d.flags & (IMAGE_NOT_SHARED | NVN_TEXTURE_FLAGS_IMAGE))) return nil;
+    int dfmt = t->d.format == NVN_FORMAT_R32F ? NVN_FORMAT_DEPTH32F : t->d.format == NVN_FORMAT_R16 ? NVN_FORMAT_DEPTH16 : 0;
+    if (!dfmt || !t->L.size) return nil;
+    if (tex_get(t->serial)) return nil;   // a texture of its own (made by a write path, or before)
+    tex_t d; int found = 0;
+    pthread_mutex_lock(&g_smu);
+    alias_key own = tex_alias_key(t);
+    if (!hm_get_id(&g_alias, &own))   // nor one another object of its description made
+        for (uint32_t i = 0; i < g_image_desc.cap && !found; i++) { const tex_t *o = g_image_desc.vals[i];
+            if (!o || o->pool != t->pool || o->off != t->off || o->d.format != dfmt || o->d.target != t->d.target || o->d.width != t->d.width || o->d.height != t->d.height
+                || o->d.depth != t->d.depth || o->d.levels != t->d.levels || o->d.samples > 1 || memcmp(&o->L, &t->L, sizeof o->L)) continue;
+            d = *o; found = 1; }
+    pthread_mutex_unlock(&g_smu);
+    if (!found) return nil;
+    id<MTLTexture> m = tex_mtl(&d);   // the depth texture as its own uses find it (made now if none did yet)
+    MTLPixelFormat want = dfmt == NVN_FORMAT_DEPTH32F ? MTLPixelFormatDepth32Float : MTLPixelFormatDepth16Unorm;
+    if (!m || m.pixelFormat != want || m.parentTexture || m.buffer || m.sampleCount > 1 || m.width != t->d.width || m.height != t->d.height || m.mipmapLevelCount != MAX(t->d.levels, 1u)) return nil;
+    g_dtwin_n++;
+    static int said; if (said++ < 4) MLOG("colour texture ser=%llu %ux%u format %#x over the storage of depth texture ser=%llu: read through the depth texture, no texture of its own (DM_NVN_DEPTH_TWIN)",
+                                         (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, (unsigned long long)d.serial);
+    return m;
+}
+static id<MTLTexture> treg_tex(const treg_t *r) {   // Caller holds g_rmu
+    if (r->gone) return tex_made(&r->t);
+    id<MTLTexture> d = !r->has_v || !r->v.set_format || r->v.format == r->t.d.format ? depth_twin(&r->t) : nil;   // a view of another format reads the colour texture's own storage
+    return d ? d : tex_mtl(&r->t);
+}
 // The upload stamp of the packaged texture an ID's view was made from (tex_by_id's guest-write shortcut); none for sparse ones (their page table changes too) or another base. Caller holds g_rmu
 static void treg_pkg_stamp(treg_t *rp, id<MTLTexture> base) {
     rp->view_span = NULL; if (!rp->view_pkg) return;
@@ -7863,8 +7903,10 @@ static id<MTLTexture> tex_by_id(int tid) {   // Caller holds g_rmu
     if (!base.buffer) for (int c = 0; c < 4; c++) if (fsw[c] >= MTLTextureSwizzleRed) fsw[c] = (uint8_t)(MTLTextureSwizzleRed + c);
     // Metal cannot cast a depth texture to its single-channel colour equivalent. Use the same depth storage,
     // but present (R, 0, 0, 1) to the NVN swizzle: a float shader reading Metal depth can see depth in G and B too.
-    if ((base.pixelFormat == MTLPixelFormatDepth32Float && view_pf == MTLPixelFormatR32Float) ||
-        (base.pixelFormat == MTLPixelFormatDepth16Unorm && view_pf == MTLPixelFormatR16Unorm)) {
+    // A colour texture read through its depth twin (depth_twin, no view format) is the same case: its own format is the colour one
+    uint32_t col_pf = view_pf; if (!col_pf && (base.pixelFormat == MTLPixelFormatDepth32Float || base.pixelFormat == MTLPixelFormatDepth16Unorm)) { uint8_t junk[4]; nvn_fmt_to_mtl(r.t.d.format, &col_pf, junk); }
+    if ((base.pixelFormat == MTLPixelFormatDepth32Float && col_pf == MTLPixelFormatR32Float) ||
+        (base.pixelFormat == MTLPixelFormatDepth16Unorm && col_pf == MTLPixelFormatR16Unorm)) {
         view_pf = (uint32_t)base.pixelFormat;
         fsw[1] = fsw[2] = MTLTextureSwizzleZero;
         fsw[3] = MTLTextureSwizzleOne;
