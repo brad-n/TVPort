@@ -163,14 +163,14 @@ int main(void) { @autoreleasepool {
         CHECK("a known range adds nothing", g_gml_n == n0 + 1);
         finish();
     }
-    // A smaller pool is one buffer, and the removal of the large one takes all its entries
-    uint8_t *small = mmap(NULL, 64 * MB, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (small == MAP_FAILED) abort();
-    int n3 = g_npool; mtl_pool_add(small, 64 * MB); CHECK("one entry", g_npool == n3 + 1 && g_nbig == 1);
-    CHECK("its buffer is the whole pool", look((uint64_t)(uintptr_t)small + 10, 16).length == 64 * MB);
+    // A smaller pool (under WIRE_MIN, DM_NVN_WIRE_BOUND) is one buffer, and the removal of the large one takes all its entries
+    uint8_t *small = mmap(NULL, 24 * MB, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (small == MAP_FAILED) abort();
+    int n3 = g_npool; mtl_pool_add(small, 24 * MB); CHECK("one entry", g_npool == n3 + 1 && g_nbig == 1);
+    CHECK("its buffer is the whole pool", look((uint64_t)(uintptr_t)small + 10, 16).length == 24 * MB);
     mtl_pool_del(mem); mtl_drain();
     CHECK("no large pool left", g_nbig == 0);
     CHECK("only the small pool's entry is left of those added", g_npool == pools0 + 1);
-    CHECK("the small pool still answers, its entry moved", look((uint64_t)(uintptr_t)small + 20, 16).length == 64 * MB);
+    CHECK("the small pool still answers, its entry moved", look((uint64_t)(uintptr_t)small + 20, 16).length == 24 * MB);
     CHECK("the large pool's addresses do not", !mtl_gpu_addr(base + 100, 4, &mb, &mo, &gpu));
     mtl_pool_del(small); mtl_drain();
     // A buffer made while any of its pages is write-protected (nvn_dirty_protect: a packaged texture's upload, an index range) drops every GPU write through it, with no error, even to pages

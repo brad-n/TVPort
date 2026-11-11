@@ -204,6 +204,14 @@ t_gmem_budget: t_gmem_budget.m $(MTL_T_DEP)
 .PHONY: check_t_gmem_budget
 check_t_gmem_budget: t_gmem_budget
 	DM_NVN_GMEM_BUDGET_MB=3 MTL_DEBUG_LAYER=1 ./t_gmem_budget
+t_wire_bound: t_wire_bound.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_wire_bound.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_wire_bound
+check_t_wire_bound: t_wire_bound
+	DM_NVN_WIRE_BOUND=1 DM_NVN_GMEM_MODE='learned!' MTL_DEBUG_LAYER=1 ./t_wire_bound
+t_zero_punch: t_zero_punch.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_zero_punch.m $(MTL_T_SRC) $(FW)
+check_t_zero_punch: RUN_ENV = MTL_DEBUG_LAYER=1
 t_gmem_learned: t_gmem_learned.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_gmem_learned.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_gmem_learned

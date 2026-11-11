@@ -350,6 +350,43 @@ static int discard_run(uintptr_t a, size_t len, int prot, int method) {
     if (!(prot & PROT_WRITE)) mprotect((void *)a, len, prot);
     return ok;
 }
+// Zero pages back to the guest file as holes (DM_GUEST_ZERO_PUNCH, nvn_mtl.m mtl_zero_punch): of the protected pages of [addr, addr + len), those whose bytes are all 0 go to punch
+// (hle_svc.c dm_guest_punch_range), which makes them holes of the guest file: they then hold no memory and no block and are never written out, and read 0 as before. Protected means no CPU
+// write since they were protected (a write faults first and leaves the page unprotected); a page is BUSY from before its check until the punch has landed, so a write meanwhile waits in the
+// fault handler (busy_wait) and finds it protected again, still 0. Runs of at most ZP_RUN pages, so a writer never waits long. Returns the bytes punched
+enum { ZP_RUN = 64 };
+static int page_zero(uintptr_t a) { const uint64_t *w = (const uint64_t *)a; for (size_t i = 0, n = g_pg / 8; i < n; i++) if (w[i]) return 0; return 1; }
+size_t nvn_dirty_punch_zero(const void *addr, size_t len, int (*punch)(uintptr_t a, size_t n)) {
+    if (!len || !punch || !g_pg) return 0;
+    uintptr_t a = ((uintptr_t)addr + g_pg - 1) & ~(g_pg - 1), b = ((uintptr_t)addr + len) & ~(g_pg - 1);
+    if (a >= b) return 0;
+    size_t done = 0;
+    pthread_mutex_lock(&g_slot_mu);
+    range_t *r = find_span(a, b - a);
+    if (r) {
+        uintptr_t run = 0, p = (a - r->base) >> g_shift, q = (b - 1 - r->base) >> g_shift; int open = 0;
+        for (uintptr_t i = p; i <= q + 1; i++) {
+            int took = 0, full = open && i - run >= ZP_RUN;
+            if (i <= q && !full) {
+                uint8_t st = PG_PROT;
+                if (atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY)) {
+                    if (page_zero(r->base + (i << g_shift))) took = 1;
+                    else atomic_store(&r->state[i], PG_PROT);   // written before it was protected: kept as it is
+                }
+            }
+            if (took) { if (!open) { run = i; open = 1; } continue; }
+            if (open) {
+                size_t n = (i - run) << g_shift;
+                if (punch(r->base + (run << g_shift), n)) done += n;
+                for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT);
+                open = 0;
+                if (full && i <= q) i--;   // this page was not looked at: again, in a new run
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_slot_mu);
+    return done;
+}
 __attribute__((weak)) int dm_guest_in_files(void) { return 0; }   // hle_svc.c's answers in the host; tests that link no host have none
 size_t nvn_dirty_discard(const void *addr, size_t len, int tracked, int method) {
     if (dm_guest_in_files()) return 0;   // the guest in files: fresh anonymous pages would be charged to the footprint again, as guest_release says

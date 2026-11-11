@@ -149,6 +149,54 @@ static void guest_file_scan(const char *vec, size_t pg) {
 }
 
 static void guest_file_sweep(void);
+// DM_GUEST_ZERO_PUNCH (on by default; =0 off; only with the guest in files): every 10 s the dirty pages of the guest file inside memory pools the GPU is not using that read all 0 go back to the file as holes. 730 MB of
+// Ocarina of Time's 1.06 GB of dirty guest pages are zeros (DM_GUEST_FILE_SCAN): each holds memory, takes a block when written out, and is written again whenever it is dirtied again; a hole
+// holds none and reads 0 with no read from the disk. The scan reads each dirty page of a pool that is not in the residency set from the file; a run of zero pages goes to
+// mtl_zero_punch (nvn_mtl.m), which gives back only what no resident or in-flight pool buffer covers, under the graphics layer's pool lock, and only pages the dirty tracker has kept protected
+// since the round before (a write faults first): the first round protects them, the next punches those still 0. A page that is the source of a MapMemory (another address for it) is skipped
+static pthread_mutex_t g_map_lock; static int map_source_busy(uint64_t addr, uint64_t size);   // below
+__attribute__((weak)) size_t mtl_zero_punch(uint64_t lo, uint64_t hi, uint64_t *prot) { (void)lo; (void)hi; (void)prot; return 0; }   // nvn_mtl.m; the host tests link none
+static _Atomic uint64_t g_zp_punched, g_zp_looked, g_zp_zero_seen;   // bytes punched, bytes handed to mtl_zero_punch (protected or punched), all-0 dirty bytes the scans found in unwired pools
+int dm_guest_punch_range(uintptr_t a, size_t n) {   // F_PUNCHHOLE over [a, a + n) of the guest file; 1 = every piece punched (nvn_dirty_punch_zero's callback)
+    if (!g_gf_n || a < (uintptr_t)g_as || a + n > (uintptr_t)g_as + g_reserve || !n) return 0;
+    int ok = 1;
+    for (uintptr_t lo = a, hi = a + n; lo < hi; ) {
+        size_t off = lo - (uintptr_t)g_as, k = off / g_gf_chunk, in = off - k * g_gf_chunk, fsz = (int)k == g_gf_n - 1 ? g_reserve - k * g_gf_chunk : g_gf_chunk;
+        size_t len = hi - lo < fsz - in ? hi - lo : fsz - in;
+        fpunchhole_t ph = {0}; ph.fp_offset = (off_t)in; ph.fp_length = (off_t)len;
+        if (fcntl(g_gf_tab[k], F_PUNCHHOLE, &ph)) ok = 0; else atomic_fetch_add(&g_zp_punched, len);
+        lo += len;
+    }
+    return ok;
+}
+static void guest_zero_punch(const char *vec, size_t pg) {
+    size_t np = g_reserve / pg, cap = 1 << 16, nr; uint64_t *plo = malloc(cap * 8), *phi = malloc(cap * 8), *buf = malloc(pg); uint8_t *pres = malloc(cap);
+    if (!plo || !phi || !buf || !pres) { free(plo); free(phi); free(buf); free(pres); return; }
+    nr = mtl_pool_ranges(plo, phi, pres, cap);
+    uint64_t looked = 0;
+    for (size_t j = 0; j < nr; j++) {
+        if (pres[j] || plo[j] < (uint64_t)(uintptr_t)g_as || phi[j] <= plo[j]) continue;   // a resident pool: wired, its pages stay
+        size_t a = (size_t)(plo[j] - (uint64_t)(uintptr_t)g_as + pg - 1) / pg, b = (size_t)(phi[j] - (uint64_t)(uintptr_t)g_as) / pg; if (b > np) b = np;   // whole pages inside the pool
+        size_t run = 0; int open = 0;
+        for (size_t i = a; i <= b; i++) {
+            int z = 0;
+            if (i < b && (vec[i] & MINCORE_MODIFIED) && (!open || i - run < 64)) {
+                size_t off = i * pg, k = off / g_gf_chunk;
+                if (pread(g_gf_tab[k], buf, pg, (off_t)(off - k * g_gf_chunk)) == (ssize_t)pg) { uint64_t any = 0; for (size_t w = 0; w < pg / 8 && !any; w++) any = buf[w]; z = !any; }
+            }
+            if (z) { if (!open) { run = i; open = 1; } atomic_fetch_add(&g_zp_zero_seen, pg); continue; }
+            if (open) {
+                uint64_t lo = (uint64_t)(uintptr_t)g_as + run * pg, hi = (uint64_t)(uintptr_t)g_as + i * pg;
+                pthread_mutex_lock(&g_map_lock); int src = map_source_busy(lo, hi - lo); pthread_mutex_unlock(&g_map_lock);
+                if (!src) mtl_zero_punch(lo, hi, &looked);
+                open = 0;
+                if (i < b && (vec[i] & MINCORE_MODIFIED) && i - run >= 64) i--;   // the run was full: this page again
+            }
+        }
+    }
+    atomic_fetch_add(&g_zp_looked, looked);
+    free(plo); free(phi); free(buf); free(pres);
+}
 // The free space on the files' disk with what the system can purge on demand (caches, offloadable data): NSURLVolumeAvailableCapacityForImportantUsageKey, through CFURL, the figure an app is
 // meant to check before writing what the user asked for, and close to what Settings shows as available; f_bavail leaves that space out (on the iPad that stopped at 5.0 GB f_bavail).
 // The query asks the system's cache-delete service: 4-65 ms on the Mac, where it gave 14.73 GB for 14.71 of f_bavail (little is purgeable there). -1 when it fails
@@ -178,6 +226,8 @@ static double guest_file_free_important(void) {
 static void *guest_file_thread(void *arg) {
     (void)arg; const double G = 1073741824.0; size_t pg = (size_t)getpagesize(); char *vec = malloc(g_reserve / pg + 1);
     const char *sc = getenv("DM_GUEST_FILE_SCAN"); int scan = sc && atoi(sc) > 0, purge_told = 0;
+    const char *zs = getenv("DM_GUEST_ZERO_PUNCH"); int zpunch = !(zs && *zs && atoi(zs) == 0);
+    if (zpunch) LOG("[mem] guest file: all-zero dirty pages of pools the GPU is not using go back to the file as holes every 10 s (DM_GUEST_ZERO_PUNCH)");
     double imp = -1, dirty = -1, count_ms = 0; unsigned imp_at = 0;
     pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
     for (unsigned sec = 1;; sec++) {
@@ -204,14 +254,16 @@ static void *guest_file_thread(void *arg) {
         if (sec % 10) continue;
         if (sec - imp_at >= 10) { imp = guest_file_free_important(); imp_at = sec; }
         if (scan && vec && dirty >= 0 && sec % 30 == 0) guest_file_scan(vec, pg);
+        if (zpunch && vec && dirty >= 0) guest_zero_punch(vec, pg);
         for (int i = 0; i < g_gf_n; i++) if (!fstat(g_gf_tab[i], &st)) held += st.st_blocks * 512.0;
         int ru_ok = !proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ru);
         if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) != KERN_SUCCESS) memset(&vi, 0, sizeof vi);
         LOG("%s[mem] guest file: %.2f GB allocated on disk, %.2f GB dirty in memory (%.0f ms to count, every 10 s), %.2f GB given back as holes; process read %.2f GB, %llu page-ins, logical writes %.2f GB; "
-            "footprint %.2f GB (internal %.2f, compressed %.2f, peak so far %.2f), file pages mapped (external) %.2f GB; %.1f GB free on its disk (%.1f with what the system can purge)",
+            "footprint %.2f GB (internal %.2f, compressed %.2f, peak so far %.2f), file pages mapped (external) %.2f GB; %.1f GB free on its disk (%.1f with what the system can purge); zero pages punched %.2f GB (looked at %.2f, seen %.2f: DM_GUEST_ZERO_PUNCH)",
             g_gf_min_free && fs_ok && (imp > avail ? imp : avail) - need < g_gf_min_free + G ? "[RED] " : "", held / G, dirty / G, count_ms, atomic_load(&g_gf_punched) / G,
             ru_ok ? ru.ri_diskio_bytesread / G : -1, ru_ok ? (unsigned long long)ru.ri_pageins : 0ull,
-            ru_ok ? ru.ri_logical_writes / G : -1, vi.phys_footprint / G, vi.internal / G, vi.compressed / G, ru_ok ? ru.ri_lifetime_max_phys_footprint / G : -1, vi.external / G, avail / G, imp / G);
+            ru_ok ? ru.ri_logical_writes / G : -1, vi.phys_footprint / G, vi.internal / G, vi.compressed / G, ru_ok ? ru.ri_lifetime_max_phys_footprint / G : -1, vi.external / G, avail / G, imp / G,
+            atomic_load(&g_zp_punched) / G, atomic_load(&g_zp_looked) / G, atomic_load(&g_zp_zero_seen) / G);
     }
     return NULL;
 }

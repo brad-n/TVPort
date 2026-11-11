@@ -918,8 +918,24 @@ static _Atomic uint64_t *pool_stamp_new(void) {   // caller holds g_mu
 // stride holding its address and on up to the end of what it asked (rounded up to the stride, plus a stride), made when first asked for. Only what lookups reach is wired. The chunks overlap, as adjacent
 // pools' buffers do at shared pages; GPU addresses are not contiguous across them, so a lookup must say how far it reads. One that does not know (length 1: an indirect draw's index buffer, a raw storage
 // address) gets BIG_UNKNOWN past its address. Raw global memory, whose pool table the shader walks by itself, takes the whole pool: big_full
-enum { BIG_MIN = 512u << 20, BIG_S = 16u << 20, BIG_UNKNOWN = 64u << 20, BIG_MAX = 32 };
-typedef struct { uintptr_t lo, hi, a, b; const void *mem; int *chunk, full; NSMutableArray *old; } big_pool;   // chunk: stride → g_pools index + 1; full: the whole pool's entry + 1; old: buffers a longer chunk replaced, alive with the pool
+// DM_NVN_WIRE_BOUND (on by default; =0 off, =<MB> sets the size, at least 32) holds every pool of 32 MB or more in chunks this way, not only those of BIG_MIN: a pool was otherwise wired whole as
+// soon as one binding reaches into it. Ocarina of Time binds one storage buffer in its 305 MB physical pool (behind the 305 MB virtual pool), so all of it stayed wired, 304.8 MB of it zeros,
+// dirty and written back to the guest file at every flush (with an 88 MB and a 150 MB pool, 591 MB of wired zeros of the 1.06 GB of dirty guest pages; on the Apple TV the app died
+// paging its guest file). Such a pool (small: under BIG_MIN) keeps what a whole buffer gave every lookup: one of unknown extent reaches the pool's end (not BIG_UNKNOWN), and once a raw load or
+// store reaches into it (learned mode's read and write logs) it is whole from then on (big_raw_whole), so raw global memory finds it as it did. A binding's own range, from its stride's
+// start to a stride past its end, is what it is wired for
+enum { BIG_MIN = 512u << 20, BIG_S = 16u << 20, BIG_UNKNOWN = 64u << 20, BIG_MAX = 512, WIRE_MIN = 32u << 20 };
+typedef struct { uintptr_t lo, hi, a, b; const void *mem; int *chunk, full; NSMutableArray *old; int small; } big_pool;   // chunk: stride → g_pools index + 1; full: the whole pool's entry + 1; old: buffers a longer chunk replaced, alive with the pool; small: under BIG_MIN, in chunks for DM_NVN_WIRE_BOUND
+static uint64_t wire_min(void) {   // the size from which a pool is held in chunks
+    static uint64_t v;
+    if (!v) { const char *e = getenv("DM_NVN_WIRE_BOUND"); long long m = e && *e ? atoll(e) : 1;
+        v = m <= 0 ? BIG_MIN : m == 1 ? WIRE_MIN : MIN(MAX((uint64_t)m << 20, (uint64_t)WIRE_MIN), (uint64_t)BIG_MIN);
+        if (m > 0) MLOG("memory pools of %llu MB or more are held in chunks, wired as far as their bindings reach (DM_NVN_WIRE_BOUND)", (unsigned long long)(v >> 20));
+        else MLOG("DM_NVN_WIRE_BOUND=0: a pool under %llu MB is wired whole when a binding reaches into it", (unsigned long long)(BIG_MIN >> 20)); }
+    return v;
+}
+static uint64_t g_wire_whole_n, g_wire_whole_b;   // small pools in chunks made whole when raw global memory reached into them (big_raw_whole)
+static void big_raw_whole(uint64_t addr);   // below, by the raw table
 static big_pool g_big[BIG_MAX]; static int g_nbig;
 // Chunk buffers a longer chunk replaced and that were in the residency set (kept alive by big_pool.old); the residency budget (res_evict_to_budget) takes them out again, except one a texture
 // is made on (pin, see pool_pin_buf). Under g_mu
@@ -932,9 +948,9 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)mem, hi = lo + size;
     uintptr_t a = lo & ~(pg - 1), b = (hi + pg - 1) & ~(pg - 1);
     static int chunks = -1; if (chunks < 0) { const char *e = getenv("DM_NVN_POOL_CHUNKS"); chunks = !e || atoi(e); }
-    if (size >= BIG_MIN && chunks) {
+    if (size >= wire_min() && chunks) {
         pthread_mutex_lock(&g_mu); int k = g_nbig < BIG_MAX ? g_nbig : -1;
-        if (k >= 0) { int *ch = calloc(((b - a) >> 24) + 1, sizeof *ch); if (!ch) MDIE("pool chunk table"); g_big[g_nbig++] = (big_pool){lo, hi, a, b, mem, ch, 0, [NSMutableArray array]};
+        if (k >= 0) { int *ch = calloc(((b - a) >> 24) + 1, sizeof *ch); if (!ch) MDIE("pool chunk table"); g_big[g_nbig++] = (big_pool){lo, hi, a, b, mem, ch, 0, [NSMutableArray array], size < BIG_MIN};
             g_pidx_ok = 0; g_plast = -1; atomic_fetch_add(&g_pool_gen, 1); g_pool_adds++; atomic_fetch_add(&g_big_n, 1); alias_mark(); }
         pthread_mutex_unlock(&g_mu);
         if (k >= 0) { reg_bump(-1, REG_POOL); static int nl; if (nl++ < 8) MLOG("memory pool %p+%llu MB: in chunks, wired as far as lookups reach", mem, (unsigned long long)(size >> 20)); return; }
@@ -1033,7 +1049,8 @@ static int big_lookup(big_pool *b, uint64_t addr, uint64_t len) {
     if (addr + len > b->hi) return -1;
     if (b->full) return b->full - 1;
     uintptr_t k = (addr - b->a) >> 24, lo = b->a + (k << 24);
-    uint64_t want = len > 1 ? len : BIG_UNKNOWN; uintptr_t end = (addr + want + BIG_S - 1) & ~(uintptr_t)(BIG_S - 1); end += BIG_S; if (end > b->b || end < lo) end = b->b;
+    uint64_t want = len > 1 ? len : b->small ? (uint64_t)(b->hi - addr) : BIG_UNKNOWN;   // unknown extent: BIG_UNKNOWN, or in a small pool the rest of it, as its whole buffer gave
+    uintptr_t end = (addr + want + BIG_S - 1) & ~(uintptr_t)(BIG_S - 1); end += BIG_S; if (end > b->b || end < lo) end = b->b;
     int i = b->chunk[k] - 1;
     uintptr_t have = i >= 0 ? g_pools[i].end : 0;
     if (i >= 0 && (have >= b->hi || have >= addr + want)) return i;
@@ -1048,6 +1065,29 @@ static int big_lookup(big_pool *b, uint64_t addr, uint64_t len) {
     b->chunk[k] = n + 1;
     return n;
 }
+// DM_GUEST_ZERO_PUNCH (hle_svc.c guest_zero_punch): [lo, hi), all 0 when the scan read it, goes back to the guest file as holes unless the GPU may reach it: a pool buffer over it (a pool, a
+// chunk, a chunk a longer one replaced) in the residency set or used by a submission not completed yet, or a sparse virtual pool's mapping of it elsewhere (nvn_phys_remapped). g_mu is held from
+// the look to the punch, so no buffer over it becomes resident meanwhile (pool_res, the raw table and the residency budget take it). A write by the CPU is what the protection excludes: the pages
+// still protected and all 0 are punched (nvn_dirty_punch_zero), the others protected now, for the next round if nothing writes them meanwhile. Returns the bytes punched; *prot: bytes looked at
+__attribute__((weak)) int dm_guest_punch_range(uintptr_t a, size_t n) { (void)a; (void)n; return 0; }   // hle_svc.c: F_PUNCHHOLE on the guest file (tests give their own)
+int nvn_phys_remapped(uintptr_t lo, uintptr_t hi);   // hle_nvn.c
+static int (*g_zp_punch)(uintptr_t a, size_t n) = dm_guest_punch_range;   // what makes the holes (a test sets its own)
+static uint64_t g_zp_skip_gpu, g_zp_skip_remap;
+size_t mtl_zero_punch(uint64_t lo, uint64_t hi, uint64_t *prot) {
+    if (hi <= lo) return 0;
+    if (nvn_phys_remapped((uintptr_t)lo, (uintptr_t)hi)) { g_zp_skip_remap++; return 0; }
+    pthread_mutex_lock(&g_mu);
+    uint64_t done = g_done; int gpu = 0;
+    for (int i = 0; i < g_npool && !gpu; i++) { const pool_ent *p = &g_pools[i]; uint64_t blo = p->base, bhi = p->base + p->buf.length;
+        if (blo < hi && lo < bhi && (p->res || atomic_load_explicit(p->used, memory_order_relaxed) > done)) gpu = 1; }
+    for (int i = 0; i < g_n_old_res && !gpu; i++) { uint64_t blo = (uint64_t)(uintptr_t)g_old_res[i].buf.contents, bhi = blo + g_old_res[i].buf.length; if (blo < hi && lo < bhi) gpu = 1; }
+    size_t got = 0;
+    if (gpu) g_zp_skip_gpu++;
+    else { got = nvn_dirty_punch_zero((const void *)(uintptr_t)lo, hi - lo, g_zp_punch); nvn_dirty_protect((const void *)(uintptr_t)lo, hi - lo); if (prot) *prot += hi - lo; }
+    pthread_mutex_unlock(&g_mu);
+    return got;
+}
+void mtl_zero_punch_stats(uint64_t *skip_gpu, uint64_t *skip_remap) { *skip_gpu = g_zp_skip_gpu; *skip_remap = g_zp_skip_remap; }
 static int rel_wired(uintptr_t lo, uintptr_t hi) {   // whether a pool entry over [lo, hi) is in the residency set (its pages are wired through a zero-copy buffer); the pool table is only read
     int w = 0; pthread_mutex_lock(&g_mu);
     for (int i = 0; i < g_npool; i++) if (g_pools[i].res && g_pools[i].lo < hi && g_pools[i].hi > lo) { w = 1; break; }
@@ -1069,9 +1109,10 @@ static int pool_find(uint64_t addr, uint64_t len) {
 }
 // The entry that holds addr, or -1, making no buffer: a large pool answers with its stride's chunk if it has one. For questions no GPU use follows: through pool_find the pool walk's log
 // asked about every texture's storage and made a chunk of 80 MB and more for each stride (BIG_UNKNOWN past the address), or lengthened its chunk to that, 77 of them, 6.7 GB counted
-// by Metal, in Ocarina of Time's first area load. Caller holds g_mu
+// by Metal, in Ocarina of Time's first area load. A stride's chunk counts only where it reaches addr: tv-all's DM_NVN_WIRE_BOUND keeps chunks to what bindings reach, and a chunk the
+// statistic made over all of a 305 MB pool was taken and wired whole by the storage buffer bound there (tv-all-wire's pool_peek, folded in here). Caller holds g_mu
 static int pool_peek(uint64_t addr) {
-    if (g_nbig) { int b = big_of(addr); if (b >= 0) { const big_pool *bp = &g_big[b]; return bp->full ? bp->full - 1 : bp->chunk[(addr - bp->a) >> 24] - 1; } }
+    if (g_nbig) { int b = big_of(addr); if (b >= 0) { const big_pool *bp = &g_big[b]; if (bp->full) return bp->full - 1; int i = bp->chunk[(addr - bp->a) >> 24] - 1; return i >= 0 && g_pools[i].end > addr ? i : -1; } }
     return pool_held(addr, 1);
 }
 // Whether [addr, addr + len) lies in a pool, with no side effect: mtl_addr makes the pool resident, for a GPU use to follow. A large pool is answered from its range, since its lookup
@@ -12093,7 +12134,7 @@ static int gmem_learned_entries(uint8_t *t, const uint8_t *keep, int *over, int 
             p->want = 0; pool_used(p->used); gmem_item_add(&R, &nR, &cR, p->lo, p->hi, p->gpu - p->base, 0);
         } else for (uint64_t a = p->lo; a < p->hi; a += GMEM_STUB) gmem_item_add(&S, &nS, &cS, a, MIN(a + GMEM_STUB, (uint64_t)p->hi), zgpu - a, 1);
     }
-    for (int k = 0; k < g_nbig; k++) { const big_pool *b = &g_big[k]; if (!addr_meets(b->lo, b->hi)) continue;
+    for (int k = 0; k < g_nbig; k++) { const big_pool *b = &g_big[k]; if (!addr_meets(b->lo, b->hi) || b->full) continue;   // a whole pool (big_raw_whole) is listed by its entry above
         for (uint64_t w = b->a; w < b->hi; w += BIG_S) if (!b->chunk[(w - b->a) >> 24]) { uint64_t lo = MAX(w, (uint64_t)b->lo); gmem_item_add(&S, &nS, &cS, lo, MIN(w + BIG_S, (uint64_t)b->hi), zgpu - lo, 1); } }
     qsort(R, (size_t)nR, sizeof *R, gmem_item_cmp); qsort(S, (size_t)nS, sizeof *S, gmem_item_cmp);
     uint64_t end = 0; int m = 0;
@@ -12244,7 +12285,7 @@ static void gml_read(id<MTLBuffer> b, id<MTLBuffer> map, int predicted, uint64_t
         if (known) continue;
         if (g_gml_n == GML_MAX) { g_gml_over = 1; break; }
         if (predicted) for (int j = 0; j < nr; j++) if (e[0] < rhi[j] && rlo[j] < e[1]) { shadowed++; break; }   // under a shadow? The whole pool counts: the log does not say where in it
-        pthread_mutex_lock(&g_mu); int p = pool_peek(e[0]); double age = p >= 0 ? (double)(now - g_pools[p].born) / 1e6 : -1; pthread_mutex_unlock(&g_mu);
+        pthread_mutex_lock(&g_mu); big_raw_whole(e[0]); int p = pool_peek(e[0]); double age = p >= 0 ? (double)(now - g_pools[p].born) / 1e6 : -1; pthread_mutex_unlock(&g_mu);   // a raw store makes a small pool in chunks whole
         if (age >= 0) { if (age < age_lo) age_lo = age; if (age > age_hi) age_hi = age; }
         g_gml_lo[g_gml_n] = e[0]; g_gml_hi[g_gml_n++] = e[1]; added++;
     }
@@ -12268,8 +12309,19 @@ static void gml_read(id<MTLBuffer> b, id<MTLBuffer> map, int predicted, uint64_t
 }
 // The read half of a log (learned mode, on completion): for each entry a load chose, a resident pool's use is stamped with the submission's fence (pool_age keeps what is read wired), and a stub's pool is
 // marked wanted -- a large pool: its 16 MiB window gets a chunk -- and a new table is asked for (g_gmem_stale), which lists it resident. Entries are those of the table the shader used (map)
+// A small pool in chunks (DM_NVN_WIRE_BOUND) that raw global memory reaches into: one entry for all of it from now on (b->full), as its whole buffer was before, so raw loads and stores
+// anywhere in it find its memory as they did. Caller holds g_mu
+static void big_raw_whole(uint64_t addr) {
+    int bi = big_of(addr); if (bi < 0) return;
+    big_pool *b = &g_big[bi]; if (!b->small || b->full) return;
+    int n = big_new(b, b->a, b->b, b->b, 0); if (n < 0) return;
+    b->full = n + 1; g_wire_whole_n++; g_wire_whole_b += b->b - b->a;
+    static int nl; if (nl++ < 8) MLOG("memory pool %p+%llu MB (in chunks, DM_NVN_WIRE_BOUND): raw global memory reaches into it, whole from now on (%llu pools, %llu MB so far)", b->mem,
+                                     (unsigned long long)((b->hi - b->lo) >> 20), (unsigned long long)g_wire_whole_n, (unsigned long long)(g_wire_whole_b >> 20));
+}
 static int gmem_entry_pool(uint64_t lo, int create) {   // caller holds g_mu: the pool entry for the entry's first address; a large pool's window is made exactly (not BIG_UNKNOWN past it)
     int bi = big_of(lo); if (bi < 0) return pool_find(lo, 1);
+    if (g_big[bi].small) { big_raw_whole(lo); return g_big[bi].full - 1; }   // a small pool: whole once a raw load reads it (its entry wanted if this was a stub)
     big_pool *b = &g_big[bi]; uintptr_t k = (lo - b->a) >> 24, wlo = b->a + (k << 24);
     int i = b->chunk[k] - 1; if (i >= 0 || !create) return i;
     uintptr_t wend = wlo + BIG_S; if (wend > b->b) wend = b->b;
