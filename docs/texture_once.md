@@ -94,6 +94,9 @@ Counters join the existing ASTC counters line after each `memory up to frame` li
 - Install: send <build>/tvport-once/romfs.img as Library/Caches/romfs.img (same retries + size verify); do not send astc-ro.pack and remove a stale
   Library/Caches/astc-ro.pack from that game's container.
 - If tex_once.py fails, log one warning and install exactly as today (plain RomFS.img + astc-ro.pack). The feature never fails a build.
+- If the prebuild (bntx_astc.py) leaves no pack, an Apple TV build stops there with the reason (backend.py `pack_required`, with Compressed textures on, before anything is sent):
+  without the pack there is nothing to store textures once against, and on a GPU without BC formats every BC texture is held decoded until the game has encoded it
+  (Ocarina of Time's run 17: 600 more textures, 455 MB against 188, then out of memory). A target whose GPU has BC formats would go on without it, as before.
 
 ## 6. Verification before Brad's TV
 Mac, on the real stripped images (Smash cap 512, MK8 cap 0): the engine's C sparse reader reads each whole logical image and its SHA-256

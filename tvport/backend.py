@@ -1066,21 +1066,45 @@ def astc_block(args) -> int:
     return astc_blocks(args)[0]
 
 
-def prebuild_astc(game: Game, block: int, python: str, texture_cap: int, bc1_block: Optional[int] = None) -> Optional[Path]:
+TARGET_BC_FORMATS = False   # whether the GPU TVPort builds for reads BC textures: no Apple TV's does (A8 to A15). One that does (a Mac's) draws the game's own BC textures while it encodes them
+
+
+def pack_required(block: int, bc_formats: Optional[bool] = None) -> bool:
+    """Whether a texture pack that could not be prepared stops the build: on a GPU without BC formats with Compressed textures on (block > 0), which Store textures once needs too.
+    Without the pack every BC texture is held decoded until the game has encoded it in the background, several times its ASTC size (Ocarina of Time on the Apple TV, run 17:
+    600 more textures decoded, 455 MB against 188, and the app ran out of memory). A GPU with BC formats (bc_formats, by default TARGET_BC_FORMATS) goes on without it, as before."""
+    return block > 0 and not (TARGET_BC_FORMATS if bc_formats is None else bc_formats)
+
+
+def pack_stopped(reason: str) -> Failure:
+    """The error that ends a build whose required pack could not be prepared (pack_required), in the words the app shows"""
+    return Failure(f"Build stopped: the compressed textures could not be prepared ({reason}). The Apple TV cannot read the game's own compressed textures, so without them "
+                   'the game would hold its textures uncompressed, several times the memory, and a large game runs out of it. Nothing was sent to the Apple TV. '
+                   'Build & Install again once the reason is fixed, or set Compressed textures to Off for this game to build without them.')
+
+
+def prebuild_astc(game: Game, block: int, python: str, texture_cap: int, bc1_block: Optional[int] = None, required: bool = False) -> Optional[Path]:
     """Run the engine's prebuild (dm/gfx/tools/bntx_astc.py) over the extracted game: every BC1/2/3/7 texture encoded to ASTC on this Mac and packed into one astc-ro.pack. The game's texture cap (DM_BC_MAX_DIM in the app's env, 0 = none) goes along: only the mip levels the app keeps under it are packed. It is incremental: with the same game files, engine, block size and cap it
-    returns the pack it made before at once. A failure is not fatal: the game then encodes textures while it runs (slower the first time, and the textures stay uncompressed until it has)."""
+    returns the pack it made before at once. A failure stops the build when the pack is required (pack_required: the Apple TV); otherwise it is not fatal: the game then encodes textures while it runs (slower the first time, and the textures stay uncompressed until it has)."""
     stage('Preparing compressed textures')
     out = game.build / 'tvport-astc'
     pack = out / 'astc-ro.pack'
     try:
         stream([python, '-I', REPO / 'dm/gfx/tools/bntx_astc.py', game.romfs, '--out', out, '--block', str(block), '--bc1-block', str(bc1_block or block), '--max-dim', str(texture_cap), '--drop-cache'], cwd=REPO, log_filter=lambda line: line.startswith('astc'))
     except Failure as failure:
-        # The build goes on without a pack, and so without Store textures once: until the game has encoded a texture in the background it holds it decoded, several times its ASTC size
-        # (Ocarina of Time on the Apple TV, run 17: 600 more textures decoded, 455 MB against 188, and the app ran out of memory). The engine's log says so too ([RED] ASTC: no prebuilt texture pack)
-        emit('log', line=f'Compressed textures could not be prepared ({str(failure).splitlines()[-1][:300] if str(failure) else "no reason given"}). The game prepares them while it runs instead; '
+        reason = str(failure).splitlines()[-1][:300] if str(failure).strip() else 'no reason given'
+        if required:
+            raise pack_stopped(reason) from None
+        # The build goes on without a pack, and so without Store textures once: until the game has encoded a texture in the background it holds it decoded, several times its ASTC size.
+        # The engine's log says so too ([RED] ASTC: no prebuilt texture pack)
+        emit('log', line=f'Compressed textures could not be prepared ({reason}). The game prepares them while it runs instead; '
                          'until it has, its textures take several times the memory, which a large game may not have on the Apple TV. Build & Install again once the reason is fixed.')
         return None
-    return pack if pack.is_file() else None
+    if pack.is_file():
+        return pack
+    if required:
+        raise pack_stopped('the tool finished without a pack')
+    return None
 
 
 TEXTURE_ONCE_CHOICES = ('auto', 'on', 'off')
@@ -1342,7 +1366,7 @@ def cmd_build(args) -> None:
                 emit('log', line=f"The engine's patches for this game changed ({why}), but prod.keys was not found, so the game's code is not rewritten again this time.")
     bundle = game.bundle_id(team)
     block, bc1_block = astc_blocks(args)
-    pack = prebuild_astc(game, block, python, args.texture_cap, bc1_block) if block else None   # the game's files are extracted: encode its BC textures once, here
+    pack = prebuild_astc(game, block, python, args.texture_cap, bc1_block, pack_required(block)) if block else None   # the game's files are extracted: encode its BC textures once, here; without them an Apple TV build stops here, before anything is sent
     if args.device:
         remember_shaders(game, args.device, bundle)
         stage('Backing up saves to this Mac')

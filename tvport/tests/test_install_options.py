@@ -165,7 +165,7 @@ class CompressedTextures(unittest.TestCase):
         self.assertEqual(argv[argv.index('--max-dim') + 1], '512')   # the game's texture cap, the same number write_env gives the app as DM_BC_MAX_DIM
         self.assertIn('--drop-cache', argv)
 
-    def test_a_failed_prebuild_does_not_fail_the_build(self):
+    def test_a_failed_prebuild_does_not_fail_the_build_when_the_pack_is_not_required(self):   # see PackRequired for the Apple TV
         game = SimpleNamespace(build=Path(self.tmp.name) / 'nothing', romfs=Path(self.tmp.name) / 'romfs.img')
         out = io.StringIO()
         with patch.object(backend, 'stream', side_effect=backend.Failure('clang: not found')), redirect_stdout(out):
@@ -507,6 +507,109 @@ class StoreTexturesOnce(unittest.TestCase):
         argv = [str(a) for a in stream.call_args.args[0]]
         self.assertEqual(argv[argv.index('--destination') + 1], 'Library/Caches/astc-ro.pack')
         self.assertFalse(self.root.joinpath('build/tvport-once').exists())
+
+
+class PackRequired(unittest.TestCase):
+    """A texture pack that cannot be prepared stops an Apple TV build (no BC formats) with Compressed textures on, before anything is sent: Ocarina of Time's run 17 went on
+    without one and ran out of memory. A target whose GPU has BC formats keeps going without the pack, as before."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / 'extract').mkdir(); (self.root / 'build').mkdir()
+        (self.root / 'extract/RomFS.img').write_bytes(b'r' * 500)
+        (self.root / 'App.app').mkdir(); (self.root / 'App.app/embedded.mobileprovision').write_text('x')
+        self.game = SimpleNamespace(build=self.root / 'build', romfs=self.root / 'extract/RomFS.img', app=self.root / 'App.app', prepared=True, addons=[], input_signature=lambda: 's',
+                                    state=lambda: {'source_signature': 's'}, bundle_id=lambda team: 'b', save_state=lambda **kw: None)
+
+    def prebuild(self, required, fail='clang: error: linker command failed with exit code 1', make=False):
+        """prebuild_astc with the engine tool replaced: it fails with `fail`, or (fail None) finishes, leaving a pack when `make`; returns (pack or the Failure raised, log text)"""
+        def fake(argv, **kwargs):
+            if fail:
+                raise backend.Failure(f'bntx_astc.py stopped\n{fail}')
+            if make:
+                (self.root / 'build/tvport-astc').mkdir(exist_ok=True); (self.root / 'build/tvport-astc/astc-ro.pack').write_bytes(b'p')
+        out = io.StringIO()
+        with patch.object(backend, 'stream', side_effect=fake), redirect_stdout(out):
+            try:
+                result = backend.prebuild_astc(self.game, 4, 'python3', 256, 6, required)
+            except backend.Failure as failure:
+                result = failure
+        return result, out.getvalue()
+
+    def test_the_pack_is_required_on_a_gpu_without_bc_formats_with_compressed_textures_on(self):
+        self.assertFalse(backend.TARGET_BC_FORMATS)   # TVPort builds for the Apple TV, whose GPUs have no BC formats
+        self.assertTrue(backend.pack_required(4)); self.assertTrue(backend.pack_required(6))
+        self.assertFalse(backend.pack_required(0))   # Compressed textures Off: there is no pack to prepare
+        self.assertFalse(backend.pack_required(4, bc_formats=True))   # a Mac's GPU draws the game's BC textures as they are
+
+    def test_a_required_pack_that_fails_stops_with_what_failed_and_why(self):
+        failure, text = self.prebuild(required=True)
+        self.assertIsInstance(failure, backend.Failure)
+        message = str(failure)
+        self.assertTrue(message.startswith('Build stopped: the compressed textures could not be prepared (clang: error: linker command failed with exit code 1).'), message)
+        self.assertIn('cannot read the game\'s own compressed textures', message)   # why it stopped
+        self.assertIn('Nothing was sent to the Apple TV', message)
+        self.assertIn('set Compressed textures to Off', message)   # what the person can do
+        self.assertNotIn('"log"', text)   # one error, no warning line before it
+
+    def test_a_required_pack_the_tool_did_not_make_stops_too(self):
+        failure, _ = self.prebuild(required=True, fail=None, make=False)
+        self.assertIsInstance(failure, backend.Failure)
+        self.assertIn('(the tool finished without a pack)', str(failure))
+        pack, _ = self.prebuild(required=True, fail=None, make=True)
+        self.assertEqual(pack, self.root / 'build/tvport-astc/astc-ro.pack')
+
+    def test_a_pack_not_required_keeps_the_fallback(self):
+        result, text = self.prebuild(required=False)
+        self.assertIsNone(result)
+        self.assertIn('could not be prepared (clang: error: linker command failed with exit code 1)', text)
+        self.assertIsNone(self.prebuild(required=False, fail=None, make=False)[0])
+
+    def build(self, bc_formats=False, astc='auto', once='auto'):
+        """cmd_build with the real prebuild_astc over a failing engine tool and everything after it replaced: returns (the Failure raised or None, the mocks after the prebuild)"""
+        args = SimpleNamespace(folder=str(self.root), team='T', keys=None, device='dev', texture_cap=256, astc=astc, astc_block='matched', texture_once=once, compress_data='auto', icloud=False,
+                               art=None, mode='handheld', render_scale=1)
+        names = ('remember_shaders', 'backup_saves', 'store_textures_once', 'compress_game_data', 'generate_project', 'bundle_shaders', 'compile_app', 'install', 'restore_saves')
+        values = {'backup_saves': {'state': 'none', 'files': 0}, 'restore_saves': 0}
+        mocks = {name: patch.object(backend, name, return_value=values.get(name)) for name in names}
+        out = io.StringIO()
+        with patch.object(backend, 'Game', return_value=self.game), patch.object(backend, 'known_team', return_value='T'), patch.object(backend, 'relocate_build', return_value=self.game), \
+             patch.object(backend, 'BUNDLED', False), patch.object(backend, 'engine_python', return_value='python3'), patch.object(backend, 'one_build_at_a_time'), \
+             patch.object(backend, 'provisioning', return_value={}), patch.object(backend, 'TARGET_BC_FORMATS', bc_formats), \
+             patch.object(backend, 'stream', side_effect=backend.Failure('bntx_astc.py stopped\nclang: error: unable to execute command: Killed')) as stream, redirect_stdout(out):
+            started = {name: mock.start() for name, mock in mocks.items()}
+            try:
+                backend.cmd_build(args)
+                raised = None
+            except backend.Failure as failure:
+                raised = failure
+            finally:
+                for mock in mocks.values():
+                    mock.stop()
+        started['stream'] = stream
+        return raised, started
+
+    def test_an_apple_tv_build_stops_before_anything_is_sent(self):
+        for once in ('auto', 'on', 'off'):   # the pack is required whenever Compressed textures is on: without it every BC texture is held decoded
+            raised, calls = self.build(once=once)
+            self.assertIsNotNone(raised, once)
+            self.assertIn('(clang: error: unable to execute command: Killed)', str(raised))
+            self.assertTrue(calls['stream'].call_args.args[0][2].as_posix().endswith('dm/gfx/tools/bntx_astc.py'))   # it was the prebuild that failed
+            for name in ('backup_saves', 'store_textures_once', 'compress_game_data', 'generate_project', 'compile_app', 'install'):
+                calls[name].assert_not_called()
+
+    def test_a_target_with_bc_formats_goes_on_without_the_pack(self):
+        raised, calls = self.build(bc_formats=True)
+        self.assertIsNone(raised)
+        calls['store_textures_once'].assert_not_called()   # no pack to store textures once against
+        calls['compress_game_data'].assert_called_once()   # the whole game files compressed, as before
+        self.assertIsNone(calls['install'].call_args.args[3])   # installed with no pack
+
+    def test_compressed_textures_off_builds_without_a_prebuild(self):
+        raised, calls = self.build(astc='off')
+        self.assertIsNone(raised)
+        calls['stream'].assert_not_called()
+        calls['install'].assert_called_once()
 
 
 class Advanced(unittest.TestCase):

@@ -559,7 +559,7 @@ struct SettingsForm: View {
                             Text("6×6").tag(6)
                         }
                         .pickerStyle(.segmented).disabled(library.games.first { $0.id == library.selection }?.compressedTextures == "off")
-                        note("The Apple TV's GPU has no BC texture formats, so the game's BC1/2/3/7 textures would be stored as RGBA8, 4 to 8 times their size. On, and Automatic, which is on for the Apple TV, prepares them as ASTC on this Mac while building and sends them with the game files (it can add several GB), and the game stores them that way. Matched keeps each texture about its original size: BC1 textures (the most compact Switch format) are slightly softer at 6×6. 4×4 is sharpest but BC1 textures double in size; 6×6 for everything is smallest. Off keeps them as RGBA8.")
+                        note("The Apple TV's GPU has no BC texture formats, so the game's BC1/2/3/7 textures would be stored as RGBA8, 4 to 8 times their size. On, and Automatic, which is on for the Apple TV, prepares them as ASTC on this Mac while building and sends them with the game files (it can add several GB), and the game stores them that way; if they can't be prepared the build stops and says why. Matched keeps each texture about its original size: BC1 textures (the most compact Switch format) are slightly softer at 6×6. 4×4 is sharpest but BC1 textures double in size; 6×6 for everything is smallest. Off keeps them as RGBA8.")
                         Picker("Store textures once", selection: textureOnceBinding) {
                             Text("Automatic").tag("")
                             Text("On").tag("on")
