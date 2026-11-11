@@ -73,6 +73,9 @@ static void lg_shared(void) { @autoreleasepool {
     for (int i = 0; i < nog && i < 5; i++) { char fb[16]; uint64_t k = og[i].key;
         MLOG("[ledger]   unreferenced shared textures %llux%llu x%llu %s: %u, %.0f MB", (unsigned long long)(k >> 48), (unsigned long long)(k >> 32 & 0xffff), (unsigned long long)(k >> 24 & 0xff), lg_fmt((uint32_t)(k & 0xffff), fb, sizeof fb), og[i].n, og[i].bytes / M); }
     MLOG("[ledger]   deferred-release queue: %llu objects to free, %.0f MB; %llu references to drop", (unsigned long long)dq_n, dq_b / M, (unsigned long long)dr_n);
+    if (rr_mode() == 2) MLOG("[ledger]   render targets dead by overwrite (DM_NVN_RT_RETIRE=log, kept): %llu, %.0f MB would go now; %llu storages, %.0f MB, counted so far",
+                             (unsigned long long)g_rr_log_now_n, g_rr_log_now_b / M, (unsigned long long)g_rr_log_n, g_rr_log_b / M);
+    else MLOG("[ledger]   render targets dead by overwrite (DM_NVN_RT_RETIRE): retired %llu, %.0f MB so far, %llu made again", (unsigned long long)g_rr_n, g_rr_b / M, (unsigned long long)g_rr_again);
 } }
 static void lg_dump(void) { @autoreleasepool {
     const double M = 1048576.0;
