@@ -4060,6 +4060,139 @@ static void up_blit_add(id<MTLBuffer> src, size_t off, size_t row, size_t image,
                         id<MTLTexture> dst, NSUInteger slice, NSUInteger level) { up_blit_add_at(src, off, row, image, size, dst, slice, level, MTLOriginMake(0, 0, 0)); }
 
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture> reuse, MTLTextureUsage keep);
+// DM_NVN_READ_TRAP=1 (diagnostic, off by default; a stripped RomFS image, "Store textures once"): which CPU code reads a stripped texture's memory. A stripped plane is a tag and zeros
+// there; the upload resolves the tag to its ASTC blocks, but code that reads the bytes itself would get the tag and zeros. After a texture's planes were found by their tags, the pages of its
+// storage are made inaccessible (PROT_NONE); the next access faults (nvn_dirty.c asks this trap first), is recorded with its pc and lr and the address, and the page gets back the protection
+// the dirty-page tracking expects. Every 300 frames the memory readout names what was hit, by module offset, with the texture (serial, format, size, its first tag; tex_once.py --manifest
+// lists every tag with its file); each trapped texture is listed once. Host code reading the storage (the ASTC decision, edge pages, a re-upload) is named once per call site and not counted
+// as a reader. Pages are 16 KB: an address outside the texture on a trapped page is another object's, counted apart. Not seen: a copy of the bytes the game keeps elsewhere, reads before the
+// upload, a system call that touches a trapped page (it fails with EFAULT instead of faulting). Ocarina of Time in Link's house (387 textures trapped, the lamps, leaves and baked lighting
+// among them): no game code read one; their damage was the texture tools' GOB order (bntx_astc.gob_switch2)
+#include <sys/ucontext.h>
+#include <dlfcn.h>
+static int rt_on(void);
+enum { RT_SLOTS = 1 << 18, RT_RING = 16384 };
+static _Atomic uintptr_t g_rt_page[RT_SLOTS];   // trapped host pages (open addressing, 0 = empty)
+static _Atomic uint8_t g_rt_armed[RT_SLOTS];    // 1 armed (inaccessible), 2 being restored by a fault, 0 restored
+typedef struct { uintptr_t addr, pc, lr; int wr; _Atomic uint64_t seq; } rt_hit;
+static rt_hit g_rt_ring[RT_RING]; static _Atomic uint64_t g_rt_head; static uint64_t g_rt_tail; static _Atomic uint64_t g_rt_lost;
+typedef struct { uintptr_t lo, hi; uint64_t serial; uint32_t fmt, w, h, levels; uint8_t tag[8]; } rt_tex;
+static rt_tex *g_rt_tex; static size_t g_rt_ntex, g_rt_cap; static pthread_mutex_t g_rt_mu = PTHREAD_MUTEX_INITIALIZER; static uintptr_t g_rt_pg;
+static uint64_t g_rt_pages, g_rt_faults, g_rt_reads, g_rt_inside;
+static size_t rt_slot(uintptr_t pg) { return (size_t)(((pg >> 12) * 0x9E3779B97F4A7C15ull) >> 46) & (RT_SLOTS - 1); }
+static int rt_find(uintptr_t pg) { size_t i = rt_slot(pg); for (int k = 0; k < 128; k++, i = (i + 1) & (RT_SLOTS - 1)) { uintptr_t v = atomic_load(&g_rt_page[i]); if (v == pg) return (int)i; if (!v) return -1; } return -1; }
+static int rt_insert(uintptr_t pg) { size_t i = rt_slot(pg); for (int k = 0; k < 128; k++, i = (i + 1) & (RT_SLOTS - 1)) { uintptr_t v = 0; if (atomic_compare_exchange_strong(&g_rt_page[i], &v, pg) || v == pg) return (int)i; } return -1; }
+static int rt_fault(void *addr, int is_write, void *uc_) {   // signal context: atomics and mprotect only
+    uintptr_t pg = (uintptr_t)addr & ~(g_rt_pg - 1); int i = rt_find(pg); if (i < 0) return 0;
+    uint8_t st = 1;
+    if (atomic_compare_exchange_strong(&g_rt_armed[i], &st, 2)) {
+        mprotect((void *)pg, g_rt_pg, nvn_dirty_page_protected((void *)pg) ? PROT_READ : PROT_READ | PROT_WRITE);
+        ucontext_t *uc = uc_; uint64_t k = atomic_fetch_add(&g_rt_head, 1);
+        if (k - g_rt_tail >= RT_RING) atomic_fetch_add(&g_rt_lost, 1);
+        else { rt_hit *h = &g_rt_ring[k % RT_RING]; h->addr = (uintptr_t)addr; h->pc = uc ? (uintptr_t)uc->uc_mcontext->__ss.__pc : 0; h->lr = uc ? (uintptr_t)uc->uc_mcontext->__ss.__lr : 0; h->wr = is_write; atomic_store(&h->seq, k + 1); }
+        atomic_store(&g_rt_armed[i], 0);
+        return 1;
+    }
+    if (st == 2) { while (atomic_load(&g_rt_armed[i]) == 2) sched_yield(); return 1; }   // another thread is restoring it: run the access again
+    return 0;
+}
+static int rt_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_READ_TRAP"); v = e && atoi(e) != 0;
+    if (v) { g_rt_pg = (uintptr_t)getpagesize(); nvn_dirty_set_trap(rt_fault); MLOG("DM_NVN_READ_TRAP=1: CPU accesses to stripped texture storage are trapped and listed (diagnostic)"); } } return v; }
+static void rt_arm_range(uintptr_t lo, uintptr_t hi) {
+    for (uintptr_t pg = lo & ~(g_rt_pg - 1); pg < hi; pg += g_rt_pg) {
+        int i = rt_insert(pg); if (i < 0) continue;
+        uint8_t z = 0; if (atomic_compare_exchange_strong(&g_rt_armed[i], &z, 1)) { mprotect((void *)pg, g_rt_pg, PROT_NONE); g_rt_pages++; }
+    }
+}
+static void rt_arm(const tex_t *t, const uint8_t *tag) {   // a texture whose planes were found by their tags (pkg_upload_)
+    if (!rt_on() || !t->mem || !t->L.size) return;
+    uintptr_t lo = (uintptr_t)t->mem, hi = lo + t->L.size;
+    pthread_mutex_lock(&g_rt_mu);
+    int known = 0; for (size_t i = 0; i < g_rt_ntex && !known; i++) known = g_rt_tex[i].lo == lo && g_rt_tex[i].hi == hi;
+    if (!known) { if (g_rt_ntex == g_rt_cap) { g_rt_cap = g_rt_cap ? g_rt_cap * 2 : 1024; g_rt_tex = realloc_or_die(g_rt_tex, g_rt_cap * sizeof *g_rt_tex, "the read trap's textures"); }
+        rt_tex *e = &g_rt_tex[g_rt_ntex++]; *e = (rt_tex){lo, hi, t->serial, t->d.format, t->d.width, t->d.height, t->d.levels, {0}}; if (tag) memcpy(e->tag, tag, 8); }
+    pthread_mutex_unlock(&g_rt_mu);
+    rt_arm_range(lo, hi);
+}
+static __thread const tex_t *t_rt_pending; static __thread uint8_t t_rt_tag[8];
+static void rt_arm_pending(const tex_t *t) { if (t_rt_pending && t_rt_pending == t) { rt_arm(t, t_rt_tag); } t_rt_pending = NULL; }
+static int rt_guest(uintptr_t pc) { module_t *m = module_of((void *)pc); return m != NULL; }
+static void rt_drain(void) {   // the memory readout: name the hits, re-arm their pages
+    if (!rt_on()) return;
+    typedef struct { uintptr_t pc, lr; uint64_t serial; int wr, inside; uint64_t n; } agg;
+    static agg *seen; static size_t nseen, capseen;
+    uint64_t head = atomic_load(&g_rt_head), new_n = 0;
+    pthread_mutex_lock(&g_rt_mu);
+    for (; g_rt_tail < head; g_rt_tail++) {
+        rt_hit *h = &g_rt_ring[g_rt_tail % RT_RING]; if (atomic_load(&h->seq) != g_rt_tail + 1) continue;
+        g_rt_faults++; if (!h->wr) g_rt_reads++;
+        rt_tex *tx = NULL; for (size_t i = 0; i < g_rt_ntex; i++) if (h->addr >= g_rt_tex[i].lo && h->addr < g_rt_tex[i].hi) { tx = &g_rt_tex[i]; break; }
+        if (tx) g_rt_inside++;
+        size_t k = 0; for (; k < nseen; k++) if (seen[k].pc == h->pc && seen[k].wr == h->wr && seen[k].serial == (tx ? tx->serial : 0)) break;
+        if (k < nseen) { seen[k].n++; } else {
+            if (nseen == capseen) { capseen = capseen ? capseen * 2 : 256; seen = realloc_or_die(seen, capseen * sizeof *seen, "the read trap's hits"); }
+            seen[nseen++] = (agg){h->pc, h->lr, tx ? tx->serial : 0, h->wr, tx != NULL, 1};
+            if (!rt_guest(h->pc) && !rt_guest(h->lr)) { static uintptr_t hl[32]; static int nhl; int known = 0; for (int q = 0; q < nhl; q++) known |= hl[q] == h->lr;
+                if (!known && nhl < 32) { hl[nhl++] = h->lr; Dl_info di; const char *sym = dladdr((void *)h->lr, &di) && di.dli_sname ? di.dli_sname : "?";
+                    MLOG("[readtrap] host code reads stripped storage: lr=%#lx (%s+%#lx), pc=%#lx (first case)", (unsigned long)h->lr, sym, (unsigned long)(h->lr - (uintptr_t)di.dli_saddr), (unsigned long)h->pc); }
+                rt_arm_range(h->addr, h->addr + 1); continue; }
+            if (new_n++ < 400) { char pcs[96], lrs[96]; module_t *m = module_of((void *)h->pc), *ml = module_of((void *)h->lr);
+                if (m) snprintf(pcs, sizeof pcs, "%s+%#lx", m->name, (unsigned long)(h->pc - (uintptr_t)m->base)); else snprintf(pcs, sizeof pcs, "host %#lx", (unsigned long)h->pc);
+                if (ml) snprintf(lrs, sizeof lrs, "%s+%#lx", ml->name, (unsigned long)(h->lr - (uintptr_t)ml->base)); else snprintf(lrs, sizeof lrs, "host %#lx", (unsigned long)h->lr);
+                if (tx) MLOG("[readtrap] %s of stripped texture ser=%llu format %#x %ux%u levels %u (tag %02x%02x%02x%02x%02x%02x%02x%02x) at +%#lx by pc=%s lr=%s", h->wr ? "write" : "read", (unsigned long long)tx->serial, tx->fmt, tx->w, tx->h, tx->levels,
+                             tx->tag[0], tx->tag[1], tx->tag[2], tx->tag[3], tx->tag[4], tx->tag[5], tx->tag[6], tx->tag[7], (unsigned long)(h->addr - tx->lo), pcs, lrs);
+                else MLOG("[readtrap] %s beside stripped textures (another object on a trapped page) at %#lx by pc=%s lr=%s", h->wr ? "write" : "read", (unsigned long)h->addr, pcs, lrs); }
+        }
+        rt_arm_range(h->addr, h->addr + 1);   // re-armed: a reader that comes back is seen again (once per drain)
+    }
+    static size_t listed; for (; listed < g_rt_ntex; listed++) { const rt_tex *x = &g_rt_tex[listed];   // each trapped texture once: its first tag names its file (tex_once.py --manifest)
+        MLOG("[readtrap] trapped ser=%llu format %#x %ux%u levels %u tag %02x%02x%02x%02x%02x%02x%02x%02x", (unsigned long long)x->serial, x->fmt, x->w, x->h, x->levels,
+             x->tag[0], x->tag[1], x->tag[2], x->tag[3], x->tag[4], x->tag[5], x->tag[6], x->tag[7]); }
+    MLOG("[readtrap] up to frame %llu: %zu stripped textures trapped (%llu page arms), %llu faults (%llu reads), %llu inside a stripped texture, %zu distinct (pc, texture) pairs, %llu lost",
+         (unsigned long long)atomic_load(&g_cur_frame), g_rt_ntex, (unsigned long long)g_rt_pages, (unsigned long long)g_rt_faults, (unsigned long long)g_rt_reads, (unsigned long long)g_rt_inside, nseen, (unsigned long long)atomic_load(&g_rt_lost));
+    pthread_mutex_unlock(&g_rt_mu);
+}
+// DM_NVN_UPLOAD_DIGEST=<file> (diagnostic, off by default): one TSV line per plane of a BC texture that an upload stages on the CPU (pkg_upload_), and one per texture taken from a
+// released texture's copy: frame, serial, the texture's description (format, size, levels, target, flags, packaged block height), the NVN level and layer, how the plane was filled (tag: a
+// stripped plane's pack entry; cache: the ASTC cache by the plane's key; encode: encoded here, DM_NVN_ASTC_MISS=sync; void: a miss's void blocks; unresolved: a tag nothing resolved;
+// decoded: BC decoded on the CPU; donor: the copy), the first 8 bytes of the plane's pack key (a stripped plane's tag, else the key of its BC bytes as the runtime reads them: the two agree
+// when the strip and the runtime see the same plane) and an FNV-1a 64 of the bytes staged. A run on the original game files with DM_NVN_ASTC_MISS=sync (every eligible texture through
+// this path) and a run on a stripped image, joined on the key, show the planes a texture gets differently. Textures decoded on the GPU (no BC, DM_NVN_ASTC_MISS=background misses) are not listed
+static FILE *g_ud_f; static pthread_mutex_t g_ud_mu = PTHREAD_MUTEX_INITIALIZER;
+static int ud_on(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ const char *e = getenv("DM_NVN_UPLOAD_DIGEST"); if (!e || !*e) return;
+        if (!(g_ud_f = fopen(e, "w"))) { MLOG("[RED] DM_NVN_UPLOAD_DIGEST=%s cannot be written (%s): no digests", e, strerror(errno)); return; }
+        setvbuf(g_ud_f, NULL, _IOLBF, 0);
+        fputs("frame\tserial\tformat\twidth\theight\tdepth\tlevels\ttarget\tflags\tpkg_block_h\tlevel\tlayer\thow\tkey8\tfnv64\tbytes\n", g_ud_f);
+        MLOG("DM_NVN_UPLOAD_DIGEST=%s: every BC plane an upload stages is listed with its key and a digest (diagnostic)", e); });
+    return g_ud_f != NULL;
+}
+static uint64_t g_ud_dump_ser[16]; static int g_ud_ndump; static char g_ud_dump_dir[512];   // DM_NVN_UPLOAD_DIGEST_DUMP=<serial,...>:<dir>
+static void ud_dump(const tex_t *t, unsigned level, unsigned layer, const void *stored, size_t stored_n, const void *bc, size_t bc_n) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ const char *e = getenv("DM_NVN_UPLOAD_DIGEST_DUMP"); const char *c = e ? strchr(e, ':') : NULL; if (!c) return;
+        snprintf(g_ud_dump_dir, sizeof g_ud_dump_dir, "%s", c + 1);
+        for (const char *q = e; q < c && g_ud_ndump < 16; ) { g_ud_dump_ser[g_ud_ndump++] = strtoull(q, (char **)&q, 10); if (*q == ',') q++; else break; }
+        MLOG("DM_NVN_UPLOAD_DIGEST_DUMP: the BC planes of %d textures go to %s (diagnostic)", g_ud_ndump, g_ud_dump_dir); });
+    int want = 0; for (int i = 0; i < g_ud_ndump; i++) want |= g_ud_dump_ser[i] == t->serial;
+    if (!want) return;
+    char path[640]; FILE *f;
+    snprintf(path, sizeof path, "%s/%llu_%u_%u_%llu.stored", g_ud_dump_dir, (unsigned long long)t->serial, level, layer, (unsigned long long)atomic_load(&g_cur_frame));
+    if (stored && (f = fopen(path, "wb"))) { fwrite(stored, 1, stored_n, f); fclose(f); }
+    snprintf(path, sizeof path, "%s/%llu_%u_%u_%llu.bc", g_ud_dump_dir, (unsigned long long)t->serial, level, layer, (unsigned long long)atomic_load(&g_cur_frame));
+    if (bc && (f = fopen(path, "wb"))) { fwrite(bc, 1, bc_n, f); fclose(f); }
+}
+static void ud_key(uint32_t format, uint32_t w, uint32_t h, unsigned block, const void *bc, size_t n, char out[17]) {
+    nvn_astc_cache_key k = {{0}}; nvn_bc_astc_plane_key(format, w, h, block ? block : 4, bc, n, &k); memcpy(out, k.hex, 16); out[16] = 0; if (!out[0]) snprintf(out, 17, "-");
+}
+static void ud_plane(const tex_t *t, unsigned level, unsigned layer, const char *how, const char *key, const void *bytes, size_t n) {
+    uint64_t hv = 1469598103934665603ull; const uint8_t *b = bytes; for (size_t i = 0; b && i < n; i++) hv = (hv ^ b[i]) * 1099511628211ull;
+    pthread_mutex_lock(&g_ud_mu);
+    fprintf(g_ud_f, "%llu\t%llu\t%#x\t%u\t%u\t%u\t%u\t%d\t%#x\t%d\t%u\t%u\t%s\t%s\t%016llx\t%zu\n", (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)t->serial, (unsigned)t->d.format,
+            t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.target, (unsigned)t->d.flags, t->d.pkg_block_h, level, layer, how, key && *key ? key : "-", (unsigned long long)(b ? hv : 0), b ? n : 0);
+    pthread_mutex_unlock(&g_ud_mu);
+}
 static int g_direct_upload_on = -1; static uint64_t g_direct_uploads, g_direct_dispatches;
 static int direct_upload_on(void) { if (g_direct_upload_on < 0) { const char *e=getenv("DM_NVN_DIRECT_UPLOAD"); g_direct_upload_on=!e||atoi(e); } return g_direct_upload_on; }
 int nvn_host_readable(uint64_t a, uint64_t n);   // hle_nvn.c: guest memory and sparse pools
@@ -4167,8 +4300,10 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     if (stamp) {   // no stamp: a one-time upload of content the CPU will not change (tex_init_fill), with no write tracking
         *stamp = nvn_dirty_now();
         if (sparse) nvn_sparse_protect(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size); else nvn_dirty_protect(t->mem, t->L.size); }
+    int ud = ud_on() && t->d.format >= 0x41 && t->d.format <= 0x50;   // DM_NVN_UPLOAD_DIGEST: BC formats (nvn_fmt_bc)
     if (stamp && !sparse && !rb_shift) { id<MTLTexture> dt = rel_donor(t, mt);   // over released storage: a copy of the texture released there (no rel_push: its pages are released already)
-        if (dt) { up_begin(); if (!g_up_tc_src) { g_up_tc_src = [NSMutableArray array]; g_up_tc_dst = [NSMutableArray array]; }
+        if (dt) { if (ud) ud_plane(t, 0, 0, "donor", NULL, NULL, 0);
+                  up_begin(); if (!g_up_tc_src) { g_up_tc_src = [NSMutableArray array]; g_up_tc_dst = [NSMutableArray array]; }
                   [g_up_tc_src addObject:dt]; [g_up_tc_dst addObject:mt]; [g_up_texs addObject:mt];
                   if (!g_cb) up_flush();
                   return mt; } }
@@ -4258,6 +4393,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     res_add(stg); [g_up_keep addObject:stg];
     size_t off = 0;
     int zb = zblock_on() && t->d.format >= 0x79 && t->d.format <= 0x94; if (zb) { g_zb_ser = t->serial; g_zb_n = (int)MIN(d.mipmapLevelCount, 16u); memset(g_zb, 0, sizeof g_zb); memset(g_zb_tot, 0, sizeof g_zb_tot); }
+    unsigned rt_tagged = 0; uint8_t rt_tag0[8] = {0};   // DM_NVN_READ_TRAP: planes found by their tags, the first tag
     for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
         uint32_t w = MAX(t->d.width >> (l + sk), 1u), h = MAX(t->d.height >> (l + sk), 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
         size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
@@ -4266,10 +4402,13 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
                 static _Atomic uint64_t planes, hits, encode_ns; static const char *cache, *ro; static dispatch_once_t once;
                 dispatch_once(&once, ^{ cache = getenv("DM_NVN_ASTC_CACHE"); ro = getenv("DM_NVN_ASTC_CACHE_RO"); });
                 size_t apitch = (size_t)((w + ablock - 1) / ablock) * 16, arows = (h + ablock - 1) / ablock; int hit = 0, error = 0, tagged = 0;
+                char udk[17] = "-"; const char *udh = "void";   // DM_NVN_UPLOAD_DIGEST
                 uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC), po, pl;
                 if (!nvn_astc_plane_storage(&t->d, l + sk, y, &po, &pl) && po + pl <= t->L.size) {   // a stripped plane (a tag and zeros): its entry by the tag, no deswizzle, no hash
                     nvn_astc_tag_result tr = nvn_bc_astc_tag_fetch(src + po, (size_t)pl, apitch * arows, (uint8_t *)stg.contents + off);
                     hit = tr == NVN_TAG_HIT; tagged = tr == NVN_TAG_MISS;
+                    if (hit && !rt_tagged++) memcpy(rt_tag0, src + po, 8);
+                    if (hit && ud) { for (int i = 0; i < 8; i++) snprintf(udk + 2 * i, 3, "%02x", src[po + i]); udh = "tag"; }
                 }
                 if (!hit) {
                     uint8_t *cb = malloc(pitch * rows);
@@ -4282,11 +4421,15 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
                         error = hit < 0;
                         if (hit == 0) { uint8_t vb[16]; astc_void_block(t->d.format, vb); for (size_t i = 0; i < apitch * arows; i += 16) memcpy((uint8_t *)stg.contents + off + i, vb, 16); }
                     }
+                    if (ud) { uint64_t dpo = 0, dpl = 0; int sto = !nvn_astc_plane_storage(&t->d, l + sk, y, &dpo, &dpl) && dpo + dpl <= t->L.size;
+                              ud_dump(t, l + sk, y, sto ? src + dpo : NULL, sto ? (size_t)dpl : 0, cb, pitch * rows);
+                              ud_key(t->d.format, w, h, (unsigned)ablock, cb, pitch * rows, udk); udh = tagged && hit != 1 ? "unresolved" : hit == 1 ? "cache" : astc_sync() && !error ? "encode" : error ? "error" : "void"; }
                     free(cb);
                     if (tagged && hit != 1) astc_tag_event(t, NVN_TAG_NOTE_UNRESOLVED, l + sk, w, h);
                 }
                 uint64_t ns = clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0;
                 if (error) { RED_ONCE(162, "ASTC transcode failed: format %#x %ux%u (%d); the level stays empty", t->d.format, w, h, error); memset((uint8_t *)stg.contents + off, 0, apitch * arows); }
+                if (ud) ud_plane(t, l + sk, y, udh, udk, (uint8_t *)stg.contents + off, apitch * arows);
                 atomic_fetch_add(&encode_ns, hit ? 0 : ns); atomic_fetch_add(&hits, hit);
                 uint64_t n = atomic_fetch_add(&planes, 1) + 1;
                 if (astc_sync() && n % 512 == 0) MLOG("ASTC planes %llu, cache hits %llu, encode time %llu ms", (unsigned long long)n, (unsigned long long)atomic_load(&hits), (unsigned long long)(atomic_load(&encode_ns) / 1000000));
@@ -4298,6 +4441,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
                 uint8_t *cb = malloc(pitch * rows * z); size_t up = (size_t)w * ubpp;
                 if (!cb || nvn_deswizzle(&t->d, l + sk, y, src, cb, pitch)) { free(cb); RED_ONCE(9, "deswizzle failed format %#x target %d", t->d.format, t->d.target); break; }
                 for (uint32_t zi = 0; zi < z; zi++) nvn_bc_decode(t->d.format, cb + zi * pitch * rows, pitch, w, h, (uint8_t *)stg.contents + off + zi * up * h, up);
+                if (ud) { char k[17]; ud_key(t->d.format, w, h, astc_block_for(t->d.format), cb, pitch * rows * z, k); ud_plane(t, l + sk, y, "decoded", k, (uint8_t *)stg.contents + off, up * h * z); }
                 free(cb);
                 up_blit_add(stg, off, up, up * h, MTLSizeMake(w, h, z), mt, y, l);
                 off += up * h * z;
@@ -4318,6 +4462,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     }
     free(part);
     up_flush();
+    if (rt_tagged && !sparse && g_embedded && rt_on()) { t_rt_pending = t; memcpy(t_rt_tag, rt_tag0, 8); }   // armed by the caller once its own reads of the storage are done (rt_arm_pending)
     return mt;
 }
 // ---------- Placement sparse textures ----------
@@ -5245,7 +5390,7 @@ static int pu_restore(NvPkg *pk, NvPurge *p, const tex_t *t) {
             res_remove(mt); [mt setPurgeableState:MTLPurgeableStateEmpty]; pthread_mutex_lock(&g_pu_mu); p->state = PU_EMPTY; pthread_mutex_unlock(&g_pu_mu); return 0;
         }
         if (nt != mt) { pk->tex = nt; defer_obj_release(mt); }
-        pk->stamp = stamp; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = stamp; pkg_edges_take(pk, t); if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size);
+        pk->stamp = stamp; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = stamp; pkg_edges_take(pk, t); rt_arm_pending(t); if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size);
         g_pu_reload_n++;
         static unsigned n; if (n++ < 8 || !(n % 256)) MLOG("purged texture restored: ser=%llu %ux%u format %#x re-uploaded (%llu re-uploads, %llu restored in all)", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, (unsigned long long)g_pu_reload_n, (unsigned long long)g_pu_back_n);
     }
@@ -5414,7 +5559,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
                 if (pk->spare && pk->spare != nt) defer_obj_release(pk->spare);   // still in use, or of another shape: retired as before
                 if (pk->sparse) sparse_view(pk, t);
                 zb_report(t, pk->sparse ? (unsigned)pk->vbase : 0, "re-upload");
-                pk->spare = old; pk->spare_fence = g_fence + 1; ser_note(t->serial); pk->stamp = st; pk->vgen = pk->vseen = vg; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = st; g_pkg_reuploads++; if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size); pkg_edges_take(pk, t); }
+                pk->spare = old; pk->spare_fence = g_fence + 1; ser_note(t->serial); pk->stamp = st; pk->vgen = pk->vseen = vg; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = st; g_pkg_reuploads++; if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size); pkg_edges_take(pk, t); rt_arm_pending(t); }
             return pk->view ? pk->view : pk->tex;
         }
         pk = [NvPkg new];
@@ -5424,7 +5569,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         pu_adopt(pk, t);
         pk->span = nvn_dirty_span(t->mem, t->L.size);
         pk->seen = pk->stamp; g_pkg_uploads++; if (dirtycheck() && !pk->sparse) pk->hash = full_hash(t->mem, t->L.size);   // "nothing written since" starts at the stamp: a write that faulted during the upload moved "now" past it
-        pkg_edges_take(pk, t);
+        pkg_edges_take(pk, t); rt_arm_pending(t);
         if (pk->sparse) sparse_view(pk, t);
         zb_report(t, pk->sparse ? (unsigned)pk->vbase : 0, "upload");
         tex_put(t->serial, pk);
@@ -5546,6 +5691,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
 #endif
     MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d, %llu of %llu MB; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total), retired but held by a serial %u, recycled render-target heaps made %llu, reused %llu, freed %llu, waiting %u (%llu MB); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, (unsigned long long)(pres_b >> 20), (unsigned long long)(pool_b >> 20), peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, nwait,
          (unsigned long long)g_rh_made, (unsigned long long)g_rh_reused, (unsigned long long)g_rh_trimmed, rh_n, (unsigned long long)(rh_bytes >> 20), avail);
+    rt_drain();
     if (astc_block()) { char sb[900]; uint64_t th, tu, td; nvn_bc_astc_bg_format_stats(sb, sizeof sb); nvn_bc_astc_tag_stats(&th, &tu, &td); MLOG("%s; textures decided: %llu ASTC, %llu decoded%s; created empty, first filled by copy: %llu (ASTC via pack %llu, a piece of a level %llu; %.1f MB hashed in %.1f ms); tagged planes: %llu hits, %llu unresolved, %llu decoded", sb, (unsigned long long)atomic_load(&g_astc_n_astc), (unsigned long long)atomic_load(&g_astc_n_decoded), astc_sync() ? " (DM_NVN_ASTC_MISS=sync: all ASTC)" : "",
                                                                   (unsigned long long)atomic_load(&g_astc_copy_first), (unsigned long long)atomic_load(&g_astc_copy_astc), (unsigned long long)atomic_load(&g_astc_copy_partial), atomic_load(&g_astc_copy_bytes) / 1048576.0, atomic_load(&g_astc_copy_ns) / 1e6, (unsigned long long)th, (unsigned long long)tu, (unsigned long long)td); }
     { void mtl_vc_stats(unsigned *, uint64_t *, uint64_t *), mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); unsigned vn; uint64_t vh, vm, tb, tm, tf, tc, tcb;

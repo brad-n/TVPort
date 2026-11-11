@@ -92,8 +92,16 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
         if (!busy_wait(r, p)) return 0;
     }
 }
+static int (*_Atomic g_trap_fn)(void *addr, int is_write, void *uc);   // nvn_dirty_set_trap: a diagnostic's page trap, asked first
+void nvn_dirty_set_trap(int (*fn)(void *addr, int is_write, void *uc)) { atomic_store(&g_trap_fn, fn); }
+int nvn_dirty_page_protected(const void *addr) {   // signal-safe: whether a range holding the page has it read-only (or is changing it)
+    uintptr_t a = (uintptr_t)addr; int n = atomic_load(&g_nr);
+    for (int i = 0; i < n; i++) { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end && atomic_load(&r->state[(a - r->base) >> g_shift]) != PG_NONE) return 1; }
+    return 0;
+}
 static int on_fault(void *addr, int is_write, void *uc) {
-    (void)uc;
+    int (*trap)(void *, int, void *) = atomic_load(&g_trap_fn);
+    if (trap && trap(addr, is_write, uc)) return 1;
     if (!is_write) return 0;
     uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
     for (int i = 0; i < n; i++)   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
