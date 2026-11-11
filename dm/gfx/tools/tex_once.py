@@ -212,8 +212,8 @@ def sarc_ranges(d):
 
 # ---- the walker: strip and check share the container dispatch and the texture plan -----------------------------------------------------------------------------------------------
 class Walker:
-    def __init__(self, lib, native, block, max_dim, pack, dicts, bc1_block=None, fmt_blocks=None):
-        self.L, self.N = B.lib_open(lib), native_open(native)
+    def __init__(self, lib, native, block, max_dim, pack, dicts, bc1_block=None, fmt_blocks=None, gob=0):
+        self.L, self.N = B.lib_open(lib, gob), native_open(native)   # gob: the GOB order the runtime reads this game's storage in (bntx_astc.gob_switch2)
         self.block, self.max_dim, self.pack, self.dicts = block, max_dim, pack, dicts
         self.bc1_block = bc1_block or block
         self.fmt_blocks = B.norm_fmt_blocks(*(fmt_blocks or ()))   # BC4 / BC5 / BC6H blocks (0: the pack does not hold the format)
@@ -536,7 +536,7 @@ _W = {}
 def worker_init(cfg):
     if cfg.get('zstd_work'): Z.configure(cfg['zstd_work'])
     pack = PackIndex(cfg['pack'])
-    _W.update(cfg=cfg, w=Walker(cfg['lib'], cfg['native'], cfg['block'], cfg['max_dim'], pack, cfg['dicts'], cfg.get('bc1_block'), cfg.get('fmt_blocks')), fd=os.open(cfg['romfs'], os.O_RDONLY))
+    _W.update(cfg=cfg, w=Walker(cfg['lib'], cfg['native'], cfg['block'], cfg['max_dim'], pack, cfg['dicts'], cfg.get('bc1_block'), cfg.get('fmt_blocks'), cfg.get('gob', 0)), fd=os.open(cfg['romfs'], os.O_RDONLY))
     if cfg.get('sparse'): _W['sparse'] = S.SparseImage(cfg['sparse'])
 
 
@@ -760,12 +760,14 @@ def run(args):
     if not have: log(f'[RED] {pack} is no complete ASTC pack'); return 2
     fp_args = {} if bc1 == block else {'bc1_block': bc1}      # a pack built without --bc1-block is the pack of today: same fingerprint
     fp_args['fmt_blocks'] = fb
+    gob = B.gob_of(getattr(args, 'gob', 'auto'), romfs)    # the GOB order the planes are read in, as the runtime will (Switch 2 games: their own)
+    fp_args['gob'] = gob
     expect = None
     if not args.no_pack_check:
         try: expect = B.fingerprint(romfs, block, max_dim, **fp_args)
         except TypeError: log('[RED] this bntx_astc.py has no --bc1-block'); return 2
     if expect is not None and have['fingerprint'] != expect:
-        log(f'[RED] {pack} was not built from this RomFS, cap {max_dim}, block {block}x{block}' + (f', BC1 block {bc1}' if bc1 != block else '') + ': build it again with bntx_astc.py'); return 2
+        log(f'[RED] {pack} was not built from this RomFS, cap {max_dim}, block {block}x{block}' + (f', BC1 block {bc1}' if bc1 != block else '') + f', {"Switch 2" if gob else "Switch"} GOB order: build it again with bntx_astc.py'); return 2
     import romfs as romfs_mod
     img = romfs_mod.Image(romfs)
     logical = os.path.getsize(romfs)
@@ -806,7 +808,7 @@ def run(args):
     if arc and arc.table: marks.append((arc.table_off, arc.table_size, None, 'table'))
     marks.sort(key=lambda m: m[0])
     tasks = partition(logical, marks)
-    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, fmt_blocks=fb, max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs, zstd_work=os.path.join(out, 'lib'), zlevel=zl)
+    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, fmt_blocks=fb, max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs, zstd_work=os.path.join(out, 'lib'), zlevel=zl, gob=gob)
     writer = S.SparseWriter(target, logical, version=2 if zl is not None else 1)
     totals = collections.Counter(); errors = []; n_errors = 0
     updates, mods_by_task, table_new = {}, {}, None
@@ -1062,7 +1064,7 @@ def run_manifest(args):
     fd = os.open(romfs, os.O_RDONLY)
     marks = [(off, size, (name, off, size, bool(arc and arc.table and name.startswith('/data.arc#'))), 'item') for name, off, size in items if candidate(fd, name, off, size)]
     tasks = [t for t in partition(os.path.getsize(romfs), sorted(marks, key=lambda m: m[0])) if t['kind'] != 'table']
-    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, fmt_blocks=B.norm_fmt_blocks(getattr(args, 'bc4_block', None), getattr(args, 'bc5_block', None), getattr(args, 'bc6h_block', None)), max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs, manifest=True, zstd_work=os.path.join(out, 'lib'))
+    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, fmt_blocks=B.norm_fmt_blocks(getattr(args, 'bc4_block', None), getattr(args, 'bc5_block', None), getattr(args, 'bc6h_block', None)), max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs, manifest=True, gob=B.gob_of(getattr(args, 'gob', 'auto'), romfs), zstd_work=os.path.join(out, 'lib'))
     n = 0
     with cf.ProcessPoolExecutor(args.workers, initializer=worker_init, initargs=(cfg,)) as ex, open(args.manifest + '.part', 'w') as f:
         for i, r in enumerate(ex.map(strip_task, tasks)):
@@ -1086,6 +1088,7 @@ def main():
     ap.add_argument('--max-dim', type=int, default=0, help='the texture cap the pack was built with (0 = none)')
     ap.add_argument('--block', type=int, default=4, choices=(4, 6))
     ap.add_argument('--workers', type=int, default=0, help='processes (default: every core)')
+    ap.add_argument('--gob', choices=('auto', 'switch', 'switch2'), default='auto', help="the order inside a GOB the textures are read in (default: the game's sdk module, as the runtime decides; the pack must have been built with it)")
     for nm in ('bc4', 'bc5', 'bc6h'): ap.add_argument('--%s-block' % nm, type=int, default=None, choices=(0, 4, 5, 6), help='ASTC block of the %s textures (default 6 / 4 / 4 for BC4 / BC5 / BC6H); the pack must have been built with it' % nm.upper())
     ap.add_argument('--bc1-block', type=int, default=None, choices=(4, 5, 6), help='ASTC block of BC1 textures when it differs from --block (default: --block); the pack must have been built with it')
     ap.add_argument('--no-pack-check', action='store_true', help=argparse.SUPPRESS)   # tests only: a pack made by hand
