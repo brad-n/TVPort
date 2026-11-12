@@ -1,5 +1,6 @@
-"""Execute Ocarina's render scale, static shadow map size, reflection probe interval, ground mist and foliage stubs (the 3D views' scale and the literal 12288 of the shadow texture from the host). The frame step is upstream's function-matched stub (MATCH_FRAME_STEP), which calls them; the real-speed stub it replaced is gone."""
+"""Execute Ocarina's render scale, static shadow map size, reflection probe interval, ground mist, foliage, model level-of-detail and shadow cascade stubs (the 3D views' scale and the literal 12288 of the shadow texture from the host). The frame step is upstream's function-matched stub (MATCH_FRAME_STEP), which calls them; the real-speed stub it replaced is gone."""
 import importlib
+import os
 import importlib.util
 from pathlib import Path
 import struct
@@ -337,6 +338,140 @@ class Foliage(unittest.TestCase):
                 self.assertEqual(pc, BASE + FOLIAGE_CALC + 4)
 
 
+MODEL_CALC, MODEL_LOD, MODEL_LOD_INLINE, SCENE_CONFIG = 0x7bb80, 0x31d48b0, 0x31d4d80, 0x35667c0   # v131072: the model scene calc, the graphics module's level function, the caller that inlines it, gsys ModelSceneConfigParam's binder
+# site: (kind, the register its value is in, the register holding the graphics module, its original word, the scratch registers it may change)
+LOD_SITES = {}
+for off in (0x26c4, 0x8a80, 0xabe4): LOD_SITES[MODEL_CALC + off] = ('size', 3, None, '831655bd', {'x': {11}, 's': {4}})   # ldr s3,[x20,#0x1514]
+for off in (0x34a0, 0x91bc, 0xb9c4): LOD_SITES[MODEL_CALC + off] = ('distance', 4, 20, '84924dbd', {'x': {8}, 's': {5}})   # ldr s4,[x20,#0xd90]
+LOD_SITES[MODEL_LOD + 0x14c] = LOD_SITES[MODEL_LOD_INLINE + 0x228] = ('product', 3, None, '8308231e', {'x': {16, 17}, 's': {4}})   # fmul s3,s4,s3
+LOD_SITES[MODEL_LOD + 0x1e4] = ('distance', 5, 21, 'a5924dbd', {'x': {16, 17}, 's': {7}})   # ldr s5,[x21,#0xd90]
+LOD_SITES[MODEL_LOD_INLINE + 0x2a4] = ('distance', 5, 19, '65924dbd', {'x': {16, 17}, 's': {7}})   # ldr s5,[x19,#0xd90]
+CASCADE_SITE = SCENE_CONFIG + 0x2408
+GFX_MODULE, CONFIG = 0x3700000, 0x3780000   # stand for the graphics module and the parameter object (x20)
+
+
+def lod_machine():
+    assert unicorn is not None and arm is not None
+    machine = unicorn.Uc(unicorn.UC_ARCH_ARM64, unicorn.UC_MODE_ARM)
+    machine.mem_map(BASE, 0x3800000)
+    machine.reg_write(arm.UC_ARM64_REG_CPACR_EL1, 3 << 20)
+    ctx = Ctx(machine)
+    ctx.others = {'model calc': MODEL_CALC, 'model lod': MODEL_LOD, 'model lod inline': MODEL_LOD_INLINE, 'scene config binder': SCENE_CONFIG}
+    ctx.capabilities = set()
+    return machine, ctx
+
+
+def sreg(machine, n):
+    return struct.unpack('<f', struct.pack('<I', machine.reg_read(arm.UC_ARM64_REG_S0 + n) & 0xffffffff))[0]
+
+
+def lod_site(site, factor, flags=0x60000000, canary=0x5a5a5a5a5a5a5a5a):
+    """Run one model level-of-detail stub from its site to the instruction after it: the value it leaves (the pixel scale, the scale x pixel scale product or the distance
+    coefficient), whether the registers and flags it may not touch kept their values, and where it goes on"""
+    machine, ctx = lod_machine()
+    profile.model_lod(ctx)
+    machine.mem_write(BASE + STATE + 0xb4, struct.pack('<f', factor))
+    kind, out, module, _, scratch = LOD_SITES[site]
+    kept = [r for r in range(29) if r not in scratch['x']]
+    for r in kept: machine.reg_write(arm.UC_ARM64_REG_X0 + r, canary + r)
+    for n in range(8): machine.reg_write(arm.UC_ARM64_REG_S0 + n, float_reg(10.0 + n))
+    machine.reg_write(arm.UC_ARM64_REG_NZCV, flags)
+    machine.mem_write(BASE + GFX_MODULE + 0x1514, struct.pack('<f', 1.5))   # the module's pixel scale
+    machine.mem_write(BASE + GFX_MODULE + 0xd90, struct.pack('<f', 0.8))   # the start distance coefficient (handheld)
+    if kind == 'product':
+        machine.reg_write(arm.UC_ARM64_REG_S3, float_reg(1.5))
+        machine.reg_write(arm.UC_ARM64_REG_S4, float_reg(0.75))   # the level scale of the model's kind
+    if kind == 'size' or module is not None:
+        module = module if module is not None else 20
+        machine.reg_write(arm.UC_ARM64_REG_X0 + module, BASE + GFX_MODULE)
+        kept.remove(module)
+    machine.emu_start(BASE + site, BASE + site + 4, count=16)
+    ok = all(machine.reg_read(arm.UC_ARM64_REG_X0 + r) == canary + r for r in kept)
+    ok = ok and all(sreg(machine, n) == 10.0 + n for n in range(8) if n != out and n not in scratch['s'] and not (kind == 'product' and n == 4))
+    ok = ok and machine.reg_read(arm.UC_ARM64_REG_NZCV) == flags
+    if module is not None: ok = ok and machine.reg_read(arm.UC_ARM64_REG_X0 + module) == BASE + GFX_MODULE
+    return sreg(machine, out), ok, ctx, machine.reg_read(arm.UC_ARM64_REG_PC)
+
+
+@unittest.skipIf(unicorn is None, 'optional ARM64 execution dependency: unicorn')
+class ModelLod(unittest.TestCase):
+    def test_the_sites_are_the_pixel_scale_and_the_distance_coefficient(self):
+        ctx = lod_site(MODEL_CALC + 0x26c4, 0.0)[2]
+        for site, (_, _, _, original, _) in LOD_SITES.items():
+            with self.subTest(site=hex(site)):
+                self.assertEqual(ctx.sites[site], original)
+        self.assertEqual(len(ctx.sites), 10)
+        self.assertIn('MODEL_LOD', ctx.capabilities)
+
+    def test_unset_keeps_the_games_levels(self):
+        for site, (kind, _, _, _, _) in LOD_SITES.items():
+            with self.subTest(site=hex(site)):
+                value, ok, _, pc = lod_site(site, 0.0)
+                self.assertAlmostEqual(value, {'size': 1.5, 'product': 1.125, 'distance': 0.8}[kind], places=6)
+                self.assertTrue(ok)
+                self.assertEqual(pc, BASE + site + 4)
+
+    def test_a_factor_divides_the_size_and_the_start_distance(self):
+        for factor in (1.25, 2.0, 3.0, 8.0):
+            for site, (kind, _, _, _, _) in LOD_SITES.items():
+                for flags in (0x60000000, 0x80000000):   # the flags of the compare before a distance site reach the fcsel after it
+                    with self.subTest(factor=factor, site=hex(site), flags=hex(flags)):
+                        value, ok, _, pc = lod_site(site, factor, flags)
+                        self.assertAlmostEqual(value, {'size': 1.5 * factor, 'product': 1.125 * factor, 'distance': 0.8 / factor}[kind], places=5)
+                        self.assertTrue(ok)
+                        self.assertEqual(pc, BASE + site + 4)
+
+
+def cascades(host, file_value, w0=0, canary=0x5a5a5a5a5a5a5a5a):
+    """Run the shadow cascade stub from its site (after the binder's visit of DepthShadowCascadeNum0) to the instruction after it: the field it leaves, the Z flag of the
+    original cmp w0,#1, whether the registers and the bytes around the field kept their values, and where it goes on"""
+    machine, ctx = lod_machine()
+    profile.shadow_cascades(ctx)
+    machine.mem_write(BASE + STATE + 0xb8, struct.pack('<I', host))
+    c = BASE + CONFIG
+    machine.mem_write(c + 0x390, bytes([0xa5] * 4) + struct.pack('<I', file_value) + bytes([0xa5] * 4))
+    kept = [r for r in range(1, 29) if r not in (8, 9, 20)]   # x8 and x9 are written again by the binder before it reads them
+    for r in kept: machine.reg_write(arm.UC_ARM64_REG_X0 + r, canary + r)
+    machine.reg_write(arm.UC_ARM64_REG_X0, w0)
+    machine.reg_write(arm.UC_ARM64_REG_X20, c)
+    machine.emu_start(BASE + CASCADE_SITE, BASE + CASCADE_SITE + 4, count=16)
+    ok = all(machine.reg_read(arm.UC_ARM64_REG_X0 + r) == canary + r for r in kept) and machine.reg_read(arm.UC_ARM64_REG_X20) == c and machine.reg_read(arm.UC_ARM64_REG_X0) == w0
+    ok = ok and bytes(machine.mem_read(c + 0x390, 4)) + bytes(machine.mem_read(c + 0x398, 4)) == bytes([0xa5] * 8)
+    z = (machine.reg_read(arm.UC_ARM64_REG_NZCV) >> 30) & 1
+    return struct.unpack('<I', machine.mem_read(c + 0x394, 4))[0], z, ok, ctx, machine.reg_read(arm.UC_ARM64_REG_PC)
+
+
+@unittest.skipIf(unicorn is None, 'optional ARM64 execution dependency: unicorn')
+class ShadowCascades(unittest.TestCase):
+    def test_the_site_follows_the_visit_of_the_cascade_count(self):
+        ctx = cascades(0, 3)[3]
+        self.assertEqual(ctx.sites[CASCADE_SITE], '1f040071')   # cmp w0,#1
+        self.assertIn('SHADOW_CASCADES', ctx.capabilities)
+
+    def test_unset_keeps_the_files_cascades(self):
+        for file_value in (1, 3, 4):
+            with self.subTest(file_value=file_value):
+                value, _, ok, _, pc = cascades(0, file_value)
+                self.assertEqual(value, file_value)
+                self.assertTrue(ok)
+                self.assertEqual(pc, BASE + CASCADE_SITE + 4)
+
+    def test_the_host_number_lowers_but_never_raises_it(self):
+        for host in (1, 2, 3):
+            for file_value in (1, 2, 3):
+                with self.subTest(host=host, file_value=file_value):
+                    value, _, ok, _, pc = cascades(host, file_value)
+                    self.assertEqual(value, min(host, file_value))
+                    self.assertTrue(ok)
+                    self.assertEqual(pc, BASE + CASCADE_SITE + 4)
+
+    def test_the_flags_are_the_original_compare(self):
+        for host in (0, 2):
+            for w0, z in ((1, 1), (0, 0), (2, 0)):
+                with self.subTest(host=host, w0=w0):
+                    self.assertEqual(cascades(host, 3, w0)[1], z)
+
+
 class MatchedFrameStep(unittest.TestCase):
     def test_render_scale_is_part_of_the_matched_stub_and_only_at_v131072_offsets(self):
         ctx = Ctx(None)
@@ -349,10 +484,10 @@ class MatchedFrameStep(unittest.TestCase):
         self.assertEqual(ctx.sites, {})
 
     def test_the_quality_stubs_need_their_functions(self):
-        for stub in (profile.probe_interval, profile.ground_mist, profile.foliage):
+        for stub in (profile.probe_interval, profile.ground_mist, profile.foliage, profile.model_lod, profile.shadow_cascades):
             with self.subTest(stub=stub.__name__):
                 ctx = Ctx(None)
-                ctx.others, ctx.capabilities = {'probe scheduler': None, 'fluid draw': None, 'foliage calc': None}, set()
+                ctx.others, ctx.capabilities = {'probe scheduler': None, 'fluid draw': None, 'foliage calc': None, 'model calc': None, 'model lod': None, 'model lod inline': None, 'scene config binder': None}, set()
                 stub(ctx)
                 self.assertEqual((ctx.sites, ctx.capabilities), ({}, set()))
 
@@ -361,10 +496,40 @@ class MatchedFrameStep(unittest.TestCase):
         self.assertEqual(others['probe scheduler']['size'], 0xa84)
         self.assertEqual(others['fluid draw']['size'], 0x13f8)
         self.assertEqual(others['foliage calc']['size'], 0x6f8)
+        self.assertEqual(others['model calc']['size'], 0xc374)
+        self.assertEqual(others['model lod']['size'], 0x4a8)
+        self.assertEqual(others['model lod inline']['size'], 0x860)
+        self.assertEqual(others['scene config binder']['size'], 0xbe1c)
+
+    def test_model_lod_needs_all_its_functions(self):   # a copy left out would keep the game's levels for the models it handles
+        ctx = Ctx(None)
+        ctx.others, ctx.capabilities = {'model calc': 0x7bb80, 'model lod': 0x31d48b0, 'model lod inline': None}, set()
+        profile.model_lod(ctx)
+        self.assertEqual((ctx.sites, ctx.capabilities), ({}, set()))
 
     def test_the_frame_step_is_matched_not_build_bound(self):
         self.assertFalse(hasattr(profile, 'FRAME_STEP'))
         self.assertIn('main', profile.MATCH_FRAME_STEP)
+
+
+@unittest.skipUnless(os.environ.get('DM_TEST_OOT_MAIN'), 'set DM_TEST_OOT_MAIN to the main NSO of Ocarina of Time v131072 (ExeFS/main of the extract)')
+class PlacesOnV131072(unittest.TestCase):
+    """The frame step rule and every one of its other functions are found once each in the real v131072 main, at the offsets the stubs' comments and tests use, and every site's
+    original bytes are the image's (the rewriter asserts the same as it patches)"""
+    def test_the_rule_and_its_functions_are_found_and_every_site_matches(self):
+        import nso, nso_match
+        module = nso.read(os.environ['DM_TEST_OOT_MAIN'])
+        rule, start, others, _ = nso_match.locate_stub(bytes(module.image), module.text_end, profile.MATCH_FRAME_STEP['main'], report=lambda line: None)
+        self.assertEqual(start, 0x6e6be0)
+        self.assertEqual(others, {'dynamic resolution': 0x8065e0, 'dynamic resolution update': 0x805aa0, 'probe scheduler': 0x33d6a0, 'fluid draw': 0x26b110,
+                                  'foliage calc': 0x2c00a40, 'model calc': MODEL_CALC, 'model lod': MODEL_LOD, 'model lod inline': MODEL_LOD_INLINE, 'scene config binder': SCENE_CONFIG})
+        ctx = Ctx(None); ctx.base, ctx.others, ctx.capabilities = start, others, set()
+        ctx.emit = lambda word: setattr(ctx, 'cursor', ctx.cursor + 4); ctx.put = lambda offset, words, reason: None   # no machine: the stubs are laid out, the sites recorded
+        rule['stub'](ctx)
+        for site, original in ctx.sites.items():
+            with self.subTest(site=hex(site)):
+                self.assertEqual(bytes(module.image[site:site + len(original) // 2]).hex(), original)
+        self.assertTrue({'MODEL_LOD', 'SHADOW_CASCADES', 'FOLIAGE', 'GROUND_MIST', 'REFLECTION_INTERVAL', 'DYNAMIC_RESOLUTION'} <= ctx.capabilities)
 
 
 if __name__ == '__main__':

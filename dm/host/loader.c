@@ -354,6 +354,16 @@ void dm_fps_state_apply(void) {
     if (fo && *fo && strcmp(fo, "on") && strcmp(fo, "off")) LOG("[RED] DM_FOLIAGE=%s: on or off; keeping the foliage", fo);
     if (foff) LOG("%s: foliage off (DM_FOLIAGE; builds with the stub)", g_fps_mod);
     memcpy(dm_fps_state + 0xb0, &foff, sizeof foff);
+    // Model level of detail, float at +0xb4: DM_MODEL_LOD=<factor> (1.25 to 8) makes the game pick its models' lower-detail meshes as if they were that many times farther away
+    // (Ocarina of Time's model_lod stubs in its level function: the size on screen divided, the distance coefficient divided); 1 or unset keeps the game's. Read every frame
+    const char *ml = getenv("DM_MODEL_LOD"); float mlf = 0;
+    if (ml && *ml) { char *end; float v = strtof(ml, &end); if (end == ml || *end || !(v >= 1.0f && v <= 8.0f)) LOG("[RED] DM_MODEL_LOD=%s: 1 to 8; keeping the game's level of detail", ml); else if (v > 1.0f) { mlf = v; LOG("%s: models at %.2fx the game's level-of-detail distance (DM_MODEL_LOD; builds with the stub)", g_fps_mod, 1.0f / v); } }
+    memcpy(dm_fps_state + 0xb4, &mlf, sizeof mlf);
+    // Shadow cascades, u32 at +0xb8: DM_SHADOW_CASCADES=1 or 2 lowers the number of the sun's depth shadow cascades the game sets up (Ocarina of Time: 3) when its parameters load;
+    // 0 or unset keeps the game's
+    const char *cn = getenv("DM_SHADOW_CASCADES"); uint32_t scn = 0;
+    if (cn && *cn) { char *end; unsigned long v = strtoul(cn, &end, 10); if (end == cn || *end || v > 3) LOG("[RED] DM_SHADOW_CASCADES=%s: 1, 2 or 3; keeping the game's shadow cascades", cn); else if (v) { scn = (uint32_t)v; LOG("%s: at most %u shadow cascades (DM_SHADOW_CASCADES; builds with the stub)", g_fps_mod, scn); } }
+    memcpy(dm_fps_state + 0xb8, &scn, sizeof scn);
     // Screen shape: DM_SCREEN_ASPECT, the screen's width / height between 1.3 and 1.77, makes the builds with screen-shape stubs
     // (Breath of the Wild 1.9.0's patches.py) render that shape: the output keeps its width (1920) and takes the height that gives the ratio, a multiple of 48 so the
     // 2/3-size layout space (1280 wide) stays whole: 1.43 → 1920x1344 and 1280x896. State +0x48 u32 output height, +0x4c u32 layout height, +0x50 its float; 0 = 16:9
