@@ -165,13 +165,16 @@ In the order they're planned:
 
 ## Research branches
 
-These measured something and were not merged. They stay published for anyone who wants the data:
+These measured something and are not on the default branch. They stay published for anyone who wants the data:
 
 | Branch | What it measured |
 |---|---|
 | `tv-all-ptable` | A page table for the game's GPU memory addresses in the shader translator, and what the hot shaders would gain |
 | `tv-all-wingback`, `tv-all-wingback-vs` | Shaders without their uniform bounds tests, in fragment and then vertex shaders |
-| `tv-all-flatva-spike` | Metal's limits for a flat guest GPU address space, and a pointer-chase benchmark |
+| `tv-all-flatva-spike` | Metal's limits for a flat guest GPU address space, and a pointer-chase benchmark (also on `switch2-experimental`) |
+| `tv-all-tvhot` | What per-pixel marks on a bitmap word cost the GPU, and how to compare an Apple TV pass with a Mac's (also on `switch2-experimental`) |
+| `tv-all-strict` | Diagnostics for TV-only texture bugs: `DM_NVN_READ_TRAP` (what reads a stripped texture's memory) and an upload check. Not merged yet: it conflicts with newer engine code |
+| `tv-all-macbench` | Two still-standing Mac bench routes for Ocarina of Time and a ledger line of the residency set's buffers and heaps by size. The routes are in; the ledger line conflicts with newer engine code |
 | `feat/shader-trim`, `spike/shader-trim` | Trimming each game's shader library to the shaders it uses, with a TVPort option. Not merged yet |
 
 ## Other Switch 2 games
