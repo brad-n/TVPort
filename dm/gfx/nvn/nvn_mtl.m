@@ -420,11 +420,14 @@ static id<MTLHeap> rh_take(MTLTextureDescriptor *d, int *reused) {
     *reused = 0; id<MTLHeap> h = [g_dev newHeapWithDescriptor:hd]; h.label = @"dm.rt";   // the label says which kind a heap of the residency set is (lg_dump)
     return h;
 }
+// The game's own render target in a GPU-only pool: COMPRESSIBLE (NVN's mark of a target) in a pool the CPU cannot read, not display, video, linear or sparse (rh_texture, rl_apply)
+static int rh_target(const tex_t *t) {
+    return t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) && (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE)
+        && !(t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET));
+}
 // A shared render target in a GPU-only pool (tex_mtl_), in recycled memory: written by the GPU alone, so its bytes never come from the CPU's view of the pool
 static id<MTLTexture> rh_texture(const tex_t *t, MTLTextureDescriptor *d) {
-    if (!sw_on(rh_mode()) || !t->pool || !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) || !(t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE)
-        || (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))
-        || d.storageMode != MTLStorageModePrivate || d.textureType == MTLTextureTypeTextureBuffer) return nil;
+    if (!sw_on(rh_mode()) || !rh_target(t) || d.storageMode != MTLStorageModePrivate || d.textureType == MTLTextureTypeTextureBuffer) return nil;
     int reused = 0; id<MTLHeap> heap = rh_take(d, &reused);
     id<MTLTexture> mt = heap ? [heap newTextureWithDescriptor:d offset:0] : nil;
     if (!mt) {   // not placeable after all: a heap taken from the list waits again; a new one goes
@@ -435,6 +438,62 @@ static id<MTLTexture> rh_texture(const tex_t *t, MTLTextureDescriptor *d) {
     objc_setAssociatedObject(mt, &g_rh_owner_key, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     atomic_fetch_add(reused ? &g_rh_reused : &g_rh_made, 1);
     return mt;
+}
+// Lossy render targets (DM_NVN_RT_LOSSY, off by default). Ported from Fasen24-AI/swordboiMacNative commit af07b1df5b (EmmanueleC, 2026-11-11: standalone private targets of a list of
+// formats, on Apple8 and later) and fitted to the recycled heaps and the retirement here. On Metal GPU family Apple8 (the Apple TV 4K's A15, the M2) and later, a texture can be stored with
+// lossy compression (MTLTextureCompressionTypeLossy): about half the memory, guaranteed, at a precision loss that depends on the content (little where neighbouring texels correlate, most at
+// sharp edges and in noise). Measured on an M2 Pro (Apple8): heapTextureSizeAndAlignWithDescriptor with lossy set gives 0.50-0.56 of the lossless size (1920x1080 of 1 to 16 bytes a texel,
+// 2560x1440 RGBA16F, 512x512x64 arrays, mip chains), and a texture placed in a placement heap of its own is lossy there too. rh_take sizes the heap from the descriptor, so the saving
+// reaches the recycled heaps, and a retired target's heap (rt_retire) waits at the lossy size for the next target it fits.
+// Metal aborts the process on a lossy descriptor of a format it cannot compress rather than returning nil: on the M2 Pro, RG11B10Float, RGB9E5Float, the 16-bit packed formats and every
+// depth and stencil format. So the formats are a list of those measured to take it (rl_format). Taken: what rh_texture places, the game's own targets (rh_target: tex_desc gives
+// render-target use to every uncompressed texture, so assets in such a pool have it too), single-sample 2D and 2D array (a cube is a 2D array here), private with GPU-optimized contents and
+// no shader-write, atomic or format-view use (Metal refuses them; a later need of one remakes the target lossless, tex_upgrade). Left lossless: integer and snorm formats (IDs, masks,
+// normals) and 32-bit channels (depth copies, positions), whose values are data rather than colour; 3D targets (colour lookup tables, which the whole picture goes through); multisample
+// ones; targets under RL_MIN lossless (little to save, and where a frame's reductions live, such as an exposure average carried into the next frame); resolution families (image_texture
+// makes them uncompressed); and a target the game carries across frames, which is made lossless when that shows (rl_attach, below). The [ledger] lines count the lossy targets alive and what they save
+enum { RL_LOSSY, RL_FORMAT, RL_USAGE, RL_SHAPE, RL_SMALL, RL_CARRIED, RL_N };   // what rl_apply decided for a target rh_target takes (RL_CARRIED: storage a history was found in)
+#define RL_MIN (256u << 10)
+static int g_rl_mode = -1, g_rl_gpu = -1;   // g_rl_gpu: the GPU has lossy compression (Apple8 or later); a test sets 0 for a GPU without it
+static _Atomic uint64_t g_rl_n[RL_N], g_rl_saved_b;   // decisions so far; bytes saved by the lossy ones, as made
+static NSMapTable *g_rl_live; static os_unfair_lock g_rl_lk = OS_UNFAIR_LOCK_INIT;   // the lossy targets alive (weak) → the bytes each saves, for the ledger
+static int rl_mode(void) {
+    if (g_rl_mode < 0) {
+        const char *e = getenv("DM_NVN_RT_LOSSY"); int want = e && atoi(e) > 0;
+        if (want && g_rl_gpu < 0) g_rl_gpu = [g_dev supportsFamily:MTLGPUFamilyApple8];
+        g_rl_mode = want && g_rl_gpu > 0;
+        if (want) MLOG("%s", g_rl_mode ? "render targets: lossy compression where it applies (DM_NVN_RT_LOSSY)"
+                                 : "render targets: DM_NVN_RT_LOSSY asks for lossy compression, which this GPU does not have (Metal GPU family Apple8, the A15 and the M2, and later): lossless as before");
+    }
+    return g_rl_mode;
+}
+static int rl_format(MTLPixelFormat pf) {   // colour formats measured to take lossy compression on Apple8 (the M2 Pro); Metal aborts on one that does not
+    switch (pf) {
+        case MTLPixelFormatR8Unorm: case MTLPixelFormatRG8Unorm: case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
+        case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatBGR10A2Unorm: case MTLPixelFormatR16Unorm: case MTLPixelFormatRG16Unorm: case MTLPixelFormatRGBA16Unorm:
+        case MTLPixelFormatR16Float: case MTLPixelFormatRG16Float: case MTLPixelFormatRGBA16Float: return 1;
+        default: return 0;
+    }
+}
+// Sets lossy compression on d where it applies (tex_mtl_, before rh_texture places it): the bytes it saves against lossless, 0 when left lossless
+static int rl_kept(const tex_t *t);
+static uint64_t rl_apply(const tex_t *t, MTLTextureDescriptor *d) {
+    if (!rl_mode() || !rh_target(t)) return 0;
+    int why = RL_LOSSY; MTLSizeAndAlign full = {0}, half = {0};
+    if (rl_kept(t)) why = RL_CARRIED;
+    else if (d.storageMode != MTLStorageModePrivate || !d.allowGPUOptimizedContents || !(d.usage & MTLTextureUsageRenderTarget)
+        || (d.usage & (MTLTextureUsageShaderWrite | MTLTextureUsageShaderAtomic | MTLTextureUsagePixelFormatView))) why = RL_USAGE;
+    else if ((d.textureType != MTLTextureType2D && d.textureType != MTLTextureType2DArray) || d.sampleCount > 1) why = RL_SHAPE;
+    else if (!rl_format(d.pixelFormat)) why = RL_FORMAT;
+    else if ((full = [g_dev heapTextureSizeAndAlignWithDescriptor:d]).size < RL_MIN) why = RL_SMALL;
+    atomic_fetch_add(&g_rl_n[why], 1);
+    if (why != RL_LOSSY) return 0;
+    d.compressionType = MTLTextureCompressionTypeLossy; half = [g_dev heapTextureSizeAndAlignWithDescriptor:d];
+    return full.size > half.size ? full.size - half.size : 0;
+}
+static void rl_note(id<MTLTexture> mt, uint64_t saved) {   // a lossy target made (tex_mtl_)
+    os_unfair_lock_lock(&g_rl_lk); if (!g_rl_live) g_rl_live = [NSMapTable weakToStrongObjectsMapTable]; [g_rl_live setObject:@(saved) forKey:mt]; os_unfair_lock_unlock(&g_rl_lk);
+    atomic_fetch_add(&g_rl_saved_b, saved);
 }
 // When a submission begins: heaps that waited RH_IDLE_NS, and the oldest past RH_CAP bytes, leave the residency set and are freed
 static void rh_trim(void) {
@@ -3967,6 +4026,7 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextu
     d.arrayLength = base.arrayLength; d.mipmapLevelCount = base.mipmapLevelCount; d.sampleCount = base.sampleCount;
     d.storageMode = base.storageMode; d.cpuCacheMode = base.cpuCacheMode; d.hazardTrackingMode = base.hazardTrackingMode;
     d.resourceOptions = base.resourceOptions; d.usage = base.usage | add | (tex_atomic_capable(base) ? MTLTextureUsageShaderAtomic : 0);   // the usage property leaves the atomic usage out
+    // compressionType stays lossless: a lossy target (DM_NVN_RT_LOSSY) that needs shader writes, atomics or a format view, which lossy compression refuses, is copied into a lossless one
     // A linear texture aliases the guest pool. Adding usage must keep that backing: a new standalone texture copies the old pixels once, but later GPU writes never reach the CPU map.
     id<MTLBuffer> backing = base.buffer;
     int reinterpret = (add & MTLTextureUsageShaderAtomic) && !pf_r32i(base.pixelFormat);
@@ -4020,7 +4080,7 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextu
         } else if (!named) tex_put(t->serial, upgraded);
         defer_obj_release(base);
     }
-    MLOG("texture upgraded to allow %s ser=%llu base format %lu → view format %lu (upgrades=%llu)", add & MTLTextureUsageShaderWrite ? "image writes" : add & MTLTextureUsageRenderTarget ? "render-target use" : "format views", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf, ++g_pfv_upgrades);
+    MLOG("texture upgraded to allow %s ser=%llu base format %lu → view format %lu (upgrades=%llu)", add & MTLTextureUsageShaderWrite ? "image writes" : add & MTLTextureUsageRenderTarget ? "render-target use" : add ? "format views" : "lossless storage", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf, ++g_pfv_upgrades);
     return upgraded_view ? upgraded_view : upgraded;
 }
 static id<MTLTexture> tex_upgrade_pfv(const tex_t *t, id<MTLTexture> base, MTLPixelFormat view_pf) { return tex_upgrade(t, base, MTLTextureUsagePixelFormatView, view_pf); }
@@ -5950,7 +6010,8 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         if (!d) return nil;
         mt = image_texture(t, d);
         int filled = 0;
-        if (!mt) { mt = rh_texture(t, d); if (!mt) mt = [g_dev newTextureWithDescriptor:d];
+        if (!mt) { uint64_t rl = rl_apply(t, d); mt = rh_texture(t, d); if (!mt) mt = [g_dev newTextureWithDescriptor:d];   // rl_apply: DM_NVN_RT_LOSSY
+            if (mt && d.compressionType == MTLTextureCompressionTypeLossy && mt.compressionType == MTLTextureCompressionTypeLossy) rl_note(mt, rl);
             if (mt) { res_add(mt); if (!(filled = tex_init_fill(t, mt))) { uint32_t apf; if (bc_astc(t, &apf)) astc_zero_fill(t, mt); else tex_zero_fill(mt); } } }
         if (mt && !filled && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) && t->d.target != NVN_TEXTURE_TARGET_BUFFER) rel_push(t, 0);   // the GPU-only texture of a pool nobody reads: its guest pages mean nothing, the host never reads them
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
@@ -6907,8 +6968,57 @@ static NSUInteger att_layers(MTLRenderPassAttachmentDescriptor *a, const view_t 
     if (has_v && v->set_layers && v->nlayers) n = MIN(n, (NSUInteger)v->nlayers);
     return MAX(n, 1u);
 }
+// DM_NVN_RT_LOSSY: a lossy target the game carries across frames. Its error is written again each frame on top of what it held, and in a history (a temporal filter's, a
+// simulation's) it can gather instead of staying one write's worth. In Ocarina of Time a 960x540 R8 target was written in 3,598 frames of a walk and bound for reading in 3,595 of
+// them before that frame's write, and a 480x270 R16F one in 208 of 8,545. So each lossy target keeps the frames it was attached in (written) and the frames it was bound for reading
+// (tex_fast_rid: a texture ID's binding or a texture pool table walk) with content from an earlier frame; once both reach RL_FB, the next attachment copies it into a lossless texture
+// (tex_upgrade: its pixels, every name of it), and its storage stays lossless for the targets made there later (rl_kept). A table walk reaches every texture of the table, so a target
+// can be taken for carried when it is not: it then stays lossless, the safe side. A target written once and read for long (a text panel of the interface) is not one
+#define RL_FB 8
+typedef struct { uint64_t wframe, xframe; uint32_t nwf, nxf; } rl_rec;   // last frame written / read from an earlier frame (frame + 1; 0: never), and the frames of each
+static char g_rl_rec_key;
+static nvn_hmap g_rl_keep = {.klen = sizeof(alias_key)}; static os_unfair_lock g_rl_keep_lk = OS_UNFAIR_LOCK_INIT;   // storage a carried target was found in
+static int rl_kept(const tex_t *t) {
+    alias_key k = tex_alias_key(t);
+    os_unfair_lock_lock(&g_rl_keep_lk); int r = g_rl_keep.n && nvn_hm_get(&g_rl_keep, &k) != NULL; os_unfair_lock_unlock(&g_rl_keep_lk);
+    return r;
+}
+static rl_rec *rl_rec_of(id<MTLTexture> t0) {   // the record of a lossy texture (of the texture a view is of); NULL for any other
+    id<MTLTexture> t = t0; while (t.parentTexture) t = t.parentTexture;
+    if (t.compressionType != MTLTextureCompressionTypeLossy) return NULL;
+    NSMutableData *d = objc_getAssociatedObject(t, &g_rl_rec_key);
+    if (!d) { d = [[NSMutableData alloc] initWithLength:sizeof(rl_rec)]; objc_setAssociatedObject(t, &g_rl_rec_key, d, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }   // (not autoreleased: bindings run outside a pool too)
+    return d.mutableBytes;
+}
+// A binding resolved to tex (tex_fast_rid). A frame resolves the same texture again for draw after draw, so each texture is looked at once a frame (a small cache per thread).
+// Ocarina of Time standing in Link's house on the Mini: translation 6.14 ms a frame with the switch off, 6.4 looking at every binding, 6.24 once a frame
+static void rl_read(void *tex) {
+    static _Thread_local struct { void *t; uint64_t f; } seen[4096];   // a frame binds 1,000-2,000 distinct textures
+    uint64_t f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed) + 1;
+    unsigned h = (unsigned)((((uintptr_t)tex >> 4) * 0x9E3779B1u) >> 20) & 4095;
+    if (seen[h].t == tex && seen[h].f == f) return;
+    seen[h].t = tex; seen[h].f = f;
+    rl_rec *r = rl_rec_of((__bridge id<MTLTexture>)tex); if (!r) return;
+    if (r->wframe && r->wframe < f && r->xframe != f) { r->nxf++; r->xframe = f; }
+}
+static id<MTLTexture> rl_attach(const tex_t *t, id<MTLTexture> base) {   // a lossy target attached (attach): written this frame, and made lossless once it shows as carried
+    rl_rec *r = rl_rec_of(base); if (!r) return base;
+    uint64_t f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed) + 1;
+    if (r->wframe != f) { r->nwf++; r->wframe = f; }
+    if (r->nwf < RL_FB || r->nxf < RL_FB) return base;
+    uint32_t nwf = r->nwf, nxf = r->nxf;
+    alias_key k = tex_alias_key(t);
+    os_unfair_lock_lock(&g_rl_keep_lk); if (g_rl_keep.n > 4096) nvn_hm_clear(&g_rl_keep, NULL); nvn_hm_put(&g_rl_keep, &k, (void *)1); os_unfair_lock_unlock(&g_rl_keep_lk);
+    id<MTLTexture> up = tex_upgrade(t, base, 0, base.pixelFormat);
+    if (up && rl_rec_of(up)) return base;   // (not lossless after all: kept as it was)
+    atomic_fetch_add(&g_rl_n[RL_CARRIED], 1);
+    static int said; if (said++ < 8) MLOG("render targets: ser=%llu %ux%u format %#x carried across frames (written in %u frames, read from an earlier frame in %u): made lossless (DM_NVN_RT_LOSSY; %d so far)",
+                                        (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, nwf, nxf, said);
+    return up ? up : base;
+}
 static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const view_t *v, int has_v) {
     id<MTLTexture> base = tex_mtl(t); sparse_gpu_wrote(t);
+    if (base && g_rl_mode > 0) base = rl_attach(t, base);   // DM_NVN_RT_LOSSY: a lossy target the game carries across frames becomes lossless
     if (base && !mtl_fmt_block(base.pixelFormat) && nvn_fmt_bc(t->d.format)) {   // the same texture stored decompressed on a GPU without BC: not attached either (see rt_view_fmt)
         RED_ONCE(78, "render target is a compressed texture (no BC, stored decompressed: Metal format %lu %lux%lu, view format change %d -> NVN %#x): not attached, draws to this attachment are lost", (unsigned long)base.pixelFormat, (unsigned long)base.width, (unsigned long)base.height,
                  has_v ? v->set_format : 0, has_v ? v->format : 0);
@@ -8583,7 +8693,12 @@ static id<MTLTexture> tex_float_fit(int tid, id<MTLTexture> t, uint64_t *rid) {
     r->im = (void *)CFBridgingRetain(v); r->im_of = (__bridge void *)t; r->im_rid = v.gpuResourceID._impl;
     *rid = r->im_rid; return v;
 }
-static inline __attribute__((always_inline)) uint64_t tex_fast_rid(int tid, void **out) {
+static inline __attribute__((always_inline)) uint64_t tex_fast_rid_(int tid, void **out);
+static inline __attribute__((always_inline)) uint64_t tex_fast_rid(int tid, void **out) {   // DM_NVN_RT_LOSSY: what a binding reads (rl_read)
+    if (g_rl_mode <= 0) return tex_fast_rid_(tid, out);
+    void *o = NULL; uint64_t r = tex_fast_rid_(tid, &o); if (out) *out = o; if (o) rl_read(o); return r;
+}
+static inline __attribute__((always_inline)) uint64_t tex_fast_rid_(int tid, void **out) {
     uint64_t ep = treg_ep();   // first, as in tex_fast
     if (tid > 0 && tid < g_ntreg && !g_pu_walk) g_treg[tid].ufence = atomic_load_explicit(&g_fence, memory_order_relaxed) + 1;   // a use (rt_retire): a table walk is none
     if (tid > 0 && tid < g_ntreg && g_treg[tid].ok && g_treg[tid].view && g_treg[tid].view_ser == ep && (!g_treg[tid].view_pkg || g_treg[tid].view_dirty == nvn_dirty_now())) { if (out) *out = g_treg[tid].view; return g_treg[tid].view_rid; }
