@@ -76,6 +76,7 @@ Changes in this fork that the TVPort and nxnative releases don't have yet, in pl
 - **Argument blocks reused across program switches and passes (`DM_NVN_ARGS_CACHE=1`, off):** the engine re-describes each draw's textures and buffers to the GPU whenever anything may have changed. This switch keeps a description while exactly what it was made from is still bound, across shader switches and later passes. Measured on Ocarina of Time it doesn't help: almost every draw there binds a different uniform buffer (92% of the descriptions are new, only 8% repeat one made earlier in the frame), so it reuses about 3 more descriptions a frame out of ~3,100. Kept as an option for games that draw many things with the same bindings.
 
 **Switch 2 games (experimental)**
+- **Ocarina of Time plays on the Apple TV:** the Switch 2 edition of The Legend of Zelda: Ocarina of Time now plays on an Apple TV 4K (3rd generation) through the whole opening, to control of Link and across Kokiri Forest, without crashing, at about 14 to 28 frames a second. It is the first Switch 2 game to run on an Apple TV. The settings it needs, the results of each test session, what it took and what is still missing are in [Switch 2 games on the Apple TV](docs/switch2-apple-tv.md). New Switch 2 Apple TV work lands first on the [`switch2-experimental`](https://github.com/brad-n/TVPort/tree/switch2-experimental) branch, and comes to this one once a session on the TV shows it helps.
 - **Plain-picture movies (`DM_MOVIE_NETWORK=bypass`):** Ocarina of Time runs its movies through a neural enhancement network that costs about 90 ms a frame on an Apple TV 4K (3rd generation), so movies played in slow motion. This option skips the network and scales the movie's own picture instead, about 1-2 ms a frame. It is off by default, and uses no MetalFX. Upstream now runs the network itself as the engine's own GPU programs by default (`DM_NDVE_ENGINE`, about half the GPU time on a Mac); `bypass` still takes precedence when set and skips the network entirely.
 - **Game's own upscaler off (`DM_UPSCALER=bilinear`):** Ocarina of Time enlarges its picture (1536x864 to 2048x1152) with a neural network. This option, "Game's upscaler: Off (plain scale)" in the launcher, turns the network off and stretches the picture with a plain smooth scale instead: much less work for the Apple TV's GPU and no extra memory beyond one small image, at the cost of some sharpness. It never calls MetalFX, which has frozen an Apple TV. Off by default.
 - **Ground mist off (`DM_GROUND_MIST=off`, off by default):** the soft haze that drifts over Kokiri Forest's floor in Ocarina of Time is one of the most expensive things the game draws. This option tells the game to skip drawing it (the haze's movement is still worked out, because the grass follows it). From Link's balcony the distant floor just looks a little clearer and darker; down on the forest floor, where the haze is thick, the scene looks noticeably darker and more saturated without it. Nothing else changes. On a Mac mini with the Apple TV's settings it saves about 2.2 ms of GPU time a frame, so expect several times that on an Apple TV.
@@ -188,6 +189,8 @@ These screenshots use fictional games, dummy artwork and sample save records.
 | Super Mario Odyssey | 1.3.0 | Plays |
 | Animal Crossing: New Horizons | 1.0.0 | Plays, one shared island for every player |
 | The Legend of Zelda: Tears of the Kingdom | 1.4.2 | Plays at 30 fps in Handheld mode at 75% 3D resolution. Loading screens slow down a lot once the TV gets hot |
+| Mario Kart 8 Deluxe | update v1507328 | Plays |
+| The Legend of Zelda: Ocarina of Time (Switch 2) | update v131072 | Experimental. Plays through the opening and Kokiri Forest at about 14 to 28 fps with the [Apple TV settings](docs/switch2-apple-tv.md#settings-for-ocarina-of-time-on-the-apple-tv) (grass, ground mist and full-size 3D off). Memory is tight: 1,978 MB at its highest against the TV's limit of about 2,050 MB |
 
 Many more games run on iPhone and iPad with nxnative; see the [games table](dm/games/README.md#games). On the Apple TV, a game needs a 64-bit build. Mario Kart 8 Deluxe before update 2.0 is 32-bit, for example, and cannot run.
 
@@ -300,6 +303,8 @@ Game too big to install? Build again with `--romfs separate`, and run the comman
 Controls, saves and settings: [Playing](docs/playing.md).
 
 ### Switch 2 games
+
+On the Apple TV, see [Switch 2 games on the Apple TV](docs/switch2-apple-tv.md) (experimental).
 
 A Switch 2 game is built from one [NUP](https://github.com/a55uka/nup) container (a `.nup` file) or a folder of its files, not from NSPs. Neither needs `prod.keys`. A game this project has no profile for is surveyed and gets a provisional profile, as NSPs do ([Port another game](docs/development.md#port-another-game)), which may not boot. You get a Mac app; iPhone and iPad are untested.
 
