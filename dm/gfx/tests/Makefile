@@ -69,6 +69,10 @@ t_astc_bench: t_astc_bench.m ../tex/nvn_astc_cache.m ../tex/nvn_astc_cache.h ../
 # make t_flatva_bench && ./t_flatva_bench limits && ./t_flatva_bench chase
 t_flatva_bench: t_flatva_bench.m
 	clang -O2 -g -Wall -fobjc-arc -o $@ t_flatva_bench.m -framework Metal -framework Foundation
+
+# GPU cost of per-pixel marks on a bitmap word: atomic-load test, plain-load test, untested OR (prints numbers, not a test): make t_mark_bench && ./t_mark_bench [w h marks stride reps]
+t_mark_bench: t_mark_bench.m
+	clang -O2 -g -Wall -fobjc-arc -o $@ t_mark_bench.m -framework Foundation -framework Metal
 # DM_NVN_BC_ASTC on the GPU: uploads of BC1/2/3/7 as ASTC against the CPU decode (DM_TEST_NO_BC and the variable are set by the test)
 t_astc_upload: t_astc_upload.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_astc_upload.m $(MTL_T_SRC) $(FW)
