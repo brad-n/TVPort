@@ -638,6 +638,16 @@ check_t_rt_recycle: t_rt_recycle
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_rt_recycle
 	DM_NVN_RT_RECYCLE=0 MTL_DEBUG_LAYER=1 ./t_rt_recycle
 	DM_NVN_RH_FIT_DIV=16 DM_NVN_RH_CAP_MB=128 DM_NVN_RH_IDLE_MS=3000 MTL_DEBUG_LAYER=1 ./t_rt_recycle
+	DM_NVN_RT_LOSSY=1 MTL_DEBUG_LAYER=1 ./t_rt_recycle   # the recycled heaps holding lossy targets (on Apple8 and later)
+t_rt_lossy: t_rt_lossy.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_rt_lossy.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_rt_lossy
+check_t_rt_lossy: t_rt_lossy
+	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_rt_lossy
+	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_rt_lossy
+	DM_NVN_RT_RECYCLE=0 MTL_DEBUG_LAYER=1 ./t_rt_lossy
+	MTL_DEBUG_LAYER=1 ./t_rt_lossy off
+	MTL_DEBUG_LAYER=1 ./t_rt_lossy nogpu
 t_rt_retire: t_rt_retire.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_rt_retire.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
 .PHONY: check_t_rt_retire
@@ -646,6 +656,7 @@ check_t_rt_retire: t_rt_retire
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_rt_retire
 	MTL_DEBUG_LAYER=1 ./t_rt_retire log
 	MTL_DEBUG_LAYER=1 ./t_rt_retire off
+	DM_NVN_RT_LOSSY=1 MTL_DEBUG_LAYER=1 ./t_rt_retire   # lossy targets retired, their heaps reused, drawn again with their pixels
 # A game's upscaler drawn by MetalFX (any profile; the profile's upscaler shaders, from its shader map, when it has some); with and without the switch, and on the encoding thread
 t_upscaler_mfx: t_upscaler_mfx.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upscaler_mfx.m $(MTL_T_SRC) $(FW)

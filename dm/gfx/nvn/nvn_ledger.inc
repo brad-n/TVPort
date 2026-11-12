@@ -126,6 +126,19 @@ static void lg_dump(void) { @autoreleasepool {
          (unsigned long long)secs, (unsigned long long)atomic_load(&g_cur_frame), total / M, g_dev.recommendedMaxWorkingSetSize / M, avail, robjs, rb / M, total > rb ? (total - rb) / M : 0.0);
     MLOG("[ledger]   render targets %llu textures, %.0f MB; sampled textures %llu, %.0f MB (ASTC %llu / %.0f MB, BC %llu / %.0f MB, other %llu / %.0f MB)",
          (unsigned long long)rt_n, rt_b / M, (unsigned long long)(st_n[0] + st_n[1] + st_n[2]), (st_b[0] + st_b[1] + st_b[2]) / M, (unsigned long long)st_n[0], st_b[0] / M, (unsigned long long)st_n[1], st_b[1] / M, (unsigned long long)st_n[2], st_b[2] / M);
+    if (rl_mode()) {   // DM_NVN_RT_LOSSY: the lossy targets alive (alone or in recycled heaps), the largest groups, and the decisions so far
+        lg_group lg[LG_GROUPS]; int nl = 0; uint64_t ln = 0, lb = 0, ls = 0;
+        os_unfair_lock_lock(&g_rl_lk);
+        for (id<MTLTexture> t in g_rl_live.keyEnumerator) { uint64_t sz = t.allocatedSize; ln++; lb += sz; ls += [[g_rl_live objectForKey:t] unsignedLongLongValue];
+            lg_add(lg, &nl, (uint64_t)MIN(t.width, 65535u) << 48 | (uint64_t)MIN(t.height, 65535u) << 32 | (uint64_t)MIN(t.arrayLength * t.depth, 255u) << 24 | (uint64_t)MIN(t.sampleCount, 255u) << 16 | ((uint32_t)t.pixelFormat & 0xffff), sz); }
+        os_unfair_lock_unlock(&g_rl_lk);
+        MLOG("[ledger]   lossy render targets (DM_NVN_RT_LOSSY): %llu alive, %.0f MB, saving %.0f MB; made lossy %llu so far (%.0f MB saved as made); left lossless %llu by format, %llu by use, %llu by shape, %llu under %u KB; made lossless as carried across frames %llu",
+             (unsigned long long)ln, lb / M, ls / M, (unsigned long long)g_rl_n[RL_LOSSY], g_rl_saved_b / M, (unsigned long long)g_rl_n[RL_FORMAT], (unsigned long long)g_rl_n[RL_USAGE],
+             (unsigned long long)g_rl_n[RL_SHAPE], (unsigned long long)g_rl_n[RL_SMALL], RL_MIN >> 10, (unsigned long long)g_rl_n[RL_CARRIED]);
+        qsort(lg, nl, sizeof lg[0], lg_cmp);
+        for (int i = 0; i < nl && i < 6; i++) { char fb[16]; uint64_t k = lg[i].key;
+            MLOG("[ledger]   lossy render targets %llux%llu x%llu %s: %u, %.0f MB", (unsigned long long)(k >> 48), (unsigned long long)(k >> 32 & 0xffff), (unsigned long long)(k >> 24 & 0xff), lg_fmt((uint32_t)(k & 0xffff), fb, sizeof fb), lg[i].n, lg[i].bytes / M); }
+    }
     MLOG("[ledger]   buffers in the set %llu, %.0f MB (of them resident pool buffers %llu, %.0f MB, and replaced chunks %llu, %.0f MB: %.0f MB of distinct memory); heaps %llu, %.0f MB; other objects %llu, %.0f MB",
          (unsigned long long)buf_n, buf_b / M, (unsigned long long)poolres_n, poolres_b / M, (unsigned long long)oldres_n, oldres_b / M, distinct_b / M, (unsigned long long)heap_n, heap_b / M, (unsigned long long)other_n, other_b / M);
     MLOG("[ledger]   heaps by kind: recycled render targets %llu, %.0f MB; image families %llu, %.0f MB; sparse tiles %llu, %.0f MB; other %llu, %.0f MB; textures over buffers %llu (their memory is the buffers'; buffers outside the set %.0f MB)",
