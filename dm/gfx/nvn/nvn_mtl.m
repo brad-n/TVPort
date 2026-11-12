@@ -6480,8 +6480,9 @@ static long ab_len(void) { if (g_ab_len < 0) { const char *e = getenv("DM_AB"); 
 enum { SW_MAX = 8 }; static const char *g_sw_name[SW_MAX]; static int g_sw_mode[SW_MAX], g_sw_n;
 static inline int sw_on_at(int m, long ph) { if (m < 2) return m; int n = (m - 2) & 15, mask = (m - 2) >> 4; return mask >> (ph % n) & 1; }
 // The mode of switch <name>: 0 off, 1 on, 2 + n + 16 * mask = on in the phases whose number modulo n is in mask; ab without DM_AB is off
-static int sw_mode(const char *name, int dflt) {
-    const char *e = getenv(name); int m = dflt, mask = 2, n = 2;
+static int g_abst_seq;   // DM_AB_STATE's value lists (below): the phases of one round
+static int sw_mode_of(const char *name, const char *e, int dflt) {
+    int m = dflt, mask = 2, n = 2;
     if (e && !strncmp(e, "ab", 2)) {
         if (e[2] == ':') { const char *sl = strchr(e, '/'); int nn = sl ? atoi(sl + 1) : 0, mk = 0;
             for (const char *q = e + 3; sl && q < sl; ) { int k = atoi(q); if (k >= 0 && k < 15) mk |= 1 << k; while (q < sl && *q != ',') q++; if (q < sl) q++; }
@@ -6493,7 +6494,52 @@ static int sw_mode(const char *name, int dflt) {
     if (g_sw_n < SW_MAX) { g_sw_name[g_sw_n] = name; g_sw_mode[g_sw_n++] = m; }
     return m;
 }
+static int sw_mode(const char *name, int dflt) { return sw_mode_of(name, getenv(name), dflt); }
 static inline int sw_on(int m) { return sw_on_at(m, atomic_load_explicit(&g_ab_phase, memory_order_relaxed)); }
+// DM_AB_STATE=<offset>=<value>[,<offset>=<value>...] (measurement, with DM_AB; up to 8 fields, offsets 0x40 to 0x1fc of the frame step state page, hle.h, or 0x10, the render
+// scale, which the render-scale stubs apply when it changes; the frame step's own fields below 0x40 are the host's): in the phases where
+// switches set to ab are on (DM_AB_STATE_PHASES=ab:<k>[,<k>...]/<n> picks others, as a switch's own ab:<k>/<n> does) the page's u32 at each offset holds that value, in the others
+// what the loader wrote there. A game's stubs that read the page every frame (Ocarina of Time's quality switches) then alternate inside one run, as the host's ab switches do:
+// both sides see the same scene. A value with a '.' is stored as a float. The [ab] lines call it AB_STATE. A value list <v0>/<v1>/.../<vn-1> (up to 8; '-' is the loader's value)
+// gives the field v(phase % n) instead, several settings in one run, and the [ab] lines call phase k AB_STATE<k> (k > 0; the fields of one setting list the same n).
+// Settings a stub reads only once (when the game loads its parameters) cannot be measured this way
+extern uint8_t *dm_fps_state;
+static struct { uint32_t off, on, base, seq[8]; int n; } g_abst[8]; static int g_abst_n = -1, g_abst_mode; static long g_abst_ph = -1;
+static void abst_frame(long ph) {
+    if (g_abst_n < 0) {
+        g_abst_n = 0; const char *e = getenv("DM_AB_STATE");
+        if (!e || !*e) return;
+        if (!dm_fps_state) { MLOG("[RED] DM_AB_STATE: this build has no frame step state page; nothing alternates"); return; }
+        for (const char *q = e; *q && g_abst_n < 8; ) {
+            char *x; unsigned long off = strtoul(q, &x, 16); uint32_t v = 0;
+            if (*x != '=' || (off < 0x40 && off != 0x10) || off > 0x1fc || off % 4) { MLOG("[RED] DM_AB_STATE=%s: <hex offset 0x10 or 0x40-0x1fc>=<value>[,...]; stopped at %s", e, q); break; }
+            const char *vs = x + 1; size_t vl = strcspn(vs, ",");
+            memcpy(&g_abst[g_abst_n].base, dm_fps_state + off, 4); g_abst[g_abst_n].off = (uint32_t)off; g_abst[g_abst_n].n = 0;
+            for (const char *t = vs; t < vs + vl && g_abst[g_abst_n].n < 8; ) {   // one value, or a list of them separated by '/'
+                size_t tl = strcspn(t, "/,"); if (tl > (size_t)(vs + vl - t)) tl = (size_t)(vs + vl - t);
+                if (tl == 1 && *t == '-') v = g_abst[g_abst_n].base;
+                else if (memchr(t, '.', tl)) { float f = strtof(t, NULL); memcpy(&v, &f, 4); } else v = (uint32_t)strtoul(t, NULL, 0);
+                g_abst[g_abst_n].seq[g_abst[g_abst_n].n++] = v; t += tl; if (t < vs + vl && *t == '/') t++;
+            }
+            g_abst[g_abst_n].on = g_abst[g_abst_n].seq[0]; if (g_abst[g_abst_n].n > 1 && g_abst[g_abst_n].n > g_abst_seq) g_abst_seq = g_abst[g_abst_n].n;
+            g_abst_n++;
+            q = vs + vl; if (*q == ',') q++;
+        }
+        if (g_abst_seq) {
+            for (int i = 0; i < g_abst_n; i++) MLOG("DM_AB_STATE: state page +%#x takes %d values in turn, one a phase (the first %#x, the loader's %#x)", g_abst[i].off, g_abst[i].n, g_abst[i].seq[0], g_abst[i].base);
+        } else {
+            const char *ph_e = getenv("DM_AB_STATE_PHASES");
+            g_abst_mode = sw_mode_of("DM_AB_STATE", ph_e && *ph_e ? ph_e : "ab", 0);
+            for (int i = 0; i < g_abst_n; i++) MLOG("DM_AB_STATE: state page +%#x = %#x in the phases it is on, %#x (the loader's) in the others", g_abst[i].off, g_abst[i].on, g_abst[i].base);
+        }
+    }
+    if (!g_abst_n || ph == g_abst_ph) return;
+    g_abst_ph = ph; int on = g_abst_seq ? 0 : sw_on_at(g_abst_mode, ph);
+    for (int i = 0; i < g_abst_n; i++) {
+        uint32_t v = g_abst_seq ? (g_abst[i].n > 1 ? g_abst[i].seq[ph % g_abst[i].n] : g_abst[i].seq[0]) : on ? g_abst[i].on : g_abst[i].base;
+        __atomic_store_n((uint32_t *)(dm_fps_state + g_abst[i].off), v, __ATOMIC_RELAXED);
+    }
+}
 // Each phase is reported once its frames' GPU times have arrived (8 frames late) as an [ab] line: the switches on in it, GPU time and whole frame time (p50 / p90 / mean over the phase
 // without its first quarter, while the GPU clock and the frame step settle), and attachment traffic and render passes per frame (the bandwidth ledger)
 enum { AB_MAXF = 4096 };
@@ -6504,6 +6550,7 @@ static void ab_frame(uint64_t f) {   // frame f begins (mtl_set_frame): the phas
     long ph = (long)(f / (uint64_t)g_ab_len);
     if (atomic_load(&g_ab_phase) != ph || f % (uint64_t)g_ab_len == 0) { g_ab_bw1[0] = g_bw_load; g_ab_bw1[1] = g_bw_store; g_ab_pass1 = g_stat_pass; g_ab_f1 = f; }
     atomic_store(&g_ab_phase, ph);
+    abst_frame(ph);
 }
 static void ab_report(long ph) {
     int n = g_ab_nf, skip = n / 4, m = n - skip; if (m < 10) return;
@@ -6515,6 +6562,7 @@ static void ab_report(long ph) {
     for (int i = 0; i < g_sw_n && o < sizeof on; i++) if (g_sw_mode[i] >= 2 && sw_on_at(g_sw_mode[i], ph)) {
         const char *nm = g_sw_name[i]; if (!strncmp(nm, "DM_NVN_", 7)) nm += 7; else if (!strncmp(nm, "DM_", 3)) nm += 3;
         o += (size_t)snprintf(on + o, sizeof on - o, "%s%s", o ? "," : "", nm); }
+    if (g_abst_seq > 1 && ph % g_abst_seq && o < sizeof on) o += (size_t)snprintf(on + o, sizeof on - o, "%sAB_STATE%ld", o ? "," : "", ph % g_abst_seq);   // DM_AB_STATE's value lists
     MLOG("[ab] phase %ld %s: %d frames, GPU p50 %.2f / p90 %.2f / mean %.2f ms, frame p50 %.2f / p90 %.2f / mean %.2f ms; per frame: attachments load %.0f MB store %.0f MB, passes %.1f",
          ph, o ? on : "base", m, g[m / 2], g[m * 9 / 10], gs / m, fr[m / 2], fr[m * 9 / 10], fs / m,
          (g_ab_bw1[0] - g_ab_bw0[0]) / nf / 1048576.0, (g_ab_bw1[1] - g_ab_bw0[1]) / nf / 1048576.0, (g_ab_pass1 - g_ab_pass0) / nf);

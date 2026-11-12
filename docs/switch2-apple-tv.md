@@ -158,7 +158,7 @@ In the order they're planned:
 
 1. **Compressed render targets** (`DM_NVN_RT_LOSSY`). Metal's lossy compression for render targets, to free memory and some GPU bandwidth. In progress.
 2. **ASTC 6x6 for the texture pack.** Less than half the bits of 4x4 (3.56 against 8 a pixel), with some loss of detail. Planned for one Apple TV session to see whether it helps the frame rate as well as memory.
-3. **Lower-detail geometry.** The game's own level-of-detail, draw distance and shadow cascade settings.
+3. **Lower-detail geometry.** The game's own level-of-detail, draw distance and shadow cascade settings. Two switches so far, measured on a Mac mini and not yet run on the TV: `DM_MODEL_LOD=4` (models take their simpler meshes sooner: by estimate it brings the Deku Tree's dialogue to 30 fps, but the tree's beard of roots becomes a flat sheet, and it hardly helps Navi's flight) and `DM_SHADOW_CASCADES=1` (about half a millisecond, softer shadows). Details: [Quality options](../dm/games/0400486024DEC000/README.md#quality-options-for-slower-gpus).
 4. **Loading ahead.** Reading an area's data before it's needed, against the drops while an area loads.
 5. **A Performance preset** in TVPort's game settings, so none of this needs `env.txt`.
 6. **The movie.** Holding the movie to the audio, or converting it to a format the Apple TV decodes in hardware.

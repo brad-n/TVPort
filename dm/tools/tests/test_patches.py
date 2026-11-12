@@ -286,5 +286,17 @@ class RewriteKey(unittest.TestCase):
             self.assertEqual(nsp.patch_files(REPO, tmp / 'exe', ['main']), sdk_wide + [mine])
 
 
+class FrameStepSites(unittest.TestCase):
+    def test_a_rule_with_many_other_functions_reaches_them_all(self):   # 16 MB apart, a seventh other function lay beyond a b's reach of the dry run's patch area (Ocarina of Time's rule has nine)
+        import nso_asm
+        labels = ['f%d' % i for i in range(24)]
+        def stub(ctx):
+            for label in labels:
+                site = ctx.others[label] + 0x10
+                ctx.put(site, [nso_asm.B(site, ctx.here())], label)
+        _, _, in_others, _ = docs_patches.frame_step_sites(stub, others={label: {} for label in labels})
+        self.assertEqual({label: [off for off, _ in got] for label, got in in_others.items()}, {label: [0x10] for label in labels})
+
+
 if __name__ == '__main__':
     unittest.main()
