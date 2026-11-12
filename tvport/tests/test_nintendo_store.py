@@ -9,7 +9,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import nintendo_store as ns  # noqa: E402
-import switchtv_catalog as sc  # noqa: E402
 
 OCARINA = '0400486024DEC000'
 PAGE = (Path(__file__).resolve().parent / 'fixtures/ocarina_product.html').read_text()
@@ -228,69 +227,6 @@ class ArtworkTests(unittest.TestCase):
         net.file = lambda url, destination: (_ for _ in ()).throw(OSError('reset'))
         self.assertIsNone(self.run_fallback(net=net))
         self.assertEqual(list((self.data / 'artwork').iterdir()), [])
-
-
-class CatalogTests(unittest.TestCase):
-    """The SwitchTV catalogue uses the store only for a game titledb has no banner for."""
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        root = Path(self.temp.name)
-        self.data, self.cache, self.out = root / 'data', root / 'cache', root / 'out'
-        (self.data / 'artwork').mkdir(parents=True)
-        self.cache.mkdir()
-        (self.cache / 'US.en.json').write_text(json.dumps({'1': {'id': KART, 'name': 'Kart', 'publisher': 'Nintendo', 'category': ['Racing'], 'description': 'Race.',
-                                                                   'bannerUrl': 'https://img-eshop.cdn.nintendo.net/i/k.jpg'}}))
-        self.library = [{'name': 'Mario Kart', 'titleID': KART, 'built': True}, {'name': 'Ocarina of Time', 'titleID': OCARINA, 'built': True}]
-        self.asked = []
-        self.fetched = []
-
-    def tearDown(self):
-        self.temp.cleanup()
-
-    def store(self, title_id):
-        self.asked.append(title_id)
-        return ns.parse_product(PAGE, OCARINA)
-
-    def fetch(self, url, destination):
-        self.fetched.append(url)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(b'img')
-
-    def make(self, store='default'):
-        return sc.build_catalog(self.library, self.data, self.cache, self.out, lambda item: 'b.' + item['titleID'], fetch=self.fetch, scale=lambda s, d, n: shutil.copy(s, d),
-                                store=self.store if store == 'default' else store)
-
-    def games(self, **kw):
-        return {g['titleID']: g for g in self.make(**kw)['games']}
-
-    def test_a_switch_2_game_gets_its_info_and_banner_from_the_store(self):
-        game = self.games()[OCARINA]
-        self.assertEqual((game['publisher'], game['releaseDate'], game['genres']), ('Nintendo', '2026-11-05', ['Action', 'Adventure']))
-        self.assertTrue(game['description'].startswith('Take up your sword'))
-        self.assertEqual(game['name'], 'Ocarina of Time')   # the library's name still wins
-        self.assertTrue(game['banner'] and game['card'])
-        self.assertIn(WIDE, self.fetched)
-
-    def test_the_store_is_asked_only_on_a_titledb_miss(self):
-        game = self.games()[KART]
-        self.assertEqual(self.asked, [OCARINA])
-        self.assertEqual((game['description'], game['genres']), ('Race.', ['Racing']))
-        self.assertNotIn(ns.IMAGE_HOST, ''.join(u for u in self.fetched if 'img-eshop' in u))
-
-    def test_artwork_in_the_cache_wins_over_the_store_banner(self):
-        (self.data / 'artwork' / f'{OCARINA}.jpg').write_bytes(b'custom')
-        self.games()
-        self.assertNotIn(WIDE, self.fetched)
-        self.assertEqual((self.out / f'images/{OCARINA}-banner.jpg').read_bytes(), b'custom')
-
-    def test_no_store_given_means_no_store(self):
-        game = self.games(store=None)[OCARINA]
-        self.assertIsNone(game['publisher'])
-        self.assertEqual(game['banner'], '')
-
-    def test_a_store_that_knows_nothing_leaves_the_game_as_before(self):
-        game = self.games(store=lambda t: None)[OCARINA]
-        self.assertEqual((game['publisher'], game['banner']), (None, ''))
 
 
 if __name__ == '__main__':

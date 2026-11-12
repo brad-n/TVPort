@@ -1,0 +1,3 @@
+[submodule "tvport/switchtv"]
+	path = tvport/switchtv
+	url = https://github.com/brad-n/SwitchTV.git

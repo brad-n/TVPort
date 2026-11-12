@@ -38,6 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          submodules: true   # tvport/switchtv is the brad-n/SwitchTV repo
           persist-credentials: false
       - name: Host unit tests (dm/host/tests)
         run: |
@@ -88,6 +89,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          submodules: true   # tvport/switchtv is the brad-n/SwitchTV repo
           persist-credentials: false
       - name: ASan and UBSan, every host unit test (dm/host/tests)
         run: |
@@ -114,6 +116,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          submodules: true   # tvport/switchtv is the brad-n/SwitchTV repo
           persist-credentials: false
           fetch-depth: 2   # a pull request checks out its merge commit: HEAD^1 is the base branch it merges onto, the diff coverage's base
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -170,6 +173,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          submodules: true   # tvport/switchtv is the brad-n/SwitchTV repo
           persist-credentials: false
       - name: Install the selected Xcode's Metal toolchain
         run: xcodebuild -downloadComponent MetalToolchain   # a separate component, not included in the xcode-27 image
@@ -217,6 +221,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          submodules: true   # tvport/switchtv is the brad-n/SwitchTV repo
           persist-credentials: false
       - name: Install the selected Xcode's Metal toolchain
         run: xcodebuild -downloadComponent MetalToolchain
@@ -258,6 +263,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          submodules: true   # tvport/switchtv is the brad-n/SwitchTV repo
           persist-credentials: false
       - name: Install XcodeGen
         run: command -v xcodegen || brew install xcodegen

@@ -25,8 +25,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-ENGINE = ('dm', 'scripts', 'LICENSE', 'tvport/switchtv')   # tvport/switchtv: the SwitchTV launcher app, which backend.py switchtv builds
-LEFT_OUT = ('dm/tools/fuzz/',)   # the fuzzers' inputs: made-up game files, which no build reads
+ENGINE = ('dm', 'scripts', 'LICENSE', 'tvport/switchtv')   # tvport/switchtv: the SwitchTV launcher app and its build tool (a git submodule), which backend.py switchtv runs
+SUBMODULES = ('tvport/switchtv',)   # git ls-files in this checkout names a submodule as one entry; its files come from its own repo
+LEFT_OUT = ('dm/tools/fuzz/', 'tvport/switchtv/tests/', 'tvport/switchtv/docs/')   # the fuzzers' inputs: made-up game files, which no build reads
 GAME_SUFFIXES = {'.nsp', '.xci', '.nsz', '.xcz', '.nca', '.ncz', '.tik', '.keys', '.nso', '.nro', '.img', '.ipa', '.ips'}
 GAME_NAMES = {'prod.keys', 'title.keys', 'dev.keys', 'control.nacp', 'main.npdm', 'c1_full.tsv', 'cb_extent.tsv', 'pso_user.tsv', 'tvport-shaders.tsv', 'tvport.json', 'tvport-env.txt'}
 GAME_FOLDERS = re.compile(r'^([0-9A-Fa-f]{16}_build|.*-work|.*\.app|.*\.xcarchive|save-backups|save)$')
@@ -48,10 +49,24 @@ def unsafe(paths) -> list:
     return [p for p in paths if Path(p).suffix.lower() in GAME_SUFFIXES or Path(p).name in GAME_NAMES or any(GAME_FOLDERS.match(part) for part in Path(p).parts[:-1])]
 
 
+def submodule_files(sub: str) -> tuple:
+    """(tracked files, tracked files that .gitignore says a build makes) of a submodule, as paths from the checkout's root. A submodule that is not checked out stops the packaging: the app would build without SwitchTV."""
+    folder = REPO / sub
+    if not (folder / 'switchtv.py').is_file() or not (folder / 'project.yml').is_file():
+        raise Stop(f'{sub} is empty: it is the brad-n/SwitchTV submodule, and the app carries it. Run: git submodule update --init')
+    names = lambda *args: [f'{sub}/{p}' for p in run(['git', '-C', folder, 'ls-files', '-z', *args]).split('\0') if p]
+    return names(), names('-ci', '--exclude-standard')
+
+
 def engine_files() -> list:
-    listed = run(['git', '-C', REPO, 'ls-files', '-z', '--', *ENGINE]).split('\0')
+    plain = [e for e in ENGINE if e not in SUBMODULES]
+    listed = run(['git', '-C', REPO, 'ls-files', '-z', '--', *plain]).split('\0')
+    ignored = [p for p in run(['git', '-C', REPO, 'ls-files', '-z', '-ci', '--exclude-standard', '--', *plain]).split('\0') if p]   # tracked although .gitignore says a build makes them
+    for sub in SUBMODULES:
+        tracked, made_by_a_build = submodule_files(sub)
+        listed += tracked
+        ignored += made_by_a_build
     files = sorted(p for p in listed if p and not p.startswith(LEFT_OUT) and (REPO / p).is_file())
-    ignored = [p for p in run(['git', '-C', REPO, 'ls-files', '-z', '-ci', '--exclude-standard', '--', *ENGINE]).split('\0') if p]   # tracked although .gitignore says a build makes them
     bad = unsafe(files) + ignored
     if bad:
         raise Stop('These tracked files look like game files, keys or build outputs, so they stay out of the app. Remove them from git first:\n  ' + '\n  '.join(bad[:20]))
@@ -78,7 +93,7 @@ def uv_files(uv_arg) -> tuple:
     return uv, run([uv, '--version']).split()[1], licenses
 
 
-TVPORT_FILES = ('backend.py', 'save_import.py', 'switchtv_catalog.py', 'nintendo_store.py', 'requirements.txt')   # what Contents/Resources carries beside the engine: backend.py runs from there, so every module it imports must be here
+TVPORT_FILES = ('backend.py', 'save_import.py', 'nintendo_store.py', 'requirements.txt')   # what Contents/Resources carries beside the engine: backend.py runs from there, so every module it imports must be here
 
 
 def build_number(repo: Path = REPO) -> str:

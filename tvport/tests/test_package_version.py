@@ -37,10 +37,27 @@ class PackageVersion(unittest.TestCase):
         import re
         here = {p.stem for p in (REPO / 'tvport').glob('*.py')}
         used = set()
-        for name in ('backend.py', 'switchtv_catalog.py', 'save_import.py'):
+        for name in ('backend.py', 'save_import.py'):
             used |= {m for m in re.findall(r'^\s*(?:import|from)\s+(\w+)', (REPO / 'tvport' / name).read_text(), re.M) if m in here}
         packaged = {Path(n).stem for n in package_tvport.TVPORT_FILES}
         self.assertFalse(used - packaged, f'modules backend.py needs but the package leaves out: {sorted(used - packaged)}')
+
+    def test_the_switchtv_submodule_goes_into_the_engine_by_its_own_files(self):
+        # git ls-files names a submodule as one entry, not a file: the packaging reads the submodule's own file list, and its tests and screenshots stay out
+        files = package_tvport.engine_files()
+        self.assertIn('tvport/switchtv/switchtv.py', files)
+        self.assertIn('tvport/switchtv/project.yml', files)
+        self.assertIn('tvport/switchtv/tools/tv_icon.swift', files)
+        self.assertFalse([f for f in files if f.startswith(('tvport/switchtv/tests/', 'tvport/switchtv/docs/'))])
+
+    def test_a_submodule_that_is_not_checked_out_stops_the_packaging_loudly(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as empty:
+            (Path(empty) / 'tvport/switchtv').mkdir(parents=True)
+            with patch.object(package_tvport, 'REPO', Path(empty)), self.assertRaisesRegex(package_tvport.Stop, 'git submodule update --init'):
+                package_tvport.submodule_files("tvport/switchtv")
+
 
 if __name__ == '__main__':
     unittest.main()

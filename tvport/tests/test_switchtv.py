@@ -1,161 +1,98 @@
-"""SwitchTV's catalogue: made from a fixture library and a titledb snippet, with no network and no Xcode."""
+"""TVPort's side of SwitchTV (the launcher is the brad-n/SwitchTV submodule at tvport/switchtv, with its own tests): the library as SwitchTV's games file, the catalogue made through its
+command line tool, and when the app on the Apple TV is refreshed."""
 import io
 import json
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import unittest
+import zlib
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import backend  # noqa: E402
-import switchtv_catalog as sc  # noqa: E402
 
 KART, WONDER, UNBUILT = '0100152000022000', '010015100B514000', '0100AAAA00000000'
 GAME_BANNER = 'https://img-eshop.cdn.nintendo.net/i/game.jpg'
 TITLEDB = {
-    '1': {'id': KART, 'name': 'Mario Kart™ 8 Deluxe', 'publisher': 'Nintendo', 'releaseDate': 20170428, 'numberOfPlayers': 4, 'category': ['Racing', 'Multiplayer', 'Other'],
-          'description': 'Race.', 'intro': 'Race anywhere', 'bannerUrl': 'https://img-eshop.cdn.nintendo.net/i/kart.jpg', 'screenshots': ['https://img-eshop.cdn.nintendo.net/i/s1.jpg', 'ftp://bad']},
-    '2': {'id': WONDER, 'name': 'Wonder', 'publisher': 'Nintendo', 'releaseDate': 20231020, 'numberOfPlayers': 4, 'category': ['Platformer', 'Action'], 'bannerUrl': GAME_BANNER, 'screenshots': []},
-    '3': {'id': WONDER, 'name': 'Wonder Switch 2 Edition', 'publisher': 'Nintendo', 'releaseDate': 20260326, 'bannerUrl': 'https://img-eshop.cdn.nintendo.net/i/s2.jpg'},
+    '1': {'id': KART, 'name': 'Mario Kart™ 8 Deluxe', 'publisher': 'Nintendo', 'releaseDate': 20170428, 'numberOfPlayers': 4, 'category': ['Racing', 'Multiplayer'],
+          'bannerUrl': 'https://img-eshop.cdn.nintendo.net/i/kart.jpg'},
+    '2': {'id': WONDER, 'name': 'Wonder', 'publisher': 'Nintendo', 'releaseDate': 20231020, 'category': ['Platformer'], 'bannerUrl': GAME_BANNER},
 }
 LIBRARY = [
     {'name': 'Mario Kart 8 Deluxe', 'titleID': KART, 'built': True, 'folder': '/nowhere/kart'},
-    {'name': 'Wonder', 'titleID': WONDER, 'built': True, 'folder': '/nowhere/wonder'},
+    {'name': 'Wonder', 'titleID': WONDER.lower(), 'built': True, 'folder': '/nowhere/wonder'},
     {'name': 'Not built', 'titleID': UNBUILT, 'built': False},
     {'name': 'No title ID', 'built': True},
 ]
 
 
-def fake_scale(source, destination, longest):
-    shutil.copy(source, destination)
+def png(path: Path) -> None:
+    def chunk(kind, data):
+        body = kind + data
+        return struct.pack('>I', len(data)) + body + struct.pack('>I', zlib.crc32(body))
+    rows = b''.join(b'\x00' + b'\x80\x40\xc0' * 16 for _ in range(9))
+    path.write_bytes(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 16, 9, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(rows)) + chunk(b'IEND', b''))
 
 
 class Fixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.data, self.cache, self.out = self.root / 'data', self.root / 'cache', self.root / 'out'
+        self.data, self.cache = self.root / 'data', self.root / 'cache'
         (self.data / 'artwork').mkdir(parents=True)
-        for title in (KART, WONDER):
-            (self.data / 'artwork' / f'{title}.jpg').write_bytes(b'art-' + title.encode())
+        png(self.data / 'artwork' / f'{KART}.jpg')   # a PNG under the .jpg name: the tool converts whatever it is given
         (self.data / 'artwork/sources.json').write_text(json.dumps({WONDER: GAME_BANNER}))
         self.cache.mkdir()
         (self.cache / 'US.en.json').write_text(json.dumps(TITLEDB))
-        self.fetches = []
+        (self.cache / 'banners').mkdir()
+        png(self.cache / 'banners' / f'{WONDER}.jpg')
 
     def tearDown(self):
         self.temp.cleanup()
 
-    def fetch(self, url, destination):
-        self.fetches.append(url)
-        raise OSError('offline')
 
-    def make(self, library=LIBRARY):
-        return sc.build_catalog(library, self.data, self.cache, self.out, lambda item: f'bundle.{item["titleID"]}', fetch=self.fetch, scale=fake_scale)
+class GamesFileTests(Fixture):
+    def test_only_built_games_with_a_title_id_and_what_tvport_knows_about_them(self):
+        games = backend.switchtv_games(LIBRARY, 'TEAM123456', self.data)
+        self.assertEqual([g['titleID'] for g in games], [KART, WONDER])
+        kart, wonder = games
+        self.assertEqual(kart['artwork'], str(self.data / 'artwork' / f'{KART}.jpg'))
+        self.assertNotIn('artworkSource', kart)
+        self.assertEqual(wonder['artworkSource'], GAME_BANNER)
+        self.assertNotIn('artwork', wonder)   # no art of its own: SwitchTV takes the shop banner
+        self.assertEqual(wonder['bundleID'], 'dev.tvport.team123456.g010015100b514000')   # the standard bundle ID when the build folder is not at hand
 
-
-class CatalogTests(Fixture):
-    def test_only_built_games_with_a_title_id(self):
-        catalog = self.make()
-        self.assertEqual([g['titleID'] for g in catalog['games']], [WONDER, KART])
-        self.assertEqual({g['name'] for g in catalog['games']}, {'Mario Kart 8 Deluxe', 'Wonder'})
-
-    def test_fields_come_from_titledb_and_the_library(self):
-        game = next(g for g in self.make()['games'] if g['titleID'] == KART)
-        self.assertEqual((game['publisher'], game['releaseDate'], game['numberOfPlayers']), ('Nintendo', '2017-04-28', 4))
-        self.assertEqual(game['genres'], ['Racing'])   # Multiplayer and Other are not genres
-        self.assertEqual(game['scheme'], 'switchtv-0100152000022000')
-        self.assertEqual(game['bundleID'], f'bundle.{KART}')
-        self.assertEqual(game['screenshots'], ['https://img-eshop.cdn.nintendo.net/i/s1.jpg'])
-        self.assertEqual(game['name'], 'Mario Kart 8 Deluxe')   # the library's name, not the shop's with its trademark sign
-
-    def test_the_product_the_artwork_came_from_wins(self):
-        game = next(g for g in self.make()['games'] if g['titleID'] == WONDER)
-        self.assertEqual(game['releaseDate'], '2023-10-20')   # not the Switch 2 Edition's
-
-    def test_images_are_written_beside_the_catalogue(self):
-        catalog = self.make()
-        game = catalog['games'][0]
-        self.assertTrue((self.out / game['card']).is_file() and (self.out / game['banner']).is_file())
-        self.assertEqual(json.loads((self.out / 'catalog.json').read_text()), catalog)
-
-    def test_missing_fields_are_reported(self):
-        report = sc.field_report(self.make())
-        self.assertEqual(report['Mario Kart 8 Deluxe'], [])
-        self.assertEqual(report['Wonder'], ['description', 'screenshots'])
-
-    def test_a_title_database_that_cannot_be_fetched_still_lists_the_games(self):
-        (self.cache / 'US.en.json').unlink()
-        catalog = self.make()
-        self.assertEqual(len(catalog['games']), 2)
-        game = catalog['games'][0]
-        self.assertIsNone(game['publisher'])
-        self.assertTrue(game['banner'])   # the artwork cache still gives the picture
-
-    def test_a_complete_recent_title_database_is_not_fetched_again(self):
-        self.make()
-        self.assertEqual(self.fetches, [])
-
-    def test_a_game_missing_from_an_old_database_fetches_it_again(self):
-        old = {k: v for k, v in TITLEDB.items() if v['id'] != KART}
-        (self.cache / 'US.en.json').write_text(json.dumps(old))
-        os.utime(self.cache / 'US.en.json', (1, 1))
-        self.make()
-        self.assertEqual(self.fetches, [sc.TITLEDB_URL])
+    def test_the_tool_is_found_in_the_submodule_and_a_missing_one_says_how_to_get_it(self):
+        self.assertTrue(backend.switchtv_tool().is_file())
+        with patch.object(backend, 'REPO', self.root), self.assertRaisesRegex(backend.Failure, 'git submodule update --init'):
+            backend.switchtv_tool()
 
 
-class ProjectSpecTests(unittest.TestCase):
-    SPEC = (Path(backend.REPO) / 'tvport/switchtv/project.yml').read_text()
-
-    def test_team_values_fill_both_targets(self):
-        spec = sc.render_spec(self.SPEC, 'L9492K5865', '77', ['switchtv-0100000000000001', 'switchtv-0100000000000002'])
-        self.assertNotRegex(spec, r'\$\{SWITCHTV_\w+\}')
-        self.assertEqual(spec.count('L9492K5865.dev.tvport.switchtv'), 4)   # two entitlements and two Info.plists
-        self.assertIn('PRODUCT_BUNDLE_IDENTIFIER: dev.tvport.l9492k5865.switchtv.topshelf', spec)   # the extension's ID is the app's plus a suffix
-        self.assertIn('LSApplicationQueriesSchemes: [switchtv-0100000000000001, switchtv-0100000000000002]', spec)
-
-    def test_extension_entry_point_and_string_versions(self):
-        spec = sc.render_spec(self.SPEC, 'L9492K5865', '77', [])
-        # TVServices exports _TVExtensionMain as a bare "ret" (the tv-app-extension default entry): the extension process returned at once, exit status 3, and never ran ContentProvider
-        self.assertIn('LD_ENTRY_POINT: _NSExtensionMain', spec)
-        # a number where Info.plist wants a string crashes CFNetwork (its user agent string) on the first request
-        self.assertEqual(spec.count('CFBundleVersion: "77"'), 2)
-        self.assertEqual(spec.count('CFBundleShortVersionString: "1.0"'), 2)
-
-    def test_group_name_is_the_one_game_builds_derive(self):
-        self.assertEqual(sc.group_id('L9492K5865'), 'L9492K5865.dev.tvport.switchtv')
-        script = (Path(backend.REPO) / 'dm/ios/tools/build_ipa.sh').read_text()
-        self.assertIn('$DM_TEAM_ID.dev.tvport.switchtv', script)
-
-
-class FingerprintTests(Fixture):
-    def test_same_library_same_fingerprint_whenever_it_is_made(self):
-        self.make()
-        first = sc.fingerprint(self.out, 'app-1')
-        with patch('time.time', return_value=1e9):
-            self.make()
-        self.assertEqual(sc.fingerprint(self.out, 'app-1'), first)
-
-    def test_changes_with_games_images_and_the_app(self):
-        self.make()
-        base = sc.fingerprint(self.out, 'app-1')
-        self.assertNotEqual(sc.fingerprint(self.out, 'app-2'), base)
-        (self.data / 'artwork' / f'{KART}.jpg').write_bytes(b'new art')
-        self.make()
-        self.assertNotEqual(sc.fingerprint(self.out, 'app-1'), base)
-        self.make(LIBRARY[:1])
-        self.assertNotEqual(sc.fingerprint(self.out, 'app-1'), base)
+@unittest.skipUnless(sys.platform == 'darwin', 'sips is macOS')
+class CatalogThroughTheToolTests(Fixture):
+    def test_prepare_makes_the_catalogue_and_a_fingerprint_that_follows_the_library(self):
+        (self.data / 'library.json').write_text(json.dumps(LIBRARY))
+        env = {'TVPORT_SWITCHTV_CACHE': str(self.cache)}
+        with patch.dict(os.environ, env), patch.object(backend, 'DATA', self.data), redirect_stdout(io.StringIO()):
+            work, catalog, first = backend.prepare_switchtv('TEAM123456')
+            self.assertEqual([g['titleID'] for g in catalog['games']], [WONDER, KART])
+            self.assertEqual(catalog['games'][1]['publisher'], 'Nintendo')
+            self.assertTrue((work / catalog['games'][1]['card']).is_file())
+            self.assertEqual(backend.prepare_switchtv('TEAM123456')[2], first)   # same library, same fingerprint
+            (self.data / 'library.json').write_text(json.dumps(LIBRARY[:1]))
+            self.assertNotEqual(backend.prepare_switchtv('TEAM123456')[2], first)
 
 
 class SyncTests(Fixture):
     def run_sync(self, fingerprint, **kwargs):
         calls = []
         prepare = lambda team: (self.root / 'work', {'games': [1, 2]}, fingerprint)
-        compile_app = lambda work, device: calls.append('build') or self.root / 'SwitchTV.app'
+        compile_app = lambda work, device, team: calls.append('build') or self.root / 'SwitchTV.app'
         install_app = lambda app, device: calls.append('install')
         with patch.dict(os.environ, {'TVPORT_SWITCHTV_CACHE': str(self.cache)}), redirect_stdout(io.StringIO()):
             result = backend.sync_switchtv('TV1', 'TEAM', prepare=prepare, compile_app=compile_app, install_app=install_app, **kwargs)
