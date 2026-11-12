@@ -8,7 +8,11 @@ Tested hardware: Apple TV 4K (3rd generation, A15), tvOS 27.2, Xcode 27.2.
 
 **The packed app:** unzip `TVPort-<version>.zip` and open TVPort.app from any folder. It is signed ad hoc and not notarized, so the first time macOS refuses it: open **System Settings > Privacy & Security** and press **Open Anyway**. At its first start it sets itself up (see [The packed app](#the-packed-app)) and lists anything else this Mac needs in **Setup**.
 
-**From this checkout**, which runs the checkout's own engine:
+**From this checkout**, which runs the checkout's own engine. SwitchTV (the Apple TV launcher) is a git submodule, so clone with `--recursive`, or in a clone you already have run `git submodule update --init`:
+
+```bash
+git clone --recursive https://github.com/brad-n/TVPort.git && cd TVPort
+```
 
 ```bash
 cd tvport/app && xcodegen generate
@@ -71,25 +75,21 @@ Drop NSP, XCI, NSZ or XCZ updates/DLC onto a game in the sidebar or its game pag
 
 ## SwitchTV, the launcher
 
-SwitchTV is a small Apple TV app that lists the games TVPort built and opens one with a press of Select. It lives in `tvport/switchtv/` (SwiftUI, tvOS 17+, bundle ID `dev.tvport.<team>.switchtv`); every colour is in `Sources/Theme.swift`.
+![SwitchTV on the tvOS Simulator: Recently Played and All Games, with the game in focus across the top](../docs/images/switchtv-home.jpg)
 
-**The home screen** (`Sources/HomeView.swift`) works like Plex or Netflix on the Apple TV. The top is a hero that follows focus: the game's artwork across the whole screen under a gradient, its title, publisher, year, players, genres and the first lines of its description, which crossfade to whichever poster has focus. The hero never scrolls; the poster rows (Recently Played, newest first; All Games, A-Z; one row per genre with at least two games) scroll in the space below it.
+SwitchTV is a small Apple TV app that lists the games TVPort built, with their box art, and opens one with a press of Select. It is **its own project, [brad-n/SwitchTV](https://github.com/brad-n/SwitchTV)**, with its own build tool (`switchtv.py`) that works without TVPort; its README describes the app, how games are opened and how Recently Played is shared. TVPort includes it as the git submodule `tvport/switchtv` (clone with `--recursive`, or run `git submodule update --init`), and `backend.py` keeps only what is TVPort's own:
 
-**Select plays the game.** Long-press Select opens a small menu (Play, Details); the Play/Pause button opens the details page (description, publisher, release date, players, genres, screenshots, and a Play button). A game whose app was built before this feature has no `switchtv-<id>` URL scheme, so SwitchTV cannot open it: it says "Rebuild <game> in TVPort to play it from SwitchTV" (an alert on Select, and a line on the details page) and never does nothing silently.
-
-How it opens a game: each game app TVPort builds answers the URL scheme `switchtv-<title ID in lowercase>` (`dm/ios/project_tv.yml`, `CFBundleURLTypes`; the host just comes to the front). SwitchTV lists every game's scheme in `LSApplicationQueriesSchemes`, asks `canOpenURL`, and opens `switchtv-<id>://play`.
-
-**Recently played** is shared through a keychain access group, `<team>.dev.tvport.switchtv` (`Shared/SharedStore.swift`): one keychain item per game (service `dev.tvport.switchtv`, account the title ID in capitals, value the Unix time of the last play). SwitchTV writes it when it opens a game; a game app writes its own when it comes to the front (`dm/ios/SourcesTV/TVLastPlayed.m`, from the next TVPort build of the game, which also gets the `keychain-access-groups` entitlement), so a game started from anywhere counts. A copy is kept in SwitchTV's preferences. It is a keychain group rather than an App Group because an App Group needs an App ID registered in the developer account, which Xcode can only do with an Apple ID signed in under Xcode > Settings > Accounts; the keychain group works under the wildcard profile automatic signing already has. Without the entitlement every call fails quietly.
-
-**Top Shelf.** SwitchTV has a Top Shelf extension (`TopShelf/ContentProvider.swift`, `com.apple.tv-top-shelf`). With SwitchTV in the top row of the home screen, the shelf shows Recently Played (up to 8) then All Games, each with its poster; Select on one opens the game directly when its app can be opened (SwitchTV records which can, after it has run once), else opens SwitchTV on that game's details (`switchtv://game/<title ID>`). Until a game has been played, or SwitchTV has been opened, the shelf lists All Games with links into SwitchTV. The extension carries its own copy of the catalogue and images.
-
-Putting it on the Apple TV: **Install SwitchTV** (toolbar, and in the Apple TV section of the settings), or `backend.py switchtv install --device <id>`. `switchtv catalog` only writes the catalogue, `build` builds without installing, and `sync` installs only when the catalogue changed (a fingerprint of the catalogue, its images and the app's own files, kept per Apple TV). The catalogue is made from the library, the artwork cache and blawar/titledb's US list (fetched once, about 90 MB, into `switchtv-cache/` in TVPort's folder; `TVPORT_SWITCHTV_CACHE` moves it). Fields the list lacks are simply left out. Under Settings, **Keep SwitchTV up to date** (on by default) refreshes SwitchTV after every Build & Install and after a game is removed; a failure there is a warning in the log and never fails a game build.
+- **The library as SwitchTV's games file.** `switchtv_games()` writes the library's built games (title ID, name, the game app's bundle ID, TVPort's artwork for it and the shop banner that artwork came from) to `games.json` in the cache folder; `switchtv.py catalog --games` makes the catalogue from it. Games TVPort builds answer the URL scheme `switchtv-<title ID in lowercase>` (`dm/ios/project_tv.yml`, `CFBundleURLTypes`) and record when they were played in the keychain access group `<team>.dev.tvport.switchtv` (`dm/ios/SourcesTV/TVLastPlayed.m`, with the `keychain-access-groups` entitlement `build_ipa.sh` adds): that is what the SwitchTV README lists as what a game build needs.
+- **The cache folder.** `switchtv_cache()`: `TVPORT_SWITCHTV_CACHE`, else `switchtv-cache/` in TVPort's own folder. It holds the title database (about 90 MB, fetched once), banners, Nintendo store answers, the catalogue, the build, and which fingerprint is installed on which Apple TV.
+- **The team.** The signing team TVPort already knows (or `--team`).
+- **When SwitchTV is refreshed.** **Install SwitchTV** (toolbar, and the Apple TV section of the settings), or `backend.py switchtv install --device <id>`. `switchtv catalog` only makes the catalogue, `build` builds without installing (`build --simulator` builds for the tvOS Simulator, unsigned, and installs nothing), and `sync` installs only when the fingerprint of the catalogue, its images and the app's own files changed since the last install on that Apple TV. Under Settings, **Keep SwitchTV up to date** (on by default) refreshes SwitchTV after every Build & Install and after a game is removed; a failure there is a warning in the log and never fails a game build.
+- **A checkout without the submodule** stops `backend.py switchtv` and `scripts/package_tvport.py` with the command to run (`git submodule update --init`); the packed app carries the submodule's files.
 
 tvOS has no way for an app to put other apps in a home-screen folder: new apps appear at the end of the home screen. Make a "Games" folder there once by hand (hold the clickpad on an app, choose New Folder) to keep the top row clean.
 
 ### Changing the icon
 
-The one file to swap is `tvport/switchtv/Branding/switchtv-icon-source.png`: a square PNG (the owner's is 1254 x 1254) with the mark above a wordmark on a white background. `Branding/make_branding.swift` cuts the mark (the App Icon, centred on the logo's own white) and centres the whole logo (the Top Shelf images), and `dm/ios/tools/tv_icon.swift` (with `DM_ICON_BACKDROP`) lays them out as the layered tvOS assets, on every install. If the new logo has its mark somewhere else, change `markRect` in `make_branding.swift`; if its red differs, set `accent` and `ink` in `Sources/Theme.swift` (`make_branding.swift` writes the sampled colours to `colors.txt`).
+The one file to swap is `tvport/switchtv/Branding/switchtv-icon-source.png` (in the SwitchTV repo): a square PNG with the mark above a wordmark on a white background. See the SwitchTV README and `Branding/make_branding.swift` there.
 
 ## Starting a build from a URL
 

@@ -171,7 +171,7 @@ def load_product(cache: Path, title_id: str, *, fetch_loc: Callable[[str], str] 
 
 
 def catalog_entry(product: dict) -> dict:
-    """The product as a titledb entry (what switchtv_catalog.game_record reads)."""
+    """The product as a titledb entry (what SwitchTV catalog.game_record reads)."""
     return {'id': None, 'name': product.get('name'), 'publisher': product.get('publisher'), 'releaseDate': product.get('releaseDate'), 'category': product.get('genres') or [],
             'description': product.get('description'), 'bannerUrl': product.get('wideUrl') or None, 'screenshots': []}
 

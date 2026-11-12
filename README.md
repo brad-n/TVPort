@@ -79,13 +79,17 @@ Changes in this fork that the TVPort and nxnative releases don't have yet, in pl
 
 <img src="tvport/switchtv/Branding/switchtv-icon-source.png" alt="SwitchTV icon" width="160">
 
+![SwitchTV on the tvOS Simulator: Recently Played and All Games, with the game in focus across the top](docs/images/switchtv-home.jpg)
+
+SwitchTV is its own project, [brad-n/SwitchTV](https://github.com/brad-n/SwitchTV), with its own build tool; it needs no TVPort. TVPort includes it as a git submodule (`git clone --recursive`, or `git submodule update --init`) and keeps it up to date for you.
+
 - **A launcher for the games TVPort built:** SwitchTV is an Apple TV app that lists every game you built with TVPort, with its box art: a large banner for the game you're on, a Continue Playing row, All Games, rows by genre, and a page of details for each game. Press Select to play. Hold Select (or press Play/Pause) for the details. A game that's no longer installed says to build it again instead.
 - **On the Apple TV home screen:** with SwitchTV in the top row, its Top Shelf shows your recently played games and all your games, so you can start one without opening anything.
 - **Recently played:** each game tells SwitchTV when you last played it, so Continue Playing and the Top Shelf stay in order.
 - **Kept up to date by TVPort:** after every Build & Install, and after you remove a game, TVPort refreshes SwitchTV on the Apple TV so the list matches what's installed. Nothing is sent when nothing changed. Turn this off in TVPort's Settings ("Keep SwitchTV up to date").
 - **Art for Switch 2 games too:** the public title list has no Switch 2 games, so TVPort looks those up on Nintendo's own store for their icon, Top Shelf art and details.
 - **Keep your home screen tidy:** tvOS doesn't let one app put others in a folder. Each new game appears at the end of the home screen, so make a "Games" folder once by hand: hold the clickpad on an app and choose New Folder.
-- The source is in [`tvport/switchtv`](tvport/switchtv). TVPort builds and installs it for you; there's nothing to set up.
+- The source is in [brad-n/SwitchTV](https://github.com/brad-n/SwitchTV) (the submodule [`tvport/switchtv`](tvport/switchtv)). TVPort builds and installs it for you; there's nothing to set up. Games built by other tools are listed too, but SwitchTV can only open the ones built with the small addition its README describes.
 
 **Switch 2 games (experimental)**
 - **Ocarina of Time plays on the Apple TV:** the Switch 2 edition of The Legend of Zelda: Ocarina of Time now plays on an Apple TV 4K (3rd generation) through the whole opening, to control of Link and across Kokiri Forest, without crashing, at about 14 to 28 frames a second. It is the first Switch 2 game to run on an Apple TV. The settings it needs, the results of each test session, what it took and what is still missing are in [Switch 2 games on the Apple TV](docs/switch2-apple-tv.md). New Switch 2 Apple TV work lands first on the [`switch2-experimental`](https://github.com/brad-n/TVPort/tree/switch2-experimental) branch, and comes to this one once a session on the TV shows it helps.
