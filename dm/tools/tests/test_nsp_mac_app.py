@@ -109,7 +109,7 @@ class PackReuse(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix='pack-reuse-', dir=TEST_ROOT)).resolve()
         self.addCleanup(shutil.rmtree, self.tmp)
         t = self.tmp
-        for d in ('patched', 'romfs/empty', 'msl', 'profile', 'font', 'aoc/1', 'pso', 'bin', 'sdk', 'source', 'host', 'tools', 'ios/Sources'):
+        for d in ('patched', 'romfs/empty', 'msl', 'profile', 'font', 'aoc/1', 'pso', 'bin', 'sdk', 'source', 'host', 'tools', 'ios/Sources', 'third_party/zstd/common', 'third_party/zstd/decompress'):
             (t / d).mkdir(parents=True)
         files = {
             'dmhost': b'host', 'patched/main.patched.bin': b'code', 'patched/main.fixups.tsv': b'fixups',
@@ -118,7 +118,7 @@ class PackReuse(unittest.TestCase):
             'font/nintendo_ext.ttf': b'font', 'aoc/1/data': b'dlc', 'pso/gpu.mtl4a': b'archive',
             'pso/prebuilt.tsv': b'prebuilt', 'pso/rest_pairs.tsv': b'rest', 'pso/archive.tsv': b'index',
             'env.txt': b'DM_TEST=1', 'split.tsv': b'split', 'icon.jpg': b'jpeg', 'source/launcher.c': b'launcher',
-            'host/romfs_image.h': b'validator', 'host/save_sync.c': b'sync', 'host/save_sync.h': b'sync api', 'tools/romfs.py': b'reader',
+            'host/romfs_image.h': b'validator', 'host/romfs_sparse.h': b'sparse reader', 'third_party/zstd/common/zc.c': b'zstd common', 'third_party/zstd/decompress/zd.c': b'zstd decoder', 'host/save_sync.c': b'sync', 'host/save_sync.h': b'sync api', 'tools/romfs.py': b'reader',
             'source/Launcher.swift': b'window', 'ios/Sources/LauncherSettings.swift': b'model', 'ios/Sources/LauncherRow.swift': b'rows',
         }
         for n in pack_app.TABLES: files['profile/' + n] = n.encode()
@@ -206,6 +206,7 @@ class PackReuse(unittest.TestCase):
                  'pso/gpu.mtl4a', 'pso/prebuilt.tsv', 'pso/rest_pairs.tsv', 'pso/archive.tsv', 'env.txt', 'icon.jpg', 'source/launcher.c',
                  'source/Launcher.swift', 'ios/Sources/LauncherSettings.swift', 'ios/Sources/LauncherRow.swift',   # the settings window's sources
                  'host/save_sync.c', 'host/save_sync.h']   # the cloud-save code the launcher links (its send after the host exits)
+        names += ['host/romfs_sparse.h', 'third_party/zstd/common/zc.c', 'third_party/zstd/decompress/zd.c']   # the DMSPARS1 reader and the zstd decoder the launcher links
         names += ['profile/' + n for n in pack_app.TABLES]
         for name in names:
             with self.subTest(name=name):
@@ -940,3 +941,18 @@ class SeenShaders(unittest.TestCase):   # --seen-shaders: the keys, the partial 
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LauncherLinks(unittest.TestCase):
+    """The real launcher compiles and links (pack_app.build_launcher), zstd decoder included: --platform mac-app stopped at the pack on undefined ZSTD_* symbols once romfs_image.h read DMSPARS1 v2 images."""
+
+    @unittest.skipUnless(sys.platform == 'darwin' and shutil.which('xcrun'), 'needs Xcode')
+    def test_launcher_links(self):
+        run = lambda *a: subprocess.run(['xcrun', *a], capture_output=True, text=True, check=True).stdout.strip()
+        clang, swiftc, sdk = Path(run('--find', 'clang')), Path(run('--find', 'swiftc')), Path(run('--sdk', 'macosx', '--show-sdk-path'))
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as d:
+            out = Path(d) / 'G.app/Contents/MacOS/nxnative'
+            out.parent.mkdir(parents=True)
+            pack_app.build_launcher(out, '26.6', clang, swiftc, sdk)
+            self.assertTrue(out.is_file())
+            self.assertNotIn('_ZSTD_', subprocess.run(['nm', '-u', out], capture_output=True, text=True).stdout)
