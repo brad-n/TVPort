@@ -657,6 +657,14 @@ check_t_rt_retire: t_rt_retire
 	MTL_DEBUG_LAYER=1 ./t_rt_retire log
 	MTL_DEBUG_LAYER=1 ./t_rt_retire off
 	DM_NVN_RT_LOSSY=1 MTL_DEBUG_LAYER=1 ./t_rt_retire   # lossy targets retired, their heaps reused, drawn again with their pixels
+t_mem_relief: t_mem_relief.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_mem_relief.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+.PHONY: check_t_mem_relief
+check_t_mem_relief: t_mem_relief
+	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_mem_relief
+	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_mem_relief
+	MTL_DEBUG_LAYER=1 ./t_mem_relief off
+	DM_NVN_RT_LOSSY=1 MTL_DEBUG_LAYER=1 ./t_mem_relief   # lossy targets: heaps of another size class
 # A game's upscaler drawn by MetalFX (any profile; the profile's upscaler shaders, from its shader map, when it has some); with and without the switch, and on the encoding thread
 t_upscaler_mfx: t_upscaler_mfx.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upscaler_mfx.m $(MTL_T_SRC) $(FW)

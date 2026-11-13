@@ -398,6 +398,85 @@ static _Atomic uint64_t g_rh_made, g_rh_reused, g_rh_trimmed;   // for the memor
 @end
 static char g_rh_owner_key;
 static int sw_mode(const char *name, int dflt); static inline int sw_on(int m);
+// ---------- Memory relief (DM_NVN_MEM_RELIEF) ----------
+// iOS and tvOS end the app at a fixed footprint (the Apple TV 4K's A15: about 2,100 MB), and there memory the host only keeps for reuse counts as live memory does. When the process is
+// short of memory, each submission start gives back what is cached or recycled rather than live, before the next allocation can end the app: every recycled render-target heap waiting
+// for a target (rh_trim, oldest first, with no cap and no idle time), the sharing table's unreferenced textures (alias_sweep with no cap, its idle rules kept), render targets dead by
+// overwrite without the hold for storage the game came back to or RR_MS (rt_retire, every 8 submissions; dead by NVN's rule either way, the hold only spares remaking them), idle upload
+// staging (up_idle_release after 250 ms), re-upload spares (spare_sweep, every frame) and the free command allocators larger than any remembered submission needs (alloc_pick, at
+// each pick instead of once a second). Short of memory: os_proc_available_memory under DM_NVN_MEM_RELIEF_MB (256 by default) until it is 64 MB above that, or the system's memory
+// pressure source said warn or critical within the last 5 s (the per-process limit is watched by the look, which the source does not report). Why 256 MB: on the Apple TV in play
+// (Ocarina of Time, run 19) the available memory stood at 170-350 MB, and the largest rise of the graphics ledger in one 10 s ledger window was 224 MB (+932 to +942 s, render targets of
+// a new area, the window that ended the app); the memory given back here goes only after the submissions that used it complete, a frame or two, so the relief has to start with about
+// one such burst still left. The look is every 20 ms at a submission start (a kernel call).
+// On by default on iOS and tvOS (DM_NVN_MEM_RELIEF=0 off for A/B, ab alternates it with DM_AB); off on the Mac, which has no such limit: there DM_NVN_MEM_RELIEF=1 with
+// DM_NVN_MEM_RELIEF_LIMIT_MB=<n> takes the available memory as n less the process's graphics footprint (the kernel's graphics ledger, DM_MEMSTAT's graphics column), to measure it
+// with the Apple TV's settings (on the TV in play the rest of the footprint stood at 470-540 MB under a 2,096-2,106 MB limit: n = 1,560), and DM_NVN_MEM_RELIEF_FAKE_AVAIL_MB fixes it
+enum { MR_RH, MR_SWEEP, MR_RETIRE, MR_ALLOC, MR_STAGING, MR_SPARE, MR_N };   // what the relief gave back, for its log lines and the ledger
+static int g_mr_mode = -1; static int64_t g_mr_fake = -1, g_mr_limit = -1; static uint64_t g_mr_low, g_mr_high;
+static _Atomic int g_mr_short; static _Atomic uint64_t g_mr_sys_until, g_mr_avail = UINT64_MAX;   // the last look: short of memory; the pressure source's deadline; the MB available
+static _Atomic uint64_t g_mr_n[MR_N], g_mr_b[MR_N]; static uint64_t g_mr_episodes, g_mr_on_ns, g_mr_since, g_mr_min = UINT64_MAX;
+static dispatch_source_t g_mr_src;
+static uint64_t mr_env(const char *n, uint64_t d) { const char *e = getenv(n); return e && *e && atoll(e) >= 0 ? (uint64_t)atoll(e) : d; }
+static int mr_mode(void) {
+    if (g_mr_mode >= 0) return g_mr_mode;
+    g_mr_mode = sw_mode("DM_NVN_MEM_RELIEF", TARGET_OS_IPHONE ? 1 : 0);
+    g_mr_low = mr_env("DM_NVN_MEM_RELIEF_MB", 256); g_mr_high = g_mr_low + 64;
+    const char *f = getenv("DM_NVN_MEM_RELIEF_FAKE_AVAIL_MB"); if (f && *f) g_mr_fake = atoll(f);
+    const char *l = getenv("DM_NVN_MEM_RELIEF_LIMIT_MB"); if (l && *l) g_mr_limit = atoll(l);
+    if (!g_mr_mode) { MLOG("memory relief: off (DM_NVN_MEM_RELIEF)"); return 0; }
+    g_mr_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0, DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    if (g_mr_src) {
+        dispatch_source_set_event_handler(g_mr_src, ^{ unsigned long d = dispatch_source_get_data(g_mr_src);
+            if (d & (DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL)) atomic_store(&g_mr_sys_until, clock_gettime_nsec_np(CLOCK_MONOTONIC) + 5000000000ull);
+            MLOG("memory relief: the system reports memory pressure %s", d & DISPATCH_MEMORYPRESSURE_CRITICAL ? "critical" : d & DISPATCH_MEMORYPRESSURE_WARN ? "warn" : "normal"); });
+        dispatch_resume(g_mr_src);
+    }
+    MLOG("memory relief: cached and recycled memory goes first when under %llu MB is available, until %llu MB (DM_NVN_MEM_RELIEF%s)%s", (unsigned long long)g_mr_low, (unsigned long long)g_mr_high,
+         g_mr_mode >= 2 ? ", alternating with DM_AB" : "", g_mr_fake >= 0 ? "; available memory fixed by DM_NVN_MEM_RELIEF_FAKE_AVAIL_MB" : g_mr_limit > 0 ? "; available memory: DM_NVN_MEM_RELIEF_LIMIT_MB less the graphics footprint" : "");
+    return g_mr_mode;
+}
+static uint64_t mr_avail_mb(void) {
+    if (g_mr_fake >= 0) return (uint64_t)g_mr_fake;
+    if (g_mr_limit > 0) {   // a Mac measuring the TV's limit: that less the kernel's graphics ledger
+        task_vm_info_data_t vi; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+        if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) != KERN_SUCCESS) return UINT64_MAX;
+        uint64_t g = (vi.ledger_tag_graphics_footprint + vi.ledger_tag_graphics_footprint_compressed) >> 20;
+        return g < (uint64_t)g_mr_limit ? (uint64_t)g_mr_limit - g : 0;
+    }
+#if TARGET_OS_IPHONE
+    return os_proc_available_memory() >> 20;
+#else
+    return UINT64_MAX;
+#endif
+}
+static inline int mr_active(void) { return g_mr_mode > 0 && sw_on(g_mr_mode) && atomic_load_explicit(&g_mr_short, memory_order_relaxed); }
+static void mr_note(int what, uint64_t bytes) { atomic_fetch_add(&g_mr_n[what], 1); atomic_fetch_add(&g_mr_b[what], bytes); }
+static void mr_line(char *buf, size_t n) {   // what the relief gave back so far
+    snprintf(buf, n, "recycled heaps waiting %llu, %llu MB; unreferenced shared textures %llu, %llu MB; render targets dead by overwrite retired without the hold %llu, %llu MB; "
+             "command allocators made again empty %llu, %llu MB; upload staging %llu blocks, %llu MB; re-upload spares %llu, %llu MB",
+             (unsigned long long)g_mr_n[MR_RH], (unsigned long long)(g_mr_b[MR_RH] >> 20), (unsigned long long)g_mr_n[MR_SWEEP], (unsigned long long)(g_mr_b[MR_SWEEP] >> 20),
+             (unsigned long long)g_mr_n[MR_RETIRE], (unsigned long long)(g_mr_b[MR_RETIRE] >> 20), (unsigned long long)g_mr_n[MR_ALLOC], (unsigned long long)(g_mr_b[MR_ALLOC] >> 20),
+             (unsigned long long)g_mr_n[MR_STAGING], (unsigned long long)(g_mr_b[MR_STAGING] >> 20), (unsigned long long)g_mr_n[MR_SPARE], (unsigned long long)(g_mr_b[MR_SPARE] >> 20));
+}
+// A submission's start, before rh_trim, alias_sweep and rt_retire (mtl_sub_begin): one look every 20 ms
+static void mr_step(void) {
+    if (!sw_on(mr_mode())) { atomic_store(&g_mr_short, 0); return; }
+    static uint64_t next; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    if (now < next) return;
+    next = now + 20000000ull;
+    uint64_t avail = mr_avail_mb(); int sys = now < atomic_load(&g_mr_sys_until), was = atomic_load(&g_mr_short);
+    int s = sys || (was ? avail < g_mr_high : avail < g_mr_low);
+    atomic_store(&g_mr_avail, avail); if (avail < g_mr_min) g_mr_min = avail;
+    if (s == was) return;
+    atomic_store(&g_mr_short, s);
+    static unsigned lines; int say = lines++ < 40 || !(lines % 100);
+    if (s) { g_mr_episodes++; g_mr_since = now;
+        if (say) MLOG("memory relief: short of memory (%llu MB available, under %llu MB%s): recycled heaps, unreferenced targets, dead targets, idle staging, spares and oversized command allocators go first",
+                      (unsigned long long)avail, (unsigned long long)g_mr_low, sys ? "; or the system's memory pressure" : ""); }
+    else { g_mr_on_ns += now - g_mr_since;
+        if (say) { char b[512]; mr_line(b, sizeof b); MLOG("memory relief: %llu MB available again after %.1f s; given back so far: %s", (unsigned long long)avail, (now - g_mr_since) / 1e9, b); } }
+}
 static int rh_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_RT_RECYCLE", 1); return m; }
 // A heap for a texture of this descriptor: the smallest waiting one it fits, up to 1/rh_fit_div() larger, or a new one of its exact size. nil when the descriptor cannot be placed
 static id<MTLHeap> rh_take(MTLTextureDescriptor *d, int *reused) {
@@ -503,10 +582,12 @@ static void rh_trim(void) {
         static int said; if (said++ < 30 || !(said % 20)) MLOG("recycled render-target heaps: %u waiting, %llu MB (cap %llu MB, idle %llu ms, fit 1/%llu); made %llu, reused %llu, freed %llu so far", n, (unsigned long long)(b >> 20), (unsigned long long)(rh_cap() >> 20),
             (unsigned long long)(rh_idle_ns() / 1000000), (unsigned long long)rh_fit_div(), (unsigned long long)g_rh_made, (unsigned long long)g_rh_reused, (unsigned long long)g_rh_trimmed); }
     if (!g_rh_n) return;
+    int mr = mr_active(); uint64_t idle = mr ? 0 : RH_IDLE_NS, cap = mr ? 0 : RH_CAP;   // short of memory (mr_step): every waiting heap goes, the oldest first
     os_unfair_lock_lock(&g_rh_lk);
     while (g_rh_n && nd < 64) {
         unsigned old = 0; for (unsigned i = 1; i < g_rh_n; i++) if (g_rh[i].t < g_rh[old].t) old = i;
-        if (now - g_rh[old].t < RH_IDLE_NS && g_rh_bytes <= RH_CAP) break;
+        if (now - g_rh[old].t < idle && g_rh_bytes <= cap) break;
+        if (mr && now - g_rh[old].t < RH_IDLE_NS && g_rh_bytes <= RH_CAP) mr_note(MR_RH, g_rh[old].size);   // one the cap and idle time would have kept
         drop[nd++] = g_rh[old].heap; g_rh_bytes -= g_rh[old].size; g_rh[old] = g_rh[--g_rh_n];
     }
     os_unfair_lock_unlock(&g_rh_lk);
@@ -1799,11 +1880,12 @@ static int alloc_pick(uint64_t done) {
     }
     if (!nfree) return -1;
     for (int o = 0; o < ORD_MAX; o++) if (g_ord_need[o] && now - g_ord_need_ns[o] > 30000000000ull) g_ord_need[o] = 0; else if (g_ord_need[o] > M) M = g_ord_need[o];
-    if (now - g_alloc_trim_ns >= 1000000000ull) {
+    int mr = mr_active(), early = mr && now - g_alloc_trim_ns < 1000000000ull;   // short of memory (mr_step): at each pick, not once a second
+    if (mr || now - g_alloc_trim_ns >= 1000000000ull) {
         g_alloc_trim_ns = now; int big = alloc_trim_victim(sz, fr, g_alloc_n, M);
         if (big >= 0) {
             NSError *ae = nil; id<MTL4CommandAllocator> a = [g_dev newCommandAllocatorWithDescriptor:[MTL4CommandAllocatorDescriptor new] error:&ae];
-            if (a) { g_alloc4[big] = a; g_alloc_trims++; g_alloc_trim_b += sz[big];
+            if (a) { g_alloc4[big] = a; g_alloc_trims++; g_alloc_trim_b += sz[big]; if (early) mr_note(MR_ALLOC, sz[big]);
                 if (g_alloc_trims <= 4 || !(g_alloc_trims & (g_alloc_trims - 1))) MLOG("command allocators: #%d made again empty, it held %llu MB (the submissions remembered take up to %llu MB); %llu so far, %llu MB (DM_NVN_ALLOC_FIT)",
                     big, (unsigned long long)(sz[big] >> 20), (unsigned long long)(M >> 20), (unsigned long long)g_alloc_trims, (unsigned long long)(g_alloc_trim_b >> 20));
                 sz[big] = 0; }
@@ -1866,7 +1948,7 @@ static void sub_origin_pd(void);
 static void alias_sweep(void);   // the sharing table's unreferenced textures past DM_NVN_ALIAS_SWEEP_MB (below alias_take_over)
 static void rt_retire(void);   // render targets dead by overwrite (DM_NVN_RT_RETIRE, below tex_fast_rid)
 void mtl_sub_begin(void) {
-    mtl_init(); g_sub_serial++; spin_sub_begin(); pool_age(); res_budget_step(); pu_step(); spare_sweep(); g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL;
+    mtl_init(); g_sub_serial++; mr_step(); spin_sub_begin(); pool_age(); res_budget_step(); pu_step(); spare_sweep(); g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL;
     g_fence_ns[(g_fence + 1) % FENCE_NS] = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     gpc_sub_begin();
     sub_cut_begin();
@@ -3336,7 +3418,8 @@ static void alias_parents_of(nvn_hmap *m, CFMutableSetRef out) {   // the base t
 }
 // The submit thread, when a submission begins (mtl_sub_begin), every ALIAS_SWEEP_EVERY submissions; g_smu only tried, as tex_mtl_'s takeover holds it on the same path
 static void alias_sweep(void) { @autoreleasepool {
-    uint64_t cap = alias_sweep_cap(); if (!cap) return;
+    uint64_t normal = alias_sweep_cap(); int mr = mr_active(); if (!normal && !mr) return;
+    uint64_t cap = mr ? 0 : normal;   // short of memory (mr_step): every unreferenced texture its idle rules let go
     static uint64_t next; uint64_t f = atomic_load(&g_fence); if (f < next) return; next = f + ALIAS_SWEEP_EVERY;
     if (pthread_mutex_trylock(&g_smu)) return;
     sweep_cand *c = NULL; uint32_t nc = 0, cc = 0; uint64_t unref = 0;   // c: every unreferenced entry
@@ -3371,6 +3454,7 @@ static void alias_sweep(void) { @autoreleasepool {
             defer_obj_release(o);
             if (g_alias_swept_keys.n > 8192) nvn_hm_clear(&g_alias_swept_keys, NULL);
             nvn_hm_put(&g_alias_swept_keys, &c[j].k, (void *)(uintptr_t)(now + 1));
+            if (mr && unref <= normal) mr_note(MR_SWEEP, c[j].bytes);   // one the cap would have kept
             unref -= MIN(unref, c[j].bytes); n++; b += c[j].bytes;
         }
     }
@@ -3400,8 +3484,8 @@ static void alias_sweep(void) { @autoreleasepool {
 // drawn at the smaller resolution covers the first block rows of that target only, and the targets behind them keep their storage. Draws reach only their viewport and scissor; a byte in a
 // GOB a draw's rectangle covers is counted written (a pass owns the area it draws to), the padding of a target written to its edges with it. Image stores, copies and compute writes credit
 // nothing (a target they alone overwrite stays), and a use of any kind (tex_mtl, a texture ID's binding, an image binding) makes a target live again. Only GPU-only targets made in
-// a placement heap of their own or alone (rh_texture's: COMPRESSIBLE in a CPU_NO_ACCESS pool, single-sample, not a resolution family's heap, not pinned, no ghost entry, no view a serial
-// holds) are retired, and only after RR_IDLE submissions and RR_MS unused (longer for storage the game came back to, rr_again), so a target the frame graph reuses every frame keeps its
+// a placement heap of their own or alone (rh_texture's: COMPRESSIBLE in a CPU_NO_ACCESS pool, single-sample, not pinned, no ghost entry, no view a serial holds), and a resolution
+// family's textures (image_texture) only all together, once every texture placed in its heap may go, are retired, and only after RR_IDLE submissions and RR_MS unused (longer for storage the game came back to, rr_again), so a target the frame graph reuses every frame keeps its
 // texture. On the Mini with the TV's settings, Link's house through Saria's cutscene: the recycled heaps 839-933 MB at the peak and 607-748 MB in the end without, 401-625 and 246-298 MB
 // with (docs/reference/rendering.md). DM_NVN_RT_RETIRE=0 keeps every one; =log
 // counts what would go and keeps it
@@ -3591,7 +3675,7 @@ static inline id pkg_tex(id o) { if ([o isKindOfClass:[NvPkg class]]) { NvPkg *p
 static int64_t g_spare_frames = -1; static _Atomic uint64_t g_spare_drops, g_spare_drop_b;
 static uint64_t spare_frames(void) { if (g_spare_frames < 0) { const char *e = getenv("DM_NVN_PKG_SPARE_FRAMES"); g_spare_frames = e && *e ? atoll(e) : 120; if (g_spare_frames < 0) g_spare_frames = 0; } return (uint64_t)g_spare_frames; }
 static void pkg_spare_idle(NvPkg *pk) {
-    uint64_t f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed), keep = spare_frames();
+    uint64_t f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed), keep = spare_frames(); int mr = keep && mr_active(); if (mr) keep = 1;   // short of memory (mr_step): a frame on
     if (!pk->spare || !keep || f - pk->spare_frame < keep) return;
     if (pk->spare_fence > atomic_load(&g_done)) return;   // the GPU still reads it (no g_mu: the sweep holds g_rmu)
     pthread_mutex_lock(&g_smu); int held = entry_holds((__bridge void *)pk->spare); pthread_mutex_unlock(&g_smu);
@@ -3599,6 +3683,7 @@ static void pkg_spare_idle(NvPkg *pk) {
     uint64_t z = pk->spare.allocatedSize, n = atomic_fetch_add(&g_spare_drops, 1) + 1; atomic_fetch_add(&g_spare_drop_b, z);
     if (n <= 3 || !(n & (n - 1))) MLOG("re-upload spares: one unused for %llu frames released, %llu KB (%llu so far, %llu MB; DM_NVN_PKG_SPARE_FRAMES)", (unsigned long long)keep, (unsigned long long)(z >> 10),
                                        (unsigned long long)n, (unsigned long long)(atomic_load(&g_spare_drop_b) >> 20));
+    if (mr) mr_note(MR_SPARE, z);
     defer_obj_release(pk->spare); pk->spare = nil;
 }
 // The packages holding a spare (weak), so the spares no clean lookup reaches go too: a texture the pool table walk resolves from its cached view, or that nothing draws, is not looked up.
@@ -4137,22 +4222,23 @@ static void up_idle_release(void) {
 #endif
         if (idle_ns < 0) idle_ns = 0; }
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-    for (unsigned s = 0; idle_ns && !g_up_cb && s < 3; s++) {
+    int mr = mr_active(); int64_t idle = mr && (!idle_ns || idle_ns > 250000000ll) ? 250000000ll : idle_ns;   // short of memory (mr_step): after 250 ms, on the Mac too
+    for (unsigned s = 0; idle && !g_up_cb && s < 3; s++) {
         if ((!g_up_slot_blk[s] && !g_up_slot_over[s]) || atomic_load(&g_up_alloc_busy[s])) continue;
         uint64_t b = 0; const char *why = NULL;
-        if (now - g_up_slot_used_ns[s] >= (uint64_t)idle_ns) {
+        if (now - g_up_slot_used_ns[s] >= (uint64_t)idle) {
             b = (g_up_slot_blk[s] ? g_up_slot_blk[s].length : 0) + (g_up_slot_over[s] ? g_up_slot_over[s].length : 0);
             defer_obj_release(g_up_slot_blk[s]); defer_obj_release(g_up_slot_over[s]); g_up_slot_blk[s] = g_up_slot_over[s] = nil; why = "idle";
         } else {
-            if (g_up_slot_over[s] && now - g_up_over_ns[s] >= (uint64_t)idle_ns) { b += g_up_slot_over[s].length; defer_obj_release(g_up_slot_over[s]); g_up_slot_over[s] = nil; why = "overflow unused"; }
-            if (now - g_up_win_ns[s] >= (uint64_t)idle_ns) {
+            if (g_up_slot_over[s] && now - g_up_over_ns[s] >= (uint64_t)idle) { b += g_up_slot_over[s].length; defer_obj_release(g_up_slot_over[s]); g_up_slot_over[s] = nil; why = "overflow unused"; }
+            if (now - g_up_win_ns[s] >= (uint64_t)idle) {
                 size_t want = UP_SLOT_BLOCK; while (want < g_up_win_max[s]) want <<= 1;
                 if (g_up_slot_blk[s] && g_up_slot_blk[s].length > want) { b += g_up_slot_blk[s].length; defer_obj_release(g_up_slot_blk[s]); g_up_slot_blk[s] = nil; why = why ? "overflow unused, primary larger than recent batches" : "primary larger than recent batches"; }
                 g_up_slot_want[s] = g_up_win_max[s]; g_up_win_max[s] = 0; g_up_win_ns[s] = now;
             }
         }
         if (!why) continue;
-        g_up_idle_n++; g_up_idle_bytes += b;
+        g_up_idle_n++; g_up_idle_bytes += b; if (mr && b) mr_note(MR_STAGING, b);
         if (g_up_idle_n <= 8) MLOG("upload staging: slot %u (%s): %llu MB released; %llu releases, %llu MB in total", s, why, (unsigned long long)(b >> 20), (unsigned long long)g_up_idle_n, (unsigned long long)(g_up_idle_bytes >> 20));
     }
     static uint64_t said_ns;   // every 30 s: what the slots hold now
@@ -8813,24 +8899,41 @@ static inline __attribute__((always_inline)) uint64_t tex_fast_rid_(int tid, voi
 // (g_rr_use) and the binding of a texture ID registered for a serial that holds it (treg_t.ufence). Retired: out of the sharing table, out of the serial table (a note for each serial,
 // so its texture IDs and the pool tables take it again: a walk gives the zero texture, pool_unwritten_target), each such ID's cached views dropped, the texture released after the
 // submissions up to this one complete (defer_obj_release). The serial's view cache (g_vc) goes too: its views hold their parent, and it is dropped otherwise only when the texture
-// object is finalized, which Ocarina of Time does not do for these (without it, 277 retired targets, 234 MB of heaps, stayed alive in the house walk). Caller: mtl_sub_begin; the locks
-// are only tried (g_rmu, then g_smu)
+// object is finalized, which Ocarina of Time does not do for these (without it, 277 retired targets, 234 MB of heaps, stayed alive in the house walk). A resolution family's heap
+// (image_texture: sizes at one offset sharing it) goes whole or not at all: retiring one member while another holds the heap frees nothing, and a member still in use keeps the bytes the
+// others alias. They used to be left out altogether, and Ocarina's families outlived their scene: on the Mini with the Apple TV's settings, 124 MB of family heaps 100 s into the walk,
+// 97 MB of them in heaps every live texture of which other targets had drawn over (the [ledger]'s holder line); the Apple TV ended the app with 120 MB of them (run 19). Each scan also
+// records why dead targets stayed (the hold, a recent binding, a serial's view, a pin, the ghost ring, a family member that stays) for the [ledger]'s retire line. Caller: mtl_sub_begin;
+// the locks are only tried (g_rmu, then g_smu)
 enum { RR_EVERY = 32, RR_IDLE = 64, RR_MS = 250, RR_HOLD_MS = 2000 };   // Ocarina's door to Kokiri Forest, TV settings on a Mac mini: with 1 s, 225 MB of targets already dead waited out the second at the peak (601 MB of heaps); with 250 ms the peak was 345 MB, and as many were made again
-typedef struct { alias_key k; void *o; uint64_t lu, cover, bytes; int view; } rr_cand;
+typedef struct { alias_key k; void *o; uint64_t lu, cover, bytes; int view, early, fam; } rr_cand;   // fam: its resolution family's index + 1 (rr_fam), 0 for a target alone
+typedef struct { void *heap; uint64_t size; uint32_t members, ok; int state; } rr_fam;   // a family heap of the sharing table: its textures there, how many of them may go now; 1 it goes, 2 it stays
+// Why the last scan kept targets dead by overwrite (the [ledger]'s DM_NVN_RT_RETIRE line): inside the hold, bound through a texture ID within RR_IDLE submissions, a view a serial holds,
+// pinned, a finalized object's (ghost ring), a resolution family with a member that may not go
+enum { RRK_HOLD, RRK_BOUND, RRK_VIEW, RRK_PIN, RRK_GHOST, RRK_FAMILY, RRK_N };
+static uint64_t g_rr_kept_n[RRK_N], g_rr_kept_b[RRK_N], g_rr_fam_n, g_rr_fam_b;   // the last scan's; families retired so far, their heaps
 static void rr_drop_view(void **v, uint64_t *rid) { if (!*v) return; defer_obj_unref((__bridge id)*v); CFRelease(*v); *v = NULL; *rid = 0; }
 static void rt_retire(void) { @autoreleasepool {
     int mode = rr_mode(); if (!mode) return;
-    static uint64_t next; uint64_t f = atomic_load(&g_fence); if (f < next) return; next = f + RR_EVERY;
+    int mr = mr_active();   // short of memory (mr_step): every RR_EVERY / 4 submissions, without the hold (below)
+    static uint64_t next; uint64_t f = atomic_load(&g_fence); if (f < next) return; next = f + (mr ? RR_EVERY / 4 : RR_EVERY);
     if (!os_unfair_lock_trylock(&g_rmu)) return;
     if (pthread_mutex_trylock(&g_smu)) { os_unfair_lock_unlock(&g_rmu); return; }
     g_rr_scans++;
-    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), n = 0, b = 0;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), n = 0, b = 0, kn[RRK_N] = {0}, kb[RRK_N] = {0};
     rr_cand *c = NULL; uint32_t nc = 0, cc = 0;
+    rr_fam *fm = NULL; uint32_t nf = 0, fc = 0; nvn_hmap fi = {.klen = sizeof(uintptr_t)};   // family heap → index + 1
     for (uint32_t i = 0; i < g_alias.cap; i++) {
         void *v = g_alias.vals[i]; if (!v) continue;
         alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
         const pool_t *p = (const pool_t *)(uintptr_t)k.pool;
         if (!p || !(p->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) || !(k.d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) || (k.d.flags & IMAGE_NOT_SHARED) || k.d.samples > 1) continue;
+        // A resolution family (image_texture: descriptions at one offset sharing a heap) goes only whole: each texture placed in its heap is counted here, a candidate or not
+        NvImageHeap *own = objc_getAssociatedObject((__bridge id)v, &g_image_heap_owner_key); uint32_t fam = 0;
+        if (own && own->heap) { uintptr_t hk = (uintptr_t)(__bridge void *)own->heap; fam = (uint32_t)(uintptr_t)nvn_hm_get(&fi, &hk);
+            if (!fam) { if (nf == fc) { fc = fc ? 2 * fc : 16; fm = realloc_or_die(fm, fc * sizeof *fm, "the render-target retire"); }
+                fm[nf] = (rr_fam){(__bridge void *)own->heap, own->heap.size, 0, 0, 0}; fam = ++nf; nvn_hm_put(&fi, &hk, (void *)(uintptr_t)fam); }
+            fm[fam - 1].members++; }
         uint64_t seen = (uint64_t)(uintptr_t)nvn_hm_get(&g_alias_seen, &k);
         if (seen && f + 1 - seen < RR_IDLE) continue;
         nvn_texlayout L; nvn_tex_layout(&k.d, &L); if (!L.size) continue;
@@ -8839,12 +8942,14 @@ static void rt_retire(void) { @autoreleasepool {
         uintptr_t a = (uintptr_t)v; id o = (__bridge id)v;
         if (![o conformsToProtocol:@protocol(MTLTexture)]) continue;
         id<MTLTexture> t = o; id<MTLHeap> h = t.heap;
-        if (t.parentTexture || t.buffer || tex_object_pinned(t) || (g_ghost_held.n && nvn_hm_get(&g_ghost_held, &a)) || objc_getAssociatedObject(t, &g_image_heap_owner_key)
-            || (h && !objc_getAssociatedObject(t, &g_rh_owner_key)) || t.storageMode != MTLStorageModePrivate || nvn_sparse_pool(p)) continue;
+        if (t.parentTexture || t.buffer || (h && !fam && !objc_getAssociatedObject(t, &g_rh_owner_key)) || t.storageMode != MTLStorageModePrivate || nvn_sparse_pool(p)) continue;
         uint64_t lu = seen; os_unfair_lock_lock(&g_rr_use_lk); lu = MAX(lu, (uint64_t)(uintptr_t)nvn_hm_get(&g_rr_use, &a)); os_unfair_lock_unlock(&g_rr_use_lk);
-        if (cover <= lu || f + 1 - lu < RR_IDLE) continue;
+        if (cover <= lu || f + 1 - lu < RR_IDLE) continue;   // not dead by overwrite, or used lately
+        uint64_t z = fam ? 0 : h ? h.size : t.allocatedSize;   // a family's heap counts once, when it goes (below)
+        int pin = tex_object_pinned(t), ghost = g_ghost_held.n && nvn_hm_get(&g_ghost_held, &a);
+        if (pin || ghost) { kn[pin ? RRK_PIN : RRK_GHOST]++; kb[pin ? RRK_PIN : RRK_GHOST] += z; continue; }
         if (nc == cc) { cc = cc ? 2 * cc : 64; c = realloc_or_die(c, cc * sizeof *c, "the render-target retire"); }
-        c[nc++] = (rr_cand){k, v, lu, cover, h ? h.size : t.allocatedSize, 0};
+        c[nc++] = (rr_cand){k, v, lu, cover, z, 0, 0, (int)fam};
     }
     uint64_t *hs = NULL; uint32_t *hj = NULL, nh = 0, hc = 0;
     if (nc) {
@@ -8863,10 +8968,25 @@ static void rt_retire(void) { @autoreleasepool {
         nvn_hm_clear(&ci, NULL); free(ci.keys); free(ci.vals);
         for (uint32_t i = 0; i < nh; i++) { rr_cand *x = &c[hj[i]];   // their texture IDs' last bindings
             for (int k = (int)(uintptr_t)nvn_hm_get(&g_treg_serial, &hs[i]); k; k = g_treg[k - 1].next) x->lu = MAX(x->lu, g_treg[k - 1].ufence); }
-        for (uint32_t j = 0; j < nc; j++) { rr_cand *x = &c[j];
+        for (uint32_t j = 0; j < nc; j++) { rr_cand *x = &c[j];   // what may go, and why the rest stay
             uint64_t pause = (uint64_t)(uintptr_t)nvn_hm_get(&g_rr_hold, &x->k), hold = pause ? MIN(2 * (pause - 1 + RR_MS), (uint64_t)RR_HOLD_MS) : RR_MS;   // RR_MS, or twice the pause for storage the game came back to (rr_again)
             int recent = f + 1 - x->lu < FENCE_NS && now - MIN(now, g_fence_ns[x->lu % FENCE_NS]) < hold * 1000000ull;
-            if (x->view || x->cover <= x->lu || f + 1 - x->lu < RR_IDLE || recent) { x->o = NULL; continue; }
+            if (recent && mr) { recent = 0; x->early = 1; }   // dead by overwrite: the hold only spares remaking it, which memory cannot afford now
+            int why = x->cover <= x->lu ? -2 : f + 1 - x->lu < RR_IDLE ? RRK_BOUND : x->view ? RRK_VIEW : recent ? RRK_HOLD : -1;   // -2: a binding since: not dead
+            if (why >= 0) { kn[why]++; kb[why] += x->bytes; }
+            if (why != -1) { x->o = NULL; continue; }
+            if (x->fam) fm[x->fam - 1].ok++;
+        }
+        for (uint32_t j = 0; j < nc; j++) { rr_cand *x = &c[j];   // a family member goes only with every texture in its heap; the heap's memory counts once
+            if (!x->o || !x->fam) continue;
+            rr_fam *q = &fm[x->fam - 1];
+            if (!q->state) { q->state = q->ok == q->members ? 1 : 2;
+                if (q->state == 2) { kn[RRK_FAMILY]++; kb[RRK_FAMILY] += q->size; }
+                else { x->bytes = q->size; if (mode == 1) { g_rr_fam_n++; g_rr_fam_b += q->size; } } }
+            if (q->state == 2) x->o = NULL;
+        }
+        for (uint32_t j = 0; j < nc; j++) { rr_cand *x = &c[j];
+            if (!x->o) continue;
             n++; b += x->bytes;
             if (mode == 2) {   // counted once per storage (g_rr_keys), and what would go now (g_rr_log_now)
                 if (!nvn_hm_get(&g_rr_keys, &x->k)) { if (g_rr_keys.n > 8192) nvn_hm_clear(&g_rr_keys, NULL); nvn_hm_put(&g_rr_keys, &x->k, (void *)(uintptr_t)(now + 1)); g_rr_log_n++; g_rr_log_b += x->bytes; }
@@ -8877,6 +8997,7 @@ static void rt_retire(void) { @autoreleasepool {
             if (g_rr_keys.n > 8192) nvn_hm_clear(&g_rr_keys, NULL);
             nvn_hm_put(&g_rr_keys, &x->k, (void *)(uintptr_t)(now + 1));
             defer_obj_release(CFBridgingRelease(old));   // retired: released and out of the residency set after the submissions up to this one complete
+            if (x->early) mr_note(MR_RETIRE, x->bytes);
         }
         for (uint32_t i = 0; i < nh; i++) { if (!c[hj[i]].o) continue;   // each serial that held a retired one lets it go; its views (the view cache, its IDs' cached views) go with it
             void *v = nvn_hm_del(&g_by_serial, &hs[i]); if (v) { held_add(v, -1); CFRelease(v); }
@@ -8896,8 +9017,9 @@ static void rt_retire(void) { @autoreleasepool {
         for (uint32_t i = 0; i < nd; i++) nvn_hm_del(&g_rr_use, &dk[i]);
         os_unfair_lock_unlock(&g_rr_use_lk); free(dk);
     }
+    memcpy(g_rr_kept_n, kn, sizeof kn); memcpy(g_rr_kept_b, kb, sizeof kb);
     pthread_mutex_unlock(&g_smu); os_unfair_lock_unlock(&g_rmu);
-    free(c); free(hs); free(hj);
+    free(c); free(hs); free(hj); free(fm); free(fi.keys); free(fi.vals);
     if (n && mode == 1) { static int lines; if (lines++ < 40 || !(lines % 100)) MLOG("render targets dead by overwrite: %llu retired, %llu MB (unused for %d+ submissions and %d+ ms, longer for storage the game came back to; their storage written since by other textures' passes); %llu, %llu MB, so far; %llu made again",
         (unsigned long long)n, (unsigned long long)(b >> 20), RR_IDLE, RR_MS, (unsigned long long)g_rr_n, (unsigned long long)(g_rr_b >> 20), (unsigned long long)g_rr_again); }
 } }
@@ -8943,7 +9065,7 @@ static void pu_finish(uint64_t frame, uint64_t done, int pressure) {
 // The spares sweep (spare_note, DM_NVN_PKG_SPARE_FRAMES): here, where g_rmu is known
 static void spare_sweep(void) {
     static uint64_t last; uint64_t frame = atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
-    if (!spare_frames() || !g_spare_pkgs.count || frame < last + 60) return;
+    if (!spare_frames() || !g_spare_pkgs.count || frame < last + (mr_active() ? 1 : 60)) return;
     last = frame;
     NSArray<NvPkg *> *list = g_spare_pkgs.allObjects;
     os_unfair_lock_lock(&g_rmu);
