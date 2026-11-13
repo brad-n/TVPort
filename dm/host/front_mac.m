@@ -11,6 +11,7 @@
 // DM_PAD_MERGE=1 merges every controller into player 1 instead, DM_KBD_PLAYER=own makes the keyboard player 1 on its own, with the controllers from player 2 on.
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/QuartzCore.h>   // CATextLayer (the frame-rate counter)
 #import <Metal/Metal.h>
 #import <GameController/GameController.h>
 #include "dm.h"
@@ -1501,6 +1502,37 @@ static NSArray<NSURL *> *found_cheat_files(NSString *build) {
 }
 @end
 
+// Frame-rate counter (DM_SHOW_FPS=1, as on iOS in front_ios.m): the frames put on screen in the last second, counted where nvn_mtl.m presents them
+// (mtl_present_count, NVN and the Vulkan layer alike), so frames the display link merged away are not counted. A text layer over the game's Metal
+// layer, top left, refreshed once a second; a span longer than 1.5 s (the app was in the background or stalled) gives no reading
+uint64_t mtl_present_count(void);
+static void front_mac_fps_counter(CALayer *host) {
+    CATextLayer *l = [CATextLayer layer];
+    l.font = (__bridge CFTypeRef)[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightSemibold]; l.fontSize = 13;
+    l.foregroundColor = NSColor.whiteColor.CGColor; l.alignmentMode = kCAAlignmentCenter;
+    l.backgroundColor = [NSColor colorWithWhite:0 alpha:0.45].CGColor; l.cornerRadius = 6; l.masksToBounds = YES;
+    l.contentsScale = host.contentsScale > 0 ? host.contentsScale : 2; l.zPosition = 1; l.string = @"-- fps";
+    [host addSublayer:l];
+    void (^place)(void) = ^{   // top left of the layer (not flipped: y grows upwards), kept there when the window or fullscreen resizes it
+        CGRect b = host.bounds;
+        [CATransaction begin]; [CATransaction setDisableActions:YES];
+        l.frame = CGRectMake(CGRectGetMinX(b) + 12, CGRectGetMaxY(b) - 12 - 20, 72, 20);
+        if (host.contentsScale > 0) l.contentsScale = host.contentsScale;
+        [CATransaction commit];
+    };
+    place();
+    __block uint64_t n0 = mtl_present_count(); __block double t0 = CACurrentMediaTime();
+    [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+        (void)t; uint64_t n = mtl_present_count(); double now = CACurrentMediaTime();
+        [CATransaction begin]; [CATransaction setDisableActions:YES];
+        if (now - t0 < 1.5) l.string = [NSString stringWithFormat:@"%.0f fps", (double)(n - n0) / (now - t0)];
+        [CATransaction commit];
+        place();
+        n0 = n; t0 = now;
+    }];
+    LOG("front end: frame-rate counter on (DM_SHOW_FPS)");
+}
+
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
@@ -1525,6 +1557,7 @@ void front_run(void (*guest)(void)) {
         // Apple's HUD over the game (frame rate, frame and GPU time, memory): front_hud_env turns it on before the first device. The layer's developerHUDProperties
         // stay unset: mode=default forces this layer's HUD on, so the Metal HUD menu's Hide HUD left it on screen
         if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) LOG("front end: Metal performance HUD on (DM_METAL_HUD)");
+        if (getenv("DM_SHOW_FPS") && atoi(getenv("DM_SHOW_FPS"))) front_mac_fps_counter(g_layer);
         v.layer = g_layer; [(DmGameView *)v fitDrawable];
         [win center];
         [win makeKeyAndOrderFront:nil];
