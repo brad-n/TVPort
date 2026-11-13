@@ -1597,11 +1597,15 @@ if (BUILD_ID in FRAME_STEP or FS_MATCH) and NAME == 'main':
     assert FS_STATE_OFF % 0x1000 == 0 and (FAR or FS_STATE_OFF + 0x40 <= PATCH_OFF) and not any(IMG[FS_STATE_OFF:]), 'frame step state page'
 # What frame step and stub code (STUBS below) may write: a site whose original bytes match and that holds no rewrite site, the cuts list (<name>.cuts.tsv) that names it, and
 # data addresses read from the original text
+# A site also picks the patch area the stub code after it goes into: the one that reaches it (use_area), as a window's does. With one area that changes nothing; with two (TWO)
+# a site from SPLIT on gets its code in the back area, which its branches reach (Star Fox: 192 MB of text, its frame step sites at main+0xb4498e4 and main+0xb45b93c, about 200 MB
+# from the front area, where the branch back to the site failed B()'s reach check)
 def stub_site(off, orig, what):
     ob = bytes.fromhex(orig)
     assert IMG[off:off + len(ob)] == ob, f'{what} original bytes mismatch {off:#x}: {bytes(IMG[off:off + len(ob)]).hex()}'
     for o in range(off, off + len(ob), 4):
         assert o not in kinds and not any(seg[0].address <= o < seg[-1].address + 4 for seg in windows), f'{what} site is a rewrite site {o:#x}'
+    use_area(off)
 def stub_put(off, words, why, kind):
     old = bytes(IMG[off:off + 4 * len(words)])
     for i, w in enumerate(words): struct.pack_into('<I', IMG, off + 4 * i, w)
@@ -1620,7 +1624,7 @@ if FS_STATE_OFF:   # the build's stubs (FRAME_STEP of its patches.py), or those 
                                             put=lambda off, words, why: stub_put(off, words, why + (' [function match]' if FS_MATCH else ''), 'frame_step'),
                                             state=FS_STATE_OFF, render_scale=0, base=FS_MATCH[1] if FS_MATCH else 0, others=FS_MATCH[2] if FS_MATCH else {},
                                             found=FS_MATCH[3] if FS_MATCH else None, capabilities=set(), address=lambda off: stub_address(off, 'frame step'))
-    (FS_MATCH[0]['stub'] if FS_MATCH else FRAME_STEP[BUILD_ID])(fs); RENDER_SCALE = fs.render_scale; FS_CAPABILITIES = fs.capabilities
+    (FS_MATCH[0]['stub'] if FS_MATCH else FRAME_STEP[BUILD_ID])(fs); RENDER_SCALE = fs.render_scale; FS_CAPABILITIES = fs.capabilities; use_area(0)
 
 # ---- Stubs (the modules whose patch file has STUBS of their build) ----
 # A fix of the game's own code that needs more instructions than its sites hold: STUBS[build ID](ctx) in its patches.py assembles them into the patch area and branches there from
@@ -1630,7 +1634,7 @@ if FS_STATE_OFF:   # the build's stubs (FRAME_STEP of its patches.py), or those 
 STUBS = PATCHES['STUBS']
 if BUILD_ID in STUBS:
     use_area(0); STUBS[BUILD_ID](types.SimpleNamespace(here=here, emit=emit, site=lambda off, orig: stub_site(off, orig, 'stub'),
-                                                       put=lambda off, words, why: stub_put(off, words, why, 'stub'), address=lambda off: stub_address(off, 'stub')))
+                                                       put=lambda off, words, why: stub_put(off, words, why, 'stub'), address=lambda off: stub_address(off, 'stub'))); use_area(0)
 
 # ---- Spin waits (every module) ----
 # A guest loop that polls memory until another thread changes it fills only its own core on the Switch, where any higher-priority thread pinned there preempts it, so the
