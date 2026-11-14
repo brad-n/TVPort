@@ -292,6 +292,7 @@ def header_one(g):
          f'#define DM_GAME_DRAW_BARRIERS_GAME {int(dbr == "game")}',
          f'#define DM_GAME_SHADER_RAW_READ_LOG {int(rrl == "1")}',
          f'#define DM_GAME_SHADER_BORDER_EMU {int(sbe == "1")}',
+         f'#define DM_GAME_SHADER_NO_RESCALE {int(g.get("shader_no_rescale", "1") == "1")}',   # the shaders lack the resolution-scaling code, so DM_RES_SCALE stays off (nvn_rscale.inc rs_init)
          f'#define DM_GAME_UPSCALER_KEYS {q(",".join(ups))}', f'#define DM_GAME_UPSCALER_N {len(ups)}',
          f'#define DM_GAME_MOVIE_KEYS {q(",".join(mvs))}', f'#define DM_GAME_MOVIE_N {len(mvs)}',
          f'#define DM_GAME_VCONV_RANGE {int(vcr == "on")}',

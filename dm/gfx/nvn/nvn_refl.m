@@ -121,8 +121,24 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
                 r->bw = (uint8_t)(bit + 1); }
             if ((r->kind == NVN_RB_CBUF || r->kind == NVN_RB_SAMP || r->kind == NVN_RB_SAMPT || r->kind == NVN_RB_TEX || r->kind == NVN_RB_IMG || r->kind == NVN_RB_TBUF || r->kind == NVN_RB_SBUFP || r->kind == NVN_RB_UBOP || r->kind == NVN_RB_SBUFU || r->kind == NVN_RB_TEXU || r->kind == NVN_RB_SAMPU || r->kind == NVN_RB_SAMPI || r->kind == NVN_RB_IMGU || r->kind == NVN_RB_TBUFU || r->kind == NVN_RB_TEXH || r->kind == NVN_RB_SAMPH) && reg < 0)
                 FAIL("B binding %s has no resolved slot number", [b[@"msl_name"] UTF8String]);
+            if (r->kind == NVN_RB_SUPPORT) o->sup = 1;
             o->nb++;
         }
+        // The render_scale entries of the resolution-scaling helpers (Ryujinx TexturePass, HelperFunctionManager.GetScaleIndex): entry 1 + i for the shader's i-th texture descriptor
+        // that is not an array, then the images. The MSL argument buffer keeps the translator's binding order, which is the order it first used each texture in (ResourceManager's
+        // descriptor list): texture members (<stage>_t*, and separate samplers <stage>_s*) count in member order, an array or pool member does not, nor a sampler half (*Smplr)
+        { int nt = 0, ni = 0; uint8_t img[NVN_REFL_MAXB]; int nimg = 0;
+          for (int i = 0; i < o->nb && i < (int)bs.count; i++) { NSDictionary *b = bs[i]; NSString *nm = b[@"msl_name"], *ty = b[@"msl_type"]; nvn_rbind *r = &o->b[i];
+              if (![nm isKindOfClass:[NSString class]] || ![ty isKindOfClass:[NSString class]] || [nm containsString:@"Smplr"] || [ty hasPrefix:@"array<"] || [ty containsString:@"spvPool"] || r->n) continue;
+              NSRange u = [nm rangeOfString:@"_"]; if (u.location == NSNotFound || u.location + 1 >= nm.length) continue;
+              unichar c = [nm characterAtIndex:u.location + 1], c2 = u.location + 2 < nm.length ? [nm characterAtIndex:u.location + 2] : 0;
+              int tex = c == 't' && (r->kind == NVN_RB_TEX || r->kind == NVN_RB_TEXU || r->kind == NVN_RB_TBUF || r->kind == NVN_RB_TBUFU);
+              int sep = c == 's' && c2 == '_' && (r->kind == NVN_RB_SAMP || r->kind == NVN_RB_SAMPU || r->kind == NVN_RB_SAMPI);   // not a storage buffer (<stage>_s<n>)
+              if (tex) r->rsi = (uint8_t)MIN(1 + nt, 255);
+              if (tex || sep) nt++;
+              else if (c == 'i' && (r->kind == NVN_RB_IMG || r->kind == NVN_RB_IMGU)) img[nimg++] = (uint8_t)i; }
+          for (int k = 0; k < nimg; k++) { o->b[img[k]].rsi = (uint8_t)MIN(1 + nt + k, 255); ni++; }
+          o->nrsi = (uint8_t)MIN(nt + ni, 255); }
         NSDictionary *dr = j[@"drv_reads"];
         if ([dr isKindOfClass:[NSDictionary class]]) { o->drv_read[0] = dr[@"0"] != nil; o->drv_read[2] = dr[@"2"] != nil; }
         // A declared driver-segment binding means the shader reads it: the build's drv_reads scan (dmsh_build.py) matches only fragment-shader names (fp_c0 / fp_c2), so vertex and compute
