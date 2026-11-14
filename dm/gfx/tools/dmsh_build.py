@@ -35,11 +35,12 @@ BORDER_EMU = GAME.get('shader_border_emu', '1') == '1'   # 0: border_emu leaves 
 #   shader_unord_cmp: an unordered float comparison is the negation of the ordered opposite, one comparison instead of three and two ORs (InstEmit.GetFPComparison)
 #   shader_raw_loop: a raw global memory lookup's binary search over the pool table is a loop, not 13 unrolled steps at each lookup (GlobalToStorage)
 #   shader_raw_regs: a raw lookup keeps its last entry's start, end and delta in private words, so a hit reads no table word (GlobalToStorage)
+#   shader_prmt_runs: an Ampere PRMT with a constant selector is written by runs of bytes, a shift and a mask each, not an extract, a mask, a shift and an OR per byte (InstEmitAmpereAlu.APrmtRuns)
 #   shader_no_rescale: no division of gl_FragCoord.xy and no texel-fetch or size rescale by the support buffer's render scale, which the host always fills with 1.0 (InstEmitAttribute.EmitIpa, TexturePass)
-XLATE_KEYS = {'shader_fragw_fold': 'fragw_fold', 'shader_ftz_cmp': 'ftz_cmp', 'shader_unord_cmp': 'unord_cmp', 'shader_raw_loop': 'raw_loop', 'shader_raw_regs': 'raw_regs', 'shader_no_rescale': 'no_rescale'}
+XLATE_KEYS = {'shader_fragw_fold': 'fragw_fold', 'shader_ftz_cmp': 'ftz_cmp', 'shader_unord_cmp': 'unord_cmp', 'shader_raw_loop': 'raw_loop', 'shader_raw_regs': 'raw_regs', 'shader_no_rescale': 'no_rescale', 'shader_prmt_runs': 'prmt_runs'}
 # On for every game since 2026-11-09, each exact (dm/games/README.md; tests: test_dmsh_fragw.py, test_dmsh_cmp_forms.py, test_dmsh_raw_compact.py, test_dmsh_wide.py,
 # test_dmsh_xlate_defaults.py); a profile's 0 turns one off. shader_wide_device is dmsh_wide.py's, not the translator's, and on likewise
-XLATE_DEFAULT = {'shader_fragw_fold': '1', 'shader_ftz_cmp': '1', 'shader_unord_cmp': '1', 'shader_raw_loop': '0', 'shader_raw_regs': '1', 'shader_no_rescale': '1', 'shader_wide_device': '1'}
+XLATE_DEFAULT = {'shader_fragw_fold': '1', 'shader_ftz_cmp': '1', 'shader_unord_cmp': '1', 'shader_raw_loop': '0', 'shader_raw_regs': '1', 'shader_no_rescale': '1', 'shader_wide_device': '1', 'shader_prmt_runs': '0'}
 def xlate_opts(get):   # the job's translator options from the profile's keys (get: GAME.get)
     return {opt: True for key, opt in XLATE_KEYS.items() if get(key, XLATE_DEFAULT[key]) == '1'}
 XLATE_OPTS = xlate_opts(GAME.get)

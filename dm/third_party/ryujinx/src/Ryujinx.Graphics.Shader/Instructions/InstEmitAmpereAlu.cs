@@ -1352,6 +1352,13 @@ namespace Ryujinx.Graphics.Shader.Instructions
             Operand srcA = AGet(context, a);
             Operand sel = AGet(context, b);
             Operand srcC = AGet(context, c);
+
+            if (sel.Type == OperandType.Constant && context.TranslatorContext.GpuAccessor.QueryHostPrmtRuns())
+            {
+                ASet(context, x, APrmtRuns(context, srcA, srcC, sel.Value), u);
+                return;
+            }
+
             Operand res = Const(0);
 
             for (int i = 0; i < 4; i++)
@@ -1382,6 +1389,73 @@ namespace Ryujinx.Graphics.Shader.Instructions
             }
 
             ASet(context, x, res, u);
+        }
+
+        // nxnative (the profile key shader_prmt_runs, IGpuAccessor.QueryHostPrmtRuns): PRMT with a constant selector, written by runs instead of bytes. Result bytes i .. i + n - 1 that take
+        // bytes j .. j + n - 1 of one source, in order, are that source shifted by 8 (i - j) bits and masked to the run; the mask is left out where the shift already cleared every bit outside
+        // the run (below it when i or j is 0, above it when the higher of i and j plus n is 4). Ocarina of Time's selectors are half swaps: 0x5410 is (a & 0xffff) | (c << 16), two runs, three
+        // operations, where the byte form takes an extract, a mask, a shift and an OR for each byte (the Metal compiler does not merge them: extract_bits is an intrinsic to it). A byte that
+        // repeats its sign bit (s & 8) keeps the byte form. The same bits by construction (test_dmsh_prmt.py checks both forms against each other on the GPU)
+        private static Operand APrmtRuns(EmitterContext context, Operand srcA, Operand srcC, int sel)
+        {
+            Operand res = null;
+
+            for (int i = 0; i < 4;)
+            {
+                int s = (sel >> (i * 4)) & 0xf;
+                Operand src = (s & 4) != 0 ? srcC : srcA;
+                Operand part;
+                int n = 1;
+
+                if ((s & 8) != 0)
+                {
+                    Operand byteValue = context.BitfieldExtractU32(src, Const((s & 3) * 8), Const(8));
+                    byteValue = context.ShiftRightS32(context.ShiftLeft(byteValue, Const(24)), Const(31));
+                    part = context.BitwiseAnd(byteValue, Const(0xff));
+
+                    if (i != 0)
+                    {
+                        part = context.ShiftLeft(part, Const(i * 8));
+                    }
+                }
+                else
+                {
+                    int j = s & 3;
+
+                    while (i + n < 4)
+                    {
+                        int t = (sel >> ((i + n) * 4)) & 0xf;
+
+                        if ((t & 8) != 0 || (t & 4) != (s & 4) || (t & 3) != j + n)
+                        {
+                            break;
+                        }
+
+                        n++;
+                    }
+
+                    part = src;
+
+                    if (i > j)
+                    {
+                        part = context.ShiftLeft(part, Const((i - j) * 8));
+                    }
+                    else if (j > i)
+                    {
+                        part = context.ShiftRightU32(part, Const((j - i) * 8));
+                    }
+
+                    if (Math.Min(i, j) != 0 || Math.Max(i, j) + n != 4)
+                    {
+                        part = context.BitwiseAnd(part, Const((int)((n == 4 ? 0xffffffffu : (1u << (n * 8)) - 1) << (i * 8))));
+                    }
+                }
+
+                res = res == null ? part : context.BitwiseOr(res, part);
+                i += n;
+            }
+
+            return res;
         }
 
         // POPC Rd, b: bit count (63: of the bitwise not)

@@ -251,6 +251,15 @@ namespace Ryujinx.Graphics.Shader
         }
 
         /// <summary>
+        /// nxnative: queries whether a PRMT with a constant selector is written by runs of bytes (a shift and a mask each) rather than byte by byte (a profile's shader_prmt_runs, InstEmitAmpereAlu.APrmt).
+        /// </summary>
+        /// <returns>True for the runs, false for the byte form</returns>
+        bool QueryHostPrmtRuns()
+        {
+            return false;
+        }
+
+        /// <summary>
         /// nxnative: queries whether a raw global memory lookup's binary search over the pool table is a loop rather than unrolled (a profile's shader_raw_loop, GlobalToStorage).
         /// </summary>
         /// <returns>True for the loop, false for the unrolled steps</returns>
