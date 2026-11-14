@@ -11,6 +11,7 @@
 //    whole depth buffer (its left half 0.25, its right half 0.75: a draw at 0.5 with LESS passes on the right half only), and the depth it writes reaches the scaled buffer.
 // 6. The memory budget: a scaled texture counts what the scale adds while it lives and stops counting when it is freed; a new target past the budget, or while the memory relief finds
 //    the process short of memory, is made at the game's size, and every later descriptor of that texture (its twin, a remake) agrees, whatever the budget says then.
+// 7. A game upscaler's rectangle (DM_UPSCALER, its push constants in the game's pixels) read from a scaled input in the input's own pixels.
 #define nvn_game_fps nvn_game_fps_mtl_default
 #include "../nvn/nvn_mtl.m"
 #undef nvn_game_fps
@@ -207,6 +208,12 @@ int main(void) { @autoreleasepool {
       tex_t sh = desc(99803, &gpu_pool, NVN_FORMAT_RGBA8, 128, 72, NVN_TEXTURE_FLAGS_COMPRESSIBLE); d = tex_desc(&sh, 0);
       CHECK(d && d.width == 128 && g_rs_refused[RS_WHY_SHORT] >= 1, "while the memory relief finds the process short of memory a new target is made at the game's size");
       atomic_store(&g_mr_short, 0); g_mr_mode = mode; }
+    // 7. an upscaler's rectangle at its input's scale
+    { uint32_t v[4] = {32, 18, 63, 35}; NVNcopyRegion r = {0};   // 64x36 at 32,18 of the game's 128x72
+      CHECK(up_rect_at(v, colt, 2.0f, &r) && r.xoffset == 64 && r.yoffset == 36 && r.width == 128 && r.height == 72, "an upscaler's input rectangle of a scaled texture in its pixels");
+      CHECK(up_rect_at(v, lowt, 1.0f, &r) && r.xoffset == 32 && r.width == 64, "and of a texture at the game's size as given");
+      uint32_t big[4] = {0, 0, 255, 143};
+      CHECK(!up_rect_at(big, colt, 2.0f, &r), "a rectangle past the game's size is refused, as it was"); }
     CHECK(!mtl_last_commit_error(), "every submission completed");
     mtl_pool_del(host); free(host); mtl_pool_del(vertices); free(vertices);
     printf("resolution scale: %d checks, %d failed\n", checks, fails); return fails != 0;

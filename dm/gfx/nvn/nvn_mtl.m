@@ -17593,7 +17593,21 @@ static void dlss_eval(const p_dlss *c) {
     if (!col || !out) { static int once; if (!once++) MLOG("[RED] DLSS evaluated without %s", col ? "an output" : "an input colour"); return; }
     zskip_del(c->tex[DLSS_OUTPUT]->serial); sparse_gpu_wrote(c->tex[DLSS_OUTPUT]);
     NSUInteger iw = c->iw > 0 ? (NSUInteger)c->iw : col.width, ih = c->ih > 0 ? (NSUInteger)c->ih : col.height;
-    if (rs_of(col, c->tex[DLSS_COLOR]) != 1.0f) { static int once; if (!once++) MLOG("[res-scale] DLSS input ser=%llu is scaled: its render size and motion vectors are the game's, so the evaluation reads the input's top-left part (phase 1)", (unsigned long long)c->tex[DLSS_COLOR]->serial); }
+    // DM_RES_SCALE: a scaled input's render size, rectangle corners, motion-vector scale and jitter in its own pixels (the game gives them in its pixels; the motion texture, drawn at the scale,
+    // holds the game's values), the output's corner at its scale. Colour, depth and motion at different scales, or an input no smaller than the output (MetalFX's temporal scaler only
+    // enlarges), take the bilinear stand-in below
+    p_dlss cc; float rsc = rs_of(col, c->tex[DLSS_COLOR]), rso = rs_of(out, c->tex[DLSS_OUTPUT]);
+    if (rsc != 1.0f || rso != 1.0f) {
+        cc = *c; c = &cc;
+        for (int k = 0; k < DLSS_TEXTURES; k++) { float sk = k == DLSS_OUTPUT ? rso : k == DLSS_COLOR || k == DLSS_DEPTH || k == DLSS_MOTION ? rsc : 1.0f; cc.base[k][0] = (int32_t)rs_c(cc.base[k][0], sk); cc.base[k][1] = (int32_t)rs_c(cc.base[k][1], sk); }
+        iw = MIN(col.width, (NSUInteger)MAX(rs_c((long)iw, rsc), 1)); ih = MIN(col.height, (NSUInteger)MAX(rs_c((long)ih, rsc), 1)); cc.iw = (int32_t)iw; cc.ih = (int32_t)ih;
+        cc.mv[0] *= rsc; cc.mv[1] *= rsc; cc.jitter[0] *= rsc; cc.jitter[1] *= rsc;
+        int mixed = (dep && rs_of(dep, c->tex[DLSS_DEPTH]) != rsc) || (mot && rs_of(mot, c->tex[DLSS_MOTION]) != rsc), down = iw >= out.width && ih >= out.height;
+        if (mixed || down) dep = mot = nil;
+        static int once; if (!once++) MLOG("[res-scale] DLSS input ser=%llu at %.2fx: read as %lux%lu of %lux%lu into %lux%lu, motion vectors and jitter at the scale%s", (unsigned long long)c->tex[DLSS_COLOR]->serial, rsc,
+            (unsigned long)iw, (unsigned long)ih, (unsigned long)col.width, (unsigned long)col.height, (unsigned long)out.width, (unsigned long)out.height,
+            mixed ? "; colour, depth and motion at different scales, so a bilinear scale" : down ? "; no enlargement, so a bilinear scale" : "");
+    }
     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     dlss_scaler *e = dep && mot ? dlss_scaler_for(c, col, dep, mot, out, iw, ih) : NULL;
     if (!e) {
@@ -18748,17 +18762,24 @@ static int up_mfx_rect(const uint32_t v[4], NSUInteger w, NSUInteger h, NVNcopyR
     if (v[0] > INT_MAX || v[1] > INT_MAX || rw > INT_MAX || rh > INT_MAX || (uint64_t)v[0] + rw > w || (uint64_t)v[1] + rh > h) return 0;
     *r = (NVNcopyRegion){(int)v[0], (int)v[1], 0, (int)rw, (int)rh, 1}; return 1;
 }
-// The texture, image and rectangles of upscaler cs's dispatch (its texture slot, its image slot, the push constants' rectangles); 0 when the dispatch is not one to draw: the shader runs
-// (an image no larger than the texture, a shape or format that cannot be drawn, or bindings that are not one texture and one image)
+// A rectangle of the push constants in a texture's own pixels: the game gives it in its pixels, and DM_RES_SCALE may hold the texture at scale s (nvn_rscale.inc rs_region)
+static int up_rect_at(const uint32_t v[4], id<MTLTexture> t, float s, NVNcopyRegion *r) {
+    if (s == 1.0f) return up_mfx_rect(v, t.width, t.height, r);
+    if (!up_mfx_rect(v, (NSUInteger)ceilf((float)t.width / s), (NSUInteger)ceilf((float)t.height / s), r)) return 0;
+    *r = rs_region(r, s, t.width, t.height); return 1;
+}
+// The texture, image and rectangles of upscaler cs's dispatch (its texture slot, its image slot, the push constants' rectangles, each in its texture's pixels); 0 when the dispatch is not one to draw:
+// the shader runs (an image no larger than the texture, a shape or format that cannot be drawn, or bindings that are not one texture and one image). 2: an input DM_RES_SCALE holds scaled that is
+// no smaller than the output, which a bilinear scale takes (MetalFX's spatial scaler only enlarges)
 static int up_mfx_bind(NvShader *cs, id<MTLTexture> *inp, id<MTLTexture> *outp, tex_t *doutp, NVNcopyRegion *irp, NVNcopyRegion *orp) {
     int ti = -1, oi = -1;
     for (int i = 0; i < cs->rf.nb; i++) { int k = cs->rf.b[i].kind; if (k == NVN_RB_TEX && ti < 0) ti = i; else if (k == NVN_RB_IMG && oi < 0) oi = i; else if (k == NVN_RB_TEX || k == NVN_RB_IMG) return 0; }
     if (ti < 0 || oi < 0) { static int once; if (!once++) MLOG("[RED] upscaler %s: not one texture and one image; the shader draws", cs->key); return 0; }
     int tin = (int)(tex_slot_h(S.tex[5], S.img[5], cs->rf.b[ti].reg) & 0xfffff), tout = cs->rf.b[oi].reg < 32 ? (int)(S.img[5][cs->rf.b[oi].reg] & 0xfffff) : 0;
-    tex_t dout = {0}; id<MTLTexture> in, out;
+    tex_t dout = {0}, din = {0}; id<MTLTexture> in, out;
     os_unfair_lock_lock(&g_rmu);
     int ok = tin > 0 && tin < g_ntreg && g_treg[tin].ok && tout > 0 && tout < g_ntreg && g_treg[tout].ok;
-    if (ok) dout = g_treg[tout].t;
+    if (ok) { dout = g_treg[tout].t; din = g_treg[tin].t; }
     in = ok ? tex_by_id(tin) : nil;
     // The sampled view can be read-only (channel swizzle) even when the image backing is writable.
     // Use the shader's image binding so its level and slice survive without replacing the backing with a sampled view.
@@ -18767,12 +18788,15 @@ static int up_mfx_bind(NvShader *cs, id<MTLTexture> *inp, id<MTLTexture> *outp, 
     if (!real) out = nil;
     os_unfair_lock_unlock(&g_rmu);
     uint32_t v[8]; memcpy(v, S.push[1], sizeof v);
-    NVNcopyRegion ir, orr;
+    NVNcopyRegion ir, orr; float si = rs_of(in, &din);   // DM_RES_SCALE: the scaled input's rectangle at its scale (the image, never scaled, at 1)
     if (!in || !out || in == out || in.textureType != MTLTextureType2D || out.textureType != MTLTextureType2D || in.sampleCount != 1 || out.sampleCount != 1 ||
-        fmt_int_or_ds(in.pixelFormat) || fmt_int_or_ds(out.pixelFormat) || mtl_fmt_block(out.pixelFormat) || !up_mfx_rect(v, in.width, in.height, &ir) || !up_mfx_rect(v + 4, out.width, out.height, &orr) ||
-        orr.width < ir.width || orr.height < ir.height || (orr.width == ir.width && orr.height == ir.height)) { g_up_mfx_kept++; return 0; }
+        fmt_int_or_ds(in.pixelFormat) || fmt_int_or_ds(out.pixelFormat) || mtl_fmt_block(out.pixelFormat) || !up_rect_at(v, in, si, &ir) || !up_rect_at(v + 4, out, rs_of(out, &dout), &orr)) { g_up_mfx_kept++; return 0; }
+    int down = orr.width < ir.width || orr.height < ir.height || (orr.width == ir.width && orr.height == ir.height);
+    if (down && si == 1.0f) { g_up_mfx_kept++; return 0; }
     *inp = in; *outp = out; *doutp = dout; *irp = ir; *orp = orr;
-    return 1;
+    if (si != 1.0f) { static int once; if (!once++) MLOG("[res-scale] upscaler %s: its input ser=%llu is scaled, read as %dx%d at %d,%d of %lux%lu (the game's %ux%u) into %dx%d%s", cs->key, (unsigned long long)din.serial,
+        ir.width, ir.height, ir.xoffset, ir.yoffset, (unsigned long)in.width, (unsigned long)in.height, din.d.width, din.d.height, orr.width, orr.height, down ? ": no enlargement, so a bilinear scale" : ""); }
+    return down ? 2 : 1;
 }
 // ---- DM_UPSCALER=bilinear: the network replaced by Metal's own bilinear scale (up_plain_scale), in the colour the network would write; no MetalFX symbol is reached from here ----
 // Linear: input and output share a colour space, one scale. Root-encoded input (gamma 2, linear output): the scale squares each sample on the way (x * |x|). sRGB input, linear output:
@@ -18814,12 +18838,11 @@ static int up_bil_encode(NvShader *cs) {
 }
 // The dispatch of upscaler cs as MetalFX's spatial scaler from its texture slot's rectangle to its image slot's (see above), or as a bilinear scale (DM_UPSCALER=bilinear): 1 when drawn, 0 to run the shader
 static int up_mfx_encode(NvShader *cs) {
-    if (g_rs_on) {   // DM_RES_SCALE: the regions read from the game's uniforms are in its pixels, the input may be scaled; the game's own upscaler shader runs (phase 1)
-        static int once; if (!once++) MLOG("[res-scale] DM_UPSCALER=%s is not applied while the resolution scale is on: the game's own upscaler runs", up_mode() == UP_MODE_BILINEAR ? "bilinear" : "metalfx");
-        return 0; }
     if (up_mode() == UP_MODE_BILINEAR) return up_bil_encode(cs);
     id<MTLTexture> in, out; tex_t dout; NVNcopyRegion ir, orr;
-    if (!up_mfx_bind(cs, &in, &out, &dout, &ir, &orr)) return 0;
+    int bound = up_mfx_bind(cs, &in, &out, &dout, &ir, &orr);
+    if (!bound) return 0;
+    if (bound == 2) return up_bil_encode(cs);   // DM_RES_SCALE: a scaled input no smaller than the output, which MetalFX's spatial scaler does not take
     int srgb = cs->up_color == UP_COLOR_SRGB, root = cs->up_color == UP_COLOR_ROOT;
     up_mfx_scaler *e = up_mfx_scaler_for((NSUInteger)ir.width, (NSUInteger)ir.height, (NSUInteger)orr.width, (NSUInteger)orr.height, cs->up_color); if (!e) { g_up_mfx_kept++; return 0; }
     id<MTL4FXSpatialScaler> sc = e->sc;
