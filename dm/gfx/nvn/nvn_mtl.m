@@ -7797,15 +7797,26 @@ void mtl_set_depth_zero(int on) {
 // DM_NVN_HILITE and DM_NVN_MAGSCAN) keeps the MTLDevice path
 static os_unfair_lock g_fn4_lock = OS_UNFAIR_LOCK_INIT;
 static NSMapTable *g_fn4;   // id<MTLFunction> → MTL4FunctionDescriptor
+// Metal hands out one function object for an entry point of the same library data, from one library and from another made of the same bytes (newLibraryWithData twice:
+// two libraries, one function; Apple M2), so a shader loaded a second time (the program-creation prefetch in the background and the draw on the submit thread, or two
+// shaders whose libraries are the same) notes the function a live pipeline is built from. A function that declares function constants is therefore never noted unspecialized:
+// with no values it keeps the specialized note it has, or is noted with an empty set (every constant at its default, as shader_load specializes it). It used to be noted
+// unspecialized first and specialized a moment later, and a pipeline another thread built in between had an unspecialized fragment function, which Metal does not refuse with an
+// error but aborts on, debug layer or not (`validateWithDevice: fragmentFunction main0 cannot be used to build a pipeline state`): Star Fox, after the barrel-roll training
+static _Atomic uint64_t g_fn4_kept;   // notes with no values that kept a function's specialized note
 static id<MTLFunction> fn4_note(id<MTLFunction> f, id<MTLLibrary> lib, NSString *name, MTLFunctionConstantValues *cv) {
     if (!f || !lib || !name) return f;
+    int open = !cv && f.functionConstantsDictionary.count;   // declares constants, noted with no values
     MTL4LibraryFunctionDescriptor *ld = [MTL4LibraryFunctionDescriptor new]; ld.library = lib; ld.name = name;
     MTL4FunctionDescriptor *d = ld;
-    if (cv) { MTL4SpecializedFunctionDescriptor *sd = [MTL4SpecializedFunctionDescriptor new]; sd.functionDescriptor = ld; sd.constantValues = cv; d = sd; }
+    if (cv || open) { MTL4SpecializedFunctionDescriptor *sd = [MTL4SpecializedFunctionDescriptor new]; sd.functionDescriptor = ld; sd.constantValues = cv ?: [MTLFunctionConstantValues new]; d = sd; }
     os_unfair_lock_lock(&g_fn4_lock);
     if (!g_fn4) g_fn4 = [[NSMapTable alloc] initWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory capacity:0];   // by identity: a function made again from the same library and name (other constants: bf_fn) is another function
-    [g_fn4 setObject:d forKey:f];
+    int keep = open && [[g_fn4 objectForKey:f] isKindOfClass:[MTL4SpecializedFunctionDescriptor class]];
+    if (!keep) [g_fn4 setObject:d forKey:f];
     os_unfair_lock_unlock(&g_fn4_lock);
+    if (keep) { uint64_t n = atomic_fetch_add(&g_fn4_kept, 1) + 1;
+        if (n == 1 || n == 100 || n == 10000) MLOG("functions noted again with no values (a shader loaded a second time over the same library data) kept their specialized descriptor: %llu so far (%s)", (unsigned long long)n, name.UTF8String); }
     return f;
 }
 static MTL4FunctionDescriptor *fn4_of(id<MTLFunction> f) {
@@ -7853,14 +7864,15 @@ static id<MTLFunction> fn_spec_k(id<MTLLibrary> lib, NSString *name, MTLFunction
     FnDev *rec = [g_fn_dev objectForKey:f]; int had = rec != nil, same = had && rec->key == key;
     if (!had) { rec = [FnDev new]; rec->key = key; if (dev) { rec->lib = lib; rec->name = name; rec->cv = cv; } [g_fn_dev setObject:rec forKey:f]; }
     os_unfair_lock_unlock(&g_fn_dev_lock);
-    if (dev && had) { uint64_t n = atomic_fetch_add(same ? &g_fn_again_shared : &g_fn_again_spec, 1) + 1;
+    if (had) { uint64_t n = atomic_fetch_add(same ? &g_fn_again_shared : &g_fn_again_spec, 1) + 1;
         if (n == 1 || n == 1000) MLOG("functions asked for again (a name the library handed out before): %llu with the same values share the first one, %llu with other values specialized at once", (unsigned long long)atomic_load(&g_fn_again_shared), (unsigned long long)atomic_load(&g_fn_again_spec)); }
-    if (dev && same) return f;   // the same values: the first request's function, specialized once by fn_dev
-    // A library hands out one function object per name, and Metal hands out one library for the same data: a second request for a name takes the first one's function when its values
-    // are the same (key), and with other values (nf_fn's non-finite variants) would note them over the first's, and both would be specialized alike: without the Metal 4 compiler that
-    // one is specialized through the library at once, a function of its own. The first keeps what it asked in its record, which fn_dev specializes from, whatever is noted later.
-    // Measured with the TV's settings on the Mac: without the shared case 6,093 functions were specialized, 186 MB of malloc, more than the 4,396 (139 MB) of specializing at load
-    if (dev && had) return fn_lib_spec(lib, name, cv, e);
+    if (same) return dev ? f : fn4_note(f, lib, name, cv);   // the same values: the first request's function, specialized once by fn_dev (Metal 4: by the pipeline's descriptor)
+    // A library hands out one function object per name, and Metal hands out one function for the same library data: a second request for a name takes the first one's function when
+    // its values are the same (key), and with other values (nf_fn's non-finite variants) is specialized through the library at once, a function of its own, on both paths. The first
+    // keeps what it asked in its record, which fn_dev specializes from, whatever is noted later. On the Metal 4 path the variant was noted over the first's: the shader's other
+    // pipelines took the variant's values from then on, and the variant shared the first's pipeline bases (pbase_key names the function object), so whichever was built first
+    // served both. Measured with the TV's settings on the Mac: without the shared case 6,093 functions were specialized, 186 MB of malloc, more than the 4,396 (139 MB) of specializing at load
+    if (had) return fn_lib_spec(lib, name, cv, e);
     return fn4_note(f, lib, name, cv);
 }
 static id<MTLFunction> fn_spec(id<MTLLibrary> lib, NSString *name, MTLFunctionConstantValues *cv, NSError **e) { return fn_spec_k(lib, name, cv, 0, e); }   // the empty set of values (every caller but nf_fn)
@@ -7868,7 +7880,13 @@ static id<MTLFunction> fn_spec(id<MTLLibrary> lib, NSString *name, MTLFunctionCo
 static id<MTLFunction> fn_dev(id<MTLFunction> f) {
     if (!f) return f;
     os_unfair_lock_lock(&g_fn_dev_lock); FnDev *dev = [g_fn_dev objectForKey:f]; os_unfair_lock_unlock(&g_fn_dev_lock);
-    if (!dev) return f;
+    if (!dev) {   // never through fn_spec (an entry point the loader notes with no values: tf_fn, mesh_obj): specialized from its note when it declares constants (a specialized function lists none)
+        if (!f.functionConstantsDictionary.count || ![fn4_of(f) isKindOfClass:[MTL4SpecializedFunctionDescriptor class]]) return f;
+        os_unfair_lock_lock(&g_fn_dev_lock);
+        if (!g_fn_dev) g_fn_dev = [[NSMapTable alloc] initWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory capacity:0];
+        if (!(dev = [g_fn_dev objectForKey:f])) { dev = [FnDev new]; [g_fn_dev setObject:dev forKey:f]; }
+        os_unfair_lock_unlock(&g_fn_dev_lock);
+    }
     // Only callers of this function wait for its compilation; the map lock never covers a library/compiler call.
     @synchronized(dev) {
         if (dev->fn) return dev->fn;

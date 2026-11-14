@@ -623,6 +623,9 @@ t_spec_lazy: t_spec_lazy.m $(MTL_T_DEP)
 check_t_spec_lazy: t_spec_lazy
 	MTL_DEBUG_LAYER=1 ./t_spec_lazy
 	DM_NVN_SPEC_LAZY=0 MTL_DEBUG_LAYER=1 ./t_spec_lazy
+t_spec_mtl4: t_spec_mtl4.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_spec_mtl4.m $(MTL_T_SRC) $(FW)
+check_t_spec_mtl4: RUN_ENV = MTL_DEBUG_LAYER=1
 t_alias_sweep: t_alias_sweep.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_alias_sweep.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_alias_sweep
