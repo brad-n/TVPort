@@ -10,7 +10,7 @@ def bcond(frm, to, cond):   # b.<cond> (0 eq, 0xd le)
 
 
 # The 3D views' size, docked (v131072; found by fingerprint, so the addresses are only for reading). Once a frame the renderer's frame function (main+0xb447300) reads the cvar
-# render.resolution_scale (0.5 docked here, from the game's own data) or, when it is not zero, render.resolution_scale_console ("Nintendo only"; _handheld in handheld mode), and takes
+# render.resolution_scale (0.5 docked here: 768x432, from the game's own data) or, when it is not zero, render.resolution_scale_console ("Nintendo only"; _handheld in handheld mode), and takes
 # min(scale, [x25+0x66c]) (1.0) at main+0xb4498e4 (fminnm s11,s0,s9). The upscaler's output is 0.8 of the display (1536x864 on a 1920x1080 one: the host answers the display's size
 # docked, as a Switch 2 does, hle_vi.c) and the 3D views are that times the scale: 768x432 at 0.5, 1536x864 at 1.0. The game's dynamic resolution then works within 0.5 to 1.0 of
 # those views and stays at the top on the Mac (its controller, main+0xb45ae40, reads the GPU time right: README, The picture). The stub multiplies the scale by the host's render
@@ -72,7 +72,7 @@ MATCH_FRAME_STEP = {'main': [
 BINDING = [
     {'what': '3D view scale: the game\'s resolution scale times the host render scale (DM_RENDER_SCALE)', 'now': 'game', 'goal': 'game', 'purpose': 'rendering',
      'why': "the game's own resolution scale where its frame function caps it, found by that function's fingerprint on any build that keeps it; switchable, 1.0 the game's own",
-     'checked': 'v131072 main: one function with this fingerprint; the cvar reads, the cap and the dead registers read by disassembly; 0.5 read in play, and the cvar override at 0.75 and 1.0 gave 1152x648 and 1536x864 3D views on the Mac (2026-11-13)'},
+     'checked': 'v131072 main: one function with this fingerprint; the cvar reads, the cap and the dead registers read by disassembly; 768x432 at the default, and the cvar override at 0.75 and 1.0 gave 1152x648 and 1536x864 3D views on the Mac (2026-11-13)'},
     {'what': 'dynamic resolution: held at its top, or the game\'s own controller (DM_DYNAMIC_RESOLUTION)', 'now': 'game', 'goal': 'game', 'purpose': 'rendering',
      'why': "the scale the game's dynamic-resolution update hands on, found by the update's fingerprint on any build that keeps it; switchable",
      'checked': 'v131072 main: one function with this fingerprint; its mode, budget, GPU time and output read in play with probes (mode 1, 15 ms budget, 13 ms read, output 1.07 to 1.13 clamped to 1.0) (2026-11-13)'},
