@@ -10,7 +10,12 @@ What changes in this fork, release by release, in plain terms. The full descript
 
 ## Unreleased (on `switch2-experimental`)
 
-Nothing yet: everything that was here is in build 1656.
+Nothing yet: everything that was here is in build 1660.
+
+## 1.3.0 build 1660 (2026-11-14)
+
+**TV output: 4K** (Mac, Advanced settings)
+- **TV output** (`DM_TV_OUTPUT=1080|2160`, "TV output" under Advanced in the Mac launcher): with 4K, a docked game is told the TV is 3840x2160 through every way a game can ask (the default display resolution, the largest display buffer, the display list, the Vulkan surface), so Switch 2 games that have a 4K mode can take it. Star Fox reads the largest display buffer and has a 4K mode (its 3D upscaled to 3072x1728); Ocarina of Time asks none of these and is unchanged. 1080p stays the default, and the Apple TV stays at 1080p for its memory. Not yet tried in a game that switches to 4K.
 
 ## 1.3.0 build 1656 (2026-11-14)
 
