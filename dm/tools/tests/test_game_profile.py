@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 REPO = Path(__file__).resolve().parents[3]
 GAME = REPO / 'dm/games/game.py'
@@ -144,3 +145,27 @@ class BuildModules(unittest.TestCase):
         r, text = self.run_game(self.ROWS.replace('subsdk1=', 'subsdk2='), 'header', ID, '{d}/game.h')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('{"' + 'd' * 32 + '", "main subsdk0 sdk"}', text)
+
+
+class NoRescaleDefault(unittest.TestCase):
+    """shader_no_rescale's default turns to 0 at the next translation chain (game.py RESCALE_LAST_OFF_CHAIN): until then a profile without the key keeps its libraries"""
+    def setUp(self):
+        sys.path.insert(0, str(REPO / 'dm/games'))
+        import game
+        self.game = game
+
+    def test_flips_only_after_this_chain(self):
+        g = self.game
+        self.assertEqual(g.no_rescale_default(g.RESCALE_LAST_OFF_CHAIN), '1')
+        self.assertEqual(g.no_rescale_default(None), '1')   # no header to read: as before
+        self.assertEqual(g.no_rescale_default('0123456789ab'), '0')
+
+    def test_profile_rows_follow_the_host_chain(self):
+        g = self.game
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, 'game.tsv').write_text(TSV)
+            Path(d, 'own').mkdir(); Path(d, 'own', 'game.tsv').write_text(TSV + 'shader_no_rescale\t1\n')
+            for chain, want in ((g.RESCALE_LAST_OFF_CHAIN, 'unset'), ('0123456789ab', '0')):
+                with unittest.mock.patch.object(g, 'host_chain', return_value=chain):
+                    self.assertEqual(g.Game(d).get('shader_no_rescale', 'unset'), want)
+                    self.assertEqual(g.Game(Path(d, 'own')).get('shader_no_rescale'), '1')   # the profile's own row wins

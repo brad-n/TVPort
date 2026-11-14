@@ -46,6 +46,17 @@ class LauncherSettingsTests(unittest.TestCase):
                 self.assertEqual((s['kind'], s['section'], s['default']), ('choice', 'Game', 'off'))
                 self.assertEqual(s['options'], [['off', 'Standard'], ['metalfx', 'MetalFX']])
 
+    def test_resolution_scale_follows_the_packed_library(self):
+        """The resolution scale row is there when the shader library packed with the app carries the rescale code (SETTINGS_MSL, shader_lib.rescale_code), not by the profile alone"""
+        with tempfile.TemporaryDirectory() as lib:
+            Path(lib, 'a_b.json').write_text(json.dumps({'bindings': [{'msl_name': 'fp_c3', 'kind': 'cbuf'}]}))
+            with patch.dict(os.environ, {'SETTINGS_MSL': lib}): self.assertNotIn('DM_RES_SCALE', build(BOTW, 'nvn'))
+            Path(lib, 'b_b.json').write_text(json.dumps({'bindings': [{'msl_name': 'support_buffer', 'kind': 'support'}]}))
+            with patch.dict(os.environ, {'SETTINGS_MSL': lib}):
+                s = build(BOTW, 'nvn')['DM_RES_SCALE']
+                self.assertEqual((s['kind'], s['section'], s['default']), ('range', 'Game', '1.0'))
+        with patch.dict(os.environ, {'SETTINGS_MSL': ''}): self.assertNotIn('DM_RES_SCALE', build(BOTW, 'nvn'))   # no library named: the profile (no rescale code)
+
     def test_frame_buffering_by_graphics_api(self):
         for api, gid in [('nvn', BOTW), ('vulkan', '0100535012974000'), ('gl', '010014E00DB56000'), ('', BOTW)]:
             with self.subTest(api=api):

@@ -11,6 +11,22 @@ import os, re, sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# shader_no_rescale (dmsh_build.py XLATE_DEFAULT: 1, the resolution-scaling code left out) becomes 0 for a profile without the key at the next translation chain. A chain change already
+# rebuilds every game's shader library, so the rescale code, which DM_RES_SCALE needs and which costs Ocarina of Time 0.3 ms a frame at scale 1 (docs/reference/rendering.md,
+# Engine-wide resolution scale), comes with that build and costs players none of its own. While the chain the host is compiled with (dm/gfx/nvn/dmsh_chain.h) is still
+# RESCALE_LAST_OFF_CHAIN, nothing changes; from any other chain on, Game gives such a profile the row shader_no_rescale 0, which every reader takes (the shader build, the host header,
+# the launchers). A profile's own row wins either way. This lives here and not in dmsh_build.py, a file of the chain: changing it there would change the chain, and so rebuild every library now
+RESCALE_LAST_OFF_CHAIN = 'f3679572b069'
+
+
+def host_chain():   # the chain version the host is compiled with (dm/gfx/nvn/dmsh_chain.h DMSH_CHAIN), None when the header cannot be read
+    try: m = re.search(r'^#define DMSH_CHAIN "([0-9a-f]+)"', (HERE.parent / 'gfx/nvn/dmsh_chain.h').read_text(), re.M)
+    except OSError: return None
+    return m[1] if m else None
+
+
+def no_rescale_default(chain):   # the shader_no_rescale a profile without the key gets with this chain (RESCALE_LAST_OFF_CHAIN)
+    return '1' if chain in (None, RESCALE_LAST_OFF_CHAIN) else '0'
 
 
 class Game:
@@ -19,6 +35,7 @@ class Game:
         for line in (self.dir / 'game.tsv').read_text(encoding='utf-8').splitlines():
             if not line.strip() or line.lstrip().startswith('#'): continue
             c = line.split('\t'); self.rows.append((c[0].strip(), [v.strip() for v in c[1:]]))
+        if not self.values('shader_no_rescale') and no_rescale_default(host_chain()) == '0': self.rows.append(('shader_no_rescale', ['0']))   # RESCALE_LAST_OFF_CHAIN
 
     def values(self, key):   # every row of this key (keys such as build repeat)
         return [v for k, v in self.rows if k == key]

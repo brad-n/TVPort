@@ -19,8 +19,9 @@
 #        shader_lib.py has <lib>                       exit status 0 when it holds a shader's library (<key>_b.metallib)
 #        shader_lib.py cat <lib> <name>                one file's bytes on standard output
 #        shader_lib.py subset <lib> <out.img> [--skip-suffix S]...  a new image without .metal sources and build reports, as an app carries it
+#        shader_lib.py rescale <lib>                   exit status 0 when its shaders carry the resolution-scaling code (rescale_code), 1 when they do not, 2 without a library
 # <lib> is the path b-<chain>, with or without .img.
-import argparse, builtins, os, shutil, sys
+import argparse, builtins, json, os, shutil, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import romfs
@@ -164,12 +165,25 @@ def subset(lib, dst, skip_suffix=()):   # → the number of files in the image d
 
 
 def has_library(lib): return next(view(lib).glob('*_b.metallib'), None) is not None
+def rescale_code(lib):
+    '''Whether the library's shaders carry Ryujinx's resolution-scaling code (built with shader_no_rescale 0), which the engine-wide resolution scale needs (DM_RES_SCALE,
+    nvn_rscale.inc): such a shader reads its render scales from the support buffer, which a library built without the code binds in no shader (Ocarina of Time's 14,855: none). True when a
+    shader's reflection binds it, False when none does, None without a library. The first shader that binds it ends the search; a library without the code is read whole (about a second)'''
+    if not exists(lib): return None
+    seen = False
+    places = [romfs.Path(f) for f in (folder_of(lib), image_of(lib)) if os.path.exists(f)]   # a partial build's folder over an image: the host reads the folder's files first
+    for p in (q for place in places for q in place.glob('*_b.json')):
+        seen = True
+        try: text = p.read_text(errors='replace')
+        except OSError: continue
+        if '"support"' in text and any(b.get('kind') == 'support' for b in json.loads(text).get('bindings', ())): return True
+    return False if seen else None
 def left_out_pulling(lib): return (view(lib) / PULLING_LEFT_OUT).is_file()   # whether a build that needs the pulling libraries must make them again
 
 
 def main():
     ap = argparse.ArgumentParser(description='A game\'s shader libraries as one file, read in place')
-    ap.add_argument('cmd', choices=('pack', 'expand', 'path', 'has', 'cat', 'subset'))
+    ap.add_argument('cmd', choices=('pack', 'expand', 'path', 'has', 'cat', 'subset', 'rescale'))
     ap.add_argument('lib'); ap.add_argument('arg', nargs='?')
     ap.add_argument('--skip-suffix', action='append', default=[])
     a = ap.parse_args()
@@ -177,6 +191,7 @@ def main():
     if a.cmd == 'expand': expand(a.lib); return 0
     if a.cmd == 'path': print(view(a.lib)); return 0
     if a.cmd == 'has': return 0 if has_library(a.lib) else 1
+    if a.cmd == 'rescale': r = rescale_code(a.lib); return 2 if r is None else 0 if r else 1
     if a.cmd == 'cat':
         try: sys.stdout.buffer.write((view(a.lib) / a.arg).read_bytes())
         except OSError as e: sys.exit(f'[RED] {e}')

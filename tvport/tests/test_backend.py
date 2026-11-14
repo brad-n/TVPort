@@ -1,5 +1,6 @@
 import json
 import io
+import os
 from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 import subprocess
@@ -447,6 +448,21 @@ class Saves(unittest.TestCase):
             self.assertEqual(backend.res_scale_arg('2'), 2.0)
             with self.assertRaises(Exception): backend.res_scale_arg('2.5')
             with self.assertRaises(Exception): backend.res_scale_arg('0.4')
+
+    def test_res_scale_offered_by_the_built_library(self):
+        """The resolution scale is offered when the built shader library carries the rescale code (a shader binds the support buffer), not by the profile key"""
+        with tempfile.TemporaryDirectory() as folder:
+            game = self.make_game(folder)
+            self.assertFalse(game.res_scale_supported())   # nothing built yet
+            lib = game.build / 'shader/ios' / f'b-{backend.chain()}'
+            lib.mkdir(parents=True)
+            (lib / 'inputs.tsv').write_text('game\t0100000000010000\ninputs\t0\n')
+            (lib / 'aaaa_b.json').write_text(json.dumps({'bindings': [{'msl_name': 'fp_c3', 'kind': 'cbuf'}]}))
+            self.assertFalse(game.res_scale_supported())   # built without the code: no shader binds the support buffer
+            (lib / 'bbbb_b.json').write_text(json.dumps({'bindings': [{'msl_name': 'support_buffer', 'kind': 'support'}]}))
+            os.utime(lib / 'inputs.tsv', ns=(1, 1))   # a new build: the kept answer is for the old library
+            self.assertTrue(game.res_scale_supported())
+            self.assertTrue(game.state()['rescale_code']['value'])
 
     def test_render_scale_offered_only_with_the_stub(self):
         with tempfile.TemporaryDirectory() as folder:

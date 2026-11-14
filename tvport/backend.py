@@ -325,8 +325,27 @@ class Game:
         return bool(fixups and fixups.is_file() and any(line.startswith(f'# {key}\t') or line == f'# {key}' for line in fixups.read_text(errors='replace').splitlines()))
 
     def res_scale_supported(self) -> bool:
-        """The game's shaders carry the resolution-scaling code (profile key shader_no_rescale 0), which DM_RES_SCALE needs: with the default 1 the engine leaves the setting off"""
-        return bool(self.title_id) and self.profile_value('shader_no_rescale') == '0'
+        """The game's built shader library carries the resolution-scaling code, which DM_RES_SCALE needs: dm/tools/shader_lib.py rescale_code (a shader built with the code binds
+        the support buffer, one built without it never does), whatever the profile says now, since the app gets the library that was built. No library yet: not offered. The answer is kept in
+        the state file for the library file it read (a library without the code is read whole, about a second)"""
+        if not self.title_id or not self.shaders:
+            return False
+        lib = self.shaders / f'b-{chain()}'
+        img = lib.with_name(lib.name + '.img')
+        probe = img if img.is_file() else lib / 'inputs.tsv'
+        try:
+            st = probe.stat()
+        except OSError:
+            return False
+        sig = f'{probe}:{st.st_size}:{st.st_mtime_ns}'
+        kept = self.state().get('rescale_code')
+        if isinstance(kept, dict) and kept.get('library') == sig:
+            return bool(kept.get('value'))
+        sys.path.insert(0, str(REPO / 'dm/tools'))
+        import shader_lib
+        value = bool(shader_lib.rescale_code(lib))
+        self.save_state(rescale_code={'library': sig, 'value': value})
+        return value
 
     def render_scale_supported(self) -> bool:
         """A render-scale stub in the rewritten main (Tears of the Kingdom 1.4.2 / 1.4.3, Breath of the Wild 1.9.0)"""
