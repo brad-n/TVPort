@@ -182,6 +182,8 @@ int main(void) { @autoreleasepool {
     ok = read_px(low2t, px); in = out = 1; for (int y = 0; y < 72; y++) for (int x = 0; x < 128; x++) { const uint8_t *p = px + 4 * (y * 128 + x); int g_ = p[1] == 255 && !p[2]; if (x >= 64) in &= g_; else out &= !g_ && p[2] == 255; }
     CHECK(g_rs_proxied > prox0, "the mixed pass is drawn through a proxy");
     CHECK(ok && in && out, "the depth test of a mixed pass sees the whole scaled depth buffer (green on the right half only)");
+    { static float dz[256 * 144]; ok = read_px(dept, (uint8_t *)dz); in = 1; for (int y = 0; y < 144; y++) for (int x = 0; x < 256; x++) in &= dz[y * 256 + x] == (x < 128 ? 0.25f : 0.75f);
+      CHECK(ok && in, "a mixed pass that only tests the depth leaves the scaled depth buffer as it was (not drawn back)"); }
     g_ds = (ds_st){.dt = 1, .dw = 1, .df = NVN_DEPTH_FUNC_ALWAYS}; tdraw(&low2, &pg_green, 0, 0, 128, 72, (p_scissor){0, 0, 128, 72}); g_depth = NULL; g_ds = (ds_st){.df = NVN_DEPTH_FUNC_ALWAYS};
     { static float dz[256 * 144]; ok = read_px(dept, (uint8_t *)dz); in = 1; for (int i = 0; i < 256 * 144; i++) in &= dz[i] == 0.5f;
       CHECK(ok && in, "the depth a mixed pass writes is drawn back into the whole scaled depth buffer"); }

@@ -4038,7 +4038,7 @@ static int tex_atomic_alias(id<MTLTexture> base) {
     return bytes32 && (base.textureType == MTLTextureType2D || base.textureType == MTLTextureType2DArray) && base.sampleCount == 1 && base.storageMode == MTLStorageModePrivate && !base.buffer && !base.isSparse;
 }
 #include "nvn_rscale.inc"   // DM_RES_SCALE: the size rules (rs_apply) and the scale a texture was made at (rs_of)
-static float rs_pass(MTL4RenderPassDescriptor *pd); static float rs_rt(void); static void rs_proxy_begin(MTL4RenderPassDescriptor *pd); static void rs_proxy_flush(void); static int g_rs_nprox;   // nvn_rscale.inc, its late part
+static float rs_pass(MTL4RenderPassDescriptor *pd); static float rs_rt(void); static void rs_proxy_begin(MTL4RenderPassDescriptor *pd); static void rs_proxy_flush(void); static int g_rs_nprox, g_rs_ds_wrote;   // nvn_rscale.inc, its late part
 static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     uint32_t pf = 0; uint8_t swz[4];
     if (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf) { RED_ONCE(0, "texture format %#x has no Metal equivalent (first case)", t->d.format); return nil; }
@@ -16532,6 +16532,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
         unsigned df0 = (unsigned)S.ds.df; if (ovr) S.ds.df = 8; cur_ds = dss_get(g_pass.hd, g_pass.hs); S.ds.df = df0; cur_ds_pass = g_pass.serial; g_dss_dirty = 0; }
     else if (g_dss_dirty || cur_ds_pass != g_pass.serial) { cur_ds = dss_get(g_pass.hd, g_pass.hs); cur_ds_pass = g_pass.serial; g_dss_dirty = 0; }
     if (cur_ds != g_enc_dss) { enc_r_dss(en, cur_ds); g_enc_dss = cur_ds; }
+    if (g_rs_nprox && (S.ds.dw || S.ds.st)) g_rs_ds_wrote = 1;   // DM_RES_SCALE: a mixed pass's depth-stencil proxy goes back (rs_proxy_flush)
     { uint32_t sr = S.st_ref[0];   // enc_r_stencil_ref sends the front value only
       if (!(g_ed.ok & ED_SREF) || g_ed.sref != sr) { enc_r_stencil_ref(en, sr, sr); g_ed.sref = sr; g_ed.ok |= ED_SREF; } }
     // Viewport / scissor (clamped within the target size)
@@ -17915,6 +17916,7 @@ static void clear_color_tri(const p_clear_color *c) {
        (unsigned long)sc.x, (unsigned long)sc.y, (unsigned long)sc.width, (unsigned long)sc.height, c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3]);
 }
 static void clear_ds_tri(const p_clear_ds *c) {
+    if (g_rs_nprox) g_rs_ds_wrote = 1;   // DM_RES_SCALE: it writes a mixed pass's depth-stencil proxy (rs_proxy_flush)
     unsigned want_s = (unsigned)c->stencil_mask & 0xff;
     if (!c->depth_mask && !want_s) return;
     id<MTL4RenderCommandEncoder> en = rp_begin();

@@ -12,7 +12,7 @@ static int g_rs_screen_w = 1920, g_rs_screen_h = 1080;   // the shape targets mu
 enum { RS_WHY_TARGET, RS_WHY_IMAGE, RS_WHY_COMPRESSED, RS_WHY_LEVELS, RS_WHY_SMALL, RS_WHY_SHAPE, RS_WHY_LIMIT, RS_WHY_SPARSE, RS_NWHY };
 static const char *const g_rs_why[RS_NWHY] = {"not a 2D texture or array (3D, cube, 1D)", "shader-writable (image): a compute shader addresses it in the game's pixels",
     "a compressed format", "more than 3 levels (an asset, not a target)", "smaller than 64 pixels", "not the screen's shape", "past Metal's 16384 limit", "in a sparse pool (its tiles follow the game's mappings)"};
-static _Atomic uint64_t g_rs_made, g_rs_made_kb, g_rs_refused[RS_NWHY], g_rs_mixed;
+static _Atomic uint64_t g_rs_made, g_rs_made_kb, g_rs_refused[RS_NWHY], g_rs_mixed, g_rs_proxied;
 static void rs_init(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -33,10 +33,12 @@ static inline NSUInteger rs_dim(NSUInteger g) { long v = lroundf((float)g * g_rs
 static inline long rs_c(long x, float s) { return s == 1.0f ? x : lroundf((float)x * s); }   // a pixel edge at scale s (both edges round the same way, so abutting rectangles stay abutting)
 // The game's window textures give the screen's shape (nvnWindowBuilderSetTextures, hle_nvn.c); 16:9 until then
 static void rs_screen(const tex_t *t) { if (t && t->d.width >= 64 && t->d.height >= 64) { g_rs_screen_w = (int)t->d.width; g_rs_screen_h = (int)t->d.height; } }
-static uint64_t g_rs_noted[64]; static unsigned g_rs_nnoted;
-static int rs_first(uint64_t ser) {   // whether this texture serial was not logged yet (the last 64)
-    for (unsigned i = 0; i < 64 && i < g_rs_nnoted; i++) if (g_rs_noted[i] == ser) return 0;
-    g_rs_noted[g_rs_nnoted++ % 64] = ser; return 1;
+static os_unfair_lock g_rs_lk = OS_UNFAIR_LOCK_INIT; static CFMutableSetRef g_rs_seen;
+static int rs_first(uint64_t ser) {   // whether this texture serial is seen the first time: tex_desc runs for a texture again (its twin, its family's other members), counted and logged once
+    os_unfair_lock_lock(&g_rs_lk);
+    if (!g_rs_seen) g_rs_seen = CFSetCreateMutable(NULL, 0, NULL);
+    int fresh = !CFSetContainsValue(g_rs_seen, (const void *)(uintptr_t)ser); if (fresh) CFSetAddValue(g_rs_seen, (const void *)(uintptr_t)ser);
+    os_unfair_lock_unlock(&g_rs_lk); return fresh;
 }
 // tex_desc's GPU path: the descriptor of one of the game's render targets is scaled when it qualifies. Called for every descriptor of the texture (its sRGB twin, its image family),
 // so all of them agree; logged once per texture
@@ -77,8 +79,8 @@ static void rs_summary(unsigned long long frame) {
     last_made = made; last_mixed = mixed; lines++;
     char why[512]; size_t o = 0; why[0] = 0;
     for (int i = 0; i < RS_NWHY; i++) { uint64_t n = atomic_load(&g_rs_refused[i]); if (n && o < sizeof why) o += (size_t)snprintf(why + o, sizeof why - o, "%s%llu %s", o ? ", " : "", (unsigned long long)n, g_rs_why[i]); }
-    MLOG("[res-scale] up to frame %llu: %llu targets made at %.2fx (%llu MB at that size), %llu passes drawn unscaled for mixed attachments; refused: %s", frame, (unsigned long long)made, g_rs,
-         (unsigned long long)(atomic_load(&g_rs_made_kb) >> 10), (unsigned long long)mixed, o ? why : "none");
+    MLOG("[res-scale] up to frame %llu: %llu targets made at %.2fx (%llu MB at that size in all, the memory readout has what is alive), %llu mixed passes drawn through proxies, %llu drawn unscaled; refused: %s",
+         frame, (unsigned long long)made, g_rs, (unsigned long long)(atomic_load(&g_rs_made_kb) >> 10), (unsigned long long)atomic_load(&g_rs_proxied), (unsigned long long)mixed, o ? why : "none");
 }
 // The scale a Metal texture holds a guest texture at: g_rs when rs_apply made it so, else 1 (a view reports its base texture's; a snapshot or a copy of one has its size, so its own)
 static inline float rs_of(id<MTLTexture> mt, const tex_t *t) {
@@ -173,12 +175,13 @@ static int rs_scale_into(id<MTLTexture> u, id<MTLTexture> t, unsigned lv, unsign
 // with the scene's scaled depth buffer: attached as they were, the pass covered the depth's top-left part and the depth test put the effects in the wrong places.
 // The copies cost GPU time, and what such a pass draws into the scaled target is at the game's resolution. Multisample attachments cannot be drawn down: logged, drawn as before
 static __strong id<MTLTexture> g_rs_pdst[9], g_rs_ptmp[9]; static __strong MTLRenderPassAttachmentDescriptor *g_rs_patt[9]; static NSUInteger g_rs_plv[9], g_rs_psl[9]; static int g_rs_nprox;
-static _Atomic uint64_t g_rs_proxied;
+static uint8_t g_rs_pds[9], g_rs_pclr[9];   // the proxy is the depth-stencil one; its pass clears it. A depth-stencil proxy goes back only when the pass cleared or wrote it (g_rs_ds_wrote, set by draw):
+                                            // a depth buffer drawn down and up again for a pass that only tests it would come back at the game's resolution
 static void rs_proxy_flush(void) {
     int n = g_rs_nprox; g_rs_nprox = 0;   // copy_t2t_draw ends the pass in progress (none here) through rp_end, which would come back here
     for (int i = 0; i < n; i++) {
         id<MTLTexture> d = g_rs_pdst[i], u = g_rs_ptmp[i]; MTLRenderPassAttachmentDescriptor *a = g_rs_patt[i];
-        if (a.storeAction != MTLStoreActionDontCare) {
+        if (a.storeAction != MTLStoreActionDontCare && (!g_rs_pds[i] || g_rs_pclr[i] || g_rs_ds_wrote)) {
             NVNcopyRegion sr = {0, 0, 0, (int)u.width, (int)u.height, 1}, dr = {0, 0, 0, (int)MAX(d.width >> g_rs_plv[i], 1ul), (int)MAX(d.height >> g_rs_plv[i], 1ul), 1};
             if (!copy_t2t_draw(u, d, 0, 0, (unsigned)g_rs_plv[i], (unsigned)g_rs_psl[i], &sr, &dr, 1, 0)) rs_cannot("a mixed pass's proxy drawn back", d, 0);
         }
@@ -194,6 +197,8 @@ static int rs_proxy_one(MTLRenderPassAttachmentDescriptor *a, MTLRenderPassAttac
         NVNcopyRegion sr = {0, 0, 0, (int)MAX(d.width >> lv, 1ul), (int)MAX(d.height >> lv, 1ul), 1}, dr = {0, 0, 0, gw, gh, 1};
         if (!copy_t2t_draw(d, u, (unsigned)lv, (unsigned)sl, 0, 0, &sr, &dr, 1, 0)) return 0;
     }
+    g_rs_pds[g_rs_nprox] = mtl_fmt_depth(d.pixelFormat) || d.pixelFormat == MTLPixelFormatStencil8 || d.pixelFormat == MTLPixelFormatX32_Stencil8;
+    g_rs_pclr[g_rs_nprox] = a.loadAction == MTLLoadActionClear || (also && also.texture == d && also.loadAction == MTLLoadActionClear);
     a.texture = u; a.level = 0; a.slice = 0;
     if (also && also.texture == d) { also.texture = u; also.level = 0; also.slice = 0; }   // the stencil plane of the same depth-stencil texture
     g_rs_pdst[g_rs_nprox] = d; g_rs_ptmp[g_rs_nprox] = u; g_rs_patt[g_rs_nprox] = a; g_rs_plv[g_rs_nprox] = lv; g_rs_psl[g_rs_nprox] = sl; g_rs_nprox++;
@@ -207,7 +212,7 @@ static void rs_proxy_begin(MTL4RenderPassDescriptor *pd) {
     id<MTLTexture> dt = pd.depthAttachment.texture ?: pd.stencilAttachment.texture;
     if (dt && R.rt.depth) { if (rs_of(dt, R.rt.depth) != 1.0f) { sc++; ss = R.rt.depth; } else { un++; us = R.rt.depth; } }
     if (!sc || !un) return;
-    int ok = 1;
+    int ok = 1; g_rs_ds_wrote = 0;
     for (int i = 0; i < R.rt.n && i < 8; i++) { MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[i];
         if (c.texture && R.rt.color[i] && rs_of(c.texture, R.rt.color[i]) != 1.0f) ok &= rs_proxy_one(c, nil, R.rt.color[i]); }
     if (dt && R.rt.depth && rs_of(dt, R.rt.depth) != 1.0f) {
