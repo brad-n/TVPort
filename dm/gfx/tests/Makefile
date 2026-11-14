@@ -819,6 +819,13 @@ t_att_omit: t_att_omit.m $(MTL_T_DEP)
 check_t_att_omit: t_att_omit
 	MTL_DEBUG_LAYER=1 ./t_att_omit
 	MTL_DEBUG_LAYER=1 ./t_att_omit off
+# DM_RES_SCALE (nvn_rscale.inc) through the replay at scale 2: which targets scale, the viewport and scissor, a scaled target sampled through the resolution-scaling code,
+# copies between scales, a texture-to-buffer copy at the game's size and a buffer-to-texture copy into a scaled target
+t_res_scale: t_res_scale.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_res_scale.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+.PHONY: check_t_res_scale
+check_t_res_scale: t_res_scale
+	MTL_DEBUG_LAYER=1 ./t_res_scale
 
 # The store lookahead (DM_NVN_STORE_ELIDE) through the replay, pixels read back: a store skipped before a whole clear; kept when that clear is in a render-enable-false block the
 # replay skips, and when the next pass loads the target; off: DM_NVN_STORE_ELIDE unset, the same pixels
