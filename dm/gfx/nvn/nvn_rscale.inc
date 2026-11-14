@@ -9,10 +9,19 @@
 static float g_rs = 1.0f;   // the scale qualifying targets are made at (1 when off)
 static int g_rs_on;         // 1: DM_RES_SCALE is not 1.0 and the game's shaders carry the rescale code
 static int g_rs_screen_w = 1920, g_rs_screen_h = 1080;   // the shape targets must have (rs_apply): the game's window textures' once seen, 16:9 before that
-enum { RS_WHY_TARGET, RS_WHY_IMAGE, RS_WHY_COMPRESSED, RS_WHY_LEVELS, RS_WHY_SMALL, RS_WHY_SHAPE, RS_WHY_LIMIT, RS_WHY_SPARSE, RS_NWHY };
+enum { RS_WHY_TARGET, RS_WHY_IMAGE, RS_WHY_COMPRESSED, RS_WHY_LEVELS, RS_WHY_SMALL, RS_WHY_SHAPE, RS_WHY_LIMIT, RS_WHY_SPARSE, RS_WHY_BUDGET, RS_WHY_SHORT, RS_NWHY };
 static const char *const g_rs_why[RS_NWHY] = {"not a 2D texture or array (3D, cube, 1D)", "shader-writable (image): a compute shader addresses it in the game's pixels",
-    "a compressed format", "more than 3 levels (an asset, not a target)", "smaller than 64 pixels", "not the screen's shape", "past Metal's 16384 limit", "in a sparse pool (its tiles follow the game's mappings)"};
+    "a compressed format", "more than 3 levels (an asset, not a target)", "smaller than 64 pixels", "not the screen's shape", "past Metal's 16384 limit", "in a sparse pool (its tiles follow the game's mappings)",
+    "over the memory budget of the scale (DM_RES_SCALE_BUDGET_MB)", "the process short of memory (the memory relief, DM_NVN_MEM_RELIEF)"};
 static _Atomic uint64_t g_rs_made, g_rs_made_kb, g_rs_refused[RS_NWHY], g_rs_mixed, g_rs_proxied;
+// The memory budget of the scale. What the scale adds (a scaled texture's memory less what it takes at the game's size) is counted for every scaled texture alive (rs_track: an owner object
+// on the Metal texture, released with it, so retired, taken-over and finalized targets leave the count when their memory goes); a new target that would take the count past the budget, or
+// that comes while the memory relief finds the process short of memory (mr_active), stays at the game's size. The budget is a share of what the process may use: on iOS and tvOS a tenth of
+// its limit (os_proc_available_memory plus its footprint when the first target asks; the Apple TV 4K ends an app at about 2,100 MB, so about 210 MB), on a Mac a quarter of Metal's
+// recommended working set (the M2 Pro's 32 GB: about 5.3 GB). DM_RES_SCALE_BUDGET_MB=<n> sets it, 0 no budget. A scale below 1 adds nothing and is never refused
+static uint64_t g_rs_budget; static _Atomic uint64_t g_rs_live_b, g_rs_live_n, g_rs_peak_b;
+// The sizes scaled targets were made at (the game's): a game whose count keeps growing makes targets of new sizes, as a dynamic resolution does under GPU load, each made scaled
+static CFMutableSetRef g_rs_sizes; static _Atomic uint64_t g_rs_nsizes;
 static void rs_init(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -33,13 +42,42 @@ static inline NSUInteger rs_dim(NSUInteger g) { long v = lroundf((float)g * g_rs
 static inline long rs_c(long x, float s) { return s == 1.0f ? x : lroundf((float)x * s); }   // a pixel edge at scale s (both edges round the same way, so abutting rectangles stay abutting)
 // The game's window textures give the screen's shape (nvnWindowBuilderSetTextures, hle_nvn.c); 16:9 until then
 static void rs_screen(const tex_t *t) { if (t && t->d.width >= 64 && t->d.height >= 64) { g_rs_screen_w = (int)t->d.width; g_rs_screen_h = (int)t->d.height; } }
-static os_unfair_lock g_rs_lk = OS_UNFAIR_LOCK_INIT; static CFMutableSetRef g_rs_seen;
-static int rs_first(uint64_t ser) {   // whether this texture serial is seen the first time: tex_desc runs for a texture again (its twin, its family's other members), counted and logged once
+static os_unfair_lock g_rs_lk = OS_UNFAIR_LOCK_INIT; static CFMutableDictionaryRef g_rs_dec;
+enum { RS_DEC_NONE, RS_DEC_UNSCALED, RS_DEC_SCALED };
+// What was decided for a texture serial (RS_DEC_*): tex_desc runs for a texture again (its twin, its family's other members, a remake after retirement or an upgrade), and all of them
+// must agree, budget or not; counted and logged once
+static int rs_dec(uint64_t ser, int set) {
     os_unfair_lock_lock(&g_rs_lk);
-    if (!g_rs_seen) g_rs_seen = CFSetCreateMutable(NULL, 0, NULL);
-    int fresh = !CFSetContainsValue(g_rs_seen, (const void *)(uintptr_t)ser); if (fresh) CFSetAddValue(g_rs_seen, (const void *)(uintptr_t)ser);
-    os_unfair_lock_unlock(&g_rs_lk); return fresh;
+    if (!g_rs_dec) g_rs_dec = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+    const void *v = NULL; int had = CFDictionaryGetValueIfPresent(g_rs_dec, (const void *)(uintptr_t)ser, &v) ? (int)(uintptr_t)v : RS_DEC_NONE;
+    if (!had && set) CFDictionarySetValue(g_rs_dec, (const void *)(uintptr_t)ser, (const void *)(uintptr_t)set);
+    os_unfair_lock_unlock(&g_rs_lk); return had ? had : set;
 }
+static uint64_t rs_budget(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("DM_RES_SCALE_BUDGET_MB"); const char *how;
+        if (e && *e) { long long v = atoll(e); g_rs_budget = v > 0 ? (uint64_t)v << 20 : 0; how = "DM_RES_SCALE_BUDGET_MB"; }
+        else {
+#if TARGET_OS_IPHONE
+            task_vm_info_data_t vi; mach_msg_type_number_t n = TASK_VM_INFO_COUNT; uint64_t fp = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) == KERN_SUCCESS ? vi.phys_footprint : 0;
+            g_rs_budget = ((uint64_t)os_proc_available_memory() + fp) / 10; how = "a tenth of the process limit";
+#else
+            g_rs_budget = (uint64_t)g_dev.recommendedMaxWorkingSetSize / 4; how = "a quarter of the recommended working set";
+#endif
+        }
+        if (g_rs_budget) MLOG("[res-scale] memory budget: the scale may add %llu MB to the targets alive (%s); past it, or while the process is short of memory, new targets stay at the game's size", (unsigned long long)(g_rs_budget >> 20), how);
+        else MLOG("[res-scale] memory budget: none (DM_RES_SCALE_BUDGET_MB=0)");
+    });
+    return g_rs_budget;
+}
+@interface NvRsTrack : NSObject { @public uint64_t added; } @end
+@implementation NvRsTrack
+- (void)dealloc { atomic_fetch_sub(&g_rs_live_b, added); atomic_fetch_sub(&g_rs_live_n, 1); }
+@end
+static char g_rs_track_key;
+// A Metal texture made for a guest texture (tex_mtl_, tex_upgrade): when it holds the texture at the scale, what the scale adds is counted while it lives
+static void rs_track(id<MTLTexture> mt, const tex_t *t);
 // tex_desc's GPU path: the descriptor of one of the game's render targets is scaled when it qualifies. Called for every descriptor of the texture (its sRGB twin, its image family),
 // so all of them agree; logged once per texture
 static void rs_apply(const tex_t *t, MTLTextureDescriptor *d) {
@@ -58,15 +96,35 @@ static void rs_apply(const tex_t *t, MTLTextureDescriptor *d) {
     else if (fabs((double)w * g_rs_screen_h / ((double)h * g_rs_screen_w) - 1.0) > 0.04) why = RS_WHY_SHAPE;   // a shadow map, an atlas, a lookup table, a cube face
     else if (rs_dim(w) > 16384 || rs_dim(h) > 16384) why = RS_WHY_LIMIT;
     else if (t->pool && nvn_sparse_pool(t->pool)) why = RS_WHY_SPARSE;
-    int say = rs_first(t->serial);
+    int dec = rs_dec(t->serial, 0), say = dec == RS_DEC_NONE;
     if (why >= 0) {
+        if (say) rs_dec(t->serial, RS_DEC_UNSCALED);
         if (say && atomic_fetch_add(&g_rs_refused[why], 1) < 6)
             MLOG("[res-scale] refused ser=%llu %ux%u format %#x target %d levels %u flags %#x: %s", (unsigned long long)t->serial, w, h, t->d.format, t->d.target, t->d.levels, t->d.flags, g_rs_why[why]);
         return;
     }
+    if (dec == RS_DEC_UNSCALED) return;   // refused once by the budget: its twin, family members and remakes stay at the game's size too
+    NSUInteger w0 = d.width, h0 = d.height, l0 = d.mipmapLevelCount;
     d.width = rs_dim(d.width); d.height = rs_dim(d.height);
     NSUInteger big = MAX(d.width, d.height), fit = 1; while (big >> fit) fit++;
     if (d.mipmapLevelCount > fit) d.mipmapLevelCount = fit;   // a 0.5 scale holds one level fewer
+    if (say) {   // the budget, once per texture: what the scale adds to it against what the scaled targets alive add
+        uint64_t sz = (uint64_t)[g_dev heapTextureSizeAndAlignWithDescriptor:d].size, add = g_rs > 1.0f ? sz - (uint64_t)((double)sz / ((double)g_rs * g_rs)) : 0, b = rs_budget();
+        int over = add && b && atomic_load(&g_rs_live_b) + add > b, shortm = add && mr_active();
+        if (over || shortm) {
+            rs_dec(t->serial, RS_DEC_UNSCALED); d.width = w0; d.height = h0; d.mipmapLevelCount = l0;
+            if (atomic_fetch_add(&g_rs_refused[shortm ? RS_WHY_SHORT : RS_WHY_BUDGET], 1) < 6)
+                MLOG("[res-scale] refused ser=%llu %ux%u format %#x: %s (the scale adds %llu MB in %llu targets alive, %llu MB more for this one, budget %llu MB): it stays at the game's size",
+                     (unsigned long long)t->serial, w, h, t->d.format, g_rs_why[shortm ? RS_WHY_SHORT : RS_WHY_BUDGET], (unsigned long long)(atomic_load(&g_rs_live_b) >> 20),
+                     (unsigned long long)atomic_load(&g_rs_live_n), (unsigned long long)(add >> 20), (unsigned long long)(b >> 20));
+            return;
+        }
+        rs_dec(t->serial, RS_DEC_SCALED);
+    }
+    if (say) { uint64_t key = (uint64_t)w << 32 | h, ns = 0; int fresh;
+        os_unfair_lock_lock(&g_rs_lk); if (!g_rs_sizes) g_rs_sizes = CFSetCreateMutable(NULL, 0, NULL);
+        fresh = !CFSetContainsValue(g_rs_sizes, (const void *)(uintptr_t)key); if (fresh) { CFSetAddValue(g_rs_sizes, (const void *)(uintptr_t)key); ns = (uint64_t)CFSetGetCount(g_rs_sizes); } os_unfair_lock_unlock(&g_rs_lk);
+        if (fresh) { atomic_store(&g_rs_nsizes, ns); if (ns > 24 && ns <= 64) MLOG("[res-scale] a scaled target of a new size %ux%u (%llu sizes so far): the game makes targets of new sizes, as a dynamic resolution does", w, h, (unsigned long long)ns); } }
     if (say) { uint64_t n = atomic_fetch_add(&g_rs_made, 1); atomic_fetch_add(&g_rs_made_kb, (uint64_t)([g_dev heapTextureSizeAndAlignWithDescriptor:d].size >> 10));
         if (n < 24) MLOG("[res-scale] scaled ser=%llu %ux%u → %lux%lu format %#x target %d levels %u", (unsigned long long)t->serial, w, h, (unsigned long)d.width, (unsigned long)d.height, t->d.format, t->d.target, t->d.levels); }
 }
@@ -79,8 +137,9 @@ static void rs_summary(unsigned long long frame) {
     last_made = made; last_mixed = mixed; lines++;
     char why[512]; size_t o = 0; why[0] = 0;
     for (int i = 0; i < RS_NWHY; i++) { uint64_t n = atomic_load(&g_rs_refused[i]); if (n && o < sizeof why) o += (size_t)snprintf(why + o, sizeof why - o, "%s%llu %s", o ? ", " : "", (unsigned long long)n, g_rs_why[i]); }
-    MLOG("[res-scale] up to frame %llu: %llu targets made at %.2fx (%llu MB at that size in all, the memory readout has what is alive), %llu mixed passes drawn through proxies, %llu drawn unscaled; refused: %s",
-         frame, (unsigned long long)made, g_rs, (unsigned long long)(atomic_load(&g_rs_made_kb) >> 10), (unsigned long long)atomic_load(&g_rs_proxied), (unsigned long long)mixed, o ? why : "none");
+    MLOG("[res-scale] up to frame %llu: %llu targets made at %.2fx (%llu MB at that size in all, %llu sizes); alive %llu, the scale adding %llu MB (peak %llu MB, budget %llu MB); %llu mixed passes drawn through proxies, %llu drawn unscaled; refused: %s",
+         frame, (unsigned long long)made, g_rs, (unsigned long long)(atomic_load(&g_rs_made_kb) >> 10), (unsigned long long)atomic_load(&g_rs_nsizes), (unsigned long long)atomic_load(&g_rs_live_n), (unsigned long long)(atomic_load(&g_rs_live_b) >> 20),
+         (unsigned long long)(atomic_load(&g_rs_peak_b) >> 20), (unsigned long long)(g_rs_budget >> 20), (unsigned long long)atomic_load(&g_rs_proxied), (unsigned long long)mixed, o ? why : "none");
 }
 // The scale a Metal texture holds a guest texture at: g_rs when rs_apply made it so, else 1 (a view reports its base texture's; a snapshot or a copy of one has its size, so its own)
 static inline float rs_of(id<MTLTexture> mt, const tex_t *t) {
@@ -88,6 +147,13 @@ static inline float rs_of(id<MTLTexture> mt, const tex_t *t) {
     id<MTLTexture> b = mt; while (b.parentTexture) b = b.parentTexture;
     NSUInteger gw = t->d.width ? t->d.width : 1;
     return b.width != gw && b.width == rs_dim(gw) ? g_rs : 1.0f;
+}
+static void rs_track(id<MTLTexture> mt, const tex_t *t) {
+    if (!g_rs_on || g_rs <= 1.0f || !mt || mt.parentTexture || rs_of(mt, t) == 1.0f || objc_getAssociatedObject(mt, &g_rs_track_key)) return;
+    NvRsTrack *k = [NvRsTrack new]; uint64_t sz = (uint64_t)mt.allocatedSize; k->added = sz - (uint64_t)((double)sz / ((double)g_rs * g_rs));
+    objc_setAssociatedObject(mt, &g_rs_track_key, k, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    uint64_t now = atomic_fetch_add(&g_rs_live_b, k->added) + k->added, pk = atomic_load(&g_rs_peak_b); atomic_fetch_add(&g_rs_live_n, 1);
+    while (now > pk && !atomic_compare_exchange_weak(&g_rs_peak_b, &pk, now)) {}
 }
 // A copy region of a guest texture's level, in the Metal texture's pixels at scale s, within that level (lw x lh)
 static NVNcopyRegion rs_region(const NVNcopyRegion *r, float s, NSUInteger lw, NSUInteger lh) {

@@ -4130,7 +4130,7 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextu
         if (upgraded) { res_add(raw); NvAtomicRaw *own = [NvAtomicRaw new]; own->raw = raw; objc_setAssociatedObject(upgraded, &g_atomic_raw_key, own, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
     } else upgraded = backing ? [backing newTextureWithDescriptor:d offset:base.bufferOffset bytesPerRow:base.bufferBytesPerRow] : [g_dev newTextureWithDescriptor:d];
     if (!upgraded) { RED_ONCE(45, "texture upgrade failed ser=%llu format %lu → %lu usage %#lx", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf, (unsigned long)d.usage); return base; }
-    if (!reinterpret) res_add(upgraded);
+    if (!reinterpret) { res_add(upgraded); rs_track(upgraded, t); }   // rs_track: DM_RES_SCALE's budget (nvn_rscale.inc)
     id<MTLTexture> upgraded_view = nil;
     id<MTL4ComputeCommandEncoder> b = backing ? nil : blit();   // shared backing already contains the pixels; copying it onto itself would overlap
     NSUInteger slices = base.textureType == MTLTextureType3D ? 1 : base.arrayLength * (base.textureType == MTLTextureTypeCube || base.textureType == MTLTextureTypeCubeArray ? 6 : 1);
@@ -6105,6 +6105,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         if (!mt) { uint64_t rl = rl_apply(t, d); mt = rh_texture(t, d); if (!mt) mt = [g_dev newTextureWithDescriptor:d];   // rl_apply: DM_NVN_RT_LOSSY
             if (mt && d.compressionType == MTLTextureCompressionTypeLossy && mt.compressionType == MTLTextureCompressionTypeLossy) rl_note(mt, rl);
             if (mt) { res_add(mt); if (!(filled = tex_init_fill(t, mt))) { uint32_t apf; if (bc_astc(t, &apf)) astc_zero_fill(t, mt); else tex_zero_fill(mt); } } }
+        rs_track(mt, t);   // DM_RES_SCALE: what the scale adds, counted against its budget while the texture lives (nvn_rscale.inc)
         if (mt && !filled && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) && t->d.target != NVN_TEXTURE_TARGET_BUFFER) rel_push(t, 0);   // the GPU-only texture of a pool nobody reads: its guest pages mean nothing, the host never reads them
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
     }

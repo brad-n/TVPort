@@ -9,6 +9,8 @@
 //    game's size, and a buffer-to-texture copy into a scaled target that fills its scaled region.
 // 5. A pass that mixes a scaled depth buffer with a colour target of the game's size: drawn at the game's size through a proxy of the depth, so the depth test sees the
 //    whole depth buffer (its left half 0.25, its right half 0.75: a draw at 0.5 with LESS passes on the right half only), and the depth it writes reaches the scaled buffer.
+// 6. The memory budget: a scaled texture counts what the scale adds while it lives and stops counting when it is freed; a new target past the budget, or while the memory relief finds
+//    the process short of memory, is made at the game's size, and every later descriptor of that texture (its twin, a remake) agrees, whatever the budget says then.
 #define nvn_game_fps nvn_game_fps_mtl_default
 #include "../nvn/nvn_mtl.m"
 #undef nvn_game_fps
@@ -40,6 +42,7 @@ static tex_t desc(uint64_t ser, const pool_t *pool, int fmt, uint32_t w, uint32_
 static id<MTLTexture> make(tex_t *t) {   // as the host makes it (tex_desc), registered under its serial
     MTLTextureDescriptor *d = tex_desc(t, 0); id<MTLTexture> x = d ? [g_dev newTextureWithDescriptor:d] : nil;
     CHECK(x != nil, "texture created"); if (!x) return nil;
+    rs_track(x, t);   // as tex_mtl_ does
     res_add(x); mtl_tex_init(t); serial_put(t->serial, x); return x;
 }
 static int read_px(id<MTLTexture> t, uint8_t *out) {   // the whole level 0, RGBA8
@@ -187,6 +190,23 @@ int main(void) { @autoreleasepool {
     g_ds = (ds_st){.dt = 1, .dw = 1, .df = NVN_DEPTH_FUNC_ALWAYS}; tdraw(&low2, &pg_green, 0, 0, 128, 72, (p_scissor){0, 0, 128, 72}); g_depth = NULL; g_ds = (ds_st){.df = NVN_DEPTH_FUNC_ALWAYS};
     { static float dz[256 * 144]; ok = read_px(dept, (uint8_t *)dz); in = 1; for (int i = 0; i < 256 * 144; i++) in &= dz[i] == 0.5f;
       CHECK(ok && in, "the depth a mixed pass writes is drawn back into the whole scaled depth buffer"); }
+    // 6. the budget
+    { tex_t a = desc(99800, &gpu_pool, NVN_FORMAT_RGBA8, 128, 72, NVN_TEXTURE_FLAGS_COMPRESSIBLE); uint64_t b0 = atomic_load(&g_rs_live_b), n0 = atomic_load(&g_rs_live_n), add = 0;
+      @autoreleasepool { MTLTextureDescriptor *d = tex_desc(&a, 0); id<MTLTexture> x = d ? [g_dev newTextureWithDescriptor:d] : nil; rs_track(x, &a);
+          add = atomic_load(&g_rs_live_b) - b0;
+          CHECK(x && x.width == 256 && atomic_load(&g_rs_live_n) == n0 + 1 && add >= (uint64_t)x.allocatedSize * 3 / 4 - 1 && add <= (uint64_t)x.allocatedSize, "a scaled texture counts three quarters of its memory while it lives"); }
+      CHECK(atomic_load(&g_rs_live_b) == b0 && atomic_load(&g_rs_live_n) == n0, "freed, it no longer counts");
+      uint64_t keep = g_rs_budget; g_rs_budget = b0 + add / 2;   // room for half of one more
+      tex_t over = desc(99801, &gpu_pool, NVN_FORMAT_RGBA8, 128, 72, NVN_TEXTURE_FLAGS_COMPRESSIBLE); MTLTextureDescriptor *d = tex_desc(&over, 0);
+      CHECK(d && d.width == 128 && d.height == 72 && g_rs_refused[RS_WHY_BUDGET] >= 1, "past the budget a new target is made at the game's size");
+      g_rs_budget = keep; d = tex_desc(&over, 0);
+      CHECK(d && d.width == 128, "and stays so for every later descriptor of that texture, the budget raised or not");
+      tex_t ok2 = desc(99802, &gpu_pool, NVN_FORMAT_RGBA8, 128, 72, NVN_TEXTURE_FLAGS_COMPRESSIBLE); d = tex_desc(&ok2, 0);
+      CHECK(d && d.width == 256, "within the budget a new target is scaled");
+      int mode = g_mr_mode; g_mr_mode = 1; atomic_store(&g_mr_short, 1);
+      tex_t sh = desc(99803, &gpu_pool, NVN_FORMAT_RGBA8, 128, 72, NVN_TEXTURE_FLAGS_COMPRESSIBLE); d = tex_desc(&sh, 0);
+      CHECK(d && d.width == 128 && g_rs_refused[RS_WHY_SHORT] >= 1, "while the memory relief finds the process short of memory a new target is made at the game's size");
+      atomic_store(&g_mr_short, 0); g_mr_mode = mode; }
     CHECK(!mtl_last_commit_error(), "every submission completed");
     mtl_pool_del(host); free(host); mtl_pool_del(vertices); free(vertices);
     printf("resolution scale: %d checks, %d failed\n", checks, fails); return fails != 0;
