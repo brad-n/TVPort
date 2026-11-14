@@ -10,7 +10,16 @@ What changes in this fork, release by release, in plain terms. The full descript
 
 ## Unreleased (on `switch2-experimental`)
 
-Nothing yet: everything that was here is in build 1643.
+Nothing yet: everything that was here is in build 1654.
+
+## 1.3.0 build 1654 (2026-11-14)
+
+**Resolution scale for every game** (Advanced settings)
+- **Resolution scale** (`DM_RES_SCALE`, 50 to 200%, "Resolution scale" under Advanced in the Mac launcher and in TVPort): draws a game's 3D at a higher (or lower) resolution than the game chose, for any game. The engine scales the game's render targets and everything that touches them (viewports, clears, copies, reads back to the game at its own size), using the resolution-scaling code the shader translator inherited from Ryujinx. On a Mac mini M2 Pro, Mario Kart 8 Deluxe races hold 60 fps at 1.5x, and Ocarina of Time shows the same picture at 1.5x and 2x as at 1x.
+- **When it appears:** the scaling code has to be in a game's shaders. It becomes the default at the next shader rebuild (the next upstream update to the shader translator), so nobody rebuilds just for this; until then the setting shows only for games built with it (a profile's `shader_no_rescale 0`). The launchers check the game's own shader library, so the setting never shows where it can't work.
+- **A memory budget for it:** the extra memory a higher scale takes is capped at a tenth of what tvOS allows the app (about 210 MB on an Apple TV) and a quarter of a Mac's GPU working set (`DM_RES_SCALE_BUDGET_MB`); targets past it stay at the game's size.
+- **The game's upscalers** (MetalFX, the plain scale and the DLSS stand-in) take the scaled picture.
+- Games with their own render scale (Ocarina of Time, Star Fox) still have it: where a game can draw sharper itself, that's the better choice.
 
 ## 1.3.0 build 1643 (2026-11-14)
 
