@@ -811,6 +811,67 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** `hle_nvn.c` accepts the three calls and records nothing. Shading every pixel is the most any rate asks for, so the picture is the same or sharper, and the only cost is GPU time where the game meant to save it. This drops a feature rather than emulating it, and the choice is a platform limit.
 - **Found on:** [Mario Kart World](../../dm/games/0400C3F00006E000/README.md), every frame; [Splatoon Raiders](../../dm/games/0400380020056000/README.md), the palette.
 
+## Engine-wide resolution scale (`DM_RES_SCALE`)
+
+`DM_RES_SCALE=<0.5..2.0>` (steps of 0.05; 1.0, the default, is off) renders any game's 3D at that many times the size the game chose, with no game stub. A game's own render scale (`DM_RENDER_SCALE`: Ocarina of Time's, Star Fox's, Hades II's stubs) changes the game's resolution variable and stays the better picture where it exists; this one is for every other game, and works on top of one. The launcher shows it as **Resolution scale** under Advanced (the Mac's settings window and TVPort's game settings), only for a game whose shaders carry the resolution-scaling code ([How the shaders see a scaled texture](#how-the-shaders-see-a-scaled-texture)). The host code is `dm/gfx/nvn/nvn_rscale.inc` and its hooks in `nvn_mtl.m`; `t_res_scale` checks it on the GPU.
+
+The model is Ryujinx's resolution scaling (its `TextureManager` / `Texture` scale modes, `UpdateScale`, the support buffer's render scale array), reimplemented: Ryujinx makes every texture at 1x and scales one when it is bound as a render target beside scaled ones, copying its content up, and brings one back to 1x when a shader uses it in a way the scaling cannot follow ("blacklisted"). Here the decision is made once, when the host makes the texture's Metal texture, by rules on its descriptor. Nothing is copied between scales later, and a texture's scale never changes; the price is that a texture the rules got wrong cannot be fixed at run time (phase 1).
+
+### Which textures scale
+
+`rs_apply`, called by `tex_desc` for every GPU texture's descriptor, scales the size of:
+
+- the game's own render targets: `COMPRESSIBLE` (NVN's mark of a render target) in a pool the CPU cannot access, not display (the window textures), video, linear or sparse (`rh_target`, the same test the recycled render-target heaps use);
+- 2D, rectangle and 2D multisample, at most 3 levels (a full mip chain is an asset), at least 64x64;
+- with the screen's shape within 4 % (the window textures' shape once the game has made them, 16:9 before): the main scene, its depth, its G-buffer and the half and quarter-size effect targets of the same shape scale; a shadow map, an atlas, a lookup table or a cube face does not;
+- not `IMAGE`: a compute shader that writes a texture addresses it in the game's pixels over a grid sized for them, so it would fill a quarter of a 2x texture;
+- not compressed, within Metal's 16384.
+
+Never scaled: anything the CPU reads (pools the CPU can access), so no CPU readback ever meets a scaled texture; window textures, so the present and the frame pacing are unchanged; images, 3D textures, arrays and cubes. The game's last pass, its own upscale or composite into the window texture, samples the scaled 3D picture through normalized coordinates and comes out sharper. Each texture made scaled is logged (`[res-scale] scaled ser=… 1920x1080 → 3840x2160`, the first 24), each refused one with the rule (`[res-scale] refused … not the screen's shape`, the first 6 of each rule).
+
+What is made from a scaled texture has its size: its views, its sRGB / linear twin, a texture upgraded for a new usage (`tex_upgrade`), a family member over the same storage (`image_texture` scales the other members' descriptors by the same rules), a feedback snapshot. So the scale is read back from the size (`rs_of`): a texture is scaled when its Metal base width is the game's width times the scale.
+
+### Passes, viewports and scissors
+
+A pass's scale is its attachments' (`rs_pass`, kept in `g_pass.rs`). The draw multiplies the game's viewport by it and rounds the scissor's edges (both edges the same way, so abutting rectangles stay abutting), as do the clears drawn as triangles (`clr_scissor`), the scissored zero clears (`clear_rect_zero`), the render-area choices of `rp_begin_ex_` and `DrawTexture` (the destination at the target's scale, the source at the texture's). A pass that mixes scaled and unscaled attachments is drawn at the game's size through proxies (`rs_proxy_begin`): each scaled attachment's level is drawn down into a texture of the game's size when the pass loads it, attached in its place, and drawn back up when the pass ends (`rs_proxy_flush`), a depth-stencil one only when the pass cleared or wrote it (a depth buffer drawn down and up again for a pass that only tests it would come back at the game's resolution). Logged (`[res-scale] pass … mixes scaled … and unscaled …: drawn at the game's size through proxies`); a multisample attachment cannot be drawn down and leaves the pass as it was (the scaled one gets its picture in its top-left part).
+
+### How the shaders see a scaled texture
+
+A shader written for the game's size reads `gl_FragCoord.xy` in its pixels (a deferred light reconstructs the position as `gl_FragCoord.xy * inverse screen size`), fetches texels at integer coordinates computed in its pixels, and queries sizes. Ryujinx's translator carries the code that keeps these right, which nxnative's translator inherited: `gl_FragCoord.xy` divided by `render_scale[0]` (`InstEmitAttribute.EmitIpa`), each texel fetch's coordinate through `TexelFetchScale` and each size query through `TextureSizeUnscale` with `render_scale[1 + i]` for the shader's i-th texture descriptor (`TexturePass`; images after the textures). The profile key `shader_no_rescale 1`, every game's default since 2026-11-09, leaves that code out, as the host used to fill every scale with 1.0. With `DM_RES_SCALE` set, the host compiled for a profile with `shader_no_rescale 1` (`DM_GAME_SHADER_NO_RESCALE`, game.py) logs `[res-scale] off` and changes nothing; the launcher hides the setting there.
+
+With the code in the shaders, the host gives each shader that has the support buffer its own copy per draw or dispatch (`rs_support`), laid out as `support_buf` (the alpha test, BGRA flags and viewport fields 0, the fragment scale count 0 so a vertex shader's texture i also reads entry 1 + i): entry 0 the pass's scale, entry 1 + i the bound texture's (`rs_bound`). A scaled texture read by a pixel shader of a scaled pass is given a negative scale, which makes `TexelFetchScale` add the pixel's own position within the texel's block: a 1:1 fetch (`texelFetch(t, ivec2(gl_FragCoord.xy))`) reads each pixel's own texel instead of every second one. A compute or vertex shader gets the positive scale. Such argument blocks serve only their pass (`DM_NVN_ARGS_CACHE` does not carry them over).
+
+Which binding is texture descriptor i is not in the build's reflection, and adding it would change the translation chain, so every library would be built again. The host takes it from the MSL argument buffer's member order, which keeps the translator's binding order: `ResourceManager` numbers each texture at its first use and lists its descriptors in that order (non-array textures and separate samplers first), and SPIRV-Cross declares the members by binding. `nvn_refl.m` counts the texture and separate-sampler members that are not arrays, pools or sampler halves (`rsi`), then the images. Checked on Ocarina of Time's ground mist pixel shader `5ad65c0eefd09c7f` built with the code: its one texel fetch reads `render_scale[2]` and fetches its second texture member, `fp_t_tcb_C`.
+
+### Copies, blits and readbacks
+
+- Texture to texture (`copy_t2t_enc`): each region in its texture's own pixels (`rs_region`, clamped to the level). Two textures at the same scale keep a copy of equal sizes, a blit; a copy between scales is drawn (`copy_t2t_draw`, bilinear for colour, nearest for depth). Integer and stencil-only formats cannot be drawn between scales: logged (`[res-scale] a copy between scales of scaled ser=…`) and copied at the scaled size.
+- Texture to buffer (`copy_t2b`): a scaled texture's region is drawn down into a texture of the game's size first (`rs_unscaled`), so the buffer gets the game's pixels at the game's stride (a thumbnail, a screenshot, a probe readback).
+- Buffer to texture into a scaled texture (`copy_b2t`): the bytes go into a texture of the game's size, drawn up into the scaled region (`rs_scale_into`).
+- Texture clears (`clear_tex`): the region in the texture's pixels.
+- CPU reads (`ReadTexels`): never of a scaled texture, as scaled textures live in pools the CPU cannot access; one would be logged.
+- Present: the window textures are never scaled.
+- Not followed yet (phase 2), each logged once: `DM_UPSCALER=metalfx` / `bilinear` read their regions from the game's uniforms, so with the scale on the game's own upscaler runs instead; NVN2's DLSS takes the game's render size and motion vectors, so a scaled input is read in its top-left part.
+
+### Memory
+
+Every scaled target takes the scale squared times its memory: 2.0 is four times, 1.5 2.25 times, 0.5 a quarter. The Apple TV ends an app past about 2 GB, so the default stays 1.0 and the launcher's note says it costs memory; on the TV, only small scales above 1 or scales below 1 are likely to fit a large game.
+
+### Measured (Mac mini M2 Pro, 2026-11-14)
+
+- **Mario Kart 8 Deluxe** (4.0.1, docked, 1920x1080; the `race-50cc` route of its `bench.tsv`, the first race of the Mushroom Cup; one run each): GPU p50 7.64 ms and 59.8 fps at 1.0, 12.06 ms and 59.3 fps at 1.5 (its targets 2880x1620), 17.45 ms and 45.2 fps at 2.0 (3840x2160). The race's picture shows no glitch at either scale. Its race colour target is a one-layer 2D array drawn beside a 2D depth buffer; before 2D arrays scaled too, that pass mixed the two. Only 5 of its 29,651 shaders read `gl_FragCoord.xy` and 4 fetch texels, so its picture hardly depends on the rescale code. At 2.0 the GPU memory in the race grew from 1.4 GB (1.0 and 1.5) to 4.5-5.4 GB while the game kept making new targets (thousands of scaled targets made, storage takeovers 41 → 1,162, retired targets still held 39 → 227): most likely its dynamic resolution answering the GPU load with new sizes, each made scaled. Open: confirm it and bound the memory.
+- **Ocarina of Time** (v131072 at its full 1536x864, the `balcony-still` route, the work folder's partial library with the 2,983 shaders the code changes built again with `shader_no_rescale 0`, two runs a side): the rescale code at scale 1.0 costs GPU p50 22.51 → 22.83 ms (+0.3 ms, 1.4 %; the runs' ranges, 22.41-22.61 and 22.67-22.98, do not overlap) at the same 31 fps (its frame step's 30). At 1.5: 27.7 ms, 26.5 fps; at 2.0: 34.3 ms, 20.9 fps; with its mixed passes drawn through proxies (about 2.4 a frame: agl makes an effects target shader-writable, which stays at the game's size, and draws into it with the scaled depth buffer) 28.4 and 35.5 ms. Its picture at 1.5 and 2.0 is wrong: bright patches with sharp edges where the forest floor should be, along the silhouettes of the balcony and the trees, a faint second copy of the background, and at 2.0 Link's hat dark. Ruled out: the mixed passes (drawn through proxies, the patches stay), the ground mist (`DM_GROUND_MIST=off` leaves them), texel fetches through pool arrays (4 of the shaders). Open (phase 2).
+- **Cost of the code in every shader:** 2,983 of the 7,278 shaders Ocarina of Time's playtests used change (2,813 pixel shaders read `gl_FragCoord`, 136 shaders fetch texels and 438 query sizes), and they cost the 0.3 ms above at scale 1.0. Mario Kart 8 Deluxe's change little. Turning the code on for every game (`shader_no_rescale 0` as the default) costs each game one library build; done together with the next change of the translation chain it costs nothing more.
+
+### Phase 2
+
+- Ocarina of Time's wrong picture: find the passes (pass dumps at 1.0 and 2.0) and fix the cause, which is general.
+- Delivery of the shaders: `shader_no_rescale 0` as the default at the next chain change, or the NSP script and TVPort building a game's library with it when the player picks a scale.
+- Mixed passes cost copies and draw at the game's size: bring the unscaled target to the scale instead when no compute shader writes it (Ryujinx's way: scale by use, not by the `IMAGE` flag).
+- Memory: a budget for scaled targets (the Apple TV's ~2 GB), and the growth with a game's dynamic resolution.
+- `DM_UPSCALER=metalfx` / `bilinear` and NVN2's DLSS with scaled inputs (their regions and motion vectors at the scale).
+- Point sprites and line widths in pixels; the readable-tile and pass-merge proofs, which compare the game's sizes with the pass's and now turn themselves off for scaled passes.
+
 ## Blend, depth and stencil
 
 ### Ten attachment records for eight colors and depth-stencil

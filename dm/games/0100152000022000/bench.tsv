@@ -1,0 +1,2 @@
+# Benchmark routes for scripts/bench.py: name, DM_KEYS (seconds or f<frame> from host start), the measuring window start and length in seconds, a description
+race-50cc	f960:L+R~0.3,f1260:A,f1500:A,f1740:A,f2000:A,f2240:A,f2400:A,f2560:A,f2800:A,f3040:A,85:A~0.2,88:A~0.2,92:A~70	120	25	a save past the Mii pick (README, Mac routes): L+R at the title, Grand Prix, 50cc, Mario, Mushroom Cup; the first race, holding accelerate
