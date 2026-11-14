@@ -41,6 +41,10 @@ Hades II goes up to 300 %: it renders its whole picture, the HUD and text includ
 
 Under Advanced: the size of the game's 3D picture for any game, from 50 to 200 %, without a patch for the game. 100 % is off. Above 100 % the game's 3D is drawn larger than the game chose and comes out sharper on a large screen; below, smaller and lighter on the GPU. It costs GPU time and memory: at 200 % each enlarged picture the game draws takes four times its memory, which a large game may not have on an Apple TV. Where the game has its own **Render scale**, that one gives the better picture. It needs the game's shaders built with the resolution-scaling code, so the setting is shown only where the app's shader library has it, which every game's does once its library is built again at the next shader update, and a game's own profile can ask for sooner ([Which libraries carry the code](reference/rendering.md#which-libraries-carry-the-code)). Past a share of the device's memory (on an Apple TV about 210 MB more than at 100 %), further pictures stay at the game's size. In an `env.txt`: `DM_RES_SCALE=1.5`.
 
+### Anisotropic filtering
+
+Under Advanced: Auto, 2x, 4x, 8x or 16x. Ground, roads and walls seen at a shallow angle come out sharper instead of smearing into blur in the distance. Switch games often ask for little or none to save the console's GPU; a Mac or iPhone can afford more. Auto keeps what the game asks for; a number is the least it gets, for the textures the game filters smoothly (not pixel-art or nearest-filtered ones, shadow maps or the app's own pictures), and a game that already asks for more keeps its own. It costs a little GPU time, more at 16x. In an `env.txt`: `DM_ANISO=16`. [Anisotropic filtering](reference/rendering.md#anisotropic-filtering-dm_aniso).
+
 ### Console mode
 
 **Docked** renders at the Switch's TV resolution, **Handheld** at its lower handheld resolution, which is lighter on the phone and can give a higher frame rate.

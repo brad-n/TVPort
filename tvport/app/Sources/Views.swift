@@ -579,6 +579,11 @@ struct SettingsForm: View {
                             }
                             note("Renders the game's 3D larger or smaller than the game chose, for any game. Above 100 % it takes more GPU time and much more memory (200 % takes about four times the memory of each scaled target), and the Apple TV stops an app past about 2 GB. 100 % is off.")
                         }
+                        Picker("Anisotropic filtering", selection: anisoBinding) {
+                            Text("Auto").tag(0)
+                            ForEach([2, 4, 8, 16], id: \.self) { Text("\($0)x").tag($0) }
+                        }
+                        note("Sharper textures on ground and walls seen at a shallow angle, for a small GPU cost. Auto keeps what the game asks for; a number is the least it gets, for textures the game filters smoothly.")
                         Toggle("Metal 4 pipelines", isOn: flagBinding(\.metal4Pipelines))
                         note("Turns on DM_PSO_MTL4 and keeps the pulling shader libraries in the build. Experimental.")
                         TextField("Pipeline archive GPU", text: textBinding(\.pipelineGPU), prompt: Text("Empty for none, or g18p"))
@@ -713,6 +718,9 @@ struct SettingsForm: View {
         Binding(get: { library.current?.upscaler ?? "game" }, set: { value in library.update { $0.upscaler = value == "game" ? nil : value } })
     }
 
+    private var anisoBinding: Binding<Int> {
+        Binding(get: { library.current?.aniso ?? 0 }, set: { value in library.update { $0.aniso = value == 0 ? nil : value } })
+    }
     private var resScaleBinding: Binding<Double> {
         Binding(get: { library.current?.resScale ?? 1 }, set: { value in library.update { $0.resScale = value == 1 ? nil : value } })
     }

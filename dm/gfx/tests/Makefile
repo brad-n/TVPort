@@ -516,6 +516,9 @@ check_t_copy_alias: t_copy_alias
 .PHONY: check_t_linear_readback
 check_t_linear_readback: t_linear_readback
 	MTL_DEBUG_LAYER=1 ./t_linear_readback
+t_aniso: t_aniso.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_aniso.m $(MTL_T_SRC) $(FW)
+check_t_aniso: RUN_ENV = MTL_DEBUG_LAYER=1
 t_pfv: t_pfv.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pfv.m $(MTL_T_SRC) $(FW)
 t_dlss_scaler: t_dlss_scaler.m $(MTL_T_DEP)

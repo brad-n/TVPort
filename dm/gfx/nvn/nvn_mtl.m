@@ -9152,6 +9152,40 @@ static MTLSamplerAddressMode wrapm(int w) {
         case 6: return MTLSamplerAddressModeMirrorRepeat; }
     return MTLSamplerAddressModeRepeat;
 }
+// Anisotropic filtering override (DM_ANISO=0|2|4|8|16; 0, the default, keeps the game's own value). A number is a floor: the sampler gets at least that many taps, for the game's samplers that
+// filter minification linearly through a mip chain and that nothing else uses specially, as anisotropy changes which mip level a skewed footprint reads: a linear-minification sampler with
+// mip filtering, linear magnification, no comparison (shadow maps) and no min/max reduction (depth pyramids), and a mip range past level 0. Nearest / point samplers (pixel art, data
+// lookups) and samplers without mips keep the game's value; so do the host's own samplers (blit, upscale, UI), which this file makes beside samp_make and which never see samp_par. The
+// override is a pure function of the game's samp_par and a constant of the process, so the pins and registry keyed on samp_par (spin_intern, g_sreg) stay valid; only the descriptor differs.
+// The game's requested values are counted per distinct sampler state and logged as [aniso] lines (aniso_note)
+static int g_aniso_ovr = -1;
+static int aniso_override(void) {
+    if (g_aniso_ovr < 0) { const char *e = getenv("DM_ANISO"); int v = e && *e ? atoi(e) : 0;
+        if (v != 0 && v != 2 && v != 4 && v != 8 && v != 16) { MLOG("[aniso] DM_ANISO=%s is not 0, 2, 4, 8 or 16: off", e); v = 0; }
+        g_aniso_ovr = v; if (v) MLOG("[aniso] override %dx for the game's samplers with linear minification through mips", v); }
+    return g_aniso_ovr;
+}
+static int aniso_eligible(const samp_par *p) {
+    return (p->minf == 3 || p->minf == 5) && p->magf && !p->cmp_mode && p->reduction != 1 && p->reduction != 2 && p->lod_max > 0;
+}
+// The anisotropy the game's sampler gets with the override over (1..16)
+static NSUInteger aniso_for(const samp_par *p, int over) {
+    NSUInteger a = p->aniso < 1 ? 1 : p->aniso > 16 ? 16 : (NSUInteger)p->aniso;
+    return over && aniso_eligible(p) && a < (NSUInteger)over ? (NSUInteger)over : a;
+}
+// What the game asks for: one count per sampler state made (a pin or a registered slot, once each), by the value it requests, and how many of them the override covers. Logged as the values
+// first appear and at 4, 16, 64, ... states, so the last line of a run is its histogram
+static int g_aniso_hist[17], g_aniso_hist_el[17], g_aniso_total;
+static void aniso_note(const samp_par *p) {
+    static uint32_t seen[2048]; uint32_t h = 2166136261u; for (size_t i = 0; i < sizeof *p; i++) h = (h ^ ((const uint8_t *)p)[i]) * 16777619u; if (!h) h = 1;   // a state made again (a slot and its pin) counts once
+    for (uint32_t i = h % 2048, n = 0; n < 2048; i = (i + 1) % 2048, n++) { if (seen[i] == h) return; if (!seen[i]) { seen[i] = h; break; } }
+    int a = p->aniso < 1 ? 1 : p->aniso > 16 ? 16 : (int)p->aniso, first = !g_aniso_hist[a];
+    g_aniso_hist[a]++; g_aniso_hist_el[a] += aniso_eligible(p); g_aniso_total++;
+    if (!first && (g_aniso_total & (g_aniso_total - 1) || __builtin_ctz(g_aniso_total) & 1)) return;   // powers of 4
+    char b[400]; int n = 0;
+    for (int i = 1; i <= 16; i++) if (g_aniso_hist[i]) n += snprintf(b + n, sizeof b - n, " %dx:%d(%d)", i, g_aniso_hist[i], g_aniso_hist_el[i]);
+    MLOG("[aniso] the game's %d sampler states ask for (value:states(of them with linear minification through mips)):%s", g_aniso_total, b);
+}
 static id<MTLSamplerState> samp_make(samp_par p, void **view, uint64_t *rid, void **view_w, uint64_t *rid_w, float *bk, int sid) {
     MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
     d.magFilter = p.magf ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
@@ -9160,7 +9194,7 @@ static id<MTLSamplerState> samp_make(samp_par p, void **view, uint64_t *rid, voi
     d.sAddressMode = wrapm(p.ws); d.tAddressMode = wrapm(p.wt); d.rAddressMode = wrapm(p.wr);
     d.lodMinClamp = p.lod_min < 0 ? 0 : p.lod_min; d.lodMaxClamp = p.lod_max;
     d.lodBias = p.lod_bias < -16 ? -16 : p.lod_bias > 15.99f ? 15.99f : p.lod_bias;   // SetLodBias: Maxwell's sampler bias, Metal 26's range [-16, 15.99]
-    d.maxAnisotropy = p.aniso < 1 ? 1 : p.aniso > 16 ? 16 : (NSUInteger)p.aniso;
+    d.maxAnisotropy = aniso_for(&p, aniso_override()); aniso_note(&p);
     if (p.cmp_mode) d.compareFunction = (MTLCompareFunction)(p.cmp_func - 1);
     // Reduction (NVN 1 min / 2 max): the minimum or maximum of the texels a filtered sample covers, per channel (Metal 26). Pokémon Legends: Z-A builds its depth pyramid with a min sampler
     // (151607c7a92386cc reads the level above at an explicit LOD) and tests occlusion boxes against it; averaged, the pyramid is nearer than the scene at depth edges. Metal ignores the reduction

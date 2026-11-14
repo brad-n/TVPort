@@ -464,6 +464,13 @@ class Saves(unittest.TestCase):
             self.assertTrue(game.res_scale_supported())
             self.assertTrue(game.state()['rescale_code']['value'])
 
+    def test_aniso_reaches_the_app(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game = self.make_game(folder)
+            self.assertIn('DM_ANISO=16\n', backend.write_env(game, 'handheld', 512, aniso=16).read_text())
+            self.assertNotIn('DM_ANISO', backend.write_env(game, 'handheld', 512).read_text())   # 0, Auto: the game's own
+            self.assertEqual(backend.ANISO_CHOICES, (0, 2, 4, 8, 16))
+
     def test_render_scale_offered_only_with_the_stub(self):
         with tempfile.TemporaryDirectory() as folder:
             game = self.make_game(folder)

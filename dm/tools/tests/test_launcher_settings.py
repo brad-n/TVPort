@@ -57,6 +57,16 @@ class LauncherSettingsTests(unittest.TestCase):
                 self.assertEqual((s['kind'], s['section'], s['default']), ('range', 'Game', '1.0'))
         with patch.dict(os.environ, {'SETTINGS_MSL': ''}): self.assertNotIn('DM_RES_SCALE', build(BOTW, 'nvn'))   # no library named: the profile (no rescale code)
 
+    def test_anisotropic_filtering_is_an_advanced_nvn_choice(self):
+        """DM_ANISO: Auto (0, the game's own) and 2x to 16x, a Game row without the basic level, for the NVN host only (the Vulkan and GL layers do not read it)"""
+        s = build(BOTW, 'nvn')['DM_ANISO']
+        self.assertEqual((s['kind'], s['section'], s['default'], s['label']), ('choice', 'Game', '0', 'Anisotropic filtering'))
+        self.assertEqual(s['options'], [['0', 'Auto'], ['2', '2x'], ['4', '4x'], ['8', '8x'], ['16', '16x']])
+        self.assertNotEqual(s.get('level'), 'basic')
+        self.assertTrue(s['note'])
+        for api, gid in [('vulkan', '0100535012974000'), ('gl', '010014E00DB56000')]: self.assertNotIn('DM_ANISO', build(gid, api))
+        for platform in ('ios', 'mac'): self.assertIn('DM_ANISO', build(BOTW, 'nvn', platform))
+
     def test_frame_buffering_by_graphics_api(self):
         for api, gid in [('nvn', BOTW), ('vulkan', '0100535012974000'), ('gl', '010014E00DB56000'), ('', BOTW)]:
             with self.subTest(api=api):
