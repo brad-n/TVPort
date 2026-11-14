@@ -45,6 +45,10 @@ Under Advanced: the size of the game's 3D picture for any game, from 50 to 200 %
 
 Under Advanced: Auto, 2x, 4x, 8x or 16x. Ground, roads and walls seen at a shallow angle come out sharper instead of smearing into blur in the distance. Switch games often ask for little or none to save the console's GPU; a Mac or iPhone can afford more. Auto keeps what the game asks for; a number is the least it gets, for the textures the game filters smoothly (not pixel-art or nearest-filtered ones, shadow maps or the app's own pictures), and a game that already asks for more keeps its own. It costs a little GPU time, more at 16x. In an `env.txt`: `DM_ANISO=16`. [Anisotropic filtering](reference/rendering.md#anisotropic-filtering-dm_aniso).
 
+### TV output
+
+Under Advanced, Mac only: 1080p (the default) or 4K. It is the screen size a game in console mode is told it has. With 4K, a game that has a 4K console mode takes it: the Switch 2 games that pick their output size from the display (Star Fox, for one) render their upscaler's output at 4K and draw the HUD and menus at 4K. It costs GPU time and memory; the picture is scaled to fit the window or screen. Handheld mode is 1280x720 either way. A game with only one console size is unchanged. The Apple TV keeps 1080p.
+
 ### Console mode
 
 **Docked** renders at the Switch's TV resolution, **Handheld** at its lower handheld resolution, which is lighter on the phone and can give a higher frame rate.

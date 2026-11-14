@@ -57,6 +57,17 @@ class LauncherSettingsTests(unittest.TestCase):
                 self.assertEqual((s['kind'], s['section'], s['default']), ('range', 'Game', '1.0'))
         with patch.dict(os.environ, {'SETTINGS_MSL': ''}): self.assertNotIn('DM_RES_SCALE', build(BOTW, 'nvn'))   # no library named: the profile (no rescale code)
 
+    def test_tv_output_is_an_advanced_mac_choice(self):
+        """DM_TV_OUTPUT: 1080p (the default) or 4K, a Game row without the basic level, on the Mac only (the Apple TV keeps 1080p), for every graphics API (the host reports the display for all)"""
+        s = build(BOTW, 'nvn', 'mac')['DM_TV_OUTPUT']
+        self.assertEqual((s['kind'], s['section'], s['default'], s['label']), ('choice', 'Game', '1080', 'TV output'))
+        self.assertEqual(s['options'], [['1080', '1080p'], ['2160', '4K']])
+        self.assertNotEqual(s.get('level'), 'basic')
+        self.assertTrue(s['note'])
+        self.assertNotIn('DM_TV_OUTPUT', build(BOTW, 'nvn', 'ios'))
+        self.assertNotIn('DM_TV_OUTPUT', build(BOTW, 'nvn'))
+        self.assertIn('DM_TV_OUTPUT', build('0100535012974000', 'vulkan', 'mac'))
+
     def test_anisotropic_filtering_is_an_advanced_nvn_choice(self):
         """DM_ANISO: Auto (0, the game's own) and 2x to 16x, a Game row without the basic level, for the NVN host only (the Vulkan and GL layers do not read it)"""
         s = build(BOTW, 'nvn')['DM_ANISO']
@@ -98,7 +109,7 @@ class LauncherSettingsTests(unittest.TestCase):
         self.assertEqual(build(BOTW, 'nvn', 'ios').keys(), ios.keys())   # ios when unset
         self.assertEqual(set(ios) - set(mac), {'DM_SHOW_FPS', 'DM_TOUCH_HAPTICS', 'DM_PICTURE_FIT'})
         self.assertIn('DM_RUMBLE', mac); self.assertIn('DM_METAL_HUD', mac)
-        self.assertEqual(set(mac) - set(ios), {'DM_FULLSCREEN', 'DM_SW2'})   # the Mac window's Display mode (front_mac.m reads 1 or 0); Switch 2 controllers (pad_switch2_apple.m, wired on the Mac only)
+        self.assertEqual(set(mac) - set(ios), {'DM_FULLSCREEN', 'DM_SW2', 'DM_TV_OUTPUT'})   # the Mac window's Display mode (front_mac.m reads 1 or 0); Switch 2 controllers (pad_switch2_apple.m, wired on the Mac only); TV output (4K only on a Mac, hle_oe.c)
         s = mac['DM_FULLSCREEN']
         self.assertEqual((s['kind'], s['default'], s['options'], s['level']), ('choice', '0', [['0', 'Window'], ['1', 'Fullscreen']], 'basic'))
 

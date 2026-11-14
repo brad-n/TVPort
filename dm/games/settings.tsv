@@ -20,6 +20,7 @@ DM_DYNAMIC_RESOLUTION	toggle	-	0	fixups:DYNAMIC_RESOLUTION	Game	Dynamic resoluti
 DM_RENDER_SCALE	range	0.5:1.0:0.05	1.0	fixups:RENDER_SCALE	Game	Render scale		level=basic
 DM_RES_SCALE	range	0.5:2.0:0.25	1.0	shaders:rescale	Game	Resolution scale	Renders the game's 3D larger or smaller than the game chose, for any game. Above 100% it uses more GPU time and much more memory (twice the size takes about four times the memory of each scaled target).
 DM_ANISO	choice	0=Auto,2=2x,4=4x,8=8x,16=16x	0	gfxapi:nvn	Game	Anisotropic filtering	Sharper textures on ground and walls seen at a shallow angle, for a small GPU cost. Auto keeps what the game asks for; a number is the least it gets, for textures that are filtered smoothly.
+DM_TV_OUTPUT	choice	1080=1080p,2160=4K	1080	platform:mac	Game	TV output	The screen size a console-mode game is told. 4K makes games with a 4K console mode (many Switch 2 games) use it: a higher upscaler output and the HUD and menus drawn at 4K, for a larger GPU cost. 1080p is the default; handheld mode stays 1280x720.
 DM_OPMODE	choice	1=Docked,0=Handheld	DM_GAME_OPMODE	always	Game	Console mode		level=basic
 DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	always	Game	Upscaling	Uses more GPU time and can increase heat.
 DM_UPSCALER	choice	game=Game's own,metalfx=MetalFX,bilinear=Off (plain scale)	game	DM_GAME_UPSCALER_N!=0	Game	Game's upscaler	Off (plain scale) turns the game's upscaling network off and stretches the game's own smaller picture with a plain bilinear scale: far less GPU time, a softer picture, and no MetalFX is used.
