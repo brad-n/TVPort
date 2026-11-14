@@ -1983,6 +1983,11 @@ static void power_line(uint64_t frame) {
                 (unsigned long long)(gs[0] - pgs[0]), (gs[1] - pgs[1]) / 1048576.0 / nf, (unsigned long long)(gs[2] - pgs[2]), (gs[3] - pgs[3]) / 1048576.0 / nf, (unsigned long long)(gs[22] - pgs[22]), (gs[23] - pgs[23]) / 1048576.0 / nf,
                 (unsigned long long)(gs[5] - pgs[5]), (unsigned long long)(gs[6] - pgs[6]), (unsigned long long)(gs[7] - pgs[7]), (unsigned long long)(gs[8] - pgs[8]), (unsigned long long)(gs[9] - pgs[9]), (unsigned long long)(gs[10] - pgs[10]), (unsigned long long)(gs[12] - pgs[12]), (unsigned long long)(gs[13] - pgs[13]));
             memcpy(pbw, bw, sizeof pbw); memcpy(pgs, gs, sizeof pgs);
+            void mtl_omit_stats(uint64_t o[5]); static uint64_t pom[5]; uint64_t om[5]; mtl_omit_stats(om);
+            if (om[0] != pom[0] || om[2] != pom[2] || om[4] != pom[4])
+                LOG("[nvn] attachments a pass does not use, up to frame %llu: depth-stencil left out of %llu passes (%.1f MB per frame not loaded), colour of %llu (%.1f MB per frame), passes ended by a draw that uses one %llu (DM_NVN_DS_OMIT, DM_NVN_COLOR_OMIT)",
+                    frame, (unsigned long long)(om[0] - pom[0]), (om[1] - pom[1]) / 1048576.0 / nf, (unsigned long long)(om[2] - pom[2]), (om[3] - pom[3]) / 1048576.0 / nf, (unsigned long long)(om[4] - pom[4]));
+            memcpy(pom, om, sizeof pom);
         }
         void mtl_geohoist_stats(uint64_t *, uint64_t *, uint64_t *); static uint64_t pgh, pgr, pgs[6]; uint64_t gh, gr, gs[6]; mtl_geohoist_stats(&gh, &gr, gs);
         if (gh != pgh || gr != pgr) LOG("[nvn] geometry hoist up to frame %llu: %llu draws prepared ahead of their pass in %llu runs; runs ended by a raster read %llu, a draw that cannot be passed %llu, the table %llu, a kernel or capture hazard %llu, a draw not lean %llu, another op %llu",

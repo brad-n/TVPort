@@ -103,6 +103,32 @@ The Apple TV 4K's own profiles (`DM_NVN_GPUPROF=every:61`): run 18 (the lite set
 
 The time is fragment work in a few colour passes with few draws: on the Mac mini at the same settings the Deku Tree's pass is 4.7 ms of 11.4 in the dialogue (the TV 1.8 times that, its whole frame 2.3 times). The geometry stages (the depth prepass, the shadow cascades and the vertex stretches) are 10-20% of the frame. A geometry switch pays where it also cuts that fragment work: Apple GPUs shade a 2x2 quad for every pixel a triangle touches, and the Deku Tree's beard of thin hanging roots is most of its pass.
 
+### Attachment traffic (2026-11-13)
+
+Where the memory traffic of a frame's render passes goes, and what the host can skip without changing the picture. The Apple TV's run 19 at the Deku Tree (frame 14640, `DM_NVN_GPUPROF`): 105 passes, 84.5 MB loaded and 96.4 MB stored, about 5 ms a frame at the A15's roughly 34 GB/s. Ranked:
+
+| | load + store, MB | why |
+|---|---|---|
+| the 960x540 scene passes (RG11B10F colour with Depth32F), 11, most loading both | 43.5 + 27.7 | the scene is drawn over in passes split by dispatches, queue boundaries, feedback draws and other targets ([GPU time and passes in Kokiri Forest](#gpu-time-and-passes-in-kokiri-forest-2026-11-09)): each loads what the one before stored; depth is stored only when written |
+| the 1920x1080 target (RG11B10F): cleared at the frame's start in a pass of its own, then the upscaled picture and the HUD | 15.8 + 23.7 | the clear's next use is in a later submission, so nothing in its own proves the store unneeded |
+| the 2560x1440 window texture's 1920x1080 corner, the last copy | 7.9 + 7.9 | the copy's triangle is placed through uniforms, so `DM_NVN_LOAD_ELIDE` cannot prove it covers the corner |
+| the sun's shadow cascades (1000x1000 Depth16) | 0 + 7.6 | sampled later |
+| the rest (bloom chain, reflection faces, light masks, effects) | 17.3 + 29.5 | |
+
+The host's own passes (the upscale, clears of targets larger than their pass) are not in these counts. A pass dump of Link's house on the Mac mini with the same settings (`DM_NVN_PASSDUMP_ALL`, frame 4000: 91 MB loaded, 112 MB stored) agrees: of the stores, the host proves nothing unneeded (its reasons: read by a later draw, loaded again, or no proof before the submission ends), and over two dumped frames only about 5 MB is not sampled or loaded before its next clear, which may well be sampled through handle tables the dump does not show. `DM_NVN_STORE_ELIDE` skips 0.1-0.2 MB a frame (0.6 before [a clear under a render condition stopped counting](../../../docs/reference/rendering.md#a-clear-under-a-render-condition-counted-as-a-whole-overwrite)); `DM_NVN_LOAD_ELIDE` nothing. Both stay off.
+
+What can be skipped are [attachments a pass does not use](../../../docs/reference/rendering.md#attachments-a-pass-does-not-use): the depth prepass (one or two passes) attaches the scene colour with every channel masked, and three 960x540 and two 240x135 full-screen effect passes attach a depth they never test. In-run A/B on the Mac mini (M2 Pro), Apple TV run 19's settings, `DM_AB=300` with `DM_NVN_DS_OMIT=ab DM_NVN_COLOR_OMIT=ab`, MB a frame, load / store, the on phase against the off phases beside it:
+
+| | off | on | less |
+|---|---|---|---|
+| Link's house (`house` scene) | 96-97 / 120-121 | 86 / 117 | 10 + 4 |
+| the balcony (`balcony`) | 135 / 141 | 125 / 137 | 10 + 4 |
+| the forest floor (`forest`, one prepass pass) | 95 / 115 | 88 / 113 | 7 + 2 |
+
+No pass was split for a draw that needed what its pass left out. GPU time on the Mac does not change (house 13.8 ms on against 12.5 / 13.9 off, drifting with the scene; balcony 11.41 / 11.51 against 11.43 / 11.46): it has the bandwidth. On the Apple TV, 9-14 MB a frame at about 34 GB/s is roughly 0.3-0.4 ms of a frame (an estimate; not measured on the TV). The pictures were checked in the same runs, `DM_AB=4` with all three switches `ab` and `DM_NVN_SHOT` over presents 4100-4111 (each picture's frame and phase in the log): in the house, on the balcony and on the forest floor, pictures one or two frames apart differ only where something moves (Navi, leaves, butterflies, fireflies, the waterfall), the same between on and off frames as between two off frames.
+
+Open, not cut: waiting clears that land in passes of their own because the next pass attaches other targets (3-4 a frame here); in Link's house about 8 MB a frame could become clear load actions if a clear could wait across a pass that neither attaches nor samples its target. The 1080p clear at the frame's start (7.9 MB stored) is next used in a later submission.
+
 ## Quality options for slower GPUs
 
 Switches that trade some picture for GPU time, all off (full quality) by default on every platform. They are stubs of the frame step rule in [`patches.py`](patches.py), placed by their functions' fingerprints (`others` of the rule), and the rewriter declares the `GROUND_MIST`, `REFLECTION_INTERVAL`, `FOLIAGE`, `MODEL_LOD` and `SHADOW_CASCADES` capabilities when it places them. The first three: Measured on a Mac mini M2 Pro with the TV-like settings (`balcony` save, the 657 frame shaders as tv-all builds them, 2026-11-09), each option switched on and off every 300 frames inside one run (two separate full-quality runs differed by 1.4 ms, more than the smaller savings). GPU is the frame's command buffers added up (`@gpu_ms`), span the first start to the last end; means over about 1,700 frames a side. The Apple TV 4K's GPU is about 3-4 times slower, so expect about that many times the saving there (not measured on the TV).
@@ -201,6 +227,8 @@ From an empty save: at about 45 s `A` (title), `A` (New Game), then the movie. F
 
 ## Found on this game
 
+- [Attachments a pass does not use](../../../docs/reference/rendering.md#attachments-a-pass-does-not-use): the depth prepass's masked scene colour and the full-screen effects' untested depth, 9-14 MB a frame of attachment traffic with the Apple TV's settings ([Attachment traffic](#attachment-traffic-2026-11-13)).
+- [A clear under a render condition counted as a whole overwrite](../../../docs/reference/rendering.md#a-clear-under-a-render-condition-counted-as-a-whole-overwrite): resolved, with `DM_NVN_STORE_ELIDE=1` the stream showed through a layer drawn over it from the balcony.
 - [The 60 Hz link at 40 fps in fullscreen on a ProMotion screen](../../../docs/reference/frame-rate.md#the-60-hz-link-at-40-fps-in-fullscreen-on-a-promotion-screen): 40 fps in fullscreen on an M5 Pro MacBook Pro with the GPU at 10 ms of the 16.7, every present one 120 Hz refresh late and every other display-link tick skipped; the screen's fixed 60 Hz mode held 60.0 fps there and fullscreen now switches to it, with the 120 Hz link (59 fps) for screens with no such mode.
 - [The shader package and the shader map come from different splits](../../../docs/reference/packing.md#the-shader-package-and-the-shader-map-come-from-different-splits): resolved, a black screen with sound in a build through NX2Apple ([issue #1841](https://github.com/seedds/nxnative/issues/1841)); the present pass was translated from a terrain shader's record. Records now carry their keys, and the shader build finds them by key.
 - [Native mesh pipelines compiled at their first draw](../../../docs/reference/shaders.md#native-mesh-pipelines-compiled-at-their-first-draw): resolved. The foliage, shadows and enemies drawn with task and mesh shaders stalled at their first draw on a cold Metal cache (59.5 s of builds at the Kokiri Forest entry on an M5 Max, one frame of 42.9 s), as nothing recorded or kept their pipelines; `pso_manifest.tsv` now carries 164 `M` rows (Kokiri Forest, Hyrule Field, Castle Town, Hyrule Castle, and 41 from later play, Death Mountain Trail among it), and with the prepare step they are built before the first frame. Pipelines outside the list still stall once, then go into `pso_user.tsv`. With the first 123 alone, a cold first start (empty Metal cache and pipeline archive, M4 Pro) on a Death Mountain Trail save built 9 and 10 at their first draw in two runs, 2.7 and 4.2 s, frames of 1,775 and 1,657 ms; with all 164, none, worst frame 25.6 and 18.5 ms, the prepare step 29.6 and 29.3 s → 32.1 and 31.0 s.
