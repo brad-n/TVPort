@@ -439,6 +439,15 @@ class Saves(unittest.TestCase):
             self.assertEqual(backend.render_scale_arg('0.6'), 0.6)
             with self.assertRaises(Exception): backend.render_scale_arg('0.4')
 
+    def test_res_scale_reaches_the_app(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game = self.make_game(folder)
+            self.assertIn('DM_RES_SCALE=1.5\n', backend.write_env(game, 'handheld', 512, res_scale=1.5).read_text())
+            self.assertNotIn('DM_RES_SCALE', backend.write_env(game, 'handheld', 512).read_text())   # 1.0: off, the game's own sizes
+            self.assertEqual(backend.res_scale_arg('2'), 2.0)
+            with self.assertRaises(Exception): backend.res_scale_arg('2.5')
+            with self.assertRaises(Exception): backend.res_scale_arg('0.4')
+
     def test_render_scale_offered_only_with_the_stub(self):
         with tempfile.TemporaryDirectory() as folder:
             game = self.make_game(folder)

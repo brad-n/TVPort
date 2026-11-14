@@ -61,6 +61,7 @@ struct Game: Codable, Identifiable, Hashable {
     var compressGameData: String?     // "on" / "off"; nil = Automatic (on). Lossless zstd compression of the game files sent to the Apple TV (a DMSPARS1 v2 romfs.img)
     var pipelineGPU: String?          // GPU architectures for the pipeline archive (build script --gpu); empty = none
     var extraEnvironment: String?     // KEY=VALUE lines for the app's env file
+    var resScale: Double?             // the engine-wide resolution scale (backend --res-scale, DM_RES_SCALE); nil = 1, off. Offered only where the game's shaders have the rescale code
     var addons: [GameAddon]?
     var id: String { folder }
 
@@ -489,6 +490,7 @@ final class Library: ObservableObject {
         if game.showFPS { arguments.append("--fps") }
         if let scale = game.renderScale, scale < 1, info.render_scale == true { arguments += ["--render-scale", String(scale)] }
         if let choice = game.upscaler, choice == "metalfx" || choice == "off" { arguments += ["--upscaler", choice] }
+        if let scale = game.resScale, scale != 1, info.res_scale == true { arguments += ["--res-scale", String(scale)] }
         if game.coolWhenHot == false, info.frame_step == true { arguments.append("--no-thermal-cap") }
         if let fps = game.fpsTarget, (info.fps_target ?? 0) != 0, fps != info.fps_target { arguments += ["--fps-target", String(fps)] }
         if !team.isEmpty { arguments += ["--team", team] }

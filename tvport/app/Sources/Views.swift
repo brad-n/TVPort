@@ -573,6 +573,12 @@ struct SettingsForm: View {
                             Text("Off").tag("off")
                         }
                         note("On, and Automatic, which is on, compresses the game files on this Mac while building (lossless: the game reads exactly the same data) and sends them in that form, which can save several GB on the Apple TV. It takes a few minutes more to build. If that can't be done the build carries on and sends the files as they are.")
+                        if library.info?.res_scale == true {
+                            Picker("Resolution scale", selection: resScaleBinding) {
+                                ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { Text("\(Int($0 * 100)) %").tag($0) }
+                            }
+                            note("Renders the game's 3D larger or smaller than the game chose, for any game. Above 100 % it takes more GPU time and much more memory (200 % takes about four times the memory of each scaled target), and the Apple TV stops an app past about 2 GB. 100 % is off.")
+                        }
                         Toggle("Metal 4 pipelines", isOn: flagBinding(\.metal4Pipelines))
                         note("Turns on DM_PSO_MTL4 and keeps the pulling shader libraries in the build. Experimental.")
                         TextField("Pipeline archive GPU", text: textBinding(\.pipelineGPU), prompt: Text("Empty for none, or g18p"))
@@ -707,6 +713,9 @@ struct SettingsForm: View {
         Binding(get: { library.current?.upscaler ?? "game" }, set: { value in library.update { $0.upscaler = value == "game" ? nil : value } })
     }
 
+    private var resScaleBinding: Binding<Double> {
+        Binding(get: { library.current?.resScale ?? 1 }, set: { value in library.update { $0.resScale = value == 1 ? nil : value } })
+    }
     private var renderScaleBinding: Binding<Double> {
         Binding(get: { library.current?.renderScale ?? 1 }, set: { value in library.update { $0.renderScale = value < 1 ? value : nil } })
     }
