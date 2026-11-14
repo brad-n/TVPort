@@ -10,6 +10,12 @@ What changes in this fork, release by release, in plain terms. The full descript
 
 ## Unreleased (on `switch2-experimental`)
 
+Nothing yet: everything that was here is in build 1643.
+
+## 1.3.0 build 1643 (2026-11-14)
+
+Everything below was checked with the full test pass (the iOS and tvOS compile check, the GPU tests, the TVPort and tool tests). Where an item says it is waiting for an Apple TV session, it works on a Mac with the Apple TV's limits simulated and has an off switch.
+
 **Memory on the Apple TV**
 - **Memory relief** (`DM_NVN_MEM_RELIEF`, on by default on Apple TV, iPhone and iPad): when the app gets within 256 MB of the memory tvOS allows it, the engine gives back memory it was only keeping for reuse, before tvOS ends the app. That covers spare render-target memory, render targets the game has already drawn over, unused upload space and oversized command memory. On a Mac mini with the Apple TV's memory limit simulated, it lowered the highest memory use by 150 to 270 MB, with no change in frame time. Waiting for an Apple TV session.
 - **Render targets from finished scenes are let go:** a group of render targets the game made for an earlier scene is now released once every target in it is dead (before, the whole group stayed: up to 113 MB in Ocarina of Time).
