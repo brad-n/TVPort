@@ -1483,6 +1483,7 @@ typedef struct seg_clk seg_clk; static seg_clk *g_sclk; static void seg_clk_put(
 // GPU would at that point in the queue: Ocarina of Time reports its queries a submission ahead of the conditional draws, so every one has landed by then (1.48 million
 // conditions on its Kokiri Forest route, 42% false; the host drew them all, GPU p50 17.06 → 16.44 ms a frame on an M4 Pro). Inside a block evaluated false, draws and clears are dropped
 static int g_rc_skip;   // logical queue state: a render-enable block evaluated false is active
+static int g_rc_cond;   // logical queue state: a conditional render block, or render enable false, is active: what it guards may or may not run (the store lookahead counts no clear under it)
 // Latest command-ordered writer of each report counter. Completed reports are read
 // from memory, so CPU rewrites remain visible. Unfinished queries stay unknown;
 // timestamp counters and explicit writes can supply known bytes before completion.
@@ -6326,7 +6327,7 @@ static void ts_boundary(void) {   // the end of a segment and the start of the n
 }
 static int enc_open(void) { return g_enc != nil; }
 // Target info of the current render pass: determined once from the attachments at rp_begin and shared by all draws in the pass (pipeline key, depth-stencil, viewport / scissor all depend only on it)
-static struct { uint32_t cfmt[8], dfmt, sfmt, samples; int hd, hs; NSUInteger tw, th; uint64_t serial, reg_gen, ser_gen, range_dirty; int range_external, range_depth_nonro, layered; __unsafe_unretained id<MTLTexture> range_color, range_depth; } g_pass;
+static struct { uint32_t cfmt[8], dfmt, sfmt, samples, comit, domit; int hd, hs; NSUInteger tw, th; uint64_t serial, reg_gen, ser_gen, range_dirty; int range_external, range_depth_nonro, layered; __unsafe_unretained id<MTLTexture> range_color, range_depth; } g_pass;
 static int g_rp_layered;   // the pass about to open is for a vertex shader that writes the layer (draw → rp_begin_ex)
 // Slice-merged passes (DM_NVN_SLICE_MERGE, on by default; 0 off): consecutive passes that each draw into another layer of one level of the same array or cube texture,
 // with nothing between them but state, uniform updates and draws (no game barrier, clear, copy or dispatch: sm_scan), run as one layered pass. Each draw reaches its layer through a vertex
@@ -6551,8 +6552,17 @@ static int tbdr_on(void) { static int v = -1; if (v < 0) { const char *e = geten
 // the pass's store into DontCare, for an attachment that is private, single-sample, not window / present, not mirrored to guest storage and not backed by an image heap, and, if a bindless draw comes before the clearing event,
 // only when no texture pool descriptor was ever written for it (sdx_decide). Everything else stores as before. DM_NVN_LOAD_ELIDE=1 (default 0) likewise lets the first-draw coverage proof (first_draw_covers) turn a colour
 // attachment's Load into DontCare when the pass's first draw covers the whole attachment, without TBDR
-static int store_elide_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_STORE_ELIDE"); v = e && !strcmp(e, "1"); if (v) MLOG("DM_NVN_STORE_ELIDE=1: attachments cleared whole before their next use in the submission are not stored (the lookahead runs without DM_NVN_TBDR)"); } return v; }
+// `ab` alternates it with DM_AB: the value is taken at each submission's start (mtl_sub_index), as its lookahead index is built there for the whole submission
+static int g_se_mode = -1, g_se_sub;
+static int store_elide_mode(void) { if (g_se_mode < 0) { g_se_mode = sw_mode("DM_NVN_STORE_ELIDE", 0); if (g_se_mode) MLOG("DM_NVN_STORE_ELIDE=%s: attachments cleared whole before their next use in the submission are not stored (the lookahead runs without DM_NVN_TBDR)", getenv("DM_NVN_STORE_ELIDE")); } return g_se_mode; }
+static int store_elide_on(void) { return g_se_sub; }
 static int load_elide_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_LOAD_ELIDE"); v = e && !strcmp(e, "1"); if (v) MLOG("DM_NVN_LOAD_ELIDE=1: a colour attachment the pass's first draw covers whole is not loaded (no DM_NVN_TBDR needed)"); } return v; }
+// DM_NVN_DS_OMIT / DM_NVN_COLOR_OMIT (att_need): a draw pass leaves out a depth-stencil attachment none of its draws tests or writes, and a colour attachment none of them writes, so
+// neither is loaded or stored (with DM_NVN_TBDR the depth half is pass_ds_need's, as before). `ab` alternates each with DM_AB
+static int ds_omit_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_DS_OMIT", 1); return m; }
+static int co_omit_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_COLOR_OMIT", 1); return m; }
+static uint64_t g_om_n[2], g_om_bytes[2], g_om_split;   // passes that left out depth-stencil [0] / colour [1] attachments, the bytes of them they did not load, draws that ended such a pass because they use one
+static uint32_t g_rp_comit;   // the colour attachments the next rp_begin_ex leaves out (set by draw_ for its own call only)
 static uint64_t g_win_n, g_win_bytes;   // window passes in a corner area (DM_NVN_WINDOW_AREA), and the load and store bytes outside the corner they did not move
 static uint64_t g_el_store_n, g_el_store_bytes, g_el_load_n, g_el_load_bytes, g_el_kept[10];   // elided stores / their bytes, elided loads / their bytes; stores kept by the verdict's reason (index: why, 8 redundant but the attachment is not eligible, 9 a bindless draw may read it)
 static int rt_range_on(void) { static int v = -1; if (v < 0) { const char *e=getenv("DM_NVN_RT_RANGE"); v=e && !strcmp(e,"1"); } return v; }   // Narrow candidate, off by default
@@ -7210,9 +7220,13 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
         if (tw && th) { NSUInteger w = MIN(tw, (NSUInteger)MAX((long)R.sc.x + R.sc.w, 1)), h = MIN(th, (NSUInteger)MAX((long)R.sc.y + R.sc.h, 1));
             if (w * h * 4 <= tw * th * 3) { win_w = w; win_h = h; } }
     }
-    int any = 0;
+    int any = 0; uint32_t comit = 0;
     for (int i = 0; i < R.rt.n; i++) {
         if (!R.rt.color[i] || (clear_only == 1 && !R.clear_c[i]) || (g_geo_omit_colors && !R.clear_c[i])) continue;
+        if (i < 8 && (g_rp_comit >> i & 1) && !R.clear_c[i] && clear_only != 1) {   // no draw of this pass writes it (att_need): not loaded, not stored, its memory unchanged
+            id<MTLTexture> mt = tex_mtl(R.rt.color[i]); NSUInteger lv = R.rt.has_cview[i] && R.rt.cview[i].set_levels ? R.rt.cview[i].base_level : 0;
+            if (mt) g_om_bytes[1] += att_bytes(mt, lv); comit |= 1u << i;
+            PD("O %llu c%d ser=%llu left out: no draw of the pass writes it", g_stat_pass + 1, i, (unsigned long long)R.rt.color[i]->serial); continue; }
         if (rt_dup_slot(&R.rt, i)) continue;   // a slot attached twice is not attached (see rt_dup_slot)
         attach(pd.colorAttachments[i], R.rt.color[i], &R.rt.cview[i], R.rt.has_cview[i]);
         if (!pd.colorAttachments[i].texture) continue;
@@ -7380,7 +7394,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
             || (!t->depth && pd.colorAttachments[t->idx].resolveTexture) || pd.renderTargetArrayLength > 1; }
     memset(R.clear_c, 0, sizeof R.clear_c); R.clear_d = R.clear_s = 0;
     {   // Pass info (same convention as the former per-draw fetch: colors take each attachment's base texture format; sample count takes the last color attachment, or depth if there is depth)
-        uint64_t ser = g_pass.serial + 1; memset(&g_pass, 0, sizeof g_pass); g_pass.serial = ser;
+        uint64_t ser = g_pass.serial + 1; memset(&g_pass, 0, sizeof g_pass); g_pass.serial = ser; g_pass.comit = comit; if (comit) g_om_n[1]++;
         for (int i = 0; i < R.rt.n && i < 8; i++) { id<MTLTexture> t = R.rt.color[i] ? pd.colorAttachments[i].texture : nil;
             if (t) { g_pass.cfmt[i] = (uint32_t)t.pixelFormat; g_pass.samples = (uint32_t)t.sampleCount; } }
         id<MTLTexture> dt = R.rt.depth ? pd.depthAttachment.texture : nil, stt = R.rt.depth ? pd.stencilAttachment.texture : nil;   // Depth / stencil attachments are fetched separately (possibly only one of them is attached)
@@ -9521,7 +9535,7 @@ static void prog_resolve(void) {
 }
 static int g_state_inited;
 static void state_reset(void) {
-    g_rc_skip=0;
+    g_rc_skip=0; g_rc_cond = 0;
     g_state_inited = 1;
     memset(&S, 0, sizeof S);
     g_pso_dirty = g_dss_dirty = 1;
@@ -9534,7 +9548,7 @@ static void state_reset(void) {
 
 // GPU bindings belong to a queue, including across submissions. FFX/X-2 destroys its launcher's queue before creating a game's: a global S kept freed launcher programs in S.bst,
 // and X-2's first fragment-only bind dereferenced that stale vertex program in keys_hash. Separate queues also retain their own bindings when submissions alternate (Three Houses).
-typedef struct queue_state { uint64_t serial; typeof(S) s; typeof(R) r; tex_t rt_tex[9]; uint64_t rt_pins[9]; prog_t programs[6]; int rc_skip; struct queue_state *next; } queue_state;
+typedef struct queue_state { uint64_t serial; typeof(S) s; typeof(R) r; tex_t rt_tex[9]; uint64_t rt_pins[9]; prog_t programs[6]; int rc_skip, rc_cond; struct queue_state *next; } queue_state;
 static queue_state *g_queue_states, *g_active_queue;
 // Recording snapshots belong to command memory, not to the queue. Keep only the
 // bound target descriptions after CPU replay, before this submission can finish
@@ -9583,10 +9597,10 @@ static void queue_program_preserve(void) {
 }
 void mtl_queue_activate(uint64_t serial) {   // caller holds the submission lock
     if (g_active_queue && g_active_queue->serial == serial) return;
-    if (g_active_queue) { g_active_queue->s = S; g_active_queue->r = R; g_active_queue->rc_skip=g_rc_skip; }
+    if (g_active_queue) { g_active_queue->s = S; g_active_queue->r = R; g_active_queue->rc_skip=g_rc_skip; g_active_queue->rc_cond = g_rc_cond; }
     queue_state *q = g_queue_states;
     while (q && q->serial != serial) q = q->next;
-    if (q) { S = q->s; R = q->r; g_rc_skip=q->rc_skip; prog_resolve(); }
+    if (q) { S = q->s; R = q->r; g_rc_skip=q->rc_skip; g_rc_cond = q->rc_cond; prog_resolve(); }
     else {
         q = calloc(1, sizeof *q); if (!q) MDIE("queue state allocation failed");
         q->serial = serial; q->next = g_queue_states; g_queue_states = q;
@@ -14207,6 +14221,7 @@ static void sdx_ev_add(sdx_ev e) { if (sdx_bucket(e.ser, 0) < 0) return; if (g_s
 static void sdx_lvsl(const view_t *v, int hv, uint16_t *lv, uint16_t *sl) { *lv = (uint16_t)(hv && v->set_levels ? v->base_level : 0); *sl = (uint16_t)(hv && v->set_layers ? v->min_layer : 0); }
 static uint32_t *g_sdx_bl; static uint32_t g_sdx_nbl, g_sdx_blcap;   // sequence numbers of the draws and dispatches whose program takes texture handles from memory (the host cannot tell which textures they sample when the index is built)
 static p_scissor g_pp_sc; static int g_pp_hsc;   // the scissor as the index walk sees it (a clear under a partial scissor clears only part of the attachment)
+static int g_pp_rc;   // a render condition as the index walk sees it (g_rc_cond): the replay skips a clear under one that evaluates false, so it overwrites nothing for certain
 static int sdx_handle_reader(NvProg *pr, int compute) {
     for (int st = 0; st < 6; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || compute != (st == 5)) continue;
         if (sh->rf.bindless || sh->rf.dyn || sh->rf.pool) return 1;
@@ -14233,14 +14248,15 @@ static void sdx_walk(const uint8_t *p, int depth) {
                 if (r->depth) sdx_bucket(r->depth->serial, 1);
                 break; }
             case OP_SCISSOR: { p_scissor sc; memcpy(&sc, a, sizeof sc); g_pp_sc = sc; g_pp_hsc = 1; break; }
+            case OP_RENDER_COND: { const p_render_cond *rc = a; g_pp_rc = rc->mode != 2; break; }
             case OP_CLEAR_COLOR: { const p_clear_color *c = a; const p_set_rt *r = g_pp_rt;
-                if (!r || (c->mask & 0xf) != 0xf || c->index < 0 || c->index >= r->n || c->index >= 8 || !r->color[c->index]) break;
+                if (g_pp_rc || !r || (c->mask & 0xf) != 0xf || c->index < 0 || c->index >= r->n || c->index >= 8 || !r->color[c->index]) break;
                 if (store_elide_on() && !sdx_scissor_covers(r->color[c->index], &r->cview[c->index], r->has_cview[c->index])) break;   // a partial clear: not a whole-attachment overwrite
                 uint16_t lv, sl; sdx_lvsl(&r->cview[c->index], r->has_cview[c->index], &lv, &sl); int last = -1;   // When the same subresource is attached at several indices, the last one counts
                 for (int k = 0; k < r->n && k < 8; k++) { uint16_t l2, s2; if (!r->color[k] || r->color[k]->serial != r->color[c->index]->serial) continue; sdx_lvsl(&r->cview[k], r->has_cview[k], &l2, &s2); if (l2 == lv && s2 == sl) last = k; }
                 if (last == c->index) sdx_ev_add((sdx_ev){seq, g_pp_rtseq, r->color[c->index]->serial, p, lv, sl, SDX_CLEAR, 0, 0, 0});
                 break; }
-            case OP_CLEAR_DS: { const p_clear_ds *c = a; const p_set_rt *r = g_pp_rt; if (!r || !r->depth) break;
+            case OP_CLEAR_DS: { const p_clear_ds *c = a; const p_set_rt *r = g_pp_rt; if (g_pp_rc || !r || !r->depth) break;
                 if (store_elide_on() && !sdx_scissor_covers(r->depth, &r->dview, r->has_dview)) break;
                 uint16_t lv, sl; sdx_lvsl(&r->dview, r->has_dview, &lv, &sl);
                 if (c->depth_mask) sdx_ev_add((sdx_ev){seq, g_pp_rtseq, r->depth->serial, p, lv, sl, SDX_CLEAR, 1, !r->has_dview, 0});
@@ -14280,7 +14296,8 @@ static void sdx_walk(const uint8_t *p, int depth) {
 static void mtl_sub_index_(const uint64_t *h, int n);
 void mtl_sub_index(const uint64_t *h, int n) { cp_stamp start = cp_begin(); mtl_sub_index_(h, n); cp_end(7, start); }
 static void mtl_sub_index_(const uint64_t *h, int n) {   // Start of submit (hle_nvn.c QueueSubmitCommands): build this submit's store lookahead index
-    g_xv_ntouch = 0; g_sdx_n = g_sdx_nop = 0; g_rtx_n = g_drx_n = 0; g_exec_seq = 0; g_sdx_nbl = 0; g_sdx_ok = tbdr_on() || store_elide_on(); g_pp_sc = R.sc; g_pp_hsc = R.has_sc;
+    g_se_sub = sw_on(store_elide_mode());   // DM_NVN_STORE_ELIDE for this whole submission
+    g_xv_ntouch = 0; g_sdx_n = g_sdx_nop = 0; g_rtx_n = g_drx_n = 0; g_exec_seq = 0; g_sdx_nbl = 0; g_sdx_ok = tbdr_on() || store_elide_on(); g_pp_sc = R.sc; g_pp_hsc = R.has_sc; g_pp_rc = g_rc_cond;
     if (!g_sdx_ok) { g_xv_n = 0; g_xv_block = 1; return; }   // Index unavailable: clear the ledger and add nothing in this submit (the next touch cannot be verified)
     g_xv_block = 0;
     memset(g_sdx_hk, 0, sizeof g_sdx_hk); g_sdx_nb = 0;
@@ -16236,6 +16253,87 @@ static void draw_multi(const p_multi_draw *m) {
     g_mdx_range = NULL;
     g_mdxc.next = NULL;
 }
+// ---------- Attachments a draw pass does not use (DM_NVN_DS_OMIT, DM_NVN_COLOR_OMIT) ----------
+// A pass that attaches a target its draws never touch still loads it whole on a tile-based GPU (the store is already skipped when nothing was written, udc_on): Ocarina of Time's depth
+// prepass attaches the 960x540 scene colour with every channel masked, and its full-screen effect passes attach the scene depth with the depth and stencil tests off, about 10 MB of
+// loads a frame in Link's house. When a draw opens a pass, the replay is scanned ahead over the pass's draws (om_scan, to the first op that ends the pass for certain; a SetRenderTargets
+// of the same targets continues it, rt_same, and buffer copies and uniform updates are passed, which can only add needs): an attachment is left out when no draw tests or writes depth
+// or stencil (depth-stencil) or no draw writes the colour attachment (its channel mask is 0 in every draw and none writes an image or storage buffer, om_draw_writes), no clear of it waits or comes in the pass, the opening draw does not sample it through a slot (same-pass feedback reads
+// such an attachment from the tile), and what stays attached keeps the pass's area (an attachment smaller than the rest stays). A later draw of the pass that does use one ends the pass
+// first (draw_), so a scan that stops too early costs a split, never a picture. Not in TBDR mode (pass_ds_need), layered passes, slice-merged passes or geometry draws.
+// The colour attachments a draw may write: those its channel mask enables (every pipeline takes its write mask from the channel mask, pso_desc, narrowed to the shader's outputs; the
+// geometry and mesh pipelines copy pso_desc's, and geo_color_omit leaves a masked colour out on the same fact), all of them for a program that writes an image or storage buffer, which
+// may alias one, or one that could not be read (known 0)
+static uint32_t om_draw_writes(NvShader *const sh[5], uint32_t chmask, int known) {
+    if (!known) return 0xff;
+    for (int st = 0; st < 5; st++) { NvShader *s = sh[st]; if (!s) continue;
+        for (int i = 0; i < s->rf.nb; i++) { const nvn_rbind *b = &s->rf.b[i];
+            if (b->rw && (b->kind == NVN_RB_IMG || b->kind == NVN_RB_IMGU || b->kind == NVN_RB_SBUFP || b->kind == NVN_RB_SBUFU || b->kind == NVN_RB_GMEM)) return 0xff; } }
+    uint32_t w = 0; for (int k = 0; k < 8; k++) if ((chmask >> (4 * k)) & 0xf) w |= 1u << k;
+    return w;
+}
+static uint32_t om_prog_writes(NvProg *pr, uint32_t chmask) { NvShader *sh[5] = {0}; if (pr) for (int st = 0; st < 5; st++) sh[st] = pr->sh[st]; return om_draw_writes(sh, chmask, pr != nil); }
+static uint32_t om_slot_reads(NvProg *pr) {   // the colour attachments the draw's fragment shader samples through a texture or image slot (fb_prepare's candidates)
+    NvShader *fs = pr ? pr->sh[1] : nil; uint32_t m = 0; if (!fs) return 0;
+    for (int i = 0; i < fs->rf.nb; i++) { const nvn_rbind *b = &fs->rf.b[i];
+        int image = b->kind == NVN_RB_IMG && b->reg < 32;
+        if (!image && (b->kind != NVN_RB_TEX || b->reg >= NTEX)) continue;
+        uint64_t h = image ? S.img[1][b->reg] : tex_slot_h(S.tex[1], S.img[1], b->reg), ser = h ? h_ser(h) : 0; if (!ser) continue;
+        for (int k = 0; k < R.rt.n && k < 8; k++) if (R.rt.color[k] && R.rt.color[k]->serial == ser) m |= 1u << k; }
+    return m;
+}
+enum { OM_RET = 0, OM_END = 1, OM_ALL = 2 };
+typedef struct { ds_st ds; uint32_t chm; const prog_t *bst[5]; int dneed; uint32_t cneed; int nops; } om_st;
+static int om_scan(const uint8_t *p, om_st *o, int depth) {
+    for (;;) {
+        if (++o->nops > 20000) return OM_ALL;
+        op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8;
+        if (g_hoist_n && hoist_skipped(p)) { p += h.size; continue; }
+        switch (h.op) {
+            case OP_END: return OM_RET;
+            case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
+            case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (depth >= 8) return OM_ALL; int r = om_scan((const uint8_t *)t, o, depth + 1); if (r != OM_RET) return r; break; }
+            case OP_SET_RT: if (rt_same(&R.rt, (const p_set_rt *)a)) break; return OM_END;   // the same targets again: the pass goes on (rtc_on); others end it
+            case OP_COPY_B2T: case OP_COPY_T2B: case OP_COPY_T2T: case OP_DRAW_TEX: case OP_CLEAR_TEX: case OP_DISPATCH: return OM_END;
+            case OP_DLSS: return OM_ALL;
+            case OP_CLEAR_COLOR: { const p_clear_color *c = a; if (c->index >= 0 && c->index < 8) o->cneed |= 1u << c->index; else o->cneed = 0xff; break; }
+            case OP_CLEAR_DS: o->dneed = 3; break;
+            case OP_BIND_STATE: { const p_bind_state *b = a; if (b->kind == 5) memcpy(&o->ds, b->bytes, sizeof o->ds); else if (b->kind == 2) memcpy(&o->chm, b->bytes, sizeof o->chm); break; }
+            case OP_BIND_PROGRAM: { const p_bind_program *bp_ = a; int sb = gfx_stage_bits(bp_->stages); for (int st = 0; st < 5; st++) if (sb >> st & 1) o->bst[st] = bp_->prog; break; }
+            case OP_DRAW: case OP_DRAW_IDX: case OP_MULTI_DRAW: {
+                o->dneed |= (o->ds.dt || o->ds.dw ? 1 : 0) | (o->ds.st ? 2 : 0);
+                NvShader *sh[5] = {0}; int known = 1;
+                for (int st = 0; st < 5; st++) if (o->bst[st]) { NvProg *q = prog_get(o->bst[st]); if (!q) known = 0; else sh[st] = q->sh[st]; }
+                o->cneed |= om_draw_writes(sh, o->chm, known);
+                if (o->dneed == 3 && (o->cneed & 0xff) == 0xff) return OM_ALL;
+                break; }
+            default: break;
+        }
+        p += h.size;
+    }
+}
+static NSUInteger om_ext(const tex_t *t, const view_t *v, int hv, int h) { NSUInteger lv = hv && v->set_levels ? v->base_level : 0; return mip_extent(h ? (t->d.target == 0 || t->d.target == 3 ? 1 : t->d.height) : t->d.width, lv); }
+// The pass's need for depth-stencil (bits 1 depth 2 stencil, 3 all, as pass_ds_need) and, in *cneed, the colour attachments it must attach
+static int att_need(NvProg *pr, uint32_t *cneed) {
+    int dso = sw_on(ds_omit_mode()), coo = sw_on(co_omit_mode()); *cneed = 0xff;
+    if ((!dso && !coo) || !R.has_rt || !g_exec_next || g_ret_n > 16 || g_mtk.on || g_geo_mesh.on || (pr && pr->sh[0] && pr->sh[0]->layer_out)) return 3;
+    om_st o; memset(&o, 0, sizeof o); o.ds = S.ds; o.chm = S.chmask.mask; memcpy(o.bst, S.bst, sizeof o.bst);
+    o.dneed = (R.clear_d || S.ds.dt || S.ds.dw ? 1 : 0) | (R.clear_s || S.ds.st ? 2 : 0);
+    o.cneed = om_prog_writes(pr, S.chmask.mask) | om_slot_reads(pr); for (int k = 0; k < 8; k++) if (R.clear_c[k]) o.cneed |= 1u << k;
+    int r = o.dneed == 3 && o.cneed == 0xff ? OM_ALL : om_scan(g_exec_next, &o, 0);
+    for (int k = g_ret_n - 1; r == OM_RET && k >= 0; k--) r = om_scan(g_ret[k], &o, 0);
+    for (int k = 0; r == OM_RET && k < g_nrest; k++) r = om_scan((const uint8_t *)g_rest[k], &o, 0);
+    int dn = r == OM_ALL || !dso || !R.rt.depth ? 3 : o.dneed; uint32_t cn = r == OM_ALL || !coo ? 0xff : o.cneed & 0xff;
+    // what stays attached must keep the pass's area (a pass covers its smallest attachment), and something must stay
+    NSUInteger mw = NSUIntegerMax, mh = NSUIntegerMax; int keep = 0;
+    for (int k = 0; k < R.rt.n && k < 8; k++) if (R.rt.color[k] && (cn >> k & 1)) { keep++; mw = MIN(mw, om_ext(R.rt.color[k], &R.rt.cview[k], R.rt.has_cview[k], 0)); mh = MIN(mh, om_ext(R.rt.color[k], &R.rt.cview[k], R.rt.has_cview[k], 1)); }
+    if (R.rt.depth && dn) { keep++; mw = MIN(mw, om_ext(R.rt.depth, &R.rt.dview, R.rt.has_dview, 0)); mh = MIN(mh, om_ext(R.rt.depth, &R.rt.dview, R.rt.has_dview, 1)); }
+    if (!keep) { *cneed = 0xff; return 3; }
+    for (int k = 0; k < R.rt.n && k < 8; k++) if (R.rt.color[k] && !(cn >> k & 1) && (om_ext(R.rt.color[k], &R.rt.cview[k], R.rt.has_cview[k], 0) < mw || om_ext(R.rt.color[k], &R.rt.cview[k], R.rt.has_cview[k], 1) < mh)) cn |= 1u << k;
+    if (R.rt.depth && dn != 3 && (om_ext(R.rt.depth, &R.rt.dview, R.rt.has_dview, 0) < mw || om_ext(R.rt.depth, &R.rt.dview, R.rt.has_dview, 1) < mh)) dn = 3;
+    if (dn != 3 || cn != 0xff) PD("O %llu lookahead: depth-stencil need %d (1 depth 2 stencil), colours used %#x, scanned %d ops, %s", g_stat_pass + 1, dn, cn, o.nops, r == OM_END ? "to the pass end" : "to the submission end");
+    *cneed = cn; return dn;
+}
 static void draw_(const p_draw *dw, const p_draw_idx *di);
 // Diagnostic switch for measuring an upper bound DM_NVN_SKIP_FS=<fragment key>[,<fragment key>...] (none by default): drops all draws of these fragment shaders (the picture will be wrong;
 // only used in real-device ABA to measure "how much GPU time this class of draws is worth in total"), and the same-process alternating measurement's phase (DM_NVN_UB). Task / mesh
@@ -16330,6 +16428,8 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
         if (k >= 0) { uint64_t s_; int lv, sl; rt_sub(&R.rt, k, &s_, &lv, &sl); const tex_t *t = k == 8 ? R.rt.depth : R.rt.color[0]; if ((int)MAX(t->d.width >> lv, 1u) <= small) return; } } }
     if (S.poly.cull == NVN_FACE_FRONT_AND_BACK && !S.rast_discard) { PD("Z %llu draw skipped (before the pass begins): both faces culled", g_stat_pass + !g_enc); return; }
     // The continued render pass may have been opened with fewer depth / stencil attachments (open modes 2 / 3 / 4): if the plane this draw needs is not attached, split before it (on reopen, attach per the new lookahead)
+    if (g_enc && !tbdr_on() && (((g_pass.domit & 1) && (S.ds.dt || S.ds.dw)) || ((g_pass.domit & 2) && S.ds.st) || (g_pass.comit && ((om_prog_writes(pr, S.chmask.mask) | om_slot_reads(pr)) & g_pass.comit)))) {
+        g_om_split++; PD("M %llu a draw uses an attachment its pass left out (depth %d stencil %d, colours %#x); split here", g_stat_pass, (int)(S.ds.dt || S.ds.dw), (int)S.ds.st, g_pass.comit); rp_end(); }   // see att_need
     if (g_rt_merged && g_enc_mode != 0 && (((S.ds.dt || S.ds.dw) && !g_pass.hd) || (S.ds.st && !g_pass.hs))) {
         static int once2; if (!once2++) MLOG("same-target continuation: a draw in the continued pass needs a depth / stencil plane that is not attached; split here (first case pass %llu)", g_stat_pass);
         PD("M %llu a draw in the continued pass needs a depth / stencil plane that is not attached; split here", g_stat_pass); rp_end(); }
@@ -16361,7 +16461,15 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     if (!g_enc && tbdr_on() && !g_geo_program && !defer_has_in_p() && !g_defer_replaying && !g_fz.active && !g_fz_checking && g_exec_next) { defer_try(dw, di); if (g_defer_cur->active && g_defer_cur->in_p) return; }
     if (!g_enc && tbdr_on() && !g_fz_checking && !g_geo_program) fuse_try();   // Readable tile render pass merge is on by default; when the structure / same-pixel proof does not hold it still falls back to a normal render pass, and it is not re-entered during the CHECK redraw
     if (!g_enc && !tbdr_on() && !g_geo_program && cshoist_on()) cs_hoist_try(pr, dw, di);   // see DM_NVN_CS_HOIST
-    int need = g_enc || !tbdr_on() ? 3 : pass_ds_need(), mode = defer_q_draw ? 0 : need == 0 ? 2 : need == 2 ? 3 : need == 1 ? 4 : 0;   // 2 attach neither, 3 attach stencil only, 4 attach depth only
+    uint32_t cneed = 0xff; int need = g_enc ? 3 : tbdr_on() ? pass_ds_need() : g_geo_program || defer_q_draw ? 3 : att_need(pr, &cneed), mode = defer_q_draw ? 0 : need == 0 ? 2 : need == 2 ? 3 : need == 1 ? 4 : 0;   // 2 attach neither, 3 attach stencil only, 4 attach depth only
+    int om_d = 0;   // the planes att_need left out (1 depth 2 stencil): only a draw that uses one of those ends the pass (a stencil test on a depth-only format uses nothing)
+    if (mode && !tbdr_on()) {   // att_need: what the mode leaves out of this depth-stencil texture; nothing (a stencil-only need of a depth-only format, say) is mode 0
+        id<MTLTexture> dt = tex_mtl(R.rt.depth); MTLPixelFormat pf = dt.pixelFormat; int comb = pf == MTLPixelFormatDepth32Float_Stencil8 || pf == MTLPixelFormatDepth24Unorm_Stencil8;
+        int hasd = comb || pf == MTLPixelFormatDepth16Unorm || pf == MTLPixelFormatDepth32Float, hass = comb || pf == MTLPixelFormatStencil8 || pf == MTLPixelFormatX32_Stencil8;
+        int od = hasd && (mode == 2 || mode == 3), os = hass && (mode == 2 || mode == 4);
+        if (!dt || (!od && !os)) mode = 0;
+        else { om_d = od | os << 1; uint64_t b = att_bytes(dt, R.rt.has_dview && R.rt.dview.set_levels ? R.rt.dview.base_level : 0); g_om_n[0]++; g_om_bytes[0] += !comb ? b : od && os ? b : od ? b / 5 * 4 : b / 5;
+               PD("O %llu depth-stencil ser=%llu left out:%s%s", g_stat_pass + 1, (unsigned long long)R.rt.depth->serial, od ? " depth" : "", os ? " stencil" : ""); } }
     int skip_d = mode != 0;
     if (!g_enc) { g_fd_dw = dw; g_fd_di = di; }
     g_rp_layered = pr->sh[0] && pr->sh[0]->layer_out;
@@ -16369,7 +16477,8 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     if (g_enc && g_sm_pass && draw_samples_rt(pr)) { PD("M %llu a draw in the slice-merged pass samples its attachment; split here", g_stat_pass); rp_end(); }
     if (!g_enc && mode == 0 && !g_rp_layered && !defer_q_draw && g_exec_next && !tbdr_on() && !g_geo_program && sm_on()) sm_plan(pr);
     vbuf_prepare(pr->sh[0] ? &pr->sh[0]->rf : NULL, dw, di);   // an unaligned GPU-written stream, or one the draw reads past, needs its ordered copy before the render encoder
-    id<MTLRenderCommandEncoder> en = rp_begin_ex(mode);
+    g_rp_comit = !g_enc && !g_sm_plan.on && !g_rp_layered ? ~cneed & 0xff : 0;
+    id<MTLRenderCommandEncoder> en = rp_begin_ex(mode); g_rp_comit = 0; if (en && om_d) g_pass.domit = (uint32_t)om_d;
     g_rp_layered = 0; g_sm_plan.on = 0;
     g_fd_dw = NULL; g_fd_di = NULL;
     if (!en) { PD("Z %llu draw skipped: the render pass did not begin vs=%.16s fs=%.16s", g_stat_pass, pr && pr->sh[0] ? pr->sh[0]->key : "-", pr && pr->sh[1] ? pr->sh[1]->key : "-"); return; }   // Z lines: why a draw was dropped at these early returns
@@ -17745,7 +17854,7 @@ static void clear_color_tri(const p_clear_color *c) {
     int slot = c->index, mask = c->mask & 0xf;
     if (!mask || slot < 0 || slot >= 8 || slot >= R.rt.n || !R.rt.color[slot]) return;
     id<MTL4RenderCommandEncoder> en = rp_begin();   // a clear outside a pass opens it as a draw would (pending clears land first)
-    if (en && !g_pass.cfmt[slot] && g_enc_mode) { rp_end(); en = rp_begin(); }   // opened without this attachment (clear-only / TBDR modes): reopen with all of them
+    if (en && !g_pass.cfmt[slot] && (g_enc_mode || g_pass.comit)) { rp_end(); en = rp_begin(); }   // opened without this attachment (clear-only / TBDR modes): reopen with all of them
     if (!en) return;
     int at = slot;
     if (!g_pass.cfmt[at] && rt_dup_slot(&R.rt, slot))   // a slot attached twice is attached only once (rt_dup_slot): clear the first one
@@ -17832,6 +17941,7 @@ void mtl_exec(const uint8_t *p) {
                 else mtl_sub_counter(ad, (uint32_t)t);
                 break; }
             case OP_RENDER_COND: { const p_render_cond *rc = a;   // recorded only with the profile key render_cond (hle_nvn.c)
+                g_rc_cond = rc->mode != 2;
                 if (rc->mode >= 2) { g_rc_skip = rc->mode == 3; PD("E %llu render enable %d", g_stat_pass, rc->mode == 2); }
                 else { uint64_t x = 0, y = 0; int known = rc_value(rc->addr, &x) & rc_value(rc->addr + 16, &y);
                     g_rc_skip = known && (rc->mode ? x == y : x != y);
@@ -18925,7 +19035,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
         nshot = 0; const char *e = getenv("DM_NVN_SHOT"), *c = e ? strchr(e, ':') : NULL;
         if (c) { shot_path = c + 1; for (const char *q = e; q < c && nshot < 4096; q = strchr(q, ',') ? strchr(q, ',') + 1 : c) shots[nshot++] = atol(q); }
     }
-    for (int i = 0; i < nshot; i++) if ((long)g_present_n == shots[i]) { char path[1024]; snprintf(path, sizeof path, shot_path, (int)g_present_n); mtl_finish_gpu(); shot(src, path, 1, crop); }
+    for (int i = 0; i < nshot; i++) if ((long)g_present_n == shots[i]) { char path[1024]; snprintf(path, sizeof path, shot_path, (int)g_present_n); mtl_finish_gpu();
+        MLOG("DM_NVN_SHOT: present %llu at frame %llu%s%ld → %s", (unsigned long long)g_present_n, (unsigned long long)atomic_load(&g_cur_frame), ab_len() ? ", DM_AB phase " : "", ab_len() ? atomic_load(&g_ab_phase) : 0L, path);   // which A/B phase a burst's picture is in
+        shot(src, path, 1, crop); }
     pthread_mutex_lock(&g_shotq_mu);
     for (int i = 0; i < g_nshotq;) if (g_present_n >= g_shotq[i].frame) { mtl_finish_gpu(); shot(src, g_shotq[i].path, 1, crop); g_shotq[i] = g_shotq[--g_nshotq]; } else i++;
     pthread_mutex_unlock(&g_shotq_mu);
@@ -19588,6 +19700,7 @@ void mem_census(const char *why) { @autoreleasepool {
 #include "nvn_capture.inc"   // DM_NVN_CAPTURE (one frame for dm/gfx/tests/nvn_replay)
 #include "nvn_ndve.inc"      // DM_NDVE_ENGINE (nn::ndve's movie network)
 #pragma clang attribute pop
+void mtl_omit_stats(uint64_t o[5]) { o[0] = g_om_n[0]; o[1] = g_om_bytes[0]; o[2] = g_om_n[1]; o[3] = g_om_bytes[1]; o[4] = g_om_split; }   // att_need: passes that left out depth-stencil, its bytes, colour, its bytes, splits
 void mtl_gpupass_stats(uint64_t *o) {   // 0 store elided n, 1 bytes, 2 load elided n, 3 bytes, 4..13 stores kept by reason, 14..21 clear-only passes by reason, 22 window passes in a corner area, 23 their bytes saved
     o[0] = g_el_store_n; o[1] = g_el_store_bytes; o[2] = g_el_load_n; o[3] = g_el_load_bytes; o[22] = g_win_n; o[23] = g_win_bytes;
     for (int i = 0; i < 10; i++) o[4 + i] = g_el_kept[i];

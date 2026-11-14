@@ -811,6 +811,24 @@ check_t_window_area: t_window_area
 	MTL_DEBUG_LAYER=1 ./t_window_area elide
 	MTL_DEBUG_LAYER=1 ./t_window_area off
 
+# Attachments a pass does not use (DM_NVN_DS_OMIT, DM_NVN_COLOR_OMIT) through the replay, colour and depth read back: depth left out of a pass that never uses it and kept,
+# kept for a later depth-testing draw; colour left out of a depth-only pass and kept, kept for a later colour write or a shader that writes it; off: both switches 0, the same pixels
+t_att_omit: t_att_omit.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_att_omit.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+.PHONY: check_t_att_omit
+check_t_att_omit: t_att_omit
+	MTL_DEBUG_LAYER=1 ./t_att_omit
+	MTL_DEBUG_LAYER=1 ./t_att_omit off
+
+# The store lookahead (DM_NVN_STORE_ELIDE) through the replay, pixels read back: a store skipped before a whole clear; kept when that clear is in a render-enable-false block the
+# replay skips, and when the next pass loads the target; off: DM_NVN_STORE_ELIDE unset, the same pixels
+t_store_elide: t_store_elide.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_store_elide.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+.PHONY: check_t_store_elide
+check_t_store_elide: t_store_elide
+	MTL_DEBUG_LAYER=1 ./t_store_elide
+	MTL_DEBUG_LAYER=1 ./t_store_elide off
+
 # A read ID keeps its read mark when it gets another texture: first-table GPU pixels, finalized IDs, IDs waiting for the read budget.
 t_pool_seen_replace: t_pool_seen_replace.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_seen_replace.m $(MTL_T_SRC) $(FW)
