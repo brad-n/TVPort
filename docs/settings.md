@@ -47,7 +47,7 @@ Under Advanced: Auto, 2x, 4x, 8x or 16x. Ground, roads and walls seen at a shall
 
 ### TV output
 
-Under Advanced, Mac only: 1080p (the default) or 4K. It is the screen size a game in console mode is told it has. With 4K, a game that has a 4K console mode takes it: the Switch 2 games that pick their output size from the display (Star Fox, for one) render their upscaler's output at 4K and draw the HUD and menus at 4K. It costs GPU time and memory; the picture is scaled to fit the window or screen. Handheld mode is 1280x720 either way. A game with only one console size is unchanged. The Apple TV keeps 1080p.
+Under Advanced, Mac only: 1080p (the default) or 4K. It is the screen size a game in console mode is told it has. With 4K, a game that has a 4K console mode takes it: the Switch 2 games that pick their output size from the display (Star Fox, for one) render their upscaler's output at 4K and draw the HUD and menus at 4K. It costs GPU time and memory; the picture is scaled to fit the window or screen. Handheld mode is 1280x720 either way. A game with only one console size is unchanged (Ocarina of Time is one). The Apple TV keeps 1080p.
 
 ### Console mode
 
