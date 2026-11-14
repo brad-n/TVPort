@@ -16,6 +16,16 @@ What changes in this fork, release by release, in plain terms. The full descript
 - **The memory report names every MB** (`DM_NVN_LEDGER`): render-target memory is listed by what holds it, so a log from the TV says where the memory went.
 - **Compressed render targets** (`DM_NVN_RT_LOSSY`, off by default): Metal's lossy compression for the game's render targets. On an Apple TV (run 19) Ocarina of Time ran at about 20 fps in places that ran at 13 to 17 without it, likely because the A15 reads memory far slower than a Mac. Being checked for a plaid pattern on the ground before it's turned on.
 
+**Less memory traffic per frame on the Apple TV**
+- **Passes leave out what they don't use** (`DM_NVN_DS_OMIT`, `DM_NVN_COLOR_OMIT`, on by default): a pass that never tests or writes depth no longer loads it, and a pass whose draws write no colour (a depth prepass) no longer loads and stores colour. In Ocarina of Time that is 9 to 14 MB a frame less, about 0.3 to 0.4 ms on an Apple TV by estimate.
+- **Fixed: skipping stores that a clear makes unneeded** (`DM_NVN_STORE_ELIDE`, still off by default) trusted a clear the game can skip, which showed the village stream through a layer from the balcony. It now counts only clears that always happen.
+
+**Star Fox on the Mac: a sharper picture**
+- **Render scale** (`DM_RENDER_SCALE`, 0.5 to 2.0, "Render scale" in the launcher): Star Fox draws its 3D at 768x432 on a 1080p TV, its own docked size, which a Switch 2 also uses; its dynamic resolution was already at its top. 2.0 draws 1536x864. On a Mac mini M2, 1152x648 holds 60 fps with GPU time barely changed.
+- **Dynamic resolution** (`DM_DYNAMIC_RESOLUTION`, off by default): on, the game lowers its resolution itself under load.
+- **Fixed: game patches in very large games** could be placed where they couldn't reach their site (Star Fox's code needs two patch areas); every game now gets the area that reaches.
+- **Frame-rate counter in Mac apps** (`DM_SHOW_FPS=1`): the real frames presented per second.
+
 **Ocarina of Time: more quality options for slower GPUs** (all off by default)
 - **Simpler models** (`DM_MODEL_LOD=<factor>`): models switch to their simpler versions as if they were further away. Factor 4 saves about 3 ms a frame on a Mac mini in the Deku Tree conversation, with the tree's roots visibly simpler.
 - **One shadow cascade** (`DM_SHADOW_CASCADES=1`): about 0.3 ms a frame, with softer shadows close up.
