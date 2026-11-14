@@ -85,6 +85,18 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             // nxnative: the raw vector load helpers by word count (TryGenerateRawStorageOp), kept apart from _entries, where a scalar load would find them
             public readonly Dictionary<int, int> RawVectorFunctions = [];
 
+            // nxnative (shader_raw_outline): the shader's one miss function each with and without the read log (GetRawMissFunction), called by every raw helper
+            public readonly Dictionary<bool, int> RawMissFunctions = [];
+
+            public int AddRawMissFunction(bool readLog, Function function)
+            {
+                int functionId = _hfm.AddFunction(function);
+
+                RawMissFunctions[readLog] = functionId;
+
+                return functionId;
+            }
+
             public int AddRawVectorFunction(int count, Function function)
             {
                 int functionId = _hfm.AddFunction(function);
@@ -906,6 +918,136 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
         // shader that resets the terrain's indirect draw records reads each record's address from a storage buffer). Ryujinx drops such an access (a load reads 0). Here it
         // goes to the address itself: a tagged hint for its 2 MiB chunk, else a branchless binary search, finds the host's pool holding it, the address moves by that pool's delta (its Metal GPU address minus its
         // guest address) and is accessed through a physical storage buffer pointer. An address in no pool is still dropped
+        // The address is at or above {low, high}
+        private static Operand RawAtOrBelow(EmitterContext context, Operand addrLow, Operand addrHigh, Operand high, Operand low)
+        {
+            return context.BitwiseOr(
+                context.ICompareLessUnsigned(high, addrHigh),
+                context.BitwiseAnd(context.ICompareEqual(high, addrHigh), context.ICompareLessOrEqualUnsigned(low, addrLow)));
+        }
+
+        // The address is below {low, high}
+        private static Operand RawBelow(EmitterContext context, Operand addrLow, Operand addrHigh, Operand high, Operand low)
+        {
+            return context.BitwiseOr(
+                context.ICompareLessUnsigned(addrHigh, high),
+                context.BitwiseAnd(context.ICompareEqual(addrHigh, high), context.ICompareLessUnsigned(addrLow, low)));
+        }
+
+        private static Operand RawMapWord(EmitterContext context, int mapBinding, Operand entry, int word)
+        {
+            return context.Load(StorageKind.StorageBuffer, mapBinding, Const(0), context.IAdd(entry, Const(word)));
+        }
+
+        // The pool table entry holding the address when the entry chosen last does not: the hint of its 2 MiB chunk, else the binary search over the table's starts. Copies it to
+        // selected; a hint that fits branches to lblFound, which the caller marks after this
+        private static void EmitRawChoice(EmitterContext context, IGpuAccessor gpuAccessor, int mapBinding, Operand addrLow, Operand addrHigh, Operand selected, Operand lblFound)
+        {
+            // The hint of the address's 2 MiB chunk names an entry holding the whole chunk (dmsh_abi.h DMSH_GMEM_HINT_SHIFT). An address too high for the tag searches
+            Operand chunk = context.BitwiseOr(context.ShiftLeft(addrHigh, Const(32 - GmemHintShift)), context.ShiftRightU32(addrLow, Const(GmemHintShift)));
+            Operand indexMask = Const((1 << GmemMapLog2) - 1);
+            Operand hint = RawMapWord(context, mapBinding, context.IMultiply(context.BitwiseAnd(chunk, indexMask), Const(GmemMapEntryWords)), 6);
+            Operand hintIndex = context.BitwiseAnd(hint, indexMask);
+            Operand hintFits = context.BitwiseAnd(
+                context.BitwiseAnd(context.ICompareNotEqual(hintIndex, Const(0)), context.ICompareEqual(context.ShiftRightU32(hint, Const(GmemMapLog2)), chunk)),
+                context.ICompareLessUnsigned(addrHigh, Const(1 << (GmemHintShift - GmemMapLog2))));
+            context.Copy(selected, hintIndex);
+            context.BranchIfTrue(lblFound, hintFits);
+
+            // The last entry whose start is at or below the address (entry 0 starts at 0, so there always is one)
+            Operand index = Const(0);
+
+            if (gpuAccessor.QueryHostRawSearchLoop())
+            {
+                // nxnative (the profile key shader_raw_loop, IGpuAccessor.QueryHostRawSearchLoop): the same 13 steps as a loop. Unrolled, each of a shader's lookups carried its own copy of
+                // the search (Ocarina of Time's ground mist: 43 lookups, two thirds of its main function's 36,212 LLVM instructions), though a lookup searches only when the hint misses
+                // and the last entry does not hold the address
+                Operand idx = Local();
+                Operand step = Local();
+                Operand lblStep = Label();
+
+                context.Copy(idx, Const(0));
+                context.Copy(step, Const(1 << (GmemMapLog2 - 1)));
+                context.MarkLabel(lblStep);
+                Operand candidate = context.IAdd(idx, step);
+                Operand entry = context.IMultiply(candidate, Const(GmemMapEntryWords));
+                context.Copy(idx, context.ConditionalSelect(RawAtOrBelow(context, addrLow, addrHigh, RawMapWord(context, mapBinding, entry, 1), RawMapWord(context, mapBinding, entry, 0)), candidate, idx));
+                context.Copy(step, context.ShiftRightU32(step, Const(1)));
+                context.BranchIfTrue(lblStep, context.ICompareNotEqual(step, Const(0)));
+                index = idx;
+            }
+            else
+            {
+                for (int step = 1 << (GmemMapLog2 - 1); step != 0; step >>= 1)
+                {
+                    Operand candidate = context.IAdd(index, Const(step));
+                    Operand entry = context.IMultiply(candidate, Const(GmemMapEntryWords));
+                    index = context.ConditionalSelect(RawAtOrBelow(context, addrLow, addrHigh, RawMapWord(context, mapBinding, entry, 1), RawMapWord(context, mapBinding, entry, 0)), candidate, index);
+                }
+            }
+
+            context.Copy(selected, index);
+        }
+
+        // A load logs the entry only when it chose it by the hint or the search: the entry it chose last in this invocation was logged then
+        private static void EmitRawReadLog(EmitterContext context, int logBinding, Operand selected)
+        {
+            Operand rword = context.IAdd(context.ShiftRightU32(selected, Const(5)), Const(GmemReadLogWords));
+            Operand rbit = context.ShiftLeft(Const(1), context.BitwiseAnd(selected, Const(31)));
+            Operand lblRead = Label();
+
+            context.BranchIfTrue(lblRead, context.ICompareNotEqual(context.BitwiseAnd(context.Load(StorageKind.StorageBuffer, logBinding, Const(0), rword), rbit), Const(0)));
+            context.AtomicOr(StorageKind.StorageBuffer, logBinding, Const(0), rword, rbit);
+            context.MarkLabel(lblRead);
+        }
+
+        // nxnative (the profile key shader_raw_outline, IGpuAccessor.QueryHostRawMissOutline): the hint, the search and the read log of a lookup that misses the entry it chose
+        // last, as one function of the shader that every raw helper calls, and that the shader build keeps out of line (dmsh_rewrite.raw_miss_noinline: noinline in the MSL).
+        // spirv-cross inlines every helper (always_inline) and Metal's compiler does too, so each lookup carried its own copy of this code, though a lookup runs it only when the
+        // last entry does not hold the address: Ocarina of Time's compute 9e6b00b050e30801 makes 107 lookups, 22,939 instructions from about 2,250 Ampere ones. Returns the entry
+        // index the inline search would have chosen (the same code); the caller records it and its words, so the private words stay in registers (passed by reference to a
+        // function that is not inlined, they would live in memory). Off: 60 % fewer instructions, but the GPU is slower (the reflection probe's 128x128 faces 72 %), as the call
+        // saves registers at every miss
+        private static int GetRawMissFunction(GtsContext gtsContext, IGpuAccessor gpuAccessor, int mapBinding, bool readLog, int logBinding)
+        {
+            if (gtsContext.RawMissFunctions.TryGetValue(readLog, out int functionId))
+            {
+                return functionId;
+            }
+
+            EmitterContext context = new();
+
+            Operand addrLow = Argument(0);
+            Operand addrHigh = Argument(1);
+            Operand selected = Local();
+            Operand lblFound = Label();
+
+            EmitRawChoice(context, gpuAccessor, mapBinding, addrLow, addrHigh, selected, lblFound);
+            context.MarkLabel(lblFound);
+
+            if (readLog)
+            {
+                // An address in no pool (the entry below it ends below it) logs nothing, as the inline form skips its read log then
+                Operand found = context.IMultiply(selected, Const(GmemMapEntryWords));
+                Operand lblOut = Label();
+
+                context.BranchIfFalse(lblOut, RawBelow(context, addrLow, addrHigh, RawMapWord(context, mapBinding, found, 3), RawMapWord(context, mapBinding, found, 2)));
+                EmitRawReadLog(context, logBinding, selected);
+                context.MarkLabel(lblOut);
+            }
+
+            context.Return(selected);
+
+            Function function = new(
+                ControlFlowGraph.Create(context.GetOperations()).Blocks,
+                readLog ? "dmsh_raw_miss_rlog" : "dmsh_raw_miss",
+                true,
+                2,
+                0);
+
+            return gtsContext.AddRawMissFunction(readLog, function);
+        }
+
         private static bool TryGenerateRawStorageOp(
             GtsContext gtsContext,
             ResourceManager resourceManager,
@@ -958,24 +1100,9 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             Operand addrLow = Argument(0);
             Operand addrHigh = Argument(1);
 
-            Operand MapWord(Operand entry, int word)
-            {
-                return context.Load(StorageKind.StorageBuffer, mapBinding, Const(0), context.IAdd(entry, Const(word)));
-            }
-
-            Operand AtOrBelow(Operand high, Operand low)   // the address is at or above {low, high}
-            {
-                return context.BitwiseOr(
-                    context.ICompareLessUnsigned(high, addrHigh),
-                    context.BitwiseAnd(context.ICompareEqual(high, addrHigh), context.ICompareLessOrEqualUnsigned(low, addrLow)));
-            }
-
-            Operand Below(Operand high, Operand low)   // the address is below {low, high}
-            {
-                return context.BitwiseOr(
-                    context.ICompareLessUnsigned(addrHigh, high),
-                    context.BitwiseAnd(context.ICompareEqual(addrHigh, high), context.ICompareLessUnsigned(addrLow, low)));
-            }
+            Operand MapWord(Operand entry, int word) => RawMapWord(context, mapBinding, entry, word);
+            Operand AtOrBelow(Operand high, Operand low) => RawAtOrBelow(context, addrLow, addrHigh, high, low);   // the address is at or above {low, high}
+            Operand Below(Operand high, Operand low) => RawBelow(context, addrLow, addrHigh, high, low);   // the address is below {low, high}
 
             Operand selected = Local();
             Operand lblFound = Label();
@@ -1003,51 +1130,18 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             context.Copy(selected, last);
             context.BranchIfTrue(lblChosen, lastHolds);
 
-            // The hint of the address's 2 MiB chunk names an entry holding the whole chunk (dmsh_abi.h DMSH_GMEM_HINT_SHIFT). An address too high for the tag searches
-            Operand chunk = context.BitwiseOr(context.ShiftLeft(addrHigh, Const(32 - GmemHintShift)), context.ShiftRightU32(addrLow, Const(GmemHintShift)));
-            Operand indexMask = Const((1 << GmemMapLog2) - 1);
-            Operand hint = MapWord(context.IMultiply(context.BitwiseAnd(chunk, indexMask), Const(GmemMapEntryWords)), 6);
-            Operand hintIndex = context.BitwiseAnd(hint, indexMask);
-            Operand hintFits = context.BitwiseAnd(
-                context.BitwiseAnd(context.ICompareNotEqual(hintIndex, Const(0)), context.ICompareEqual(context.ShiftRightU32(hint, Const(GmemMapLog2)), chunk)),
-                context.ICompareLessUnsigned(addrHigh, Const(1 << (GmemHintShift - GmemMapLog2))));
-            context.Copy(selected, hintIndex);
-            context.BranchIfTrue(lblFound, hintFits);
+            bool outline = gpuAccessor.QueryHostRawMissOutline();
 
-            // The last entry whose start is at or below the address (entry 0 starts at 0, so there always is one)
-            Operand index = Const(0);
-
-            if (gpuAccessor.QueryHostRawSearchLoop())
+            if (outline)
             {
-                // nxnative (the profile key shader_raw_loop, IGpuAccessor.QueryHostRawSearchLoop): the same 13 steps as a loop. Unrolled, each of a shader's lookups carried its own copy of
-                // the search (Ocarina of Time's ground mist: 43 lookups, two thirds of its main function's 36,212 LLVM instructions), though a lookup searches only when the hint misses
-                // and the last entry does not hold the address
-                Operand idx = Local();
-                Operand step = Local();
-                Operand lblStep = Label();
-
-                context.Copy(idx, Const(0));
-                context.Copy(step, Const(1 << (GmemMapLog2 - 1)));
-                context.MarkLabel(lblStep);
-                Operand candidate = context.IAdd(idx, step);
-                Operand entry = context.IMultiply(candidate, Const(GmemMapEntryWords));
-                context.Copy(idx, context.ConditionalSelect(AtOrBelow(MapWord(entry, 1), MapWord(entry, 0)), candidate, idx));
-                context.Copy(step, context.ShiftRightU32(step, Const(1)));
-                context.BranchIfTrue(lblStep, context.ICompareNotEqual(step, Const(0)));
-                index = idx;
+                context.Copy(selected, context.Call(GetRawMissFunction(gtsContext, gpuAccessor, mapBinding, readLog, logBinding), true, addrLow, addrHigh));
             }
             else
             {
-                for (int step = 1 << (GmemMapLog2 - 1); step != 0; step >>= 1)
-                {
-                    Operand candidate = context.IAdd(index, Const(step));
-                    Operand entry = context.IMultiply(candidate, Const(GmemMapEntryWords));
-                    index = context.ConditionalSelect(AtOrBelow(MapWord(entry, 1), MapWord(entry, 0)), candidate, index);
-                }
+                EmitRawChoice(context, gpuAccessor, mapBinding, addrLow, addrHigh, selected, lblFound);
+                context.MarkLabel(lblFound);
             }
 
-            context.Copy(selected, index);
-            context.MarkLabel(lblFound);
             context.Store(StorageKind.LocalMemory, lastBinding, selected);
             Operand found = context.IMultiply(selected, Const(GmemMapEntryWords));
 
@@ -1061,16 +1155,9 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             Operand lblSkip = Label();
             context.BranchIfFalse(lblSkip, Below(MapWord(found, 3), MapWord(found, 2)));   // an address in no pool: the entry below it ends below it
 
-            if (readLog)
+            if (readLog && !outline)
             {
-                // A load logs the entry only when it chose it by the hint or the search: the entry it chose last in this invocation was logged then
-                Operand rword = context.IAdd(context.ShiftRightU32(selected, Const(5)), Const(GmemReadLogWords));
-                Operand rbit = context.ShiftLeft(Const(1), context.BitwiseAnd(selected, Const(31)));
-                Operand lblRead = Label();
-
-                context.BranchIfTrue(lblRead, context.ICompareNotEqual(context.BitwiseAnd(context.Load(StorageKind.StorageBuffer, logBinding, Const(0), rword), rbit), Const(0)));
-                context.AtomicOr(StorageKind.StorageBuffer, logBinding, Const(0), rword, rbit);
-                context.MarkLabel(lblRead);
+                EmitRawReadLog(context, logBinding, selected);   // the miss function logs its choice itself
             }
 
             // The last entry's range held it, or the hint's or the search's entry does

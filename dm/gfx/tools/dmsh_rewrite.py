@@ -2,8 +2,8 @@
 # The rewrites dmsh_build.py makes in a translated shader's MSL before it compiles it, where Metal or the translator falls short of what the Switch code does: precise
 # arithmetic (precise), 64-bit products (mul_extended), Ampere's HMMA as simdgroup matrices (hmma_msl), first stores and shared-memory stores (first_store,
 # shared_store_msl), threadgroup memory past Metal's limit (tg_spill), texture gathers with offsets (gather_offsets), border colours Metal has no sampler state for
-# (border_emu) and a pixel shader's depth snapped to its position (frag_z_snap). Functions of the MSL text and the library ABI only, with no build state, so tests import
-# them. Part of the translation chain (dmsh_chain.FILES) and of every shader's cache key (dmsh_build.py CODE_FP).
+# (border_emu), a pixel shader's depth snapped to its position (frag_z_snap) and the raw lookups' miss function kept out of line (raw_miss_noinline). Functions of the MSL text and
+# the library ABI only, with no build state, so tests import them. Part of the translation chain (dmsh_chain.FILES) and of every shader's cache key (dmsh_build.py CODE_FP).
 import bisect, collections, itertools, re
 import dmsh_abi as abi, dmsh_side
 
@@ -222,6 +222,30 @@ def hmma_msl(msl):
 # block of trees out of the list at each rebuild. A guarded store left over that is not understood leaves the whole shader as it is. Returns the shader and [(storage binding's MSL name, word, value)]
 FIRST_STORE = re.compile(r'float (\w+) = as_type<float>\(gl_WorkGroupID\.x\);\s*float (\w+) = as_type<float>\(gl_LocalInvocationID\.x\);\s*int (\w+) = as_type<int>\(\1\) << (\d+);\s*'
                          r'int (\w+) = ~as_type<int>\(\2\);\s*int (\w+) = \5 \+ 1;\s*bool (\w+) = \6 != \3;\s*')
+
+# shader_raw_outline (GlobalToStorage.GetRawMissFunction): the raw global memory lookups' miss path (the hint, the search, the read log) is one function of the shader, dmsh_raw_miss or
+# dmsh_raw_miss_rlog, which every raw helper calls when the entry it chose last does not hold the address. spirv-cross writes every function always_inline, so each lookup would carry
+# its own copy again; here it is noinline, a real call that only a miss makes. Its two address words are taken by value: a reference to them would put the caller's values in
+# memory for the call. It reads the pool table and writes the read log, nothing of the invocation's own, so no private word leaves the registers (the caller records the entry
+# and its words). Ocarina of Time's compute 9e6b00b050e30801 (107 lookups): 22,939 → 9,371 instructions on the Mac mini's GPU (M2 Pro, the Apple TV's A15 generation), but the
+# GPU is slower with it, as the call saves registers at every miss (docs/reference/shaders.md, Raw global memory lookups that each carried their own miss path)
+RAW_MISS = re.compile(r'static inline __attribute__\(\(always_inline\)\)\n(int|uint) (dmsh_raw_miss(?:_rlog)?)\(([^()]*)\)\n\{')
+
+def raw_miss_noinline(msl):
+    if 'dmsh_raw_miss' not in msl: return msl
+    found = list(RAW_MISS.finditer(msl))
+    if not found or len(found) != len(re.findall(r'\n(?:int|uint) dmsh_raw_miss(?:_rlog)?\(', msl)): raise ValueError('dmsh_raw_miss: a definition not of the expected form')
+    out, pos = [], 0
+    for m in found:
+        params = []
+        for p in split_params(m.group(3)):
+            v = re.fullmatch(r'thread const (int|uint)& (\w+)', p)
+            if v: params.append(f'{v.group(1)} {v.group(2)}'); continue
+            if not re.fullmatch(r'(const )?device \w+& \w+', p): raise ValueError('dmsh_raw_miss: unexpected parameter ' + p[:100])
+            params.append(p)
+        out += [msl[pos:m.start()], f'__attribute__((noinline))\nstatic {m.group(1)} {m.group(2)}({", ".join(params)})\n{{']
+        pos = m.end()
+    return ''.join(out) + msl[pos:]
 
 # A local size with rows: the same test on y and x, and workgroup z zero (Mario Kart World's 0823b08c2027a38d, local size 8x8)
 FIRST_STORE_2D = re.compile(r'float (\w+) = as_type<float>\(gl_WorkGroupID\.y\);\s*float (\w+) = as_type<float>\(gl_LocalInvocationID\.y\);\s*float (\w+) = as_type<float>\(gl_LocalInvocationID\.x\);\s*'

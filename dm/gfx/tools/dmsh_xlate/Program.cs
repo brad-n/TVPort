@@ -175,6 +175,8 @@ static class SwshXlate
         public bool QueryHostUnorderedCompareNot() => _job["unord_cmp"] is JsonNode n && (bool)n;
         // Job prmt_runs = true (a profile's shader_prmt_runs): a PRMT with a constant selector is written by runs of bytes, a shift and a mask each (InstEmitAmpereAlu.APrmtRuns)
         public bool QueryHostPrmtRuns() => _job["prmt_runs"] is JsonNode n && (bool)n;
+        // Job raw_outline = true (a profile's shader_raw_outline): a raw lookup's miss path is one function of the shader, kept out of line (GlobalToStorage, dmsh_rewrite.raw_miss_noinline)
+        public bool QueryHostRawMissOutline() => _job["raw_outline"] is JsonNode n && (bool)n;
         // Job raw_loop = true (a profile's shader_raw_loop): a raw lookup's binary search is a loop (GlobalToStorage)
         public bool QueryHostRawSearchLoop() => _job["raw_loop"] is JsonNode n && (bool)n;
         // Job raw_regs = true (a profile's shader_raw_regs): a raw lookup keeps its last entry's start, end and delta in private words (GlobalToStorage)

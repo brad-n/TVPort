@@ -248,7 +248,7 @@ def header_one(g):
     if sbe not in ('0', '1'): sys.exit(f'{g.id}: shader_border_emu must be 0 or 1: {sbe}')
     ssg = g.get('shader_select_guards', '1')   # bounded uniform reads at computed offsets as selects (dmsh_fetch.select_guards, upstream 918e9f34); 0 keeps the branches
     if ssg not in ('0', '1'): sys.exit(f'{g.id}: shader_select_guards must be 0 or 1: {ssg}')
-    for k in ('shader_fragw_fold', 'shader_ftz_cmp', 'shader_unord_cmp', 'shader_raw_loop', 'shader_raw_regs', 'shader_wide_device', 'shader_no_rescale'):   # translator options (dmsh_build.py XLATE_KEYS): build-only keys, no host define; defaults in dmsh_build.py XLATE_DEFAULT (all 1 but shader_raw_loop)
+    for k in ('shader_fragw_fold', 'shader_ftz_cmp', 'shader_unord_cmp', 'shader_raw_loop', 'shader_raw_regs', 'shader_wide_device', 'shader_no_rescale', 'shader_raw_outline'):   # translator options (dmsh_build.py XLATE_KEYS): build-only keys, no host define; defaults in dmsh_build.py XLATE_DEFAULT (all 1 but shader_raw_loop and shader_raw_outline)
         if g.get(k, '1') not in ('0', '1'): sys.exit(f'{g.id}: {k} must be 0 or 1: {g.get(k)}')
     dbr = g.get('draw_barriers', 'full')   # how draw passes are ordered (nvn_mtl.m barrier_game): full = each waits for all earlier GPU work, game = by the game's own barriers, so vertex work overlaps the previous pass's fragments
     if dbr not in ('full', 'game'): sys.exit(f'{g.id}: draw_barriers must be full or game: {dbr}')

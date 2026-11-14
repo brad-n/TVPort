@@ -278,6 +278,16 @@ namespace Ryujinx.Graphics.Shader
         }
 
         /// <summary>
+        /// nxnative: queries whether a raw global memory lookup that misses the entry it chose last calls one miss function of the shader (the hint, the search and the read log),
+        /// which the shader build keeps out of line, instead of carrying that code inline at every lookup (a profile's shader_raw_outline, GlobalToStorage).
+        /// </summary>
+        /// <returns>True for the shared miss function, false for the code inline at each lookup</returns>
+        bool QueryHostRawMissOutline()
+        {
+            return false;
+        }
+
+        /// <summary>
         /// nxnative: queries whether every render scale the support buffer holds is 1.0, so gl_FragCoord.xy, texel fetches and size queries need no rescale (a profile's shader_no_rescale).
         /// </summary>
         /// <returns>True to leave the rescale out, false for Ryujinx's resolution scaling code</returns>
