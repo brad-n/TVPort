@@ -16464,7 +16464,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     uint32_t cneed = 0xff; int need = g_enc ? 3 : tbdr_on() ? pass_ds_need() : g_geo_program || defer_q_draw ? 3 : att_need(pr, &cneed), mode = defer_q_draw ? 0 : need == 0 ? 2 : need == 2 ? 3 : need == 1 ? 4 : 0;   // 2 attach neither, 3 attach stencil only, 4 attach depth only
     int om_d = 0;   // the planes att_need left out (1 depth 2 stencil): only a draw that uses one of those ends the pass (a stencil test on a depth-only format uses nothing)
     if (mode && !tbdr_on()) {   // att_need: what the mode leaves out of this depth-stencil texture; nothing (a stencil-only need of a depth-only format, say) is mode 0
-        id<MTLTexture> dt = tex_mtl(R.rt.depth); MTLPixelFormat pf = dt.pixelFormat; int comb = pf == MTLPixelFormatDepth32Float_Stencil8 || pf == MTLPixelFormatDepth24Unorm_Stencil8;
+        id<MTLTexture> dt = tex_mtl(R.rt.depth); MTLPixelFormat pf = dt.pixelFormat; int comb = pf == MTLPixelFormatDepth32Float_Stencil8 || pf == (MTLPixelFormat)255;   // 255: MTLPixelFormatDepth24Unorm_Stencil8, which the iOS and tvOS SDKs do not declare (and no Apple GPU makes)
         int hasd = comb || pf == MTLPixelFormatDepth16Unorm || pf == MTLPixelFormatDepth32Float, hass = comb || pf == MTLPixelFormatStencil8 || pf == MTLPixelFormatX32_Stencil8;
         int od = hasd && (mode == 2 || mode == 3), os = hass && (mode == 2 || mode == 4);
         if (!dt || (!od && !os)) mode = 0;
