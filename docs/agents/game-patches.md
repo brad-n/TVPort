@@ -76,6 +76,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [Ori and the Will of the Wisps](#ori-and-the-will-of-the-wisps) | 0 | 0 | 10 | 0 | 0 | `build` → `engine` |
 | [Paper Mario: The Thousand-Year Door](#paper-mario-the-thousand-year-door) | 1 | 0 | 1 | 0 | 0 | `build` → `game` |
 | [Pokémon Legends: Arceus](#pokémon-legends-arceus) | 0 | 0 | 0 | 1 | 0 | `game` |
+| [Star Fox](#star-fox) | 0 | 0 | 2 | 0 | 0 | `game` ×2 |
 | [Super Mario 3D All-Stars: Super Mario Sunshine](#super-mario-3d-all-stars-super-mario-sunshine) | 2 | 0 | 0 | 0 | 0 | `build` → `game` |
 | [Super Smash Bros. Ultimate](#super-smash-bros-ultimate) | 11 | 0 | 0 | 1 | 0 | `game` |
 | [Taiko Risshiden V DX](#taiko-risshiden-v-dx) | 1 | 0 | 0 | 2 | 0 | `game` |
@@ -447,6 +448,15 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 - **`game`**, runtime, at goal, checked: function-matched on 1.1.1, the only build on hand: exactly one match, a boot to the field setup, and the patched function run on the module's own bytes in a small interpreter for both null paths. Issue #712's reporters ran the earlier cuts for about 7 hours with no crash; the path itself has not been reached with these cuts: capture demo: the empty result when the weak reference at +0x88 is unset or dead. The game's own function dereferences its own weak reference; no host service is on the path, so no host or engine rule can hold it. Whether another Game Freak game shares the function is unchecked
 
 - **function-matched** (`main` of builds without CUTS): capture demo: the empty result when the weak reference at +0x88 is unset or dead: 1 function, 5 cuts
+
+### Star Fox
+
+[Star Fox](../../dm/games/0400E88025B1A000/README.md), `0400E88025B1A000`, [patches.py](../../dm/games/0400E88025B1A000/patches.py).
+
+- **`game`**, rendering, at goal, checked: v131072 main: one function with this fingerprint; the cvar reads, the cap and the dead registers read by disassembly; 768x432 at the default, and the cvar override at 0.75 and 1.0 gave 1152x648 and 1536x864 3D views on the Mac (2026-11-13): 3D view scale: the game's resolution scale times the host render scale (DM_RENDER_SCALE). The game's own resolution scale where its frame function caps it, found by that function's fingerprint on any build that keeps it; switchable, 1.0 the game's own
+- **`game`**, rendering, at goal, checked: v131072 main: one function with this fingerprint; its mode, budget, GPU time and output read in play with probes (mode 1, 15 ms budget, 13 ms read, output 1.07 to 1.13 clamped to 1.0) (2026-11-13): dynamic resolution: held at its top, or the game's own controller (DM_DYNAMIC_RESOLUTION). The scale the game's dynamic-resolution update hands on, found by the update's fingerprint on any build that keeps it; switchable
+
+- **function-matched frame step** (`main` of builds without FRAME_STEP): 3D view scale and dynamic resolution from the host: a function of 0x744c bytes, `+0x25e4` in it; dynamic resolution update, a function of 0xb1c bytes, `+0xafc` in it; launcher capabilities: DYNAMIC_RESOLUTION
 
 ### Super Mario 3D All-Stars: Super Mario Sunshine
 

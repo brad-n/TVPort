@@ -29,7 +29,7 @@ On a Mac, a game checked at that speed (Fire Emblem Fortune's Weave, Mario & Lui
 
 ### Dynamic resolution
 
-Off, the default, keeps the 3D picture at full size. On lets the game lower its resolution when frames run heavy and raise it again when they fit, as on the Switch: steadier frame rate, at times a softer picture. Only games whose resolution control the app can hold offer it (NieR:Automata, Ocarina of Time).
+Off, the default, keeps the 3D picture at full size. On lets the game lower its resolution when frames run heavy and raise it again when they fit, as on the Switch: steadier frame rate, at times a softer picture. Only games whose resolution control the app can hold offer it (NieR:Automata, Ocarina of Time, Star Fox).
 
 ### Render scale
 
@@ -270,7 +270,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Setting | Variable | Values |
 |---|---|---|
 | Frame rate | `DM_FPS_TARGET` | `30`, `60`, `120` (Mac, games with `fps_max 120`) |
-| Render scale | `DM_RENDER_SCALE` | `0.5` to `1.0` (Hades II: to `3.0`) |
+| Render scale | `DM_RENDER_SCALE` | `0.5` to `1.0` (Hades II: to `3.0`; Star Fox: to `2.0`) |
 | Console mode | `DM_OPMODE` | `1` docked, `0` handheld |
 | Game language | `DM_LANG` | a language code, such as `ja` |
 | Display mode (Mac) | `DM_FULLSCREEN` | `1` fullscreen, `0` a window |
