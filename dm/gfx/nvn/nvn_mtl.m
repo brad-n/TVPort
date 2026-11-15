@@ -17261,7 +17261,7 @@ static geo_access cs_access_of(NvShader *sh, uint64_t ind) {   // the guest memo
 static uint64_t g_dbar_game, g_dbar_copy, g_dbar_unknown, g_dbar_free;
 void mtl_dispatch_barrier_stats(uint64_t *game, uint64_t *copy, uint64_t *unknown, uint64_t *none) {   // the periodic [nvn] line (hle_nvn.c)
     *game = g_dbar_game; *copy = g_dbar_copy; *unknown = g_dbar_unknown; *none = g_dbar_free; }
-// The fork's dispatch_overlap (profile key, DM_NVN_DISPATCH_OVERLAP: Ocarina of Time) keeps its rule for a dispatch whose reach is no range: beside the dispatch before it when only dispatches
+// The fork's dispatch_overlap (profile key, DM_NVN_DISPATCH_OVERLAP; off by default since 2026-11-15, kept for A/B) keeps its rule for a dispatch whose reach is no range: beside the dispatch before it when only dispatches
 // went into the copy encoder since its last barrier and the game issued none (dispatch_enc's game 1). DM_NVN_DISPATCH_BARRIER=full orders every one after everything before it, as a host dispatch is
 static id<MTL4ComputeCommandEncoder> dispatch_enc_cs(NvShader *cs, uint64_t ind) {
     if (!dbar_game()) { g_dsp_game_bar = 0; return dispatch_enc(0); }
