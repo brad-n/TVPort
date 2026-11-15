@@ -822,7 +822,7 @@ def restore_saves(game: Game, device: str, bundle: str) -> int:
     return len(sources)
 
 
-def write_env(game: Game, mode: str, texture_cap: int, players: str = '', render_scale: float = 1.0, thermal_cap: bool = True, fps_target: int = 0, swap_ab_xy: bool = False, swap_ab: Optional[bool] = None, swap_xy: Optional[bool] = None, pso_mtl4: bool = False, extra_env: Optional[list] = None, guest_file: Optional[str] = None, astc_block: Optional[int] = None, bc1_block: Optional[int] = None, upscaler: str = 'game', res_scale: float = 1.0, aniso: int = 0) -> Path:
+def write_env(game: Game, mode: str, texture_cap: int, players: str = '', render_scale: float = 1.0, thermal_cap: bool = True, fps_target: int = 0, swap_ab_xy: bool = False, swap_ab: Optional[bool] = None, swap_xy: Optional[bool] = None, pso_mtl4: bool = False, extra_env: Optional[list] = None, guest_file: Optional[str] = None, astc_block: Optional[int] = None, bc1_block: Optional[int] = None, upscaler: str = 'game', res_scale: float = 1.0, aniso: int = 0, fmt_blocks: Optional[tuple] = None) -> Path:
     """The switches the app reads at launch (main.m, dm/env.txt)."""
     path = game.build / 'tvport-env.txt'
     lines = ['# Written by TVPort', f'DM_OPMODE={0 if mode == "handheld" else 1}', f'DM_BC_MAX_DIM={texture_cap}']
@@ -855,6 +855,9 @@ def write_env(game: Game, mode: str, texture_cap: int, players: str = '', render
         lines.append(f'DM_NVN_BC_ASTC={astc_block}')
         if astc_block and bc1_block:   # BC1 at its own block (the engine's astc_block_for); unset it is the same block as the others
             lines.append(f'DM_NVN_BC1_ASTC={bc1_block}')
+        for name, default, value in zip(('DM_NVN_BC4_ASTC', 'DM_NVN_BC5_ASTC', 'DM_NVN_BC6H_ASTC'), ENGINE_FORMAT_BLOCKS, fmt_blocks or ENGINE_FORMAT_BLOCKS):   # BC4 / BC5 / BC6H have blocks of their own; only a block other than the engine's own default needs a line
+            if astc_block and value != default:
+                lines.append(f'{name}={value}')
     pairs = extra_env_pairs(extra_env or [])
     if pairs:   # the player's own switches: they win over a line above with the same key
         keys = {key for key, _ in pairs}
@@ -1019,7 +1022,7 @@ def generate_project(game: Game, args, team: str, bundle: str, python: str, romf
     env = profile_env(game)
     aoc = game.build / 'aoc'
     env.update(GAME=game.title_id, W=str(game.build), PATCHED=str(game.build / f'patched_{game.package}'), ROMFS=str(romfs or game.romfs), MSL_IOS=str(game.shaders), AOC=str(aoc) if aoc.is_dir() and game.prepared_content().get('dlc', True) else '',
-               DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players, args.render_scale, not args.no_thermal_cap, args.fps_target, args.swap_ab_xy, args.swap_ab, args.swap_xy, pso_mtl4, getattr(args, 'extra_env', None), getattr(args, 'guest_file', None), astc_block(args), astc_blocks(args)[1], getattr(args, 'upscaler', 'game'), getattr(args, 'res_scale', 1.0), getattr(args, 'aniso', 0))), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
+               DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players, args.render_scale, not args.no_thermal_cap, args.fps_target, args.swap_ab_xy, args.swap_ab, args.swap_xy, pso_mtl4, getattr(args, 'extra_env', None), getattr(args, 'guest_file', None), astc_block(args), astc_blocks(args)[1], getattr(args, 'upscaler', 'game'), getattr(args, 'res_scale', 1.0), getattr(args, 'aniso', 0), astc_format_blocks(args))), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
                DM_XCODE_PROJECT_DIR=str(game.build / 'tvport-xcode'), DM_XCODE_DERIVED_DATA=str(game.build / 'tvport-derived'), FONT_PY=python)
     env.update(artwork_env(args))
     control = game.extract / 'control.nacp' if game.extract else None
@@ -1084,23 +1087,37 @@ def compile_app(game: Game, project: Path, device: Optional[str]) -> None:
 ASTC_CHOICES = ('auto', 'on', 'off')
 
 
-ASTC_BLOCK_CHOICES = ('matched', '4', '6')   # Block size: matched to the original (BC1 6x6, the rest 4x4), or one block for every format
+ASTC_BLOCK_CHOICES = ('matched', '4', '6')   # Block size: matched (a block for each format, MATCHED_BLOCKS), or one block for every format
+ASTC_FORMAT_CHOICES = ('auto', '4', '6')   # one format's own block (--astc-bc7-block, --astc-bc5-block, --astc-bc6h-block): auto follows --astc-block
+ENGINE_FORMAT_BLOCKS = (6, 4, 4)   # the engine's own blocks for BC4, BC5 and BC6H (DM_NVN_BC4_ASTC, DM_NVN_BC5_ASTC, DM_NVN_BC6H_ASTC, bntx_astc.py --bc4-block ...) when no switch is set
+# The blocks of "matched": what each format's ASTC copy is encoded at. 4x4 is 8 bits a texel and 6x6 is 3.56. Measured on Ocarina of Time (docs/reference/tv-size.md, "Cut 3: ASTC 6x6 quality"):
+# BC6H and BC7 hold up at 6x6 in the pictures, BC5 (normal maps) shows the 6x6 grid and loses the finest relief, so BC5 keeps 4x4
+MATCHED_BLOCKS = dict(bc1=6, bc4=6, bc5=4, bc6h=6, bc7=6)
 
 
 def astc_blocks(args) -> tuple:
-    """(block, bc1_block) for DM_NVN_BC_ASTC and DM_NVN_BC1_ASTC; (0, 0) when Compressed textures is Off. Matched keeps each texture about its Switch size: BC1 is 4 bits a texel (ASTC 6x6 is 3.56, 4x4 would be 8), BC2/3/7 are 8 bits (ASTC 4x4). No choice, or an unknown one, is Matched. Automatic is On for the Apple TV (an A15 GPU has no BC formats, so every BC texture would be stored as RGBA8: 4 to 8 times the size)."""
+    """(block, bc1_block) for DM_NVN_BC_ASTC (BC2/3/7) and DM_NVN_BC1_ASTC; (0, 0) when Compressed textures is Off. Matched gives each format the block MATCHED_BLOCKS names (BC1 is 4 bits a texel: ASTC 6x6 is 3.56, 4x4 would be 8). No choice, or an unknown one, is Matched. --astc-bc7-block sets the block of BC2/3/7 alone. Automatic is On for the Apple TV (an A15 GPU has no BC formats, so every BC texture would be stored as RGBA8: 4 to 8 times the size)."""
     if (getattr(args, 'astc', None) or 'auto') == 'off':
         return (0, 0)
     choice = str(getattr(args, 'astc_block', None) or 'matched')
-    if choice == '6':
-        return (6, 6)
-    if choice == '4':
-        return (4, 4)
-    return (4, 6)
+    one = {'6': 6, '4': 4}.get(choice)
+    own = {'6': 6, '4': 4}.get(str(getattr(args, 'astc_bc7_block', None) or 'auto'))
+    return (own or one or MATCHED_BLOCKS['bc7'], one or MATCHED_BLOCKS['bc1'])
+
+
+def astc_format_blocks(args) -> tuple:
+    """(BC4, BC5, BC6H) blocks for DM_NVN_BC4_ASTC / DM_NVN_BC5_ASTC / DM_NVN_BC6H_ASTC and the pack (--bc4-block ...): a single --astc-block choice sets BC5 and BC6H (BC4 keeps its 6x6, 8 bits at 4x4 is what R8 takes anyway),
+    Matched uses MATCHED_BLOCKS, and --astc-bc5-block / --astc-bc6h-block set one format. (0, 0, 0) when Compressed textures is Off."""
+    if (getattr(args, 'astc', None) or 'auto') == 'off':
+        return (0, 0, 0)
+    one = {'6': 6, '4': 4}.get(str(getattr(args, 'astc_block', None) or 'matched'))
+    def pick(attr, fallback):
+        return {'6': 6, '4': 4}.get(str(getattr(args, attr, None) or 'auto')) or one or fallback
+    return (MATCHED_BLOCKS['bc4'], pick('astc_bc5_block', MATCHED_BLOCKS['bc5']), pick('astc_bc6h_block', MATCHED_BLOCKS['bc6h']))
 
 
 def astc_block(args) -> int:
-    """The ASTC block size for DM_NVN_BC_ASTC (every format but BC1): 0 when Compressed textures is Off, else 4 or 6"""
+    """The ASTC block size for DM_NVN_BC_ASTC (BC2/3/7): 0 when Compressed textures is Off, else 4 or 6"""
     return astc_blocks(args)[0]
 
 
@@ -1121,14 +1138,21 @@ def pack_stopped(reason: str) -> Failure:
                    'Build & Install again once the reason is fixed, or set Compressed textures to Off for this game to build without them.')
 
 
-def prebuild_astc(game: Game, block: int, python: str, texture_cap: int, bc1_block: Optional[int] = None, required: bool = False) -> Optional[Path]:
+def fmt_block_flags(fmt_blocks: Optional[tuple]) -> list:
+    """--bc4-block, --bc5-block and --bc6h-block for bntx_astc.py / tex_once.py (the pack and the runtime must agree); none when the blocks are the engine's own"""
+    if not fmt_blocks or tuple(fmt_blocks) == ENGINE_FORMAT_BLOCKS:
+        return []
+    return ['--bc4-block', str(fmt_blocks[0]), '--bc5-block', str(fmt_blocks[1]), '--bc6h-block', str(fmt_blocks[2])]
+
+
+def prebuild_astc(game: Game, block: int, python: str, texture_cap: int, bc1_block: Optional[int] = None, required: bool = False, fmt_blocks: Optional[tuple] = None) -> Optional[Path]:
     """Run the engine's prebuild (dm/gfx/tools/bntx_astc.py) over the extracted game: every BC1/2/3/7 texture encoded to ASTC on this Mac and packed into one astc-ro.pack. The game's texture cap (DM_BC_MAX_DIM in the app's env, 0 = none) goes along: only the mip levels the app keeps under it are packed. It is incremental: with the same game files, engine, block size and cap it
     returns the pack it made before at once. A failure stops the build when the pack is required (pack_required: the Apple TV); otherwise it is not fatal: the game then encodes textures while it runs (slower the first time, and the textures stay uncompressed until it has)."""
     stage('Preparing compressed textures')
     out = game.build / 'tvport-astc'
     pack = out / 'astc-ro.pack'
     try:
-        stream([python, '-I', REPO / 'dm/gfx/tools/bntx_astc.py', game.romfs, '--out', out, '--block', str(block), '--bc1-block', str(bc1_block or block), '--max-dim', str(texture_cap), '--drop-cache'], cwd=REPO, log_filter=lambda line: line.startswith('astc'))
+        stream([python, '-I', REPO / 'dm/gfx/tools/bntx_astc.py', game.romfs, '--out', out, '--block', str(block), '--bc1-block', str(bc1_block or block), *fmt_block_flags(fmt_blocks), '--max-dim', str(texture_cap), '--drop-cache'], cwd=REPO, log_filter=lambda line: line.startswith('astc'))
     except Failure as failure:
         reason = str(failure).splitlines()[-1][:300] if str(failure).strip() else 'no reason given'
         if required:
@@ -1203,7 +1227,7 @@ def compress_game_data(game: Game, python: str) -> Optional[Path]:
     return image
 
 
-def store_textures_once(game: Game, pack: Optional[Path], block: int, python: str, texture_cap: int, bc1_block: Optional[int] = None, compress: bool = False) -> Optional[Path]:
+def store_textures_once(game: Game, pack: Optional[Path], block: int, python: str, texture_cap: int, bc1_block: Optional[int] = None, compress: bool = False, fmt_blocks: Optional[tuple] = None) -> Optional[Path]:
     """Run the engine's tex_once.py over RomFS.img and the ASTC pack: every plane the pack covers is zeroed in the game files (the pack holds it) and the result is one sparse image with the pack embedded. Returns that romfs.img, or None when it cannot be made, with one warning line: the feature never fails a build, and the game then goes as before with the plain RomFS.img and astc-ro.pack."""
     stage('Storing textures once')
     tool = REPO / 'dm/gfx/tools/tex_once.py'
@@ -1216,7 +1240,7 @@ def store_textures_once(game: Game, pack: Optional[Path], block: int, python: st
         emit('log', line='Textures are stored twice: this engine has no tex_once.py.')
         return None
     try:
-        stream([python, '-I', tool, game.romfs, '--pack', pack, '--out', out, '--max-dim', str(texture_cap), '--block', str(block), '--bc1-block', str(bc1_block or block), '--compress', 'on' if compress else 'off'], cwd=REPO)   # tex_once.py must take --bc1-block, as bntx_astc.py does; --compress is Compress game data (docs/texture_once.md 7c)
+        stream([python, '-I', tool, game.romfs, '--pack', pack, '--out', out, '--max-dim', str(texture_cap), '--block', str(block), '--bc1-block', str(bc1_block or block), *fmt_block_flags(fmt_blocks), '--compress', 'on' if compress else 'off'], cwd=REPO)   # tex_once.py must take --bc1-block, as bntx_astc.py does; --compress is Compress game data (docs/texture_once.md 7c)
     except Failure as failure:
         emit('log', line=f'Textures are stored twice: they could not be stored once ({str(failure).splitlines()[-1][:300] if str(failure) else "no reason given"}).')
         return None
@@ -1404,7 +1428,8 @@ def cmd_build(args) -> None:
                 emit('log', line=f"The engine's patches for this game changed ({why}), but prod.keys was not found, so the game's code is not rewritten again this time.")
     bundle = game.bundle_id(team)
     block, bc1_block = astc_blocks(args)
-    pack = prebuild_astc(game, block, python, args.texture_cap, bc1_block, pack_required(block)) if block else None   # the game's files are extracted: encode its BC textures once, here; without them an Apple TV build stops here, before anything is sent
+    fmt_blocks = astc_format_blocks(args)
+    pack = prebuild_astc(game, block, python, args.texture_cap, bc1_block, pack_required(block), fmt_blocks) if block else None   # the game's files are extracted: encode its BC textures once, here; without them an Apple TV build stops here, before anything is sent
     if args.device:
         remember_shaders(game, args.device, bundle)
         stage('Backing up saves to this Mac')
@@ -1413,7 +1438,7 @@ def cmd_build(args) -> None:
                           'unavailable': 'The saves on the Apple TV could not be read, so this build goes ahead without a new backup.',
                           'busy': 'The game kept saving during each copy, so this build goes ahead without a new backup.'}[backup['state']])
     compress = compress_enabled(args)
-    once = store_textures_once(game, pack, block, python, args.texture_cap, bc1_block, compress) if pack and texture_once_enabled(args, block) else None
+    once = store_textures_once(game, pack, block, python, args.texture_cap, bc1_block, compress, fmt_blocks) if pack and texture_once_enabled(args, block) else None
     if once is None and compress:
         once = compress_game_data(game, python)   # no stripped image: the compressed whole RomFS.img (install sends the ASTC pack beside it when it does not carry one)
     # The Xcode project reads the PLAIN RomFS.img (resources it copies, romfs.id identity): its build-phase scripts run on the system
@@ -1872,6 +1897,9 @@ def main() -> int:
     build.add_argument('--compress-data', choices=COMPRESS_CHOICES, default='auto')   # Compress game data: auto is on
     build.add_argument('--texture-once', choices=TEXTURE_ONCE_CHOICES, default='auto')   # Store textures once: auto is on whenever Compressed textures is
     build.add_argument('--astc-block', choices=ASTC_BLOCK_CHOICES, default='matched')   # matched to the original (BC1 6x6, the rest 4x4), or 4x4 / 6x6 for every format
+    build.add_argument('--astc-bc7-block', choices=ASTC_FORMAT_CHOICES, default='auto')   # the block of BC2/3/7 alone (auto: --astc-block)
+    build.add_argument('--astc-bc5-block', choices=ASTC_FORMAT_CHOICES, default='auto')   # the block of BC5 (normal maps) alone
+    build.add_argument('--astc-bc6h-block', choices=ASTC_FORMAT_CHOICES, default='auto')   # the block of BC6H (HDR) alone
     build.add_argument('--gpu', default='')
     build.add_argument('--extra-env', action='append', default=[])   # KEY=VALUE
     build.add_argument('--players', default='')
