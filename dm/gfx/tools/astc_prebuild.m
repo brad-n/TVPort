@@ -42,12 +42,12 @@ static int plane_cb(void *p, unsigned level, unsigned layer, uint32_t w, uint32_
     return 0;
 }
 
-// The planes of one texture, as the runtime enumerates them. `storage` is the texture's block-linear image (a BNTX's data from its first byte); pkg_block_h is the packaged layout's
+// The planes of one texture, as the runtime enumerates them. `storage` is the texture's block-linear image (a BNTX's data from its first byte); pkg_layout is the packaged layout's
 // byte 0 + 1 (0: the automatic block height). encode=0 only keys the planes. Returns the plane count (>= 0), -1 for a texture the engine cannot lay out or whose storage is too short,
 // -2 when out is too small. max_dim is the game's texture cap (DM_BC_MAX_DIM, 0 = none): only the levels the runtime keeps under it are walked (nvn_bc_skip_levels, the runtime's own computation)
-int dm_texture_planes(int target, int format, uint32_t width, uint32_t height, uint32_t depth, uint32_t levels, int pkg_block_h,
+int dm_texture_planes(int target, int format, uint32_t width, uint32_t height, uint32_t depth, uint32_t levels, int pkg_layout,
                       const void *storage, uint64_t storage_size, unsigned block, int alt_format, const char *cache, int encode, dm_plane *out, uint32_t cap, int max_dim) {
-    nvn_texdesc d = {.target = target, .format = format, .width = width, .height = height, .depth = depth, .levels = levels, .pkg_block_h = pkg_block_h};
+    nvn_texdesc d = {.target = target, .format = format, .width = width, .height = height, .depth = depth, .levels = levels, .pkg_layout = pkg_layout};
     nvn_texlayout L; nvn_tex_layout(&d, &L);
     if (!L.bpb || L.size > storage_size || nvn_bc_astc_format((uint32_t)format, block, NULL) != 1) return -1;
     walk_ctx c = {.format = (uint32_t)format, .alt_format = (uint32_t)alt_format, .block = block, .cache = cache, .encode = encode, .out = out, .cap = cap};
@@ -63,21 +63,21 @@ unsigned dm_skip_levels(int target, int format, uint32_t width, uint32_t height,
     return nvn_bc_skip_levels(&d, max_dim);
 }
 // The storage bytes the engine's layout gives the texture (0 when it cannot lay it out)
-uint64_t dm_texture_size(int target, int format, uint32_t width, uint32_t height, uint32_t depth, uint32_t levels, int pkg_block_h) {
-    nvn_texdesc d = {.target = target, .format = format, .width = width, .height = height, .depth = depth, .levels = levels, .pkg_block_h = pkg_block_h};
+uint64_t dm_texture_size(int target, int format, uint32_t width, uint32_t height, uint32_t depth, uint32_t levels, int pkg_layout) {
+    nvn_texdesc d = {.target = target, .format = format, .width = width, .height = height, .depth = depth, .levels = levels, .pkg_layout = pkg_layout};
     nvn_texlayout L; nvn_tex_layout(&d, &L);
     return L.bpb ? L.size : 0;
 }
-uint64_t dm_level_offset(int target, int format, uint32_t width, uint32_t height, uint32_t depth, uint32_t levels, int pkg_block_h, unsigned level) {
-    nvn_texdesc d = {.target = target, .format = format, .width = width, .height = height, .depth = depth, .levels = levels, .pkg_block_h = pkg_block_h};
+uint64_t dm_level_offset(int target, int format, uint32_t width, uint32_t height, uint32_t depth, uint32_t levels, int pkg_layout, unsigned level) {
+    nvn_texdesc d = {.target = target, .format = format, .width = width, .height = height, .depth = depth, .levels = levels, .pkg_layout = pkg_layout};
     return nvn_tex_level_offset(&d, level);
 }
 // 1 when the format is one DM_NVN_BC_ASTC stores as ASTC at this block size (BC1/2/3/7 and their sRGB forms)
 int dm_format_eligible(int format, unsigned block) { return nvn_bc_astc_format((uint32_t)format, block, NULL); }
 // Swizzle one level and layer of a linear plane into storage (tests build block-linear textures with it)
-int dm_swizzle(int target, int format, uint32_t width, uint32_t height, uint32_t depth, uint32_t levels, int pkg_block_h, unsigned level, unsigned layer,
+int dm_swizzle(int target, int format, uint32_t width, uint32_t height, uint32_t depth, uint32_t levels, int pkg_layout, unsigned level, unsigned layer,
                const void *linear, size_t pitch, void *storage) {
-    nvn_texdesc d = {.target = target, .format = format, .width = width, .height = height, .depth = depth, .levels = levels, .pkg_block_h = pkg_block_h};
+    nvn_texdesc d = {.target = target, .format = format, .width = width, .height = height, .depth = depth, .levels = levels, .pkg_layout = pkg_layout};
     return nvn_swizzle(&d, level, layer, linear, pitch, storage);
 }
 

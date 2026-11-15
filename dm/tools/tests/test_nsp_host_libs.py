@@ -15,7 +15,7 @@ nsp = importlib.util.module_from_spec(spec); spec.loader.exec_module(nsp)
 class HostLibraries(unittest.TestCase):
     def test_every_library_dmhost_links_is_built_first(self):
         dry = subprocess.run(['make', '-n', '-B', 'GAME=010015100B514000', 'dmhost'], cwd=REPO / 'dm/host', capture_output=True, text=True)
-        line = next((l for l in dry.stdout.splitlines() if ' -o dmhost ' in l), None)
+        line = next((l for l in dry.stdout.splitlines() if ' -o gen/010015100B514000/dmhost ' in l), None)   # the per-game host the phony dmhost builds (upstream's object build)
         self.assertIsNotNone(line, dry.stderr[-500:])
         linked = {t for t in shlex.split(line) if t.startswith('gen/') and t.endswith('.a')}
         self.assertTrue(linked, 'no gen/*.a library in the dmhost compile line')

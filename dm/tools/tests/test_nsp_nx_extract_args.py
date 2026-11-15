@@ -44,8 +44,8 @@ class NxExtractArgs(unittest.TestCase):
         import tempfile
         from pathlib import Path
         nsp.ALLOW_DAMAGED_MANUAL = True
-        with tempfile.TemporaryDirectory() as t, mock.patch.object(nsp, 'run') as run, mock.patch.object(nsp, 'swap_in'):
-            nsp.extract_html('nx', 'keys', Path(t), 'base', None, Path(t), 0x10)
+        with tempfile.TemporaryDirectory() as t, mock.patch.object(nsp, 'run') as run, mock.patch.object(nsp, 'swap_in'), mock.patch.object(nsp, 'extraction_key', return_value='k'):
+            nsp.extract_html('nx', 'keys', Path(t), 'base', None, Path(t), 0x10, Path(t))   # repo: the extraction key's nx_extract identity (mocked here)
         self.assertIn('--allow-damaged', run.call_args[0][0])
         self.assertIn('--html', run.call_args[0][0])
 

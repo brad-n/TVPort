@@ -147,7 +147,7 @@ def zstd_compress(d):
 
 class NvnTexdesc(ctypes.Structure):   # nvn_texdesc, dm/gfx/nvn/nvn_tex.h
     _fields_ = [('target', ctypes.c_int), ('format', ctypes.c_int), ('flags', ctypes.c_int), ('samples', ctypes.c_int), ('width', ctypes.c_uint32), ('height', ctypes.c_uint32),
-                ('depth', ctypes.c_uint32), ('levels', ctypes.c_uint32), ('stride', ctypes.c_uint32), ('pkg_block_h', ctypes.c_int)]
+                ('depth', ctypes.c_uint32), ('levels', ctypes.c_uint32), ('stride', ctypes.c_uint32), ('pkg_layout', ctypes.c_int)]
 
 
 PLANE_FN = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_size_t)

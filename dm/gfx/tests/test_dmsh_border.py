@@ -181,13 +181,14 @@ class Rewrite(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
 
-# border_emu as it was before the profile key shader_border_emu: the first 16 digits of the sha256 of its output for these three shaders
-GOLDEN = {'GRASS': '012df75c8740d7b0', 'KERNEL': 'c0297a275bef153d', 'INTEGER': '1aa0c9b68612f3d4'}
+# border_emu with the profile key shader_border_emu at 1, byte for byte upstream's (since 511a0a2c it declares dm_border_off, the border-off function constant): the first 16 digits of the
+# sha256 of its output for these three shaders
+GOLDEN = {'GRASS': '048074518c9feb5f', 'KERNEL': 'fc16632a2832eb2c', 'INTEGER': 'bb2b460825a5b177'}
 TWIN_OR_BLOCK = re.compile(r'dm_bs|dm_bmix|dm_border|' + re.escape(abi.BORDER_TWIN) + r'\b')
 
 
 class KeyOn(unittest.TestCase):
-    """shader_border_emu 1 (the default) is the old behaviour, byte for byte"""
+    """shader_border_emu 1 (the default) is upstream's border_emu, byte for byte"""
     def test_output_unchanged(self):
         for name, src in (('GRASS', GRASS), ('KERNEL', KERNEL), ('INTEGER', INTEGER)):
             with self.subTest(shader=name):

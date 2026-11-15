@@ -165,7 +165,8 @@ int main(int argc, char **argv) { @autoreleasepool {
         NvShader *cs = [NvShader new]; cs->fn = lib ? fn_spec(lib, @"main0", [MTLFunctionConstantValues new], &error) : nil;
         id<MTLComputePipelineState> p = cs->fn ? cps_new_b(cs->fn, 0, &error) : nil, p_off = cs->fn ? cps_new_b(cs->fn, 1, &error) : nil;
         CHECK(p != nil && p_off != nil, "the rewritten shader compiles: %s", error.localizedDescription.UTF8String);
-        CHECK(p && p_off && p != p_off && fn4_of_b(cs->fn, 1) != fn4_of(cs->fn) && fn_dev_b(cs->fn, 1) == fn_dev_b(cs->fn, 1), "the kernel's border-off pipeline is its own, its functions cached");
+        if (g_plain) CHECK(p && p_off && fn4_of_b(cs->fn, 1) == fn4_of(cs->fn) && fn_dev_b(cs->fn, 1) == fn_dev(cs->fn), "a kernel without border corrections (shader_border_emu 0) has no border-off variant: one function");
+        else CHECK(p && p_off && p != p_off && fn4_of_b(cs->fn, 1) != fn4_of(cs->fn) && fn_dev_b(cs->fn, 1) == fn_dev_b(cs->fn, 1), "the kernel's border-off pipeline is its own, its functions cached");
         if (p && p_off) {
             MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:W height:H mipmapped:NO];
             d.storageMode = MTLStorageModeShared; g_tex = [g_dev newTextureWithDescriptor:d];

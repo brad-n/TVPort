@@ -13,6 +13,9 @@ ROOT = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location('launcher_settings', ROOT / 'dm/games/settings.py')
 settings = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(settings)
+gspec = importlib.util.spec_from_file_location('game_profile_rules', ROOT / 'dm/games/game.py')
+game = importlib.util.module_from_spec(gspec)
+gspec.loader.exec_module(game)
 
 BOTW, WONDER = '01007EF00011E000', '010015100B514000'
 PERFORMANCE_NVN = ['DM_PRESENT_SNAP', 'DM_PSO_MTL4', 'DM_PSO_PREBUILD', 'DM_NVN_ENC_THREAD', 'DM_FPS_HOLD', 'DM_METAL_HUD']
@@ -55,7 +58,10 @@ class LauncherSettingsTests(unittest.TestCase):
             with patch.dict(os.environ, {'SETTINGS_MSL': lib}):
                 s = build(BOTW, 'nvn')['DM_RES_SCALE']
                 self.assertEqual((s['kind'], s['section'], s['default']), ('range', 'Game', '1.0'))
-        with patch.dict(os.environ, {'SETTINGS_MSL': ''}): self.assertNotIn('DM_RES_SCALE', build(BOTW, 'nvn'))   # no library named: the profile (no rescale code)
+        # no library named: the profile's shader_no_rescale, which a profile without the key (BOTW) has at 0, the rescale code in, once the host's chain is past
+        # RESCALE_LAST_OFF_CHAIN (dm/games/game.py), and at 1 before
+        with patch.dict(os.environ, {'SETTINGS_MSL': ''}):
+            (self.assertIn if game.no_rescale_default(game.host_chain()) == '0' else self.assertNotIn)('DM_RES_SCALE', build(BOTW, 'nvn'))
 
     def test_tv_output_is_an_advanced_mac_choice(self):
         """DM_TV_OUTPUT: 1080p (the default) or 4K, a Game row without the basic level, on the Mac only (the Apple TV keeps 1080p), for every graphics API (the host reports the display for all)"""
