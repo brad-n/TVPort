@@ -10,7 +10,12 @@ What changes in this fork, release by release, in plain terms. The full descript
 
 ## Unreleased (on `switch2-experimental`)
 
-Nothing yet: everything that was here is in build 1672.
+Nothing yet: everything that was here is in build 1675.
+
+## 1.3.0 build 1675 (2026-11-15)
+
+**Smaller games on the Apple TV**
+- **Texture detail the Apple TV never reads is left out of its copy of the game:** Switch 2 games ship many textures already in ASTC, the format the Apple TV reads. Their largest detail levels sit above the TV's texture cap (256 by default), where the engine skips them; the TV's copy of the game file now holds zeros there, which take no space. Ocarina of Time's game image goes from 24.7 GB to 19.5 GB (5.2 GB, 21%). Only 2D and 2D-array textures under 64 MB that the engine would cap are touched, and only the levels it drops; `--native-astc-cap off` keeps them. Switch 1 games like Mario Kart 8 Deluxe have no such textures and are unchanged. Measured on the Mac with the real image builder; not yet installed and played on an Apple TV.
 
 ## 1.3.0 build 1672 (2026-11-15)
 
