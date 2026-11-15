@@ -129,7 +129,7 @@ static size_t cache_files(const char *dir) {
     return n;
 }
 static id<MTLTexture> upload(tex_t *t) {
-    mtl_sub_begin(); id<MTLTexture> mt = pkg_upload(t, NULL, nil, 0);
+    mtl_sub_begin(); id<MTLTexture> mt = pkg_upload(t, NULL, nil, 0, nil, NULL, 0, NULL);
     CHECK(mtl_wait(mtl_sub_commit(), 20000000000ull), "the upload's submission completes");
     return mt;
 }
@@ -404,7 +404,7 @@ static void run_background(const char *dir, int six) {
     CHECK(s.misses == 4 && s.queued == 4 && s.encoded == 4 && s.written == 4 && s.dropped == 0, "four planes missed, were queued, encoded and written");
     CHECK(cache_files(rw) == 4, "four cache files");
     // the decision is kept: the same texture uploaded again (now every plane is cached) stays decoded
-    id<MTLTexture> mt1b = pkg_upload(&t1, NULL, mt1, 0); mtl_drain();
+    id<MTLTexture> mt1b = pkg_upload(&t1, NULL, mt1, 0, nil, NULL, 0, NULL); mtl_drain();
     CHECK(mt1b && mt1b.pixelFormat == MTLPixelFormatRGBA8Unorm, "a decoded texture stays decoded on re-upload, though its planes are cached now");
     // 2. a new texture of the same bytes: every plane hits, ASTC
     tex_t t2 = fixture(d, &m2);
@@ -415,11 +415,11 @@ static void run_background(const char *dir, int six) {
     // 3. an ASTC texture stays ASTC when its storage gets other bytes: the planes without an entry are void blocks, queued, never encoded on this thread
     g_seed_base = 1000; fill_storage(&t2, d);
     double before = s.encode_ns; (void)before;
-    id<MTLTexture> mt2b = pkg_upload(&t2, NULL, mt2, 0); mtl_drain();
+    id<MTLTexture> mt2b = pkg_upload(&t2, NULL, mt2, 0, nil, NULL, 0, NULL); mtl_drain();
     CHECK(mt2b && mt2b.pixelFormat == astc_pf, "an ASTC texture stays ASTC when its content changes to uncached bytes");
     s = stats(); CHECK(s.fetch_misses == 4 && s.queued == 8, "its four new planes were queued");
     CHECK(nvn_bc_astc_bg_wait(120), "and drain");
-    id<MTLTexture> mt2c = pkg_upload(&t2, NULL, mt2b, 0); mtl_drain();
+    id<MTLTexture> mt2c = pkg_upload(&t2, NULL, mt2b, 0, nil, NULL, 0, NULL); mtl_drain();
     CHECK(mt2c && mt2c.pixelFormat == astc_pf, "still ASTC");
     for (unsigned l = 0; mt2c && l < 4; l++) { double mean, peak; compare_level(mt2c, &t2, d, l, 0, &mean, &peak); CHECK(mean < 0.04 * (six ? 6.0 : 1.0), "after the background encode the next upload shows the new bytes"); }
     g_seed_base = 0;

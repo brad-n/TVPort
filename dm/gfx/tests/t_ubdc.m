@@ -17,7 +17,6 @@ static void bind(int stage, int index, uint64_t off, uint64_t size) { p_bind_buf
 static void next_submission(void) { g_nubd = 0; memset(g_ubd_pf, 0, sizeof g_ubd_pf); g_ubd_wide = 0; g_ubd_ver++; pend_reset(); memset(g_ubpc, 0, sizeof g_ubpc); }
 
 int main(void) { @autoreleasepool {
-    setenv("DM_NVN_TBDR", "0", 1);
     mtl_init();
     mem = mmap(NULL, LEN, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     CHECK(mem != MAP_FAILED, "memory allocated"); if (mem == MAP_FAILED) return 1;

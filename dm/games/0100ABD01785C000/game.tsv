@@ -36,6 +36,5 @@ sys_resource	0x0
 shader_groups	/game.zip/=game
 shader_note	Portal 2 shaders
 # ---- Graphics ----
-# NVIDIA's occlusion culling in the D3D9 layer puts meshes under SetRenderEnableConditional on pairs nothing in the submission writes: evaluated (render_cond, automatic for
-# every other game), they read 0 / 0 and the vault's furniture vanished (README, Rendering). Drawn unconditionally it only costs GPU time
-render_cond	off
+# NVIDIA's occlusion culling in the D3D9 layer puts meshes under SetRenderEnableConditional on pairs a shader writes: the host evaluates them for every game, and an operand a queued
+# write may change draws (nvn_mtl.m rc_source; upstream a2514d7d, the vault's furniture is there). No render_cond line: the key is gone

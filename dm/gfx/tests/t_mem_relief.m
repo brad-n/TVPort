@@ -1,14 +1,14 @@
 // Memory relief (DM_NVN_MEM_RELIEF, nvn_mtl.m mr_step) and the ledger's heap holders (nvn_ledger.inc lh_tally), through the real replay on the GPU. The held-heap pattern of
 // Ocarina of Time on the Apple TV (run 19, ended at its memory limit 954 s in): recycled render-target heaps that nothing live needs, kept while the process ran out of memory by
 //  1. the waiting list (RH): heaps whose targets are gone, under the cap and the idle time
-//  2. a target dead by overwrite (another target's pass reached all of its storage after its last use) that its live texture object still names, inside rt_retire's hold for storage
+//  2. a target dead by overwrite (another target's pass reached all of its storage after its last use) that its live texture object still names, inside rr_retire's hold for storage
 //     the game came back to
 //  3. unreferenced shared targets (their objects finalized), under the sweep's cap
 // With plenty of memory the ledger names each heap's holder (every byte of the dm.rt heaps in the residency set) and all of them stay. Once the process is short of memory (the
 // available memory faked under DM_NVN_MEM_RELIEF_MB) they go within a few submissions, out of the residency set, and Metal's allocation comes back by their heaps; the target still
 // in use keeps its texture and its pixels, and the dead one drawn again holds its new ones. The look's hysteresis: on under the threshold, off 64 MB above it.
-//  4. (with or without the relief: rt_retire's rule) a resolution family (image_texture: two sizes at one offset sharing a heap) whose every texture another target has drawn over
-//     goes whole, its heap with it; a family with a texture still in use stays
+//  4. (with or without the relief: rr_retire's rule) a resolution family (image_texture: two sizes at one offset sharing a heap) whose every texture another target has drawn over
+//     goes whole, its heap to the waiting list (freed past the idle time); a family with a texture still in use stays
 // ./t_mem_relief [off]: DM_NVN_MEM_RELIEF=0 keeps them all under the same shortage
 #define nvn_game_fps nvn_game_fps_mtl_default
 #include "../nvn/nvn_mtl.m"
@@ -54,13 +54,15 @@ static void draw_all(tex_t *t) {   // one pass into t: a full-screen triangle dr
 }
 static void tick(int n) { for (int i = 0; i < n; i++) { mtl_sub_begin(); mtl_sub_commit(); mtl_drain(); } }
 static void settle(void) { tick(2); dispatch_sync(g_feedback_q, ^{}); defer_drain(); tick(2); dispatch_sync(g_feedback_q, ^{}); defer_drain(); }
-static void idle(void) { usleep((RR_MS + 150) * 1000); tick(RR_IDLE + 2 * RR_EVERY); settle(); }   // unused long enough for rt_retire
+static void idle(void) { usleep((RR_MS + 150) * 1000); tick(RR_IDLE + 2 * RR_EVERY); settle(); }   // unused long enough for rr_retire
 static void look(uint64_t avail_mb) { g_mr_fake = (int64_t)avail_mb; usleep(25 * 1000); tick(1); }   // the next look (every 20 ms) sees this much available
-static uintptr_t shared_tex(const tex_t *t) { alias_key k = tex_alias_key(t); pthread_mutex_lock(&g_smu); void *o = nvn_hm_get(&g_alias, &k); pthread_mutex_unlock(&g_smu); return (uintptr_t)o; }
+static uintptr_t shared_tex(const tex_t *t) { alias_key k = tex_alias_key(t); void *o; @autoreleasepool { pthread_mutex_lock(&g_smu); o = (__bridge void *)own_alias_get_locked(&k); pthread_mutex_unlock(&g_smu); } return (uintptr_t)o; }   // own pool: the owner's id return is autoreleased, which would keep the texture past its retirement
 static int live(const tex_t *t) { return shared_tex(t) && serial_get(t->serial) != nil; }
 static uintptr_t heap_of(const tex_t *t) { @autoreleasepool { uintptr_t a = shared_tex(t); return a ? (uintptr_t)(__bridge void *)((__bridge id<MTLTexture>)(void *)a).heap : 0; } }   // no reference kept
 static int resident_addr(uintptr_t a) { if (!a) return 0; int r = 0; @autoreleasepool { pthread_mutex_lock(&g_res_mu); for (id o in g_res_objects) if ((uintptr_t)(__bridge void *)o == a) { r = 1; break; } pthread_mutex_unlock(&g_res_mu); } return r; }
 static unsigned waiting(void) { os_unfair_lock_lock(&g_rh_lk); unsigned n = g_rh_n; os_unfair_lock_unlock(&g_rh_lk); return n; }
+static uint64_t waiting_b(void) { os_unfair_lock_lock(&g_rh_lk); uint64_t b = 0; for (unsigned i = 0; i < g_rh_n; i++) b += g_rh[i].size; os_unfair_lock_unlock(&g_rh_lk); return b; }
+static int heap_waits(uintptr_t h) { os_unfair_lock_lock(&g_rh_lk); int r = 0; for (unsigned i = 0; i < g_rh_n; i++) r |= (uintptr_t)g_rh[i].heap == h; os_unfair_lock_unlock(&g_rh_lk); return r; }
 static uint64_t rt_heaps_b(void) {   // the dm.rt heaps the residency set holds (in a pool of its own: an array left in main's would keep every heap alive)
     uint64_t b = 0; @autoreleasepool { pthread_mutex_lock(&g_res_mu); NSArray *a = g_res_objects.allObjects; pthread_mutex_unlock(&g_res_mu);
         for (id o in a) if ([o conformsToProtocol:@protocol(MTLHeap)] && [((id<MTLHeap>)o).label isEqualToString:@"dm.rt"]) b += ((id<MTLHeap>)o).size; }
@@ -136,10 +138,11 @@ int main(int argc, char **argv) { @autoreleasepool {
 
     // the ledger names a holder for every MB of the recycled heaps
     lh_tot t0; tally(&t0);
-    uint64_t heaps0 = rt_heaps_b(), hsz = 0;
+    uint64_t heaps0 = rt_heaps_b(), hsz = 0; unsigned wait0 = waiting();   // (A may hold one of W1-W3's heaps, see below)
     @autoreleasepool { for (int i = 0; i < 3; i++) hsz += ((__bridge id<MTLHeap>)(void *)hW[i]).size; }
     CHECK(tsum(&t0, 0) == heaps0 && heaps0 > 0, "the holders' MB add up to the dm.rt heaps in the residency set");
-    CHECK(t0.n[0][LH_WAIT] == 3 && t0.b[0][LH_WAIT] == hsz, "the three waiting heaps are named as waiting (RH), with their sizes");
+    // A may have taken one of W1-W3's heaps (a Mac's heaps are an eighth larger than their first target, rh_headroom: W's 7.4 MB RGBA16F fits A's 8.3 MB RGBA8), so the waiting count is the list's
+    CHECK(waiting() >= 2 && t0.n[0][LH_WAIT] == waiting() && t0.b[0][LH_WAIT] == waiting_b() && waiting_b() <= hsz, "the waiting heaps are named as waiting (RH), with their sizes");
     CHECK(t0.n[0][LH_UNREF] == 2, "U1 and U2's heaps: unreferenced shared textures");
     CHECK(t0.n[0][LH_LIVE0] + t0.n[0][LH_LIVE1] + t0.n[0][LH_LIVE2] + t0.n[0][LH_LIVE3] == 2 && t0.dn[0] == 1 && t0.an[0] == 1, "A and B's heaps: live texture objects', A's drawn over since its last use, over storage the game came back to");
     CHECK(t0.n[0][LH_ELSE] == 0, "no heap is left without a holder the host's tables show");
@@ -174,7 +177,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         look(g_mr_low - 1); CHECK(mr_active() && g_mr_episodes == 2, "under it again: a second episode");
         look(4096); CHECK(!mr_active(), "plenty again");
     } else {
-        CHECK(shared_tex(&U1) && shared_tex(&U2) && waiting() == 3, "off: U1, U2 and the waiting heaps all stay");
+        CHECK(shared_tex(&U1) && shared_tex(&U2) && waiting() == wait0, "off: U1, U2 and the waiting heaps all stay");
         if ((clock_gettime_nsec_np(CLOCK_MONOTONIC) - t_dead) / 1e6 < RR_HOLD_MS * 0.9) CHECK(live(&A) && heaps1 == heaps0, "off: A stays inside its hold, and the heaps as they were");
     }
     // 4. resolution families: F1 / F2 (RGBA8 1280x720 and 960x540 at one offset) share a heap; D (RGBA16F) is drawn over all of it after their last use. G1 / G2 the same at
@@ -191,7 +194,10 @@ int main(int argc, char **argv) { @autoreleasepool {
     idle(); draw_all(&G2); draw_all(&D); idle();
     CHECK(!shared_tex(&F1) && !shared_tex(&F2) && g_rr_fam_n == fam0 + 1, "the family every texture of which was drawn over is retired whole");
     settle();
-    CHECK(!resident_addr(hF), "and its heap leaves the residency set");
+    CHECK(heap_waits(hF) && resident_addr(hF), "and its heap waits for the next target, resident (upstream 707cac95: a family's heap is recycled as a target's is)");
+    os_unfair_lock_lock(&g_rh_lk); for (unsigned i = 0; i < g_rh_n; i++) g_rh[i].t -= RH_IDLE_NS; os_unfair_lock_unlock(&g_rh_lk);
+    settle();   // rh_trim when the next submission begins
+    CHECK(!heap_waits(hF) && !resident_addr(hF), "past the idle time it leaves the residency set");
     CHECK(live(&G1) && live(&G2) && heap_of(&G1) == hG && resident_addr(hG), "the family with a texture still in use stays, G1 with it");
     CHECK(g_rr_kept_n[RRK_FAMILY] >= 1, "the ledger's retire line counts it: a family with a member that stays");
     draw_all(&F1);

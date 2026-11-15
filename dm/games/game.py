@@ -101,27 +101,29 @@ def load(name=None):
     return Game(d)
 
 
-def all_games():
-    out, seen = [], set()
+def all_games(skip=()):   # skip: profile folders left out (the NSP script's own provisional and derived profiles, which it never takes as registered ones)
+    out, seen, skip = [], set(), {Path(d).resolve() for d in skip}
     for root in search_dirs():
-        if not root.is_dir(): continue
+        if not root.is_dir() or root.resolve() in skip: continue
         for d in sorted(root.iterdir()):
             if (d / 'game.tsv').exists() and d.name not in seen: seen.add(d.name); out.append(Game(d))
     return out
 
 
-def by_title(tid):
-    return next((g for g in all_games() if g.title_id == tid), None)
+def by_title(tid, skip=()):
+    return next((g for g in all_games(skip) if g.title_id == tid), None)
 
 
-def by_build(main_id):   # the profile whose build rows register this main build ID (a release of the same build under another title ID: the NSP script's same_build)
-    return next((g for g in all_games() if any(b.get('main') == main_id for b in g.builds().values())), None)
+def by_build(main_id, skip=()):   # the profile whose build rows register this main build ID (a release of the same build under another title ID: the NSP script's same_build)
+    return next((g for g in all_games(skip) if any(b.get('main') == main_id for b in g.builds().values())), None)
 
 
-# agl's upscaler network (NDSR), by where the shader map found each key: the compute shaders of agl_ndsr.pck (Donkey Kong Bananza's 24 in its release library, Splatoon Raiders' 20 in its debug one)
-# and of its variants agl_ndsr_vr.pck and agl_ndsr_vr_light.pck: The Legend of Zelda: Ocarina of Time (Switch 2) upscales with agl_ndsr_vr.pck's, so DM_UPSCALER=metalfx left its network
-# running. A variant the host cannot draw (its colour, its rectangles) is refused there and runs as the game's (nvn_mtl.m up_mfx_wanted, up_mfx_encode)
-UPSCALER_SOURCE = re.compile(r'/agl_ndsr(?:_vr(?:_light)?)?\.pck#')
+# The upscaler network (NDSR), by where the shader map found each key: the compute shaders of an NDSR pack (shader_split.py ndsr_shaders: a source ending in #NDSR@<offset>), whatever
+# ships it. The pack is a library several engines carry under their own names: agl's agl_ndsr.pck (Donkey Kong Bananza, Splatoon Raiders, Mario Kart World, Nintendo Switch Sports Resort)
+# and its siblings agl_ndsr_vr.pck and agl_ndsr_vr_light.pck (Ocarina of Time), Kirby Air Riders' and Fast Fusion's .ndsr files (the same 20 networks), Star Fox's nested in a VIPR container
+# (Splatoon Raiders' 20), and the pack inside nn::ndve's movie file. Being named only lets the host read a shader's colour from its code; one whose colour it does not know, or a dispatch
+# it cannot draw, runs as the game's (nvn_mtl.m up_mfx_color, up_mfx_encode)
+UPSCALER_SOURCE = re.compile(r'#NDSR@0x[0-9a-f]+$')
 
 
 def upscaler_keys(g):
@@ -226,8 +228,7 @@ def header_one(g):
     if sks and (not m or not 0x30 <= int(m[1], 0) or not 0 < int(m[2], 0) or int(m[1], 0) + int(m[2], 0) > 0x880 or (int(m[1], 0) < 0x760 and int(m[1], 0) + int(m[2], 0) > 0x700)):   # not over +0x700..+0x75f, the code area and compute fields the tools read
         sys.exit(f'{g.id}: shader_key_skip takes <offset>+<length> within the first 0x880 bytes of the control section, past its header (+0x30) and clear of +0x700..+0x75f: {sks}')
     sko, skl = (int(m[1], 0), int(m[2], 0)) if m else (0, 0)
-    rcd = g.get('render_cond', 'auto')   # NVN conditional rendering evaluated at replay, timestamp reports with counter 0 (nvn_mtl.m OP_RENDER_COND): on / off / auto = on from the game's first render-enable call
-    if rcd not in ('on', 'off', 'auto'): sys.exit(f'{g.id}: render_cond must be on, off or auto: {rcd}')
+    if g.get('render_cond', ''): print(f'{g.id}: render_cond is ignored: the host evaluates NVN conditional rendering for every game', file=sys.stderr)   # a profile written before the key went (a build folder's derived one)
     dov = g.get('dispatch_overlap', 'off')   # the game's dispatches with no barrier of its between them run side by side in the copy encoder (nvn_mtl.m dispatch_enc; DM_NVN_DISPATCH_OVERLAP overrides): on / off
     if dov not in ('on', 'off'): sys.exit(f'{g.id}: dispatch_overlap must be on or off: {dov}')
     tfu = g.get('tex_flush_upload', 'off')   # textures written by the CPU into a pool and published with nvnMemoryPoolFlushMappedRange are uploaded like packaged ones (hle_nvn.c): on / off
@@ -302,7 +303,6 @@ def header_one(g):
          f'#define DM_GAME_PERF_BOOST {int(pm == "boost")}',
          f'#define DM_GAME_TEX_FLUSH_UPLOAD {int(tfu == "on")}',
          f'#define DM_GAME_SHADER_KEY_SKIP_OFF {sko:#x}', f'#define DM_GAME_SHADER_KEY_SKIP_LEN {skl:#x}',
-         f'#define DM_GAME_RENDER_COND {("off", "on", "auto").index(rcd)}',   # 0 off, 1 on, 2 auto (nvn_mtl.m mtl_render_cond)
          f'#define DM_GAME_DISPATCH_OVERLAP {int(dov == "on")}',
          f'#define DM_GAME_TEX_DIRTY_UPLOAD {int(tdu == "on")}',
          f'#define DM_GAME_TEX_DYN_SLOTS {int(tds == "on")}',

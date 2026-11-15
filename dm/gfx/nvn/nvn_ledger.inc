@@ -41,22 +41,21 @@ static int lg_idle_class(uint64_t seen, uint64_t fence, uint64_t now) {
 // kept only until its storage is taken over, its pool goes, or alias_sweep), the unreferenced by how long since a lookup found them; and the deferred-release queue's memory
 static void lg_shared(void) { @autoreleasepool {
     const double M = 1048576.0;
-    uint64_t n[4] = {0}, b[4] = {0}, in[4] = {0}, ib[4] = {0}; lg_group og[LG_GROUPS]; int nog = 0;   // n/b: held, ghost, pinned, unreferenced; in/ib: the unreferenced by lg_idle_class
+    uint64_t n_[4] = {0}, b_[4] = {0}, in_[4] = {0}, ib_[4] = {0}, *n = n_, *b = b_, *in = in_, *ib = ib_; lg_group og_[LG_GROUPS], *og = og_; __block int nog = 0;   // n/b: held, ghost, pinned, unreferenced; in/ib: the unreferenced by lg_idle_class
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), fence = atomic_load(&g_fence);
     CFMutableSetRef heaps = CFSetCreateMutable(NULL, 0, NULL);
     pthread_mutex_lock(&g_smu);
-    for (uint32_t i = 0; i < g_alias.cap; i++) {
-        void *v = g_alias.vals[i]; if (!v) continue;
-        id o = (__bridge id)v; alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
-        uint64_t z = lg_tex_bytes(o, heaps); uintptr_t a = (uintptr_t)v;
-        int st = serial_table_holds(v) ? 0 : g_ghost_held.n && nvn_hm_get(&g_ghost_held, &a) ? 1 : tex_object_pinned(o) ? 2 : 3;
+    own_alias_each_seen_locked(^(const alias_key *k, id o, uint64_t seen) {   // the sharing table's entries (nvn_owner.m)
+        (void)k; const void *v = (__bridge const void *)o;
+        uint64_t z = lg_tex_bytes(o, heaps);
+        int st = serial_table_holds(v) ? 0 : own_ghost_holds_locked(v) ? 1 : tex_object_pinned(o) ? 2 : 3;
         n[st]++; b[st] += z;
-        if (st != 3) continue;
-        int c = lg_idle_class((uint64_t)(uintptr_t)nvn_hm_get(&g_alias_seen, &k), fence, now); in[c]++; ib[c] += z;
+        if (st != 3) return;
+        int c = lg_idle_class(seen, fence, now); in[c]++; ib[c] += z;
         if ([o conformsToProtocol:@protocol(MTLTexture)]) { id<MTLTexture> t = o;
             lg_add(og, &nog, (uint64_t)MIN(t.width, 65535u) << 48 | (uint64_t)MIN(t.height, 65535u) << 32 | (uint64_t)MIN(t.arrayLength * t.depth, 255u) << 24 | ((uint32_t)t.pixelFormat & 0xffff), z); }
-    }
-    uint64_t swept_n = g_alias_swept, swept_b = g_alias_swept_b, taken = g_alias_taken;
+    });
+    uint64_t swept_n = g_alias_swept, swept_b = g_alias_swept_b, taken = own_alias_stats_locked().taken;
     pthread_mutex_unlock(&g_smu);
     CFSetRemoveAllValues(heaps);
     uint64_t dq_n = 0, dq_b = 0, dr_n = 0;
@@ -89,9 +88,9 @@ static void lg_shared(void) { @autoreleasepool {
 // a pin; nobody); a serial entry's own texture or view (not or no longer shared); a retired texture waiting for the serial entries that hold it (g_retire_held); the cached views
 // (of texture IDs, by texture object g_vc, by Metal texture g_vb), each holding its parent; the deferred-release queue (still to free, or a reference to drop). A heap none of these
 // reaches is kept by something the host's tables do not show (a command buffer or an autorelease pool still holding its texture, or a leak). Of the live ones, those whose storage
-// passes into other textures have reached since their last use (rt_retire's write map: dead by overwrite, kept by its idle rules or a view) and those over storage a retired texture
-// had (made again) are counted. Takes g_rmu, then g_smu, as rt_retire does: a few milliseconds every DM_NVN_LEDGER seconds
-enum { LH_WAIT, LH_LIVE0, LH_LIVE1, LH_LIVE2, LH_LIVE3, LH_GHOST, LH_PIN, LH_UNREF, LH_SERIAL, LH_RETIRE, LH_IDVIEW, LH_VC, LH_VB, LH_DEFER, LH_DEFREF, LH_ELSE, LH_N, LH_NONE = 0xff };
+// passes into other textures have reached since their last use (rr_retire's write map: dead by overwrite, kept by its idle rules or a view) and those over storage a retired texture
+// had (made again) are counted. Takes g_rmu, then g_smu, as rr_retire does: a few milliseconds every DM_NVN_LEDGER seconds
+enum { LH_WAIT, LH_LIVE0, LH_LIVE1, LH_LIVE2, LH_LIVE3, LH_GHOST, LH_PIN, LH_UNREF, LH_SERIAL, LH_RETIRE, LH_IDVIEW, LH_VC, LH_DEFER, LH_DEFREF, LH_ELSE, LH_N, LH_NONE = 0xff };
 typedef struct { uint64_t size, tex; uint8_t kind, holder, lossy, dead, again, live; uint16_t members; } lh_ent;   // tex: the largest texture placed in it; dead: every live member drawn over
 typedef struct { nvn_hmap hm; lh_ent *e; uint32_t n; } lh_set;
 static lh_ent *lh_find(lh_set *s, id o, id<MTLTexture> *base) {   // the entry of the heap o (a texture or a view of one) is placed in, or NULL
@@ -128,22 +127,19 @@ static void lh_tally(NSArray *live, lh_tot *T) { @autoreleasepool {
     os_unfair_lock_lock(&g_rmu); pthread_mutex_lock(&g_smu);
     {   // the sharing table: each texture in a heap of the set by who holds it; the live ones' serials, for their texture IDs' last bindings
         typedef struct { void *o; alias_key k; uint64_t lu; } lh_live;
-        lh_live *lv = NULL; uint32_t nl = 0, cl = 0; nvn_hmap li = {.klen = sizeof(uintptr_t)};   // live texture → index + 1
-        for (uint32_t i = 0; i < g_alias.cap; i++) {
-            void *v = g_alias.vals[i]; if (!v) continue;
-            id o = (__bridge id)v; if (!lh_find(&s, o, NULL)) continue;
-            uintptr_t a = (uintptr_t)v; alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
-            if (!serial_table_holds(v)) { lh_mark(&s, o, g_ghost_held.n && nvn_hm_get(&g_ghost_held, &a) ? LH_GHOST : tex_object_pinned(o) ? LH_PIN : LH_UNREF); continue; }
-            uint64_t lu = (uint64_t)(uintptr_t)nvn_hm_get(&g_alias_seen, &k);
+        __block lh_live *lv = NULL; __block uint32_t nl = 0, cl = 0; __block nvn_hmap li = {.klen = sizeof(uintptr_t)};   // live texture → index + 1
+        lh_set *sp = &s;
+        own_alias_each_seen_locked(^(const alias_key *kp, id o, uint64_t seen) {
+            void *v = (__bridge void *)o; if (!lh_find(sp, o, NULL)) return;
+            uintptr_t a = (uintptr_t)v;
+            if (!serial_table_holds(v)) { lh_mark(sp, o, own_ghost_holds_locked(v) ? LH_GHOST : tex_object_pinned(o) ? LH_PIN : LH_UNREF); return; }
+            uint64_t lu = seen;
             os_unfair_lock_lock(&g_rr_use_lk); lu = MAX(lu, (uint64_t)(uintptr_t)nvn_hm_get(&g_rr_use, &a)); os_unfair_lock_unlock(&g_rr_use_lk);
             if (nl == cl) { cl = cl ? 2 * cl : 256; lv = realloc_or_die(lv, cl * sizeof *lv, "the ledger's heaps"); }
-            lv[nl] = (lh_live){v, k, lu}; nvn_hm_put(&li, &a, (void *)(uintptr_t)(++nl));
-        }
-        for (uint32_t i = 0; nl && i < g_by_serial.cap; i++) {   // the live serials that hold one: their texture IDs' last bindings are uses too
-            void *v = g_by_serial.vals[i]; if (!v) continue; uintptr_t a = (uintptr_t)v, j = (uintptr_t)nvn_hm_get(&li, &a); if (!j) continue;
-            uint64_t ser; memcpy(&ser, g_by_serial.keys + (size_t)i * 8, 8);
-            for (int k = (int)(uintptr_t)nvn_hm_get(&g_treg_serial, &ser); k; k = g_treg[k - 1].next) lv[j - 1].lu = MAX(lv[j - 1].lu, g_treg[k - 1].ufence);
-        }
+            lv[nl] = (lh_live){v, *kp, lu}; nvn_hm_put(&li, &a, (void *)(uintptr_t)(++nl)); });
+        if (nl) own_each_locked(^(uint64_t ser, id o, int ghost) {   // the live serials that hold one: their texture IDs' last bindings are uses too
+            if (ghost) return; uintptr_t a = (uintptr_t)(__bridge void *)o, j = (uintptr_t)nvn_hm_get(&li, &a); if (!j) return;
+            for (int k = (int)(uintptr_t)nvn_hm_get(&g_treg_serial, &ser); k; k = g_treg[k - 1].next) lv[j - 1].lu = MAX(lv[j - 1].lu, g_treg[k - 1].ufence); });
         for (uint32_t j = 0; j < nl; j++) {
             id o = (__bridge id)lv[j].o; int c = lg_idle_class(lv[j].lu, fence, now);
             lh_mark(&s, o, LH_LIVE0 + c);
@@ -156,15 +152,14 @@ static void lh_tally(NSArray *live, lh_tot *T) { @autoreleasepool {
         }
         nvn_hm_clear(&li, NULL); free(li.keys); free(li.vals); free(lv);
     }
-    for (uint32_t i = 0; i < g_by_serial.cap; i++) {   // a serial's own entry: a texture or a view not (or no longer) in the sharing table, a packaged texture's
-        void *v = g_by_serial.vals[i]; if (!v) continue; id o = (__bridge id)v;
-        if ([o isKindOfClass:[NvPkg class]]) { NvPkg *pk = o; lh_mark(&s, pk->tex, LH_SERIAL); lh_mark(&s, pk->spare, LH_SERIAL); lh_mark(&s, pk->view, LH_SERIAL); }
-        else lh_mark(&s, o, LH_SERIAL);
+    {   // a serial's own entry (live, then ghost): a texture or a view not (or no longer) in the sharing table, a packaged texture's; the pins; the retired objects waiting for their last entry
+        lh_set *sp = &s;
+        own_each_locked(^(uint64_t ser, id o, int ghost) { (void)ser;
+            if ([o isKindOfClass:[NvPkg class]]) { NvPkg *pk = o; lh_mark(sp, pk->tex, ghost ? LH_GHOST : LH_SERIAL); if (!ghost) lh_mark(sp, pk->spare, LH_SERIAL); lh_mark(sp, pk->view, ghost ? LH_GHOST : LH_SERIAL); }
+            else lh_mark(sp, o, ghost ? LH_GHOST : LH_SERIAL); });
+        own_pins_each_locked(^(uint64_t ser, id o) { (void)ser; lh_mark(sp, o, LH_PIN); });
+        own_waiting_each_locked(^(id o) { lh_mark(sp, o, LH_RETIRE); });
     }
-    for (uint32_t i = 0; i < g_ghost.cap; i++) { void *v = g_ghost.vals[i]; if (!v) continue; id o = (__bridge id)v;
-        if ([o isKindOfClass:[NvPkg class]]) { NvPkg *pk = o; lh_mark(&s, pk->tex, LH_GHOST); lh_mark(&s, pk->view, LH_GHOST); } else lh_mark(&s, o, LH_GHOST); }
-    for (uint32_t i = 0; i < g_tex_pins.cap; i++) { tex_pin *pin = g_tex_pins.vals[i]; if (pin && pin->object) lh_mark(&s, (__bridge id)pin->object, LH_PIN); }
-    for (uint32_t i = 0; i < g_retire_held.cap; i++) { void *v = g_retire_held.vals[i]; if (v) lh_mark(&s, (__bridge id)v, LH_RETIRE); }
     pthread_mutex_unlock(&g_smu); os_unfair_lock_unlock(&g_rmu);
     for (int c = 0;; c += 2048) {   // the texture IDs' cached views and stand-ins, under g_rmu a few thousand IDs at a time (the replay takes it at every binding)
         os_unfair_lock_lock(&g_rmu); int end = MIN(c + 2048, g_ntreg);
@@ -178,9 +173,6 @@ static void lh_tally(NSArray *live, lh_tot *T) { @autoreleasepool {
     }
     os_unfair_lock_lock(&g_rmu);
     for (uint32_t i = 0; i < g_vc.cap; i++) { vc_set *vs = g_vc.vals[i]; if (!vs) continue; for (int w = 0; w < VC_WAYS; w++) if (vs->view[w]) lh_mark(&s, (__bridge id)vs->view[w], LH_VC); }
-    os_unfair_lock_lock(&g_vb_lk);
-    for (uint32_t i = 0; i < g_vb.cap; i++) { vb_set *vs = g_vb.vals[i]; if (!vs) continue; for (int w = 0; w < VC_WAYS; w++) if (vs->view[w]) lh_mark(&s, (__bridge id)vs->view[w], LH_VB); }
-    os_unfair_lock_unlock(&g_vb_lk);
     os_unfair_lock_unlock(&g_rmu);
     pthread_mutex_lock(&g_deferred_mu);
     for (NvDeferredRelease *d in g_deferred) if (d->object) lh_mark(&s, d->object, d->keep_resident ? LH_DEFREF : LH_DEFER);
@@ -198,15 +190,15 @@ static void lg_heaps(NSArray *live) {
     static const char *kn[2] = {"recycled render-target heaps", "image families"};
     for (int k = 0; k < 2; k++) {
         if (!(hn[k][LH_WAIT] + hn[k][LH_LIVE0] + hn[k][LH_LIVE1] + hn[k][LH_LIVE2] + hn[k][LH_LIVE3] + hn[k][LH_GHOST] + hn[k][LH_PIN] + hn[k][LH_UNREF] + hn[k][LH_SERIAL] + hn[k][LH_RETIRE]
-              + hn[k][LH_IDVIEW] + hn[k][LH_VC] + hn[k][LH_VB] + hn[k][LH_DEFER] + hn[k][LH_DEFREF] + hn[k][LH_ELSE])) continue;
+              + hn[k][LH_IDVIEW] + hn[k][LH_VC] + hn[k][LH_DEFER] + hn[k][LH_DEFREF] + hn[k][LH_ELSE])) continue;
         uint64_t liven = hn[k][LH_LIVE0] + hn[k][LH_LIVE1] + hn[k][LH_LIVE2] + hn[k][LH_LIVE3], liveb = hb[k][LH_LIVE0] + hb[k][LH_LIVE1] + hb[k][LH_LIVE2] + hb[k][LH_LIVE3];
         MLOG("[ledger]   %s by holder: waiting (RH) %llu, %.0f MB; a live texture object's shared texture %llu, %.0f MB (used within %d submissions %llu, %.0f MB; under 1 s ago %llu, %.0f MB; 1-10 s %llu, %.0f MB; longer %llu, %.0f MB; of them drawn over by other textures since their last use %llu, %.0f MB, and over storage a retired target had %llu, %.0f MB); "
              "a finalized one's (ghost ring) %llu, %.0f MB; pinned %llu, %.0f MB; unreferenced shared %llu, %.0f MB; a serial's own texture or view %llu, %.0f MB; retired, waiting for the serial entries holding it %llu, %.0f MB; "
-             "cached views: of texture IDs %llu, %.0f MB, by texture object %llu, %.0f MB, by Metal texture %llu, %.0f MB; deferred-release queue: to free %llu, %.0f MB, a reference to drop %llu, %.0f MB; none of these (in flight, an autorelease pool or a leak) %llu, %.0f MB",
+             "cached views: of texture IDs %llu, %.0f MB, by Metal texture %llu, %.0f MB; deferred-release queue: to free %llu, %.0f MB, a reference to drop %llu, %.0f MB; none of these (in flight, an autorelease pool or a leak) %llu, %.0f MB",
              kn[k], (unsigned long long)hn[k][LH_WAIT], hb[k][LH_WAIT] / M, (unsigned long long)liven, liveb / M, ALIAS_IDLE, (unsigned long long)hn[k][LH_LIVE0], hb[k][LH_LIVE0] / M, (unsigned long long)hn[k][LH_LIVE1], hb[k][LH_LIVE1] / M,
              (unsigned long long)hn[k][LH_LIVE2], hb[k][LH_LIVE2] / M, (unsigned long long)hn[k][LH_LIVE3], hb[k][LH_LIVE3] / M, (unsigned long long)dn[k], db[k] / M, (unsigned long long)an[k], ab[k] / M,
              (unsigned long long)hn[k][LH_GHOST], hb[k][LH_GHOST] / M, (unsigned long long)hn[k][LH_PIN], hb[k][LH_PIN] / M, (unsigned long long)hn[k][LH_UNREF], hb[k][LH_UNREF] / M, (unsigned long long)hn[k][LH_SERIAL], hb[k][LH_SERIAL] / M,
-             (unsigned long long)hn[k][LH_RETIRE], hb[k][LH_RETIRE] / M, (unsigned long long)hn[k][LH_IDVIEW], hb[k][LH_IDVIEW] / M, (unsigned long long)hn[k][LH_VC], hb[k][LH_VC] / M, (unsigned long long)hn[k][LH_VB], hb[k][LH_VB] / M,
+             (unsigned long long)hn[k][LH_RETIRE], hb[k][LH_RETIRE] / M, (unsigned long long)hn[k][LH_IDVIEW], hb[k][LH_IDVIEW] / M, (unsigned long long)hn[k][LH_VC], hb[k][LH_VC] / M,
              (unsigned long long)hn[k][LH_DEFER], hb[k][LH_DEFER] / M, (unsigned long long)hn[k][LH_DEFREF], hb[k][LH_DEFREF] / M, (unsigned long long)hn[k][LH_ELSE], hb[k][LH_ELSE] / M);
         MLOG("[ledger]   %s: %.0f MB of heaps for %.0f MB of the largest texture placed in each (the rest is size rounding, a reused heap's slack or a family's larger members; waiting heaps hold none); lossy %llu, %.0f MB; %llu live textures in them, %llu heaps holding more than one",
              kn[k], sb[k] / M, tb[k] / M, (unsigned long long)ln[k], lb[k] / M, (unsigned long long)mem[k], (unsigned long long)multi[k]);
@@ -245,7 +237,7 @@ static void lg_dump(void) { @autoreleasepool {
     @autoreleasepool { pthread_mutex_lock(&g_mu);
         lg_rng *rr = malloc((size_t)(g_npool + g_n_old_res + 1) * sizeof *rr); int nr = 0;
         for (int i = 0; i < g_npool; i++) { uint64_t n = g_pools[i].hi - g_pools[i].lo; pool_n++; pool_b += n; if (g_pools[i].res && g_pools[i].buf) { uint64_t l = g_pools[i].buf.length; poolres_n++; poolres_b += l; if (rr) rr[nr++] = (lg_rng){g_pools[i].base, g_pools[i].base + l}; }
-            if (g_pools[i].pin) { pin_n++; pin_b += g_pools[i].buf.length; pin_big += g_pools[i].unk != 1 || g_pools[i].end != g_pools[i].hi; } }
+            if (g_pools[i].pin) { pin_n++; pin_b += g_pools[i].buf.length; pin_big += g_pools[i].reach != REACH_END || g_pools[i].end != g_pools[i].hi; } }
         for (int k = 0; k < g_n_old_res; k++) { id<MTLBuffer> b = g_old_res[k].buf; uintptr_t a = (uintptr_t)b.contents; oldres_n++; oldres_b += b.length; pin_old += g_old_res[k].pin != 0; if (rr) rr[nr++] = (lg_rng){a, a + b.length}; }
         for (id<MTLBuffer> b in g_dead_pools) { dead_n++; dead_b += b.length; }
         pthread_mutex_unlock(&g_mu);
@@ -339,12 +331,12 @@ static void lg_inventory(const char *path) { @autoreleasepool {
     NSMutableArray *tex = [NSMutableArray array], *src = [NSMutableArray array];
     g_lg_store = [NSMapTable strongToStrongObjectsMapTable];
     pthread_mutex_lock(&g_smu);   // the tables' objects, retained here (+1 each), read below without the lock
-    for (uint32_t i = 0; i < g_alias.cap; i++) { void *v = g_alias.vals[i]; if (!v) continue; alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
-        [g_lg_store setObject:[NSString stringWithFormat:@"storage %llx+%llx", (unsigned long long)k.pool, (unsigned long long)k.off] forKey:(__bridge id)v]; }
-    nvn_hmap *maps[3] = {&g_by_serial, &g_ghost, &g_alias}; const char *names[3] = {"serial", "ghost", "shared"};
-    for (int m = 0; m < 3; m++) for (uint32_t i = 0; i < maps[m]->cap; i++) { void *v = maps[m]->vals[i]; if (!v) continue; id o = (__bridge id)v;
-        if ([o isKindOfClass:[NvPkg class]]) { NvPkg *pk = o; if (pk->tex) { [tex addObject:pk->tex]; [src addObject:@"pkg"]; } if (pk->spare) { [tex addObject:pk->spare]; [src addObject:@"pkg-spare"]; } continue; }
-        if ([o conformsToProtocol:@protocol(MTLTexture)]) { [tex addObject:o]; [src addObject:@(names[m])]; } }
+    own_alias_each_locked(^(const alias_key *k, id o) { [g_lg_store setObject:[NSString stringWithFormat:@"storage %llx+%llx", (unsigned long long)k->pool, (unsigned long long)k->off] forKey:o]; });
+    void (^take)(id, const char *) = ^(id o, const char *name) {
+        if ([o isKindOfClass:[NvPkg class]]) { NvPkg *pk = o; if (pk->tex) { [tex addObject:pk->tex]; [src addObject:@"pkg"]; } if (pk->spare) { [tex addObject:pk->spare]; [src addObject:@"pkg-spare"]; } return; }
+        if ([o conformsToProtocol:@protocol(MTLTexture)]) { [tex addObject:o]; [src addObject:@(name)]; } };
+    own_each_locked(^(uint64_t ser, id o, int ghost) { (void)ser; take(o, ghost ? "ghost" : "serial"); });
+    own_alias_each_locked(^(const alias_key *k, id o) { (void)k; take(o, "shared"); });
     pthread_mutex_unlock(&g_smu);
     pthread_mutex_lock(&g_res_mu); NSArray *live = g_res_objects.allObjects; pthread_mutex_unlock(&g_res_mu);
     CFMutableSetRef seen = CFSetCreateMutable(NULL, 0, NULL), inset = CFSetCreateMutable(NULL, 0, NULL);

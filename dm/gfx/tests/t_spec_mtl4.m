@@ -54,7 +54,7 @@ int main(void) { @autoreleasepool {
     CHECK(again == f1, "the library hands out the same function object for the name");
     fn4_note(again, L, @"cfs1", nil);
     CHECK(is_spec(f1), "noted again with no values, it keeps its specialized descriptor");
-    if (is_spec(f1)) CHECK(draw_one(pso_build(desc(vs, f1), &pe)) == 0.25f, "and its pipeline draws with the constant at its default");
+    if (is_spec(f1)) CHECK(draw_one(pso_build(desc(vs, f1), 1, &pe)) == 0.25f, "and its pipeline draws with the constant at its default");
 
     // The same while another thread reads the descriptor, as a pipeline build does: never unspecialized
     id<MTLFunction> f2 = fn_spec(L, @"cfs2", none, &err);
@@ -70,11 +70,11 @@ int main(void) { @autoreleasepool {
     // An entry point noted only with no values (tf_fn, mesh_obj, never through fn_spec): an empty set, on the Metal 4 path and for an MTLDevice pipeline
     id<MTLFunction> f3 = fn4_note([L newFunctionWithName:@"cfs3"], L, @"cfs3", nil);
     CHECK(is_spec(f3), "a function with constants noted with no values gets a specialized descriptor");
-    if (is_spec(f3)) CHECK(draw_one(pso_build(desc(vs, f3), &pe)) == 0.25f, "its Metal 4 pipeline draws with the constant at its default");
+    if (is_spec(f3)) CHECK(draw_one(pso_build(desc(vs, f3), 1, &pe)) == 0.25f, "its Metal 4 pipeline draws with the constant at its default");
     id<MTLFunction> d3 = fn_dev(f3);
     CHECK(d3 && d3 != f3 && !d3.functionConstantsDictionary.count, "fn_dev specializes it for an MTLDevice pipeline");
     CHECK(fn_dev(f3) == d3, "once");
-    if (d3 && d3 != f3) CHECK(draw_one(pso_build_dev(desc(vs, f3), &pe)) == 0.25f, "and that pipeline draws with the constant at its default");
+    if (d3 && d3 != f3) CHECK(draw_one(pso_build_dev(desc(vs, f3), 1, &pe)) == 0.25f, "and that pipeline draws with the constant at its default");
 
     // A second request for the name with other values (nf_fn's variant for R11G11B10F targets): a function of its own; both requests' pipelines draw with their own values
     id<MTLFunction> f4 = fn_spec(L, @"cfs4", none, &err);
@@ -82,15 +82,15 @@ int main(void) { @autoreleasepool {
     CHECK(v4 && v4 != f4, "the variant is a function of its own");
     CHECK(is_spec(f4) && is_spec(v4), "both have specialized descriptors");
     uint64_t built0 = g_pb_built;
-    float base_px = draw_one(pso_build(desc(vs, f4), &pe));
+    float base_px = draw_one(pso_build(desc(vs, f4), 1, &pe));
     if (base_px != 0.25f) fprintf(stderr, "the first request's pipeline drew %f\n", base_px);
     CHECK(base_px == 0.25f, "the first request's pipeline keeps its values (the constant at its default)");
-    float var_px = draw_one(pso_build(desc(vs, v4), &pe));
+    float var_px = draw_one(pso_build(desc(vs, v4), 1, &pe));
     if (var_px != 3.0f) fprintf(stderr, "the variant's pipeline drew %f\n", var_px);
     CHECK(var_px == 3.0f, "the variant's pipeline draws with its values (k = 3)");
     CHECK(g_pb_built == built0 + 2, "each with a base of its own");
     CHECK(fn_spec_k(L, @"cfs4", none, 0, &err) == f4, "a request with the first one's values shares its function");
-    CHECK(draw_one(pso_build(desc(vs, f4), &pe)) == 0.25f, "whose pipelines still draw with them");
+    CHECK(draw_one(pso_build(desc(vs, f4), 1, &pe)) == 0.25f, "whose pipelines still draw with them");
     printf("t_spec_mtl4: %d checks, %d failed\n", checks, failed);
     return failed != 0;
 } }

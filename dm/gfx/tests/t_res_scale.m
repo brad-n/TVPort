@@ -99,7 +99,6 @@ static NvShader *fs_rs(id<MTLLibrary> lib, NSString *name) {   // its reflection
 }
 static void bind710(void) { p_bind_handles h = {.stage = 1, .first = 0, .n = 1}; h.h[0] = 710; emit(OP_BIND_TEX, &h, sizeof h); }
 int main(void) { @autoreleasepool {
-    setenv("DM_NVN_TBDR", "0", 1);
     mtl_init(); rs_init(); g_rs = 2.0f; g_rs_on = 1;   // the test profile's shaders have no rescale code (shader_no_rescale): on, as rs_init sets it for a profile whose shaders have it
     NSError *error = nil;
     id<MTLLibrary> lib = [g_dev newLibraryWithSource:RS_MSL options:nil error:&error];

@@ -17,13 +17,13 @@ static tex_t target(pool_t *pool, uint64_t serial, uint64_t off) {   // 640x360 
     t.d = (nvn_texdesc){.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_RGBA16F, .flags = NVN_TEXTURE_FLAGS_COMPRESSIBLE, .width = 640, .height = 360, .depth = 1, .levels = 1, .samples = 1};
     nvn_tex_layout(&t.d, &t.L); return t;
 }
-static int shared(id t) { pthread_mutex_lock(&g_smu); int r = t && CFSetContainsValue(g_alias_set, (__bridge const void *)t); pthread_mutex_unlock(&g_smu); return r; }
+static int shared(id t) { pthread_mutex_lock(&g_smu); int r = t && own_shared_locked(t); pthread_mutex_unlock(&g_smu); return r; }
 static int resident(id o) { pthread_mutex_lock(&g_res_mu); int r = [g_res_objects containsObject:o]; pthread_mutex_unlock(&g_res_mu); return r; }
 static unsigned waiting(void) { os_unfair_lock_lock(&g_rh_lk); unsigned n = g_rh_n; os_unfair_lock_unlock(&g_rh_lk); return n; }
 static void subs(int n) { for (int i = 0; i < n; i++) { mtl_sub_commit(); mtl_drain(); mtl_sub_begin(); } }
 static void settle(void) { mtl_sub_commit(); mtl_drain(); mtl_sub_begin(); mtl_sub_commit(); mtl_drain(); dispatch_sync(g_feedback_q, ^{}); defer_drain(); mtl_sub_begin(); }
 static alias_key key_of(const tex_t *t) { return tex_alias_key(t); }
-static void seen_at(const tex_t *t, uint64_t fence) { alias_key k = key_of(t); pthread_mutex_lock(&g_smu); nvn_hm_put(&g_alias_seen, &k, (void *)(uintptr_t)fence); pthread_mutex_unlock(&g_smu); }
+static void seen_at(const tex_t *t, uint64_t fence) { alias_key k = key_of(t); pthread_mutex_lock(&g_smu); own_alias_seen_set_locked(&k, fence); pthread_mutex_unlock(&g_smu); }
 static void fill(id<MTLTexture> t, uint8_t v) {
     NSUInteger row = t.width * 8, bytes = row * t.height;
     id<MTLBuffer> b = [g_dev newBufferWithLength:bytes options:MTLResourceStorageModeShared]; memset(b.contents, v, bytes); res_add(b);
@@ -56,9 +56,9 @@ int main(void) { @autoreleasepool {
     id<MTLTexture> tL = t[0], tU1 = t[1], tU2 = t[2], tU3 = t[3], tG = t[4], tP = t[5], tV = t[6];
     fill(tU1, 0x5a);
     id view = [tV newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Float]; tex_put(96107, view);   // a live twin's serial holds a view of V's texture
+    mtl_tex_pin(P.serial);   // P stays pinned past its release
     for (int i = 1; i < 7; i++) mtl_tex_release(all[i]);
-    { uintptr_t a = (uintptr_t)(__bridge void *)tG; pthread_mutex_lock(&g_smu); nvn_hm_put(&g_ghost_held, &a, (void *)1); pthread_mutex_unlock(&g_smu); }
-    { uintptr_t a = (uintptr_t)(__bridge void *)tP; pthread_mutex_lock(&g_smu); nvn_hm_put(&g_tex_pin_objects, &a, (void *)1); pthread_mutex_unlock(&g_smu); }
+    tex_put(G.serial, tG);   // a replayed record still resolves the finalized G: its ghost entry holds the texture
     CHECK(alias_sweep_cap() == (getenv("DM_NVN_ALIAS_SWEEP_MB") && atoi(getenv("DM_NVN_ALIAS_SWEEP_MB")) > 0 ? (uint64_t)atoi(getenv("DM_NVN_ALIAS_SWEEP_MB")) << 20 : 0), "the cap follows the switch");
     if (!alias_sweep_cap()) {   // DM_NVN_ALIAS_SWEEP_MB=0
         subs(ALIAS_SWEEP_IDLE + 2 * ALIAS_SWEEP_EVERY);
@@ -129,7 +129,7 @@ int main(void) { @autoreleasepool {
         pthread_mutex_lock(&g_res_mu); uint64_t r2 = g_res_bytes; pthread_mutex_unlock(&g_res_mu);
         CHECK(r2 == r0, "and gives it back once");
     }
-    serial_del(96107); view = nil;
+    serial_del(96107); view = nil; mtl_tex_unpin(P.serial);
     mtl_tex_release(&L);
     mtl_alias_drop_pool(&pool); settle(); free(mem);
     printf("t_alias_sweep: %d checks, %d failed\n", checks, failed); return failed != 0;

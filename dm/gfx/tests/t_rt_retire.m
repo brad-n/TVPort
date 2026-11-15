@@ -1,4 +1,4 @@
-// Render targets dead by overwrite (DM_NVN_RT_RETIRE, nvn_mtl.m rt_retire, wm_rect), through the real replay on the GPU: GPU-only targets in one pool, drawn green with a full-screen
+// Render targets dead by overwrite (DM_NVN_RT_RETIRE, nvn_mtl.m rr_retire, wm_rect), through the real replay on the GPU: GPU-only targets in one pool, drawn green with a full-screen
 // triangle under each viewport and scissor of the list, as Ocarina of Time's frame graph reuses its 305 MB target pool. A target stays live while no pass into other textures has reached
 // all of its storage since its last use; after that, unused for RR_IDLE submissions and RR_MS, it is retired: out of the sharing table and its serial, its texture ID's cached view gone,
 // its placement heap waiting for the next target, a pool table showing it as a target no pass has written. Each rule:
@@ -66,7 +66,7 @@ static void settle(void) { tick(2); dispatch_sync(g_feedback_q, ^{}); defer_drai
 // Unused long enough: RR_MS of wall time, then RR_IDLE submissions and the scans after them
 static void idle(void) { usleep((RR_MS + 150) * 1000); tick(RR_IDLE + 2 * RR_EVERY); settle(); }
 // The texture the sharing table holds for t's storage, by address: no reference is taken (a test that held one would keep a retired texture and its heap)
-static uintptr_t shared_tex(const tex_t *t) { alias_key k = tex_alias_key(t); pthread_mutex_lock(&g_smu); void *o = nvn_hm_get(&g_alias, &k); pthread_mutex_unlock(&g_smu); return (uintptr_t)o; }
+static uintptr_t shared_tex(const tex_t *t) { alias_key k = tex_alias_key(t); void *o; @autoreleasepool { pthread_mutex_lock(&g_smu); o = (__bridge void *)own_alias_get_locked(&k); pthread_mutex_unlock(&g_smu); } return (uintptr_t)o; }   // own pool: the owner's id return is autoreleased, which would keep the texture past its retirement
 static int serial_has(const tex_t *t) { return serial_get(t->serial) != nil; }
 static int live(const tex_t *t) { return shared_tex(t) && serial_has(t); }
 static int read_px(tex_t *t, uint8_t *out) {   // RGBA8
@@ -107,12 +107,12 @@ int main(int argc, char **argv) { @autoreleasepool {
     // 1. covered: B (RGBA16F, 640x360, 1.76 MB) drawn over all of A's storage (RGBA8 640x360, 0.88 MB) after A's last use
     tex_t A = target(931101, 0, NVN_FORMAT_RGBA8, 640, 360), B = target(931102, 0, NVN_FORMAT_RGBA16F, 640, 360);
     mtl_reg_tex(931, &A, NULL);
-    { view_t v = {0}; v.set_format = 1; v.format = NVN_FORMAT_RGBA8_SRGB; mtl_reg_tex(932, &A, &v); }   // an sRGB view of A: a view the view cache (g_vc) keeps for A's serial
+    { view_t v = {0}; v.set_format = 1; v.format = NVN_FORMAT_RGBA8_SRGB; mtl_reg_tex(932, &A, &v); }   // an sRGB view of A: a view the view cache (g_vc) keeps for A's Metal texture
     draw_all(&A); uintptr_t tA = shared_tex(&A);
     @autoreleasepool { id<MTLTexture> a = (__bridge id<MTLTexture>)(void *)tA; CHECK(a && a.heap && objc_getAssociatedObject(a, &g_rh_owner_key), "A is a GPU-only target in a placement heap of its own"); }
     os_unfair_lock_lock(&g_rmu); void *tv = NULL; tex_fast_rid(931, &tv); os_unfair_lock_unlock(&g_rmu);
     CHECK((uintptr_t)tv == tA && g_treg[931].view, "A's texture ID resolves to it and keeps a view");
-    os_unfair_lock_lock(&g_rmu); tv = NULL; tex_fast_rid(932, &tv); int vc = nvn_hm_get(&g_vc, &A.serial) != NULL; os_unfair_lock_unlock(&g_rmu);
+    os_unfair_lock_lock(&g_rmu); tv = NULL; tex_fast_rid(932, &tv); uint64_t va = (uint64_t)tA; int vc = nvn_hm_get(&g_vc, &va) != NULL; os_unfair_lock_unlock(&g_rmu);   // keyed by A's Metal texture (vc_addr)
     CHECK(tv && (uintptr_t)(__bridge void *)((__bridge id<MTLTexture>)tv).parentTexture == tA && vc, "the sRGB ID reads a view of A that the view cache keeps");
     tick(1);   // the binding above stamped the next submission (a use and a write in one submission tell nothing): one passes
     draw_all(&B);
@@ -122,7 +122,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     if (on) {
         CHECK(!live(&A) && g_rr_n > n0, "A, unused and covered, is retired: out of the sharing table and its serial");
         CHECK(!g_treg[931].view && !g_treg[932].view, "A's texture IDs' cached views went with it");
-        os_unfair_lock_lock(&g_rmu); vc = nvn_hm_get(&g_vc, &A.serial) != NULL; os_unfair_lock_unlock(&g_rmu);
+        os_unfair_lock_lock(&g_rmu); vc = nvn_hm_get(&g_vc, &va) != NULL; os_unfair_lock_unlock(&g_rmu);
         CHECK(!vc, "so did A's views in the view cache (they hold A)");
         CHECK(pool_unwritten_target(&A), "a pool table shows A as a target no pass has written (the zero texture), not a texture made again");
         CHECK(g_rh_n > w0, "A's placement heap waits for the next target");

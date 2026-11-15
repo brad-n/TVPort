@@ -423,7 +423,9 @@ void front_web_attach(UIView *box) {
 void front_web_detach(UIView *box) { (void)box; }
 // An app of several programs (main.m: dm/programs.txt; DM_EXEC_OUT is set only there). iOS cannot start the app's process again, so oe::ExecuteProgram records the next program and the
 // app ends (hle_oe.c); the next start runs it. To spare the player a silent quit, the app names the program on screen for 1.5 s, then schedules a local notification 1 s ahead that
-// opens the app again ("Tap to start …"), then ends. Notifications are asked for at the first start of such an app; a player who refuses gets the plain quit
+// opens the app again ("Tap to start …"), then ends. Notifications are asked for at the first start of such an app; a player who refuses is asked on screen to open the app again.
+// An app of one program that asks to start again (oe::RequestToRelaunchApplication: Super Smash Bros. Ultimate after a language change) cannot either: it asks the player on screen to
+// open it again, for 3 s, then ends. No notification there: such an app never asked for them, and a prompt now would come as the app ends
 static int multi_program(void) { const char *e = getenv("DM_EXEC_OUT"); return e && *e; }
 #if !TARGET_OS_TV
 @interface DmNotifyDelegate : NSObject <UNUserNotificationCenterDelegate>
@@ -458,26 +460,36 @@ static int notify_allowed(void) {
 static void front_ios_notify_setup(void) {}
 static void front_ios_notify_ask(void) {}
 #endif
-void front_program_handoff(int index, const char *name) {   // front.h; on the guest thread that called oe::ExecuteProgram, before the graceful exit
-#if TARGET_OS_TV
-    if (!multi_program()) return;
-#else
-    if (!multi_program() || !notify_allowed()) { LOG("front end: program %d starts at the next start of the app (notifications not allowed)", index); return; }
-#endif
-    NSString *nm = name && *name ? @(name) : [NSString stringWithFormat:@"program %d", index];
-    dm_audio_suspend(1);   // the game is ending: no sound under the notice
+static void handoff_notice(NSString *text) {   // the game is ending: no sound, and a line on a dark screen in its place
+    dm_audio_suspend(1);
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *w = g_root.view.window; if (!w) return;
         UIView *o = [[UIView alloc] initWithFrame:w.bounds]; o.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         o.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];
         UILabel *lb = [[UILabel alloc] initWithFrame:CGRectInset(o.bounds, 40, 0)]; lb.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         lb.numberOfLines = 0; lb.textAlignment = NSTextAlignmentCenter; lb.textColor = UIColor.whiteColor;
-        lb.font = [UIFont systemFontOfSize:22 weight:UIFontWeightSemibold]; lb.text = [NSString stringWithFormat:@"Starting %@\u2026", nm];
-#if TARGET_OS_TV
-        lb.text = [NSString stringWithFormat:@"Reopen this app from Home to start %@.", nm];
-#endif
+        lb.font = [UIFont systemFontOfSize:22 weight:UIFontWeightSemibold]; lb.text = text;
         [o addSubview:lb]; [w addSubview:o];
     });
+}
+void front_program_handoff(int index, const char *name) {   // front.h; on the guest thread that called oe::ExecuteProgram or oe::RequestToRelaunchApplication, before the graceful exit
+    if (!multi_program()) {
+        handoff_notice(@"The game restarts.\nOpen the app again to continue.");
+        LOG("front end: the app ends to start again; the player is asked to open it again");
+        usleep(3000 * 1000); return;
+    }
+    NSString *nm = name && *name ? @(name) : [NSString stringWithFormat:@"program %d", index];
+#if TARGET_OS_TV
+    // tvOS has no local notification banners: the app resumes the recorded program when it is opened again from Home, which it cannot schedule
+    handoff_notice([NSString stringWithFormat:@"Reopen this app from Home to start %@.", nm]);
+#else
+    if (!notify_allowed()) {
+        handoff_notice([NSString stringWithFormat:@"Open the app again to start %@.", nm]);
+        LOG("front end: program %d starts at the next start of the app (notifications not allowed)", index);
+        usleep(3000 * 1000); return;
+    }
+    handoff_notice([NSString stringWithFormat:@"Starting %@\u2026", nm]);
+#endif
     usleep(1500 * 1000);
 #if !TARGET_OS_TV
     UNMutableNotificationContent *c = [UNMutableNotificationContent new]; c.body = [NSString stringWithFormat:@"Tap to start %@", nm];

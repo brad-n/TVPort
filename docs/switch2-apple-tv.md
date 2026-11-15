@@ -147,7 +147,7 @@ Everything here is on by default for the Apple TV unless the row says otherwise.
 | Lazy shader specialization (`DM_NVN_SPEC_LAZY`) | Shader variants are made when a draw needs them, not all at load |
 | Texture spares released (`DM_NVN_PKG_SPARE_FRAMES`) | The spare copy kept for re-uploading a texture is released after 120 frames unused |
 | Stand-ins fixed for GPUs without BC (`DM_NVN_POOL_STANDIN`) | Upstream's placeholder textures were BC4, which the A15 can't make. The first session on that build crashed with "invalid pixelFormat". Stand-ins now use a format the GPU has |
-| Texture views cached by texture (`DM_NVN_VIEW_BY_TEX`) | Upstream PR #2260, brought in early. Ocarina of Time made 42 to 47 new views of its render targets every frame. Now it makes none |
+| Texture views cached by texture | Upstream PR #2260: the fork's early port (`DM_NVN_VIEW_BY_TEX`) until the 2026-11-15 sync, upstream's own view cache since. Ocarina of Time made 42 to 47 new views of its render targets every frame; with the early port it made none |
 | Ground mist kept (`shader_select_guards 0`) | With upstream's guarded reads as selects, the ground mist shader drew nothing on the A15's GPU family. The game keeps them as branches |
 | Fewer submissions (upstream) | Each frame went from 37 to 23 command buffers after the upstream sync of November 10 |
 

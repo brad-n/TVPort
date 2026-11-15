@@ -1,13 +1,6 @@
 // Logical render-enable state and pending query values survive scheduler chunks.
 // Every path uses public NVN recording; the last case gates only GPU completion.
-// It checks the profile key render_cond's replay, so the key is on whatever profile GAME names:
-// without it the host draws every render-enable block and posts no pending counter values.
 #include "game_profile.h"
-#undef DM_GAME_RENDER_COND
-#ifndef T_RENDER_COND
-#define T_RENDER_COND 1   // on; t_render_enable_queue_auto is built with 2, auto (the default), which must turn on at the first render-enable call and pass every check alike
-#endif
-#define DM_GAME_RENDER_COND T_RENDER_COND
 #define nvn_game_fps nvn_game_fps_mtl_default
 #include "../nvn/nvn_mtl.m"
 #undef nvn_game_fps
@@ -102,7 +95,6 @@ int main(void) { @autoreleasepool {
     const NVNtexture *colors[] = {&target}; const float viewport[] = {0,0,W,H}, blue[] = {0,0,1,1};
     const char *names[] = {"unsplit disabled control", "disabled across WaitEvent", "disabled across SignalEvent", "disabled across WaitSync", "disabled across FenceSync", "conditional false across WaitEvent"};
     NVNsync split_sync; P(nvnSyncInitialize)(&split_sync, &device);
-    CHECK(mtl_render_cond() == (T_RENDER_COND == 1), "render_cond: on before any render-enable call only when the profile says on");
     for (int k=0;k<6;k++) {
         P(nvnCommandBufferBeginRecording)(&command);
         P(nvnCommandBufferSetRenderEnable)(&command,1);
@@ -242,12 +234,33 @@ int main(void) { @autoreleasepool {
     P(nvnCommandBufferCopyTextureToBuffer)(&command,&target,NULL,&region,output,0);
     submit(0,P(nvnCommandBufferEndRecording)(&command),&sync);finish(&sync);
     CHECK(pixels(0,0,255,0),"query in flight keeps its block drawing");
+
+    // An operand no report writes, written by GPU work queued before the condition (Portal 2's D3D9 layer has a shader write each mesh's visibility word): memory does not hold
+    // it yet when the condition is evaluated, so the block draws; with no such writer, memory decides
+    uint64_t *pair=(uint64_t *)(memory+0xb0000),*ones=(uint64_t *)(memory+0xb1000);
+    const char *gpu_written[] = {"operand a queued copy writes: drawn", "operand a queued buffer clear writes: drawn", "operand nothing on the GPU writes: memory decides (equal, not drawn)",
+                                 "the word after a timestamp report of the same submission, written by the CPU: known (equal, not drawn)"};
+    for (int k=0;k<4;k++) {
+        pair[0]=pair[2]=k==2 ? 5 : 0; ones[0]=0xffff; if(k==3) pair[0]=1;   // k 3: as agl and Tears of the Kingdom, the CPU sets the record to 1, a timestamp report zeroes its counter
+        P(nvnCommandBufferBeginRecording)(&command);
+        P(nvnCommandBufferClearColor)(&command,0,blue,15);
+        if(k==0) P(nvnCommandBufferCopyBufferToBuffer)(&command,(NVNbufferAddress)(uintptr_t)ones,(NVNbufferAddress)(uintptr_t)pair,8,0);
+        if(k==1) P(nvnCommandBufferClearBuffer)(&command,(NVNbufferAddress)(uintptr_t)pair,8,0xffff);
+        if(k==3) P(nvnCommandBufferReportCounter)(&command,NVN_COUNTER_TYPE_TIMESTAMP,(NVNbufferAddress)(uintptr_t)pair);
+        P(nvnCommandBufferBindProgram)(&command,&stable_green,3);
+        P(nvnCommandBufferSetRenderEnableConditional)(&command,(NVNconditionalRenderMode)1,(NVNbufferAddress)(uintptr_t)pair);
+        P(nvnCommandBufferDrawArrays)(&command,NVN_DRAW_PRIMITIVE_TRIANGLES,0,3);
+        P(nvnCommandBufferSetRenderEnable)(&command,1);
+        P(nvnCommandBufferCopyTextureToBuffer)(&command,&target,NULL,&region,output,0);
+        submit(0,P(nvnCommandBufferEndRecording)(&command),&sync);finish(&sync);
+        CHECK(k>=2 ? pixels(0,0,0,255) : pixels(0,0,255,0),gpu_written[k]);
+        if(k<2) CHECK(pair[0]!=0 && pair[2]==0,"the queued write landed (the GPU would have drawn)");
+    }
     P(nvnSyncFinalize)(&dependency);P(nvnSyncFinalize)(&split_sync);
     P(nvnQueueFinish)(&queues[0]); P(nvnQueueFinish)(&queues[1]);
     P(nvnProgramFinalize)(&stable_red); P(nvnProgramFinalize)(&stable_green);
     P(nvnTextureFinalize)(&target); P(nvnTextureFinalize)(&replacement); P(nvnCommandBufferFinalize)(&command);
     P(nvnBufferFinalize)(&buffer); P(nvnEventFinalize)(&event); P(nvnMemoryPoolFinalize)(&pool);
     P(nvnQueueFinalize)(&queues[0]); P(nvnQueueFinalize)(&queues[1]); P(nvnDeviceFinalize)(&device); free(memory);
-    CHECK(mtl_render_cond(), "render_cond on after the game's render-enable calls (auto turns on at the first)");
-    printf("render enable continuation (render_cond %s): %d checks, %d failed\n", T_RENDER_COND == 2 ? "auto" : "on", checks, failures); return failures != 0;
+    printf("render enable continuation: %d checks, %d failed\n", checks, failures); return failures != 0;
 } }

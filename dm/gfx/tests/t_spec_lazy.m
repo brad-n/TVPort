@@ -59,7 +59,7 @@ int main(void) { @autoreleasepool {
     else CHECK(g_specs == 4, "with DM_NVN_SPEC_LAZY=0 loading specializes each function at once");
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new]; d.vertexFunction = vs; d.fragmentFunction = fs_on; d.colorAttachments[0].pixelFormat = MTLPixelFormatR32Float;
     uint64_t legacy0 = g_pb_legacy; NSError *pe = nil;
-    id<MTLRenderPipelineState> p_on = pso_build(d, &pe);
+    id<MTLRenderPipelineState> p_on = pso_build(d, 1, &pe);
     CHECK(p_on != nil, "a pipeline is built from the loaded functions");
     CHECK(g_pb_legacy == legacy0 + 1, "through the MTLDevice");
     float v_on = p_on ? draw_one(q, p_on) : -3; if (v_on != 1.0f) fprintf(stderr, "drew %f\n", v_on);
@@ -67,10 +67,10 @@ int main(void) { @autoreleasepool {
     unsigned after_one = g_specs;
     if (lazy && after_one != 2) fprintf(stderr, "specializations after one pipeline: %u\n", after_one);
     if (lazy) CHECK(after_one == 2, "the pipeline specialized its two functions");
-    d.fragmentFunction = fs_def; id<MTLRenderPipelineState> p_def = pso_build(d, &pe);
+    d.fragmentFunction = fs_def; id<MTLRenderPipelineState> p_def = pso_build(d, 1, &pe);
     CHECK(p_def && draw_one(q, p_def) == 0.25f, "a function loaded with no values keeps the constant undefined");
     if (lazy) CHECK(g_specs == after_one + 1, "the vertex function is specialized once for both pipelines");
-    d.fragmentFunction = fs_on; id<MTLRenderPipelineState> p_again = pso_build(d, &pe);
+    d.fragmentFunction = fs_on; id<MTLRenderPipelineState> p_again = pso_build(d, 1, &pe);
     CHECK(p_again != nil, "the same pipeline again");
     if (lazy) CHECK(g_specs == after_one + 1, "and nothing specialized again");
     // the same name again with other values (nf_fn asks so for its variants): the library hands out its one object for the name, which carries the first request's note
@@ -78,9 +78,9 @@ int main(void) { @autoreleasepool {
     unsigned before_off = g_specs; id<MTLFunction> fs_off = fn_spec_k(L, @"cfs", off, 1, &err);
     CHECK(fs_off && fs_off != fs_on, "a second request for the name is a function of its own");
     if (lazy) CHECK(g_specs == before_off + 1, "specialized at once");
-    d.fragmentFunction = fs_off; id<MTLRenderPipelineState> p_off = pso_build(d, &pe);
+    d.fragmentFunction = fs_off; id<MTLRenderPipelineState> p_off = pso_build(d, 1, &pe);
     CHECK(p_off && draw_one(q, p_off) == 0.5f, "it draws with its own values (k = false)");
-    d.fragmentFunction = fs_on; id<MTLRenderPipelineState> p_on2 = pso_build(d, &pe);
+    d.fragmentFunction = fs_on; id<MTLRenderPipelineState> p_on2 = pso_build(d, 1, &pe);
     CHECK(p_on2 && draw_one(q, p_on2) == 1.0f, "and the first request keeps its values");
     // the same name with the same values again (a shader loaded a second time over Metal's one library for its data): the first request's function, nothing specialized
     unsigned before_same = g_specs; id<MTLFunction> fs_same = fn_spec_k(L, @"cfs", on, 2, &err);
@@ -88,7 +88,7 @@ int main(void) { @autoreleasepool {
     // the same function object noted again with no values (a shader loaded a second time gets Metal's same library, and the loader notes each entry before it specializes it):
     // the pipeline still takes what the first request asked
     id<MTLFunction> fs3 = fn_spec_k(L, @"cfs3", on, 2, &err); fn4_note([L newFunctionWithName:@"cfs3"], L, @"cfs3", nil);
-    d.fragmentFunction = fs3; id<MTLRenderPipelineState> p3 = pso_build(d, &pe);
+    d.fragmentFunction = fs3; id<MTLRenderPipelineState> p3 = pso_build(d, 1, &pe);
     CHECK(p3 && draw_one(q, p3) == 1.0f, "a function noted again keeps the values it was loaded with");
     // the geometry capture pipeline builds its own MTLDevice pipeline from the vertex shader's capture entry
     NvShader *v = [NvShader new]; v->stage = 0; v->fn = vs; v->geo_fn = cap; strlcpy(v->key, "00000000000000ab_b", sizeof v->key);

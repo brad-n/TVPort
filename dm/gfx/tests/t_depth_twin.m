@@ -50,7 +50,7 @@ static tex_t tex(pool_t *pool, uint64_t serial, int format, unsigned w, unsigned
     nvn_tex_layout(&t.d, &t.L); return t;
 }
 static id<MTLTexture> by_id(int tid) { os_unfair_lock_lock(&g_rmu); id<MTLTexture> v = tex_by_id(tid); os_unfair_lock_unlock(&g_rmu); return v; }
-static int own(const tex_t *t) { alias_key k = tex_alias_key(t); if (tex_get(t->serial)) return 1; pthread_mutex_lock(&g_smu); int r = hm_get_id(&g_alias, &k) != nil; pthread_mutex_unlock(&g_smu); return r; }
+static int own(const tex_t *t) { alias_key k = tex_alias_key(t); int r; @autoreleasepool { if (tex_get(t->serial)) return 1; pthread_mutex_lock(&g_smu); r = own_alias_get_locked(&k) != nil; pthread_mutex_unlock(&g_smu); } return r; }
 static id<MTLTexture> root(id<MTLTexture> t) { while (t.parentTexture) t = t.parentTexture; return t; }
 int main(void) { @autoreleasepool {
     mtl_init();

@@ -128,7 +128,7 @@ static void test_engine(void) {
     nvn_bc6h_r11g11b10_set(1);
     nvn_texdesc d = {.target = NVN_TEXTURE_TARGET_2D, .format = 0x50, .width = 64, .height = 36, .depth = 1, .levels = 3, .samples = 1};
     void *mem; tex_t t = fixture(d, &mem, 5);
-    mtl_sub_begin(); id<MTLTexture> mt = pkg_upload(&t, NULL, nil, 0); CHECK(mtl_wait(mtl_sub_commit(), 20000000000ull), "the upload completes");
+    mtl_sub_begin(); id<MTLTexture> mt = pkg_upload(&t, NULL, nil, 0, nil, NULL, 0, NULL); CHECK(mtl_wait(mtl_sub_commit(), 20000000000ull), "the upload completes");
     CHECK(mt && mt.pixelFormat == MTLPixelFormatRG11B10Float && mt.width == 64 && mt.height == 36 && mt.mipmapLevelCount == 3, "unsigned BC6H texture: RG11B10Float, same size and levels");
     unsigned bad = 0, n = 0, alpha_bad = 0;
     for (unsigned l = 0; mt && l < 3; l++) {
@@ -175,13 +175,13 @@ static void test_engine(void) {
 
     // signed stays RGBA16Float
     nvn_texdesc sd = d; sd.format = 0x4f; void *smem2; tex_t st = fixture(sd, &smem2, 9);
-    mtl_sub_begin(); id<MTLTexture> sm = pkg_upload(&st, NULL, nil, 0); CHECK(mtl_wait(mtl_sub_commit(), 20000000000ull), "the signed upload completes");
+    mtl_sub_begin(); id<MTLTexture> sm = pkg_upload(&st, NULL, nil, 0, nil, NULL, 0, NULL); CHECK(mtl_wait(mtl_sub_commit(), 20000000000ull), "the signed upload completes");
     CHECK(sm && sm.pixelFormat == MTLPixelFormatRGBA16Float, "signed BC6H texture stays RGBA16Float");
     defer_obj_release(sm); release_fixture(smem2);
     // with the switch off unsigned is RGBA16Float
     nvn_bc6h_r11g11b10_set(0);
     void *umem; tex_t ut = fixture(d, &umem, 5);
-    mtl_sub_begin(); id<MTLTexture> um = pkg_upload(&ut, NULL, nil, 0); CHECK(mtl_wait(mtl_sub_commit(), 20000000000ull), "the upload completes");
+    mtl_sub_begin(); id<MTLTexture> um = pkg_upload(&ut, NULL, nil, 0, nil, NULL, 0, NULL); CHECK(mtl_wait(mtl_sub_commit(), 20000000000ull), "the upload completes");
     CHECK(um && um.pixelFormat == MTLPixelFormatRGBA16Float, "DM_BC6H_R11G11B10=0: unsigned BC6H is RGBA16Float");
     defer_obj_release(um); release_fixture(umem);
     nvn_bc6h_r11g11b10_set(1);

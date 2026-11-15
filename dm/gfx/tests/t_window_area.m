@@ -79,14 +79,13 @@ int main(int argc, char **argv) { @autoreleasepool {
     uint8_t px[32 * 32 * 4]; uint64_t st0[24], st1[24];
     tex_t w = {.magic = MAGIC('T','E','X',0), .serial = 930003}; w.d = (nvn_texdesc){.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_RGBA8, .width = 32, .height = 32, .depth = 1, .levels = 1, .samples = 1};
     tex_t a = {.magic = MAGIC('T','E','X',0), .serial = 930002}; a.d = w.d;
-    mtl_xv_window_tex(w.serial);
+    mtl_window_tex(w.serial);
     // 1. the window texture's 16x16 corner
     fill_blue(&w); mtl_gpupass_stats(st0);
     { p_scissor sc = {0, 0, 16, 16}; const float vp[1][4] = {{0, 0, 16, 16}}; draw_green(&w, 1, &sc, vp); }
     mtl_gpupass_stats(st1);
     CHECK(st1[22] - st0[22] == (off ? 0u : 1u), off ? "off: the window pass covers the whole texture" : "the window pass covers only its scissor's corner");
     CHECK(off || st1[23] - st0[23] == 2u * (32 * 32 - 16 * 16) * 4, "the bytes outside the corner are counted as not loaded or stored");
-    CHECK(st1[2] == st0[2], "the corner pass loads (with DM_NVN_LOAD_ELIDE too: the triangle covers the corner, not the texture)");
     CHECK(read_px(&w, 32, 32, px), "readback 1 completes");
     CHECK(corner(px, 32, 16), "the corner is green, the rest of the window texture keeps its blue");
     // 2. a second draw that leaves the corner

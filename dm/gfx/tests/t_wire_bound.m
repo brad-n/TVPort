@@ -87,12 +87,12 @@ int main(void) { @autoreleasepool {
     // A look that only asks (pool_peek, the walk's statistic) makes no chunk: one made to the pool's end would be what a later binding in that stride takes and wires
     { pthread_mutex_lock(&g_mu); int np = g_npool, q = pool_peek(base + 40 * MB + 64); CHECK("a peek in a stride with no chunk finds nothing and makes none", q < 0 && g_npool == np);
       q = pool_peek(base + 70 * MB + 64); CHECK("a peek finds the binding's chunk", q >= 0 && g_pools[q].base == base + 64 * MB); pthread_mutex_unlock(&g_mu); }
-    // A pool of BIG_MIN keeps BIG_UNKNOWN for unknown extents
+    // A pool of BIG_MIN answers an unknown extent with one buffer of the whole pool (upstream 34856df4, big_full; it used to be a chunk reaching BIG_UNKNOWN past the address)
     uint8_t *big = mmap(NULL, 640 * MB, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (big == MAP_FAILED) abort();
     mtl_pool_add(big, 640 * MB); CHECK("the large pool in chunks, not small", g_nbig == 2 && !g_big[1].small);
     CHECK("large pool, unknown extent found", mtl_gpu_addr((uint64_t)(uintptr_t)big + 100 * MB + 4, 1, &mb, &mo, &gpu));
     { id<MTLBuffer> b = (__bridge id<MTLBuffer>)mb; uint64_t end = (uint64_t)(uintptr_t)b.contents + b.length;
-      CHECK("large pool, unknown extent: BIG_UNKNOWN past it, not the pool's end", b.length - mo >= BIG_UNKNOWN && end < (uint64_t)(uintptr_t)big + 640 * MB); }
+      CHECK("large pool, unknown extent: one buffer of the whole pool", (uint64_t)(uintptr_t)b.contents <= (uint64_t)(uintptr_t)big + 100 * MB + 4 && end == (uint64_t)(uintptr_t)big + 640 * MB); }
     // Raw global memory, learned: every window of the small pool not chunked is a stub, and so is its resident chunk not read lately (as a resident pool not read lately is). A raw load reads 0
     mtl_pool_addressed(mem, 96 * MB);
     mtl_sub_begin(); id<MTLBuffer> map = gmem_map(); CHECK("table made", map != nil); CHECK("submission completes", mtl_wait(mtl_sub_commit(), 5000000000ull));

@@ -33,6 +33,7 @@ One game-specific patch, the render scale and dynamic resolution stubs of [`patc
 - **Cost.** On Apple GPUs this game's cost hardly depends on the 3D size (as for [Ocarina of Time](../0400486024DEC000/README.md#dynamic-resolution)): through the overlay below at 1152x648 (2.25 times the pixels) the base M2 Mac mini held 60.0 fps at the title (GPU busy p50 11.4 ms, 12.9 at 768x432) and in the main menu (12.9 ms, 12.1), and 30 fps in the cinematic (19.7 ms, 20.3), every run the same route on the same save, 20 s, 15 s and 15 s windows (2026-11-13). 1536x864 and play in a level were not measured yet: the TV was in use.
 - **A 4K display** (`render.present_resolution_override` 3, "2160p", through a RomFS overlay: below) makes the networks output 3072x1728 and the 3D 1536x864 at the game's own scale, and the host scales the 4K picture down to the 1080p screen. Not measured yet.
 - **Cvars from a RomFS overlay.** The game reads `rom:/veclipse_build.cvar` (JSON) at boot and takes any cvar in it, so `DM_ROMFS_OVERLAY=<folder>` with a copy that adds keys sets them without a build: `render.resolution_scale_console` (0.75, 1.0), `render.present_resolution_override` (0 default, 1 1080p, 2 1440p, 3 2160p), `render.dynres_enabled`. Measuring the sizes above that way needed no stub.
+- **The graphics scale tier (upstream 084f5aa5, PR #1304).** Upstream found where the 0.8 comes from: the host answered graphics scale tier 1 docked, and the game renders 0.8 times smaller below tier 0 (byte +0xa of its mode event, `main+0xba69970`): 768x432 for its 1920x1080 window where tier 0 gives 960x540, its handheld size. The host now answers tier 0 in both modes ([The graphics scale does not follow the operation mode](../../../docs/reference/services.md#the-graphics-scale-does-not-follow-the-operation-mode)). Peppy's close-up 65 s into the intro has a mean luminance gradient (x1000 at 1080p) of 5.8 in console footage, 5.3 with tier 0 and 4.6 with tier 1. The sizes and gradients were measured on a build of the PR author's fork, not on `main`. The sizes in the bullets above were all taken with tier 1 (the networks' 0.8 of the display is that tier's); with tier 0 the networks output 1920x1080 and the 3D is 960x540 at the default scale. Whether a console renders above 960x540 is not known.
 
 ## Driving it on the Mac
 
@@ -46,6 +47,7 @@ One game-specific patch, the render scale and dynamic resolution stubs of [`patc
 - [The camera commands of SDK 21's own camera module](../../../docs/reference/services.md#the-camera-commands-of-sdk-21s-own-camera-module): the game's own camera module, a console with no camera plugged in.
 - [sRGB textures loaded and stored raw through an image](../../../docs/reference/rendering.md#srgb-textures-loaded-and-stored-raw-through-an-image): the pale picture with grey blacks (the upscaler network's encoded store was encoded again); measured on a build of our fork, not on `main`.
 - [A GPU copy into a texture uploaded from its storage uploaded all of it again](../../../docs/reference/nvn-objects.md#a-gpu-copy-into-a-texture-uploaded-from-its-storage-uploaded-all-of-it-again): 7.6 s and 10 s frames at the prologue's scene changes; measured on a build of our fork, not on `main`.
+- [The graphics scale does not follow the operation mode](../../../docs/reference/services.md#the-graphics-scale-does-not-follow-the-operation-mode): the 768x432 scene docked; measured on a build of the PR author's fork, not on `main`.
 - [The DLSS network resized](../../../docs/reference/rendering.md#the-dlss-network-resized): `nvnDlssNetworkResize`.
 - [A shader loaded a second time unspecialized its live function (Metal 4)](../../../docs/reference/shaders.md#a-shader-loaded-a-second-time-unspecialized-its-live-function-metal-4): the abort after the barrel-roll training, which `DM_PSO_MTL4=0` hid.
 - [TXD through a uniform register kept no handle](../../../docs/reference/shaders.md#txd-through-a-uniform-register-kept-no-handle): 281 pixel shaders, the fur shells among them.
@@ -57,7 +59,8 @@ One game-specific patch, the render scale and dynamic resolution stubs of [`patc
 
 ## Open
 
+- [The picture](#the-picture): the 3D stayed at 768x432 docked because the host answered graphics scale tier 1 there; the host now answers tier 0, which gives 960x540 (measured on a build of the PR author's fork, not on `main`). Whether a console renders above that is not known.
 - `[RED] DLSS: the game's bias mask (a reactive mask for MetalFX) is not passed on`.
 - The game's wake-up eventfd fails (the host refuses `nn::socket::EventFd`), so its HTTP thread polls without a wake-up; harmless offline.
-- A `pso_manifest.tsv` has not been recorded; `render_cond` not tried; the later levels and combat, and iOS, not tested.
+- A `pso_manifest.tsv` has not been recorded; the later levels and combat, and iOS, not tested.
 - Mario Kart World 1.8.0 has not been run with the camera answers changed for this game.
