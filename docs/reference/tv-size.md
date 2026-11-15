@@ -154,3 +154,18 @@ Build **cut 1** first: extend `tex_once.py` to treat a native-ASTC plane above t
 - Texture samples: `bntx_astc.Job` (libastc_prebuild from the Ocarina build, `encode=0`) over 2,000 random `.bntx.zs`, and BNTX mip offsets for cut 1. No ASTC encode or decode ran, so no quality number exists.
 - zstd samples: `zstd` CLI over random 256 KiB and 4 MiB slices.
 - Not measured: anything on the TV beyond its file list, MK8's TV image content, image quality, build times of the cuts, the Ocarina trimmed-image size (sources are in the 18 GB `cas.db`), the 4.0.1 update's manifest.
+
+### Cut 3 measured: ASTC 6x6 quality and size (2026-11-15)
+
+Planes sampled from Ocarina's TV build (cap 256), encoded with the pack's own encoder (astcenc FASTEST), decoded and compared with the decoded BC source (BC6H on a tone-mapped scale):
+
+| Format | Planes | 4x4 median PSNR / SSIM | 6x6 median PSNR / SSIM | 6x6 worst |
+|---|---|---|---|---|
+| BC7 | 19 | 41.3 dB / 0.991 | 33.9 dB / 0.950 | 31.0 dB / 0.929 |
+| BC7 sRGB | 31 | 45.4 dB / 0.993 | 36.5 dB / 0.968 | 26.4 dB / 0.886 |
+| BC5 | 54 | 46.4 dB / 0.997 | 38.2 dB / 0.979 | 22.9 dB / 0.854 |
+| BC6H | 28 | 50.8 dB / 0.999 | 39.5 dB / 0.992 | 24.9 dB / 0.923 |
+
+BC5 normal maps: median mean angular error after renormalising 0.51 deg at 4x4, 1.38 deg at 6x6 (99th percentile 5.7 and 10.2 deg). Zoomed, 6x6 shows block seams in smooth normal gradients and loses the finest relief; BC7 smears fine streaks (grain, hair); typical BC6H light maps are indistinguishable. On the Mac with the TV texture path (4x4 against 6x6 for every format, BC5 included; house, forest, balcony, inside), the screenshots show no texture difference at the TV's render scale.
+
+Pack payload on Ocarina (cap 256, from the engine's plane walk, which matches the built pack byte for byte): 7.22 GB at today's blocks; 4.98 GB with BC7 and BC6H at 6x6 (-2.24 GB raw, about 0.9 GB after zstd); 3.48 GB with BC5 at 6x6 too (-3.73 GB raw, about 1.5 GB). TVPort's Matched default is BC7 and BC6H at 6x6 and BC5 at 4x4; `--astc-bc5-block 6` takes the rest.

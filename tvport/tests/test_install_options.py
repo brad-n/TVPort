@@ -104,8 +104,8 @@ class CompressedTextures(unittest.TestCase):
             backend.install(self.game, 'd', 'b', self.pack)
         return stream, out.getvalue()
 
-    def test_automatic_is_on_with_4x4_and_off_writes_a_zero(self):
-        self.assertEqual(backend.astc_block(SimpleNamespace()), 4)
+    def test_automatic_is_on_with_matched_blocks_and_off_writes_a_zero(self):
+        self.assertEqual(backend.astc_block(SimpleNamespace()), 6)
         self.assertEqual(backend.astc_block(SimpleNamespace(astc='auto', astc_block=4)), 4)
         self.assertEqual(backend.astc_block(SimpleNamespace(astc='on', astc_block=6)), 6)
         self.assertEqual(backend.astc_block(SimpleNamespace(astc='auto', astc_block=6)), 6)
@@ -123,11 +123,11 @@ class CompressedTextures(unittest.TestCase):
 
     def test_the_block_size_picker_maps_to_blocks_flags_and_env(self):
         # Matched to the original (the default: nothing saved), 4x4, 6x6 -> (block, bc1_block)
-        for choice, want in ((None, (4, 6)), ('matched', (4, 6)), ('4', (4, 4)), (4, (4, 4)), ('6', (6, 6)), (6, (6, 6)), ('weird', (4, 6))):
+        for choice, want in ((None, (6, 6)), ('matched', (6, 6)), ('4', (4, 4)), (4, (4, 4)), ('6', (6, 6)), (6, (6, 6)), ('weird', (6, 6))):
             self.assertEqual(backend.astc_blocks(SimpleNamespace(astc='auto', astc_block=choice)), want, choice)
-        self.assertEqual(backend.astc_blocks(SimpleNamespace()), (4, 6))
+        self.assertEqual(backend.astc_blocks(SimpleNamespace()), (6, 6))
         self.assertEqual(backend.astc_blocks(SimpleNamespace(astc='off', astc_block='matched')), (0, 0))
-        self.assertEqual(backend.astc_block(SimpleNamespace(astc='on', astc_block='matched')), 4)
+        self.assertEqual(backend.astc_block(SimpleNamespace(astc='on', astc_block='matched')), 6)
         with tempfile.TemporaryDirectory() as folder:
             (Path(folder) / '0100000000010000_build').mkdir()
             game = backend.Game(Path(folder))
@@ -143,6 +143,38 @@ class CompressedTextures(unittest.TestCase):
             backend.prebuild_astc(game, 4, 'python3', 512, 6)
         argv = [str(a) for a in stream.call_args.args[0]]
         self.assertEqual((argv[argv.index('--block') + 1], argv[argv.index('--bc1-block') + 1]), ('4', '6'))
+
+    def test_each_format_has_its_own_block(self):
+        # (BC4, BC5, BC6H) from the picker: matched is the measured recommendation, one block sets BC5 and BC6H (BC4 keeps 6x6), a format's own choice wins
+        on = lambda **kw: SimpleNamespace(astc='auto', **kw)
+        self.assertEqual(backend.astc_format_blocks(on()), (6, 4, 6))
+        self.assertEqual(backend.astc_format_blocks(on(astc_block='4')), (6, 4, 4))
+        self.assertEqual(backend.astc_format_blocks(on(astc_block='6')), (6, 6, 6))
+        self.assertEqual(backend.astc_format_blocks(on(astc_bc5_block='6')), (6, 6, 6))
+        self.assertEqual(backend.astc_format_blocks(on(astc_block='6', astc_bc5_block='4', astc_bc6h_block='auto')), (6, 4, 6))
+        self.assertEqual(backend.astc_format_blocks(on(astc_bc6h_block='4')), (6, 4, 4))
+        self.assertEqual(backend.astc_format_blocks(SimpleNamespace(astc='off')), (0, 0, 0))
+        self.assertEqual(backend.astc_blocks(on(astc_bc7_block='4')), (4, 6))   # BC7/BC3/BC2 alone
+        self.assertEqual(backend.astc_blocks(on(astc_block='4', astc_bc7_block='6')), (6, 4))
+        self.assertEqual(backend.fmt_block_flags((6, 4, 4)), [])   # the engine's own blocks need no flags
+        self.assertEqual(backend.fmt_block_flags((6, 4, 6)), ['--bc4-block', '6', '--bc5-block', '4', '--bc6h-block', '6'])
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / '0100000000010000_build').mkdir()
+            game = backend.Game(Path(folder))
+            text = backend.write_env(game, 'handheld', 512, astc_block=6, bc1_block=6, fmt_blocks=(6, 4, 6)).read_text()
+            self.assertIn('DM_NVN_BC6H_ASTC=6\n', text)
+            self.assertNotIn('DM_NVN_BC5_ASTC', text)   # 4x4 is the engine's own
+            self.assertNotIn('DM_NVN_BC4_ASTC', text)
+            text = backend.write_env(game, 'handheld', 512, astc_block=4, bc1_block=4, fmt_blocks=(6, 6, 4)).read_text()
+            self.assertIn('DM_NVN_BC5_ASTC=6\n', text)
+            self.assertNotIn('DM_NVN_BC6H_ASTC', text)
+            self.assertNotIn('_BC5_ASTC', backend.write_env(game, 'handheld', 512, astc_block=0, fmt_blocks=(0, 0, 0)).read_text())
+        game = SimpleNamespace(build=Path(self.tmp.name), romfs=Path(self.tmp.name) / 'romfs.img')
+        (Path(self.tmp.name) / 'tvport-astc').mkdir(exist_ok=True); (Path(self.tmp.name) / 'tvport-astc' / 'astc-ro.pack').write_bytes(b'x')
+        with patch.object(backend, 'stream') as stream, redirect_stdout(io.StringIO()):
+            backend.prebuild_astc(game, 6, 'python3', 512, 6, False, (6, 4, 6))
+        argv = [str(a) for a in stream.call_args.args[0]]
+        self.assertEqual([argv[argv.index(f) + 1] for f in ('--block', '--bc1-block', '--bc4-block', '--bc5-block', '--bc6h-block')], ['6', '6', '6', '4', '6'])
 
     def test_the_build_command_takes_both_choices(self):
         for argv, expected in ((['--astc', 'off'], ('off', 'matched')), (['--astc', 'on', '--astc-block', '6'], ('on', '6')), (['--astc-block', '4'], ('auto', '4')), (['--astc-block', 'matched'], ('auto', 'matched')), ([], ('auto', 'matched'))):
@@ -342,11 +374,11 @@ class StoreTexturesOnce(unittest.TestCase):
 
     def test_the_build_passes_the_same_blocks_to_the_prebuild_and_to_texture_once(self):
         generate, install, store = self.build(image=self.once, block='matched')
-        self.assertEqual(store.call_args.args[1:], (self.pack, 4, 'python3', 512, 6, True))
+        self.assertEqual(store.call_args.args[1:], (self.pack, 6, 'python3', 512, 6, True, (6, 4, 6)))
 
     def test_the_build_uses_the_stripped_image_for_the_app_and_the_install(self):
         generate, install, store = self.build(image=self.once)
-        self.assertEqual(store.call_args.args[1:], (self.pack, 4, 'python3', 512, 4, True))
+        self.assertEqual(store.call_args.args[1:], (self.pack, 4, 'python3', 512, 4, True, (6, 4, 4)))
         self.assertIsNone(generate.call_args.args[5])   # the app project always reads the plain RomFS.img: its build scripts run on the system Python (no zstd, 3.9), and the identity is the same
         self.assertEqual(install.call_args.args[3:], (self.pack, self.once))
 
@@ -485,7 +517,7 @@ class StoreTexturesOnce(unittest.TestCase):
         self.compress_mock.assert_not_called()
         self.assertIsNone(generate.call_args.args[5])
         self.assertEqual(install.call_args.args[3:], (self.pack, None))
-        self.assertEqual(store.call_args.args[-1], False)
+        self.assertEqual(store.call_args.args[6], False)
 
     def test_a_failed_no_pack_run_builds_as_before(self):
         generate, install, store = self.build(image=None, nopack=None)

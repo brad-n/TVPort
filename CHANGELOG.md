@@ -10,7 +10,12 @@ What changes in this fork, release by release, in plain terms. The full descript
 
 ## Unreleased (on `switch2-experimental`)
 
-Nothing yet: everything that was here is in build 1675.
+Nothing yet: everything that was here is in build 1677.
+
+## 1.3.0 build 1677 (2026-11-15)
+
+**Smaller games on the Apple TV**
+- **Colour and lighting textures packed at ASTC 6x6:** the Apple TV's converted-texture pack now stores BC7 (colour) and BC6H (HDR lighting) textures at 6x6 blocks, about half the size of 4x4; BC5 normal maps stay at 4x4, where 6x6 showed faint seams in smooth surfaces up close. In Ocarina of Time the pack payload goes from 7.22 to 4.98 GB (about 0.9 GB less once compressed), and the same scenes rendered through the Apple TV's texture path showed no visible texture difference at the TV's resolution. Measured per format on 132 of Ocarina's textures (median PSNR at 6x6: BC7 34 to 37 dB, BC6H 39.5 dB). Per-format control: `--astc-bc7-block`, `--astc-bc5-block`, `--astc-bc6h-block` (`auto`, `4`, `6`) on `backend.py build`. The next Apple TV build of a game re-makes its pack.
 
 ## 1.3.0 build 1675 (2026-11-15)
 

@@ -419,6 +419,27 @@ class PrebuildTests(unittest.TestCase):
         self.assertEqual(default['bc1_block'], 4)
         with self.assertRaises(SystemExit): tool.prebuild(str(d), str(self.root / 'out_pf_bad'), 4, bc1_block=3, log=lambda *_: None)
 
+    def test_bc7_at_6x6_and_bc5_kept_at_4x4_is_what_the_runtime_looks_up(self):
+        # TVPort's "matched" blocks (backend.MATCHED_BLOCKS): BC1, BC4, BC6H and BC7/BC2/BC3 at 6x6, BC5 at 4x4. The pack must be keyed at the block each format's runtime switch gives it
+        d, ts = self.build_tree('tree_m66')
+        small = tool.prebuild(str(d), str(self.root / 'out_m66'), 6, workers=2, log=lambda *_: None, bc1_block=6)
+        big = tool.prebuild(str(d), str(self.root / 'out_m44'), 4, workers=2, log=lambda *_: None, bc1_block=6)
+        self.assertEqual((small['plane_errors'], big['plane_errors']), (0, 0))
+        found = self.runtime_finds(ts, self.root / 'out_m66' / 'astc-ro.pack', block=6, bc1_block=6)
+        self.assertTrue(found and all(found))
+        self.assertFalse(all(self.runtime_finds(ts, self.root / 'out_m66' / 'astc-ro.pack', block=4, bc1_block=6)))   # BC7 planes keyed at 4x4 are not in a 6x6 pack
+        self.assertLess(small['astc_bytes'], big['astc_bytes'] * 0.6)   # 3.56 against 8 bits a texel for BC7/BC3/BC2 (BC1 is 6x6 in both)
+        ts456 = self.textures456()
+        d456 = self.zsdic_tree('tree456_m66', ts456)
+        fb = (6, 4, 6)
+        rep = tool.prebuild(str(d456), str(self.root / 'out456_m66'), 6, workers=2, log=lambda *_: None, bc1_block=6, fmt_blocks=fb)
+        self.assertEqual((rep['plane_errors'], rep['fmt_blocks']), (0, dict(bc4=6, bc5=4, bc6h=6)))
+        found = self.runtime_finds(ts456[:4], self.root / 'out456_m66' / 'astc-ro.pack', block=6, bc1_block=6, fmt_blocks=fb)
+        self.assertTrue(found and all(found))
+        # BC5 is not at 6x6 and BC6H not at 4x4 in this pack: the other combination finds neither format's planes
+        other = self.runtime_finds(ts456[:4], self.root / 'out456_m66' / 'astc-ro.pack', block=6, bc1_block=6, fmt_blocks=(6, 6, 4))
+        self.assertFalse(any(f for t, f in zip([t for t in ts456[:4] for _ in range(t.mips * t.layers)], other) if t.fmt in (0x1e01, 0x1f0a)))
+
     def test_texture_cap_packs_only_the_levels_the_runtime_keeps(self):
         lib = self.lib
         ts = [Texture(0x1a01, 2048, 1024, mips=6, pkg=4), Texture(0x1c01, 1024, 1024, mips=4, layers=2, dim=5, pkg=3), Texture(0x1a06, 1024, 1024, mips=3, layers=6, dim=3, pkg=1),
