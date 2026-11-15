@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The translator options every game gets without a profile key (dmsh_build.py XLATE_DEFAULT, xlate_opts; the defaults pass of 2026-11-09): the exact forms on
-(shader_fragw_fold, shader_ftz_cmp, shader_unord_cmp, shader_raw_regs, shader_no_rescale, and dmsh_wide.py's shader_wide_device), shader_raw_loop off, and a profile's 0 or 1
+(shader_fragw_fold, shader_ftz_cmp, shader_unord_cmp, shader_raw_regs, shader_no_rescale, shader_prmt_runs since 2026-11-15, and dmsh_wide.py's shader_wide_device), shader_raw_loop off, and a profile's 0 or 1
 deciding over the default. Each form's own test checks its output (test_dmsh_fragw.py, test_dmsh_cmp_forms.py, test_dmsh_raw_compact.py, test_dmsh_wide.py)."""
 import ast
 from pathlib import Path
@@ -20,7 +20,7 @@ def profile(**keys):
 
 class Defaults(unittest.TestCase):
     def test_a_profile_without_keys_gets_every_exact_form(self):
-        self.assertEqual(scope['xlate_opts'](profile()), {'fragw_fold': True, 'ftz_cmp': True, 'unord_cmp': True, 'raw_regs': True, 'no_rescale': True})
+        self.assertEqual(scope['xlate_opts'](profile()), {'fragw_fold': True, 'ftz_cmp': True, 'unord_cmp': True, 'raw_regs': True, 'no_rescale': True, 'prmt_runs': True})
         self.assertEqual(scope['XLATE_DEFAULT']['shader_wide_device'], '1')
 
     def test_raw_loop_stays_off(self):
