@@ -13,6 +13,7 @@ import tempfile
 import types
 import unittest
 
+os.environ.setdefault('DM_GAME', '0400486024DEC000')   # the profile the tables load from (dmsh_chain.load_game); the pre-release check's game when the caller sets none
 TOOLS = Path(__file__).resolve().parents[1] / 'tools'
 sys.path.insert(0, str(TOOLS))
 import dmsh_chain

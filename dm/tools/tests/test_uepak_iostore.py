@@ -365,7 +365,8 @@ class IoStore(unittest.TestCase):
         self.assertEqual(seen, [(raw, '/Game.utoc#Game/M_A.uasset')])
 
 
-FAKE_HOST = """#!{python} -I
+FAKE_HOST = """#!/bin/sh
+''''exec "{python}" -I "$0" "$@" #'''
 import struct, sys, zlib
 sys.stderr.write({say!r}); sys.stderr.flush()
 if {gone!r}: sys.exit(1)

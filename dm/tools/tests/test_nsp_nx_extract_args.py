@@ -1,9 +1,12 @@
 """NSP script: extra nx_extract arguments (--nx-extract-arg, NX_EXTRACT_ARGS) reach the extraction calls only, and --allow-damaged-manual reaches the HTML manual's call only."""
 import os
+from pathlib import Path
+import sys
 import unittest
 from unittest import mock
 
-from test_nsp_external_drive import nsp
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # its sibling test module, also when the file runs alone (python -m unittest <file> from the repo root)
+from test_nsp_external_drive import nsp  # noqa: E402
 
 
 class NxExtractArgs(unittest.TestCase):

@@ -7,6 +7,8 @@ import tempfile
 import unittest
 
 REPO = Path(__file__).resolve().parents[3]
+import importlib.util as _u
+_s = _u.spec_from_file_location("zstd_link", Path(__file__).resolve().with_name("zstd_link.py")); zstd_link = _u.module_from_spec(_s); _s.loader.exec_module(zstd_link)
 spec = importlib.util.spec_from_file_location('romfs_image', REPO / 'dm/tools/romfs_image.py')
 assert spec is not None and spec.loader is not None
 image = importlib.util.module_from_spec(spec); spec.loader.exec_module(image)
@@ -31,7 +33,7 @@ class Identity(unittest.TestCase):
     def setUpClass(cls):
         cls.tools = tempfile.TemporaryDirectory(); cls.addClassCleanup(cls.tools.cleanup)
         root = Path(cls.tools.name); (root / 'check.c').write_text(CHECK_C); cls.check = root / 'check'
-        subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-I', str(REPO / 'dm/host'), str(root / 'check.c'), '-o', str(cls.check)], check=True)
+        subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-I', str(REPO / 'dm/host'), str(root / 'check.c'), str(zstd_link.library()), '-o', str(cls.check)], check=True)
         cls.data = root / 'data'
         for name, size in (('wanted', 70_000), ('other', 70_001)):   # a first index chunk bigger than nothing, a second not a multiple of 8
             d = root / name; (d / 'sub').mkdir(parents=True)

@@ -1,5 +1,9 @@
 """Attached packages outside the base folder are identified from metadata."""
-from test_nsp_external_drive import ExternalDrive, APP, pfs0, nsp
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # its sibling test module, also when the file runs alone (python -m unittest <file> from the repo root)
+from test_nsp_external_drive import ExternalDrive, APP, pfs0, nsp  # noqa: E402
 
 
 def contents(extra, content):   # package_reader's contents: the base folder's game is a base game, the attached file has the content metas given

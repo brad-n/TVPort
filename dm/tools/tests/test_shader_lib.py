@@ -4,6 +4,8 @@ import os, subprocess, sys, tempfile, unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
+import importlib.util as _u
+_s = _u.spec_from_file_location("zstd_link", Path(__file__).resolve().with_name("zstd_link.py")); zstd_link = _u.module_from_spec(_s); _s.loader.exec_module(zstd_link)
 sys.path.insert(0, str(REPO / 'dm/tools'))
 import romfs, shader_lib
 
@@ -166,7 +168,7 @@ class AppSubset(Base):
 class HostReader(Base):
     def reader(self):
         exe = self.root / 'msl_read'; src = self.root / 'msl_read.c'; src.write_text(READER)
-        subprocess.run(['clang', '-Wall', '-Werror', '-Wno-unused-function', '-I', str(REPO / 'dm/gfx/nvn'), '-o', exe, src], check=True)
+        subprocess.run(['clang', '-Wall', '-Werror', '-Wno-unused-function', '-I', str(REPO / 'dm/gfx/nvn'), '-o', exe, src, str(zstd_link.library())], check=True)
         return exe
 
     def test_the_host_finds_every_file_in_place(self):

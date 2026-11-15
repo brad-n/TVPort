@@ -12,6 +12,8 @@ import unittest
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[3]
+import importlib.util as _u
+_s = _u.spec_from_file_location("zstd_link", Path(__file__).resolve().with_name("zstd_link.py")); zstd_link = _u.module_from_spec(_s); _s.loader.exec_module(zstd_link)
 spec = importlib.util.spec_from_file_location('romfs_image', REPO / 'dm/tools/romfs_image.py')
 assert spec is not None and spec.loader is not None
 image = importlib.util.module_from_spec(spec); spec.loader.exec_module(image)
@@ -29,7 +31,7 @@ class Images(unittest.TestCase):
                           'if (!m) return 1; romfs_image_close(m); return 0; }\n')
         cls.validator = root / 'validate'
         subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-I', str(REPO / 'dm/host'),
-                        str(source), '-o', str(cls.validator)], check=True)
+                        str(source), str(zstd_link.library()), '-o', str(cls.validator)], check=True)
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)

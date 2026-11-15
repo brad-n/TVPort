@@ -15,6 +15,9 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parents[3]
 GAME = '010015100B514000'
 
+# a shebang cannot hold a path with a space (TVPort's venv python), so sh starts the script: its second line is a string to Python and an exec to sh
+SHELL_PYTHON = '#!/bin/sh\n' + "''''exec \"" + sys.executable + "\" \"$0\" \"$@\" #'''\n"
+
 
 def script(name):
     spec = importlib.util.spec_from_file_location(name, REPO / 'scripts' / (name + '.py'))
@@ -40,7 +43,7 @@ class HostMSL(unittest.TestCase):
         tools = self.root / 'bin'
         tools.mkdir()
         compiler = tools / 'xcrun'
-        compiler.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
+        compiler.write_text(SHELL_PYTHON + textwrap.dedent('''\
             import json, os, pathlib, sys
             args = sys.argv[1:]
             if '--show-sdk-path' in args:
