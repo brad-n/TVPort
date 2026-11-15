@@ -10,7 +10,13 @@ What changes in this fork, release by release, in plain terms. The full descript
 
 ## Unreleased (on `switch2-experimental`)
 
-Nothing yet: everything that was here is in build 1660.
+Nothing yet: everything that was here is in build 1665.
+
+## 1.3.0 build 1665 (2026-11-14)
+
+**Fixed**
+- **Black screen in Star Fox on build 1660:** the display list a game reads (`vi::ListDisplays`) lost its layer sizes in build 1660, so Star Fox drew at 1x1, a black screen at every render scale (and possibly other games that read it). Fixed, with a test (`t_vi_displays`). If you built a game with 1660, build it again with this release.
+- **Crash on the Metal 4 pipeline path (every game):** Metal hands out one function object for the same shader entry, and a shader loaded a second time (a scene change prefetching a program a draw also loads, or two shaders sharing a library) briefly reset that live function to unspecialized; a pipeline built on another thread in that moment made Metal abort. Star Fox hit it after the barrel-roll training. A function with constants is now never left unspecialized, and a variant with other constants gets a function of its own. Test: `t_spec_mtl4`. On a Mac mini M2, Star Fox now runs on the Metal 4 path again: no aborts in 7 runs, and far fewer first-sight stutters than on the older path (0 long frames on a second run, against 30).
 
 ## 1.3.0 build 1660 (2026-11-14)
 
