@@ -14,7 +14,7 @@ spec = importlib.util.spec_from_file_location('launcher_settings', ROOT / 'dm/ga
 settings = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(settings)
 
-BOTW, WONDER = '01007EF00011E000', '010015100B514000'
+BOTW, WONDER, OCARINA = '01007EF00011E000', '010015100B514000', '0400486024DEC000'
 PERFORMANCE_NVN = ['DM_PRESENT_SNAP', 'DM_PSO_MTL4', 'DM_PSO_PREBUILD', 'DM_NVN_ENC_THREAD', 'DM_FPS_HOLD', 'DM_METAL_HUD']
 
 
@@ -192,6 +192,20 @@ class LauncherSettingsTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 profile = type('Profile', (), {'id': BOTW, 'get': lambda self, key, default='', bad=bad: bad})()
                 with self.assertRaises(SystemExit): settings.render_base(profile)
+
+    def test_a_games_own_options_follow_its_stubs_capabilities(self):
+        """Game options: a game's own quality trades (Ocarina of Time's stubs), each shown only when main's rewrite declares the capability its stub declares, defaulting to the game's own"""
+        own = ['DM_FOLIAGE', 'DM_GROUND_MIST', 'DM_REFLECTION_INTERVAL', 'DM_MODEL_LOD', 'DM_SHADOW_CASCADES']
+        with tempfile.TemporaryDirectory() as tmp, patch.object(settings.nacp, 'languages', return_value=['en-US']), patch.dict(os.environ, {'GFXAPI': 'nvn'}):
+            (Path(tmp) / 'main.fixups.tsv').write_text(''.join(f'# {c}\t1\n' for c in ('FOLIAGE', 'GROUND_MIST', 'MODEL_LOD', 'REFLECTION_INTERVAL', 'SHADOW_CASCADES')))
+            rows = {s['env']: s for s in settings.build(OCARINA, tmp, Path(tmp) / 'control.nacp')['settings']}
+        self.assertEqual([e for e, s in rows.items() if s['section'] == 'Game options'], own)
+        self.assertEqual(list(rows)[-len(own):], own)   # the last section, after Performance
+        self.assertEqual({e: rows[e]['default'] for e in own}, {'DM_FOLIAGE': 'on', 'DM_GROUND_MIST': 'on', 'DM_REFLECTION_INTERVAL': '1', 'DM_MODEL_LOD': '1', 'DM_SHADOW_CASCADES': '0'})
+        self.assertEqual((rows['DM_FOLIAGE']['on'], rows['DM_FOLIAGE']['off']), ('on', 'off'))   # loader.c reads on / off, as the env file does
+        self.assertEqual([o[0] for o in rows['DM_REFLECTION_INTERVAL']['options']], ['1', '2', '4', '8'])   # the loader takes 1 to 8; 1 is the game's every frame
+        self.assertFalse(set(own) & set(build(OCARINA, 'nvn')))   # a rewrite without the stubs (another build): none
+        self.assertFalse(set(own) & set(build(BOTW, 'nvn')))
 
     def test_render_scale_reaches_the_stubs_largest_scale(self):
         """The rewriter writes a render-scale stub's largest scale as RENDER_SCALE: 1 keeps the table's range (a stub that only lowers the size), 3 raises its top (Hades II)"""

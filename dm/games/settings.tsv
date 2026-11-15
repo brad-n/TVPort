@@ -10,7 +10,8 @@
 #   shown     always; DM_GAME_<NAME>!=<value> or ==<value>; fixups:<KEY>: main's rewriter table has that key (a stub in the game's build, patch_nso.py); languages>1 (more than one to pick, so also when the control data lists none); gfxapi:<API>: the packer's GFXAPI;
 #             platform:<ios | mac>: the app's platform (SETTINGS_PLATFORM, ios when unset), for a switch only that platform's front end reads
 #             shaders:rescale: the NVN shader library packed with the app carries the resolution-scaling code (dm/tools/shader_lib.py rescale_code on SETTINGS_MSL; without a library named, the profile's shader_no_rescale 0)
-#   section   Game, Controls or Performance: a heading on the single settings screen. Rows appear in table order within each section
+#   section   Game, Controls, Performance or Game options: a heading on the single settings screen. Rows appear in table order within each section. Game options holds a game's own options (quality trades
+#             its rewrite's stubs offer, shown by the capability the stubs declare: fixups:<CAPABILITY>), so a front end can tell them from the settings every game has
 #             Reset to tested defaults clears all launcher choices; values fixed by an env file stay
 #   label, note  the setting's name and the line under it (may be empty; only for a setting with a cost: latency, memory, heat)
 #   meta      optional, key=value pairs separated by ; (settings.py META lists the keys; docs/frontends.md, The settings list, describes them):
@@ -42,3 +43,8 @@ DM_PSO_PREBUILD	toggle	-	1	gfxapi:nvn	Performance	Pipeline prebuild	The first st
 DM_NVN_ENC_THREAD	toggle	-	1|DM_GAME_ENC_THREAD	gfxapi:nvn	Performance	Encode thread
 DM_FPS_HOLD	toggle	on/off	DM_GAME_FPS_HOLD	DM_GAME_FPS_TARGET!=0	Performance	Hold frames when late
 DM_METAL_HUD	toggle	-	0	always	Performance	Performance HUD
+DM_FOLIAGE	toggle	on/off	1	fixups:FOLIAGE	Game options	Grass and ground cover	Off draws no grass, ferns, clover, ivy or moss: much less GPU time and about 90 MB less graphics memory, with bare-looking ground.
+DM_GROUND_MIST	toggle	on/off	1	fixups:GROUND_MIST	Game options	Ground mist	Off skips the soft haze over the ground: less GPU time, and misty places look clearer and darker.
+DM_REFLECTION_INTERVAL	choice	1=Every frame,2=Every 2nd frame,4=Every 4th frame,8=Every 8th frame	1	fixups:REFLECTION_INTERVAL	Game options	Reflection updates	Less often saves GPU time; reflections then catch up with a change of light or place later.
+DM_MODEL_LOD	choice	1=Full,2=Lower,4=Low,8=Lowest	1	fixups:MODEL_LOD	Game options	Model detail	Lower switches models to their simpler versions closer to the camera, for less GPU time.
+DM_SHADOW_CASCADES	choice	0=Full,2=Reduced,1=Low	0	fixups:SHADOW_CASCADES	Game options	Sun shadows	Fewer shadow cascades: shadows near the player are softer and fainter, for a little less GPU time.

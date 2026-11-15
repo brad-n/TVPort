@@ -26,6 +26,7 @@
 extern char **environ;
 #if TARGET_OS_TV
 void tv_record_last_played(void);   // SourcesTV/TVLastPlayed.m: tells SwitchTV (through its App Group) that this game was played just now
+void tv_apply_switchtv_options(void);   // SourcesTV/TVOptions.m: the settings SwitchTV's Options page saved for this game
 #endif
 
 int dm_main(int argc, char **argv);   // dm/host/main.c compiled in with -Dmain=dm_main
@@ -187,6 +188,9 @@ static int boot_env(void) {
     }
     setenv("DM_ENV_FILE_KEYS", [from_file componentsJoinedByString:@" "].UTF8String, 1);   // the launcher keeps what an env file set (LauncherSettings.swift)
     setenv("DM_ENV_LAUNCH_KEYS", [from_launch componentsJoinedByString:@" "].UTF8String, 1);   // and what the launch environment set (docs/frontends.md, Saved choices)
+#if TARGET_OS_TV
+    tv_apply_switchtv_options();   // the Apple TV has no launcher screen: SwitchTV's Options page is its saved choices, applied where neither the launch nor an env file set the variable, before the host reads any
+#endif
     dm_diag_start(doc.fileSystemRepresentation);   // DM_MEMSTAT / DM_THRCPU: only now are env.txt's values visible; a relative name goes into the data directory (Caches on tvOS)
     front_hud_env();   // an env file's DM_METAL_HUD; nothing in this process makes a Metal device before startGame (front_ios.m), which applies the launcher's
     // Game language (nn::oe::GetDesiredLanguage, hle_oe.c): the one the IPA was packed with (the NSP script's LANGUAGE / --language → DMLanguage in Info.plist), unless an env file sets DM_LANG
