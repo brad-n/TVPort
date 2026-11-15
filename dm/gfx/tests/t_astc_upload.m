@@ -978,6 +978,15 @@ static int same_level(id<MTLTexture> a, unsigned ml, id<MTLTexture> b, unsigned 
     for (size_t i = 0; i < (size_t)w * h * 4; i++) if (x[i] != 0) { nonblack = 1; break; }
     free(x); free(y); return eq && nonblack;
 }
+// What tex_once.py does to a native ASTC texture under the cap (docs/texture_once.md, plan_native): every dropped level's bytes, from its offset to the next level's, in each layer, become zero.
+// The capped upload must not read them: the kept levels below are compared with the uncapped upload of the whole data
+static void zero_dropped_levels(const tex_t *t, unsigned sk) {
+    unsigned n = t->d.levels ? t->d.levels : 1, layers = nvn_astc_layers(&t->d);
+    for (unsigned l = 0; l < sk; l++) {
+        uint64_t lo = nvn_tex_level_offset(&t->d, l), hi = l + 1 < n ? nvn_tex_level_offset(&t->d, l + 1) : t->L.layer_size;
+        for (unsigned y = 0; layers && y < layers; y++) memset((uint8_t *)t->mem + (uint64_t)y * t->L.layer_size + lo, 0, (size_t)(hi - lo));
+    }
+}
 static void run_astc_native(void) {
     static const struct { uint32_t fmt; unsigned w, h, levels, target, layers; int cap; unsigned skip; int sh; const char *name; } C[] = {
         {0x79, 512, 256, 10, 1, 1, 128, 2, 0, "4x4 512x256"},   {0x7b, 300, 150, 9, 1, 1, 64, 3, 0, "5x5 300x150 (odd)"}, {0x7d, 1024, 1024, 11, 1, 1, 256, 2, 0, "6x6 1024"},
@@ -995,12 +1004,13 @@ static void run_astc_native(void) {
         int sh = 0; unsigned sk = nvn_astc_skip_levels(&d, C[c].cap, &sh);
         CHECK(sk == C[c].skip && sh == C[c].sh, "%s: nvn_astc_skip_levels = %u (short %d), want %u (%d)", C[c].name, sk, sh, C[c].skip, C[c].sh);
         void *m1, *m2; g_astc_capdim = 0; tex_t t1 = fixture(d, &m1); id<MTLTexture> ref = upload(&t1);
-        g_astc_capdim = C[c].cap; tex_t t2 = fixture(d, &m2); CHECK(bc_skip(&t2) == sk, "%s: bc_skip follows the cap", C[c].name); id<MTLTexture> cap = upload(&t2);
+        g_astc_capdim = C[c].cap; tex_t t2 = fixture(d, &m2); zero_dropped_levels(&t2, sk); CHECK(bc_skip(&t2) == sk, "%s: bc_skip follows the cap", C[c].name); id<MTLTexture> cap = upload(&t2);
         CHECK(ref && cap && ref.mipmapLevelCount == C[c].levels && ref.width == C[c].w, "%s: uncapped keeps all levels", C[c].name);
         CHECK(cap && cap.pixelFormat == ref.pixelFormat && mt_is_astc(cap), "%s: still native ASTC", C[c].name);
         CHECK(cap && cap.width == MAX(C[c].w >> sk, 1u) && cap.height == MAX(C[c].h >> sk, 1u) && cap.mipmapLevelCount == C[c].levels - sk && cap.arrayLength == ref.arrayLength && cap.textureType == ref.textureType,
               "%s: capped size %lux%lu levels %lu (skip %u)", C[c].name, cap ? (unsigned long)cap.width : 0ul, cap ? (unsigned long)cap.height : 0ul, cap ? (unsigned long)cap.mipmapLevelCount : 0ul, sk);
         if (sk) CHECK(cap.allocatedSize < ref.allocatedSize, "%s: capped allocates less (%lu < %lu)", C[c].name, (unsigned long)cap.allocatedSize, (unsigned long)ref.allocatedSize);
+        // m2 holds zeros where the dropped levels were (zero_dropped_levels): the kept levels below still equal the uncapped texture's, so no byte of a dropped level was read
         for (unsigned l = sk; cap && l < C[c].levels; l++) for (unsigned y = 0; y < (C[c].target == 4 ? C[c].layers : 1u); y++)
             CHECK(same_level(cap, l - sk, ref, l, y, MAX(C[c].w >> l, 1u), MAX(C[c].h >> l, 1u)), "%s: kept NVN level %u layer %u samples like the uncapped texture's", C[c].name, l, y);
         if (sk && cap) {   // a view names NVN levels: levels sk+1.. of the capped texture is Metal level 1..; a view that starts in a dropped level starts at Metal level 0
