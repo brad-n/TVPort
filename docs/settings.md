@@ -1,12 +1,14 @@
 # Settings
 
-The screen before the game starts shows the settings the game supports. A setting that only matters while another is on appears under it and disappears when that one is turned off. Tap **Play** to start; the app remembers your choices for the next start. All settings are on one scrollable screen, under **Game**, **Controls** and **Performance**. Tap a menu or move a slider there; no settings page needs opening. **Upscaling** is in **Game**, beside **Console mode**. A Mac app shows the same settings in a [window of its own](#the-mac-settings-window).
+The screen before the game starts shows the settings the game supports. A setting that only matters while another is on appears under it and disappears when that one is turned off. Tap **Play** to start; the app remembers your choices for the next start. All settings are on one scrollable screen, under **Game**, **Controls** and **Performance**, and **Game options** for a game that has options of its own. Tap a menu or move a slider there; no settings page needs opening. **Upscaling** is in **Game**, beside **Console mode**. A Mac app shows the same settings in a [window of its own](#the-mac-settings-window).
 
 - [Tested defaults](#tested-defaults)
 - [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Resolution scale](#resolution-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Game language](#game-language), [Picture](#picture), [Frame-rate counter](#frame-rate-counter)
 - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff), [Press a button to join](#press-a-button-to-join)
 - [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
+- [Game options](#game-options): [Grass and ground cover](#grass-and-ground-cover), [Ground mist](#ground-mist), [Reflection updates](#reflection-updates), [Model detail](#model-detail), [Sun shadows](#sun-shadows)
 - [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
+- [Apple TV](#apple-tv)
 - [In-game menu](#in-game-menu)
 - [TV](#tv)
 - [Settings in a file](#settings-in-a-file)
@@ -235,6 +237,30 @@ Apple's performance overlay over the game: frame rate, frame and GPU times, memo
 
 Sets every setting back to the game's tested default; **Play** then forgets your choices, so those defaults apply, and those of later builds too ([Tested defaults](#tested-defaults)). Settings fixed by `Documents/env.txt` stay as the file says.
 
+## Game options
+
+Options a game has of its own: quality trades its patches offer for a slower GPU, such as the Apple TV's. Each is shown only for a game build whose patches have it (today The Legend of Zelda: Ocarina of Time on Switch 2), and each starts at the game's own picture. The measurements are from a Mac mini M2 Pro with the Apple TV's settings; expect several times the saving on an Apple TV.
+
+### Grass and ground cover
+
+**Off** draws no grass, ferns, clover, ivy on walls or moss on logs. The ground keeps its own texture, so floors look smooth and bare; trees, the bushes and grass you can cut and everything else stay. About 3.5 ms less GPU time a frame in Kokiri Forest and Link's house, and about 90 MB less graphics memory. In an `env.txt`: `DM_FOLIAGE=off`.
+
+### Ground mist
+
+**Off** skips the soft haze that drifts over the ground (Kokiri Forest's floor): about 2.2 ms less GPU time a frame there, and the forest floor looks clearer and darker. In an `env.txt`: `DM_GROUND_MIST=off`.
+
+### Reflection updates
+
+How often the small pictures of the surroundings that shiny and wet surfaces reflect are redrawn: **Every frame** (the game's), or every 2nd, 4th or 8th frame. Less often saves 0.7 to 1.2 ms a frame; reflections then catch up with a change of light or place that much later. In an `env.txt`: `DM_REFLECTION_INTERVAL=4`.
+
+### Model detail
+
+**Lower**, **Low** and **Lowest** switch models to their simpler versions as if they were 2, 4 or 8 times farther away. **Low** saves about 3 ms in the Great Deku Tree's opening dialogue (the tree's hanging roots become one sheet) and about 1.3 ms on Link's balcony. In an `env.txt`: `DM_MODEL_LOD=4`.
+
+### Sun shadows
+
+**Reduced** and **Low** keep 2 or 1 of the sun's 3 shadow cascades: the remaining ones cover the whole shadow distance, so shadows near the player are softer and fainter. **Low** saves about 0.2 ms a frame; **Reduced** is not measured yet. In an `env.txt`: `DM_SHADOW_CASCADES=1`.
+
 ## The Mac settings window
 
 A Mac app ([A Mac app](development.md#a-mac-app)) shows its settings in a window before the game starts. They are the same settings as on the iPhone, with the same defaults. The window shows the most used ones first: **Frame rate**, **Render scale**, **Console mode**, **Game language**, **Display mode** and **Game rumble**, when the game has them. **Render scale** shows the picture's size in pixels beside the percentage for the chosen **Console mode**, when the game's profile has it (Breath of the Wild: 1600 × 900 docked, 1280 × 720 handheld at 100 %). The others are under **Advanced settings**, in the usual sections, with **Reset to tested defaults**. The window remembers whether Advanced settings is open. **Frame-rate counter** and **Touch feedback** are only on the iPhone.
@@ -274,6 +300,10 @@ Console mode changes as on a Switch put in or taken out of its dock. While a TV 
 ## TV
 
 Connect a TV or monitor by cable, or start Screen Mirroring to an Apple TV or AirPlay TV. The game fills it in 16:9 at up to 1080p and switches to **Docked**; the iPhone or iPad keeps the controls. Disconnect to bring the game back to the device in its earlier mode. AirPlay adds some delay; a cable has almost none.
+
+## Apple TV
+
+An Apple TV game has no settings screen of its own: it starts the game at once. Its settings are on the **Options** page of the game's details in [SwitchTV](https://github.com/brad-n/SwitchTV), the launcher app TVPort installs beside the games: the same settings with the same defaults, without the iPhone's own (touch feedback, picture fit and shape), grouped as **Picture**, **Performance**, the game's own options, **Controls** and **Language**. A choice is kept at once, and the game takes it the next time it starts; **Reset to defaults** forgets them. A setting TVPort chose when it built the game (it writes them into the app's `dm/env.txt`, Console mode among them) starts at TVPort's value, which **Reset to defaults** goes back to; a choice made on the TV wins over it. A game left suspended in the background keeps the settings it started with until it is closed. SwitchTV hands the choices to the game through the keychain group the two share, so it needs a TVPort build signed with your team (the same as SwitchTV's Recently Played); an unsigned build ignores them and says so in its log. What wins, first to last: the launch environment, a line in the game's `Library/Caches/env.txt` (hand edits; `DM_SAVED_CHOICES=0` there ignores the choices), the choice made in SwitchTV, the build's `dm/env.txt`, then the game's default. The game's log names the source that won each setting.
 
 ## Settings in a file
 

@@ -971,6 +971,144 @@ class StripTests(unittest.TestCase):
             else: os.environ['TEX_ONCE_DEBUG'] = old
 
 
+@unittest.skipUnless(sys.platform == 'darwin', 'builds the engine\'s Objective-C texture code')
+class NativeAstcCapTests(unittest.TestCase):
+    """Native ASTC textures (the Switch 2 ships them, they are not in the pack): the levels above the cap are zeroed whole, exactly the levels the runtime never loads (nvn_astc_skip_levels)"""
+    ASTC = {0x2d01: 0x79, 0x2d06: 0x87}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(); cls.root = Path(cls.tmp.name)
+        cls.libdir = os.environ.get('TEX_ONCE_TEST_LIB')
+        cls.libpath = B.build_library(cls.libdir or str(cls.root / 'lib'))
+        cls.lib = B.lib_open(cls.libpath)
+        cls.native = tool.build_native(str(cls.root / 'nlib'))
+
+    @classmethod
+    def tearDownClass(cls): cls.tmp.cleanup()
+
+    def setUp(self):   # the synthetic builders know the BC formats only: teach them ASTC 4x4 (16-byte blocks) for these tests
+        self.saved = (dict(T.NVN), dict(T.BYTES_PER_BLOCK))
+        T.NVN.update(self.ASTC); T.BYTES_PER_BLOCK.update({0x79: 16, 0x87: 16})
+
+    def tearDown(self):
+        T.NVN.clear(); T.NVN.update(self.saved[0]); T.BYTES_PER_BLOCK.clear(); T.BYTES_PER_BLOCK.update(self.saved[1])
+        B.lib_open(self.libpath, 0)
+
+    def walker(self, cap, gob=0):
+        B.lib_open(self.libpath, gob)
+        return tool.Walker(self.libpath, self.native, 4, cap, None, {}, gob=gob)
+
+    def expect(self, tex, cap):
+        """(skip, the byte ranges of the dropped levels, in the BNTX's storage): from the runtime's own function and level offsets, layer by layer"""
+        lib = self.lib
+        depth = tex.depth
+        pkg = tex.pkg + 1
+        skip = tool.astc_skip_levels(lib, tool.NvnTexdesc(tex.target, tex.nvn, 0, 0, tex.w, tex.h, depth, tex.mips, 0, 0), cap)
+        total = lib.dm_texture_size(tex.target, tex.nvn, tex.w, tex.h, depth, tex.mips, pkg)
+        layers = depth if tex.target == 4 else 1
+        ls = total // layers
+        offs = [lib.dm_level_offset(tex.target, tex.nvn, tex.w, tex.h, depth, tex.mips, pkg, i) for i in range(tex.mips)] + [ls]
+        return skip, [(y * ls + offs[l], offs[l + 1] - offs[l]) for l in range(skip) for y in range(layers)], offs, ls, layers
+
+    CASES = [dict(w=512, h=256, mips=10, cap=128), dict(w=256, h=128, mips=8, layers=3, dim=5, cap=64), dict(w=300, h=150, mips=9, pkg=2, cap=64),
+             dict(w=64, h=64, mips=7, cap=256), dict(w=512, h=512, mips=1, cap=64), dict(w=128, h=128, mips=3, cap=8), dict(w=64, h=64, mips=7, layers=6, dim=3, cap=16)]
+
+    def test_zeroed_ranges_are_exactly_the_dropped_levels_and_kept_levels_are_untouched(self):
+        for gob in (0, 1):   # Switch and Switch 2 GOB order: a level's bytes move inside the level only, the ranges are the same
+            for case in self.CASES:
+                c = dict(case); cap = c.pop('cap')
+                tex = T.Texture(0x2d01, **c)
+                data = T.bntx(self.lib, [tex], platform=b'Ounc' if gob else b'NX  ')
+                t = B.bntx_textures(data, 0)[0]
+                w = self.walker(cap, gob)
+                skip, ranges, offs, ls, layers = self.expect(tex, cap)
+                new = w.leaf(data, [t])
+                name = f'{case} gob {gob}'
+                if not ranges:
+                    self.assertIsNone(new, name); continue
+                exp = bytearray(data)
+                for o, n in ranges: exp[t['start'] + o:t['start'] + o + n] = bytes(n)
+                self.assertEqual(new, bytes(exp), name)                                  # nothing else changed: kept levels, their padding, the mip tail
+                self.assertEqual(w.c['astc_native_bytes'], sum(n for _, n in ranges), name)
+                self.assertEqual(w.c['astc_native_levels'], skip * layers, name)
+                for o, n in ranges: self.assertEqual(new[t['start'] + o:t['start'] + o + n], bytes(n))
+                # the runtime's kept planes (nvn_astc_plane_storage) lie wholly outside the zeroed ranges and read as before; the dropped planes lie wholly inside them
+                desc = tool.NvnTexdesc(tex.target, tex.nvn, 0, 0, tex.w, tex.h, tex.depth, tex.mips, 0, tex.pkg + 1)
+                for l in range(tex.mips):
+                    for y in range(layers):
+                        off, ln = tool.plane_storage(self.lib, desc, l, y)
+                        a, b = t['start'] + off, t['start'] + off + ln
+                        if l >= skip: self.assertEqual(new[a:b], data[a:b], f'{name} level {l} layer {y} must be kept')
+                        else: self.assertEqual(new[a:b], bytes(ln), f'{name} level {l} layer {y} must be zeroed')
+                for l in range(skip, tex.mips):   # the mip tail (the smallest levels) is kept whole, with its own padding
+                    for y in range(layers):
+                        a = t['start'] + y * ls + offs[l]; b = t['start'] + y * ls + offs[l + 1]
+                        self.assertEqual(new[a:b], data[a:b], name)
+
+    def test_cap_zero_cube_3d_sparse_size_and_unknown_layout_leave_the_texture_alone(self):
+        tex = T.Texture(0x2d01, 512, 512, mips=10)
+        data = T.bntx(self.lib, [tex]); t = B.bntx_textures(data, 0)[0]
+        self.assertIsNone(self.walker(0).plan(data, t))                                  # no cap: no cut
+        self.assertIsNone(self.walker(128).plan(data, dict(t, dimension=2)))              # 3D
+        cube = T.Texture(0x2d01, 64, 64, mips=7, layers=6, dim=3)
+        cd = T.bntx(self.lib, [cube]); ct = B.bntx_textures(cd, 0)[0]
+        self.assertIsNone(self.walker(16).plan(cd, ct))                                   # a cube is not cut by the runtime
+        w = self.walker(128)
+        kind, reason, _ = w.plan(data, dict(t, offs=tuple(o + 512 * i for i, o in enumerate(t['offs']))))
+        self.assertEqual((kind, reason), ('skip', 'layout_differs'))
+        old = tool.SPARSE_MIN; tool.SPARSE_MIN = 1 << 10
+        try: self.assertEqual(w.plan(data, t)[:2], ('skip', 'sparse_size'))              # large enough to be a sparse placement texture in the runtime (never cut)
+        finally: tool.SPARSE_MIN = old
+        self.assertEqual(w.plan(data, t)[0], 'ok')
+        sh = T.Texture(0x2d01, 128, 128, mips=3); sd = T.bntx(self.lib, [sh]); st = B.bntx_textures(sd, 0)[0]
+        skip, ranges, offs, ls, layers = self.expect(sh, 8)
+        self.assertEqual(skip, 2)                                                         # nothing fits under 8: the last level is kept, as the runtime keeps it
+        self.assertEqual([(o, n) for o, n in ranges], [(0, offs[1]), (offs[1], offs[2] - offs[1])])
+
+    def test_image_still_parses_and_the_tool_zeroes_exactly_those_bytes(self):
+        lib, z = self.lib, B.zstd_module()
+        a, b = T.Texture(0x2d01, 512, 256, mips=10), T.Texture(0x2d06, 256, 128, mips=8, layers=3, dim=5)
+        bc = T.Texture(0x2001, 128, 64, mips=5, pkg=1)
+        small = T.Texture(0x2d01, 64, 64, mips=7)
+        d = self.root / 'img_tree'; d.mkdir()
+        (d / 'astc.bntx').write_bytes(T.bntx(lib, [a, b, small], platform=b'Ounc'))
+        (d / 'astc2.bntx.zs').write_bytes(z.compress(T.bntx(lib, [a], platform=b'Ounc'), level=19))
+        (d / 'bc.bntx').write_bytes(T.bntx(lib, [bc], platform=b'Ounc'))
+        (d / 'notes.txt').write_bytes(b'hello ' * 5000)
+        img = self.root / 'RomFS.img'; romfs_image.pack(str(d), str(img))
+        pk = self.root / 'pk'
+        for cap in (64, 0): B.prebuild(str(img), str(pk / str(cap)), 4, workers=2, log=lambda *_: None, max_dim=cap, gob=1)   # the pack's fingerprint holds the cap
+        before = (self.root / 'RomFS.img').read_bytes()
+        host = StripTests.__new__(StripTests)
+        for cap, want_bytes in ((64, None), (0, 0)):
+            out = self.root / f'out{cap}'
+            argv = [str(img), '--pack', str(pk / str(cap) / 'astc-ro.pack'), '--out', str(out), '--workers', '2', '--max-dim', str(cap), '--gob', 'switch2']
+            old = sys.argv; sys.argv = ['tex_once.py'] + argv
+            try: self.assertEqual(tool.run(StripTests.parse(host, argv)), 0)
+            finally: sys.argv = old
+            rep = json.loads((out / 'report.json').read_text())
+            self.assertTrue(rep['self_check']['passed'])
+            n = rep['astc_native_cap']
+            if cap == 0: self.assertEqual(n, dict(levels_zeroed=0, bytes_zeroed=0)); continue
+            # expected: a (loose and inside the .zs) + b + small, per the runtime's rule
+            want = 0; levels = 0
+            for tex, copies in ((a, 2), (b, 1), (small, 1)):
+                sk, ranges, *_ = self.expect(tex, 64); want += copies * sum(r[1] for r in ranges); levels += copies * len(ranges)
+            self.assertEqual((n['bytes_zeroed'], n['levels_zeroed']), (want, levels))
+            self.assertGreater(want, 0)
+            self.assertEqual(rep['bytes']['logical'], img.stat().st_size)
+            self.assertEqual(romfs_image.identity(str(img)), romfs_image.identity(str(out / 'romfs.img')))   # the image parses, index and identity unchanged
+            import romfs
+            self.assertEqual(sorted(romfs.os.listdir(str(img))), sorted(romfs.os.listdir(str(out / 'romfs.img'))))
+            new = romfs.Path(str(out / 'romfs.img') + '/astc.bntx').read_bytes(); old_b = romfs.Path(str(img) + '/astc.bntx').read_bytes()
+            self.assertEqual(len(new), len(old_b))
+            self.assertEqual(sum(1 for x, y in zip(new, old_b) if x != y) > 0, True)
+            self.assertEqual(romfs.Path(str(out / 'romfs.img') + '/notes.txt').read_bytes(), romfs.Path(str(img) + '/notes.txt').read_bytes())
+            # the tool is idempotent about inputs: the same cap again skips, another cap rewrites
+            self.assertEqual(tool.run(StripTests.parse(host, argv)), 0)
+
+
 class ZstdHeaderLayout(unittest.TestCase):
     """A re-packed frame keeps the original frame's header layout (Smash decodes only frames without a content size / single segment, 2026-11-08)"""
     def test_new_frame_copies_original_header(self):

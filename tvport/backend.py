@@ -1661,6 +1661,16 @@ def game_bundle_id(item: dict, team: str) -> str:
         return f'dev.tvport.{team.lower()}.g{item["titleID"].lower()}'
 
 
+def game_settings_file(item: dict) -> Optional[Path]:
+    """The settings list of the game's built Apple TV app (dm/launcher.json; an app of several programs: its first program's, dm/p0/launcher.json), from which SwitchTV makes the game's Options page;
+    None when no built app is at hand."""
+    try:
+        app = Game(Path(item['folder'])).earlier_app()
+    except (Failure, OSError, KeyError, ValueError):
+        return None
+    return next((app / name for name in ('dm/launcher.json', 'dm/p0/launcher.json') if app and (app / name).is_file()), None)
+
+
 SWITCHTV_JSON = re.compile(r'^\{"switchtv": true')   # the last line `switchtv.py ... --json` prints
 
 
@@ -1672,7 +1682,8 @@ def switchtv_tool() -> Path:
 
 
 def switchtv_games(library: list, team: str, data: Optional[Path] = None) -> list:
-    """The library's built games as SwitchTV's games file (switchtv.py: README, "The games file"): title ID, name, the game app's bundle ID, the artwork TVPort has for it and the shop banner that artwork came from."""
+    """The library's built games as SwitchTV's games file (switchtv.py: README, "The games file"): title ID, name, the game app's bundle ID, the artwork TVPort has for it, the shop banner that artwork came from
+    and the game app's settings list (its Options page in SwitchTV)."""
     data = data or DATA
     try:
         sources = json.loads((data / 'artwork/sources.json').read_text())
@@ -1688,6 +1699,9 @@ def switchtv_games(library: list, team: str, data: Optional[Path] = None) -> lis
             game['artwork'] = str(data / 'artwork' / f'{title_id}.jpg')
         if sources.get(title_id):
             game['artworkSource'] = sources[title_id]
+        settings = game_settings_file(item)
+        if settings:
+            game['settings'] = str(settings)
         games.append(game)
     return games
 

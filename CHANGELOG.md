@@ -10,7 +10,23 @@ What changes in this fork, release by release, in plain terms. The full descript
 
 ## Unreleased (on `switch2-experimental`)
 
-Nothing yet: everything that was here is in build 1665.
+Nothing yet: everything that was here is in build 1675.
+
+## 1.3.0 build 1675 (2026-11-15)
+
+**Smaller games on the Apple TV**
+- **Texture detail the Apple TV never reads is left out of its copy of the game:** Switch 2 games ship many textures already in ASTC, the format the Apple TV reads. Their largest detail levels sit above the TV's texture cap (256 by default), where the engine skips them; the TV's copy of the game file now holds zeros there, which take no space. Ocarina of Time's game image goes from 24.7 GB to 19.5 GB (5.2 GB, 21%). Only 2D and 2D-array textures under 64 MB that the engine would cap are touched, and only the levels it drops; `--native-astc-cap off` keeps them. Switch 1 games like Mario Kart 8 Deluxe have no such textures and are unchanged. Measured on the Mac with the real image builder; not yet installed and played on an Apple TV.
+
+## 1.3.0 build 1672 (2026-11-15)
+
+**Game options on the Apple TV, from SwitchTV**
+- **An Options page in SwitchTV** ([SwitchTV 0.2.0](https://github.com/brad-n/SwitchTV/releases/tag/v0.2.0)): each game's settings (picture, performance, and the game's own options such as Ocarina of Time's grass, ground mist, reflections, simpler models and shadow cascades), chosen on the TV before playing. The game reads them at launch through the keychain group SwitchTV already shares for Recently Played. A choice on the TV wins over the values TVPort set when it built the game; a hand-edited `env.txt` in the app's caches still wins over both. Only the game's own player settings are accepted, never diagnostic switches.
+- Ocarina of Time's own options (`DM_FOLIAGE`, `DM_GROUND_MIST`, `DM_REFLECTION_INTERVAL`, `DM_MODEL_LOD`, `DM_SHADOW_CASCADES`) are now launcher settings too, shown in the Mac and iPhone launchers for builds that have them.
+- Tested in the tvOS Simulator and with unit tests; not yet used on a real Apple TV.
+
+**Docs**
+- [What fills a game on the Apple TV](docs/reference/tv-size.md): an inventory of Ocarina of Time and Mario Kart 8 Deluxe on the TV, and the size cuts ranked by GB.
+- The full pre-release check is one script, `scripts/full_check.sh`, and every suite passes.
 
 ## 1.3.0 build 1665 (2026-11-14)
 
