@@ -116,7 +116,7 @@ int main(void) { @autoreleasepool {
     CHECK(color_of(both, 4, NULL, 0) == UP_COLOR_LINEAR, "an encode and a decode in floats: linear input and output (Bananza)");
     CHECK(color_of(NULL, 0, dec16, 3) == UP_COLOR_SRGB, "only a decode, in half floats: sRGB input, linear output (Splatoon Raiders)");
     CHECK(color_of(enc, 2, NULL, 0) == UP_COLOR_KEEP, "an encode with no decode: the output stays encoded, the shader runs");
-    CHECK(color_of(NULL, 0, NULL, 0) == UP_COLOR_LINEAR, "no curve and no power: input and output in one colour space, drawn with no conversion (Ocarina of Time's agl_ndsr_vr.pck)");
+    CHECK(color_of(NULL, 0, NULL, 0) == UP_COLOR_KEEP, "no curve, no power and no square: nothing in the code says its colour, the shader runs (upstream's rule since the square-rooted networks; Ocarina of Time's agl_ndsr_vr.pck networks square: UP_COLOR_ROOT, below)");
     {   // no curve constant, but a MUFU.LG2 / MUFU.EX2: its curves may take their constants from a constant buffer
         uint8_t code[4096] = {0};
         for (int f = 2; f <= 3; f++) {
@@ -125,16 +125,16 @@ int main(void) { @autoreleasepool {
             CHECK(up_mfx_color(code, sizeof code) == UP_COLOR_KEEP, "no curve constant but a power (MUFU.EX2 / MUFU.LG2): the shader runs");
         }
         uint64_t lo = 0x308, hi = (uint64_t)4 << 10; memset(code, 0, sizeof code); memcpy(code + 256, &lo, 8); memcpy(code + 264, &hi, 8);   // MUFU.RCP: no power
-        CHECK(up_mfx_color(code, sizeof code) == UP_COLOR_LINEAR, "a MUFU that is no power (RCP) does not count as a curve");
+        CHECK(up_mfx_color(code, sizeof code) == UP_COLOR_KEEP, "a MUFU that is no power (RCP) is no curve either: with no square, the shader runs");
     }
     {   // no curve, but a value squared keeping its sign, x * |x|: a network on square-rooted colour writing linear colour (Ocarina of Time's agl_ndsr_vr.pck FMUL, agl_ndsr_vr_light.pck HMUL2)
         uint8_t code[4096];
         const struct { unsigned op; int abs_a, abs_b, n, want; const char *label; } cases[] = {
             {0x220, 0, 1, 8, UP_COLOR_ROOT, "FMUL x, |x| 8 times: square-rooted input, linear output"},
             {0x232, 1, 0, 8, UP_COLOR_ROOT, "HMUL2 |x|, x 8 times: square-rooted input, linear output"},
-            {0x220, 0, 0, 8, UP_COLOR_LINEAR, "a plain square (no |x|) is no sign-keeping square: one colour space"},
-            {0x220, 1, 1, 8, UP_COLOR_LINEAR, "|x| * |x| is no sign-keeping square: one colour space"},
-            {0x220, 0, 1, 7, UP_COLOR_LINEAR, "7 squares are chance, not the output's"},
+            {0x220, 0, 0, 8, UP_COLOR_KEEP, "a plain square (no |x|) is no sign-keeping square: the shader runs"},
+            {0x220, 1, 1, 8, UP_COLOR_KEEP, "|x| * |x| is no sign-keeping square: the shader runs"},
+            {0x220, 0, 1, 7, UP_COLOR_KEEP, "7 squares are chance, not the output's: the shader runs"},
         };
         for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {
             memset(code, 0, sizeof code);

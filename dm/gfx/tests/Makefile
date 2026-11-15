@@ -187,7 +187,8 @@ check_t_cpu_tex: t_cpu_tex
 	DM_NVN_VIEW_KEEP=0 MTL_DEBUG_LAYER=1 ./t_cpu_tex --metal
 t_vc_lifetime: t_vc_lifetime.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_vc_lifetime.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
-check_t_vc_lifetime: RUN_ENV = MTL_DEBUG_LAYER=1
+# upstream's lifetime of a retired registration's view, one submission: the fork's DM_NVN_VIEW_KEEP (30 frames by default) at 0
+check_t_vc_lifetime: RUN_ENV = DM_NVN_VIEW_KEEP=0 MTL_DEBUG_LAYER=1
 t_read_owner: t_read_owner.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_read_owner.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
 check_t_read_owner: RUN_ENV = MTL_DEBUG_LAYER=1
@@ -361,9 +362,11 @@ check_t_dispatch_own: t_dispatch_own
 t_dispatch_barrier: t_dispatch_barrier.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_dispatch_barrier.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_dispatch_barrier
+# upstream's order (dispatch_enc_cs) with the fork's DM_NVN_DISPATCH_OVERLAP off: the profile key turns it on for Ocarina of Time, the profile these tests are built for, and it lets
+# the game's dispatches with no range run side by side too; t_dispatch_overlap covers it
 check_t_dispatch_barrier: t_dispatch_barrier
 	@set -e; for mode in full game; do for enc in 0 1; do \
-	    DM_NVN_DISPATCH_BARRIER=$$mode DM_NVN_ENC_THREAD=$$enc MTL_DEBUG_LAYER=1 ./t_dispatch_barrier; \
+	    DM_NVN_DISPATCH_OVERLAP=0 DM_NVN_DISPATCH_BARRIER=$$mode DM_NVN_ENC_THREAD=$$enc MTL_DEBUG_LAYER=1 ./t_dispatch_barrier; \
 	done; done
 t_args_gen: t_args_gen.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_args_gen.m $(MTL_T_SRC) $(FW)
