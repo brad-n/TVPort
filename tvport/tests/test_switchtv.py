@@ -67,6 +67,28 @@ class GamesFileTests(Fixture):
         self.assertNotIn('artwork', wonder)   # no art of its own: SwitchTV takes the shop banner
         self.assertEqual(wonder['bundleID'], 'dev.tvport.team123456.g010015100b514000')   # the standard bundle ID when the build folder is not at hand
 
+    def test_a_built_app_gives_its_settings_list_for_the_options_page(self):
+        app = self.root / 'DmIOS.app'
+        (app / 'dm').mkdir(parents=True)
+        (app / 'dm/launcher.json').write_text('{"game": "%s", "settings": []}' % KART)
+
+        class Built:
+            def __init__(self, folder):
+                if folder.name != 'kart':
+                    raise backend.Failure('No such folder')
+
+            def earlier_app(self):
+                return app
+
+            def bundle_id(self, team):
+                return 'dev.tvport.built.kart'
+
+        with patch.object(backend, 'Game', Built):
+            kart, wonder = backend.switchtv_games(LIBRARY, 'TEAM123456', self.data)
+        self.assertEqual(kart['settings'], str(app / 'dm/launcher.json'))
+        self.assertNotIn('settings', wonder)   # no build at hand: SwitchTV shows no Options for it
+        self.assertNotIn('settings', backend.switchtv_games(LIBRARY, 'TEAM123456', self.data)[0])
+
     def test_the_tool_is_found_in_the_submodule_and_a_missing_one_says_how_to_get_it(self):
         self.assertTrue(backend.switchtv_tool().is_file())
         with patch.object(backend, 'REPO', self.root), self.assertRaisesRegex(backend.Failure, 'git submodule update --init'):

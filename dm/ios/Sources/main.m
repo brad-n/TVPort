@@ -13,6 +13,7 @@
 #include "romfs_image.h"
 #include "romfs_identity.h"
 #include "player_env.h"
+#include "env_file.h"
 #include "diag_path.h"
 #if TARGET_OS_TV
 #define DM_DATA_DIRECTORY NSCachesDirectory   // tvOS apps have no Documents to keep: Library/Caches holds the game files, the saves and the logs, and the system may purge it
@@ -26,6 +27,7 @@
 extern char **environ;
 #if TARGET_OS_TV
 void tv_record_last_played(void);   // SourcesTV/TVLastPlayed.m: tells SwitchTV (through its App Group) that this game was played just now
+NSArray<NSString *> *tv_apply_switchtv_options(NSSet<NSString *> *from_launch);   // SourcesTV/TVOptions.m: the settings SwitchTV's Options page saved for this game; returns the variables it set
 #endif
 
 int dm_main(int argc, char **argv);   // dm/host/main.c compiled in with -Dmain=dm_main
@@ -158,8 +160,10 @@ static int boot_env(void) {
     NSString *log = [doc stringByAppendingPathComponent:@"log.txt"], *prev = [doc stringByAppendingPathComponent:@"log.prev.txt"];
     [fm removeItemAtPath:prev error:nil]; [fm moveItemAtPath:log toPath:prev error:nil];
     if (freopen(log.fileSystemRepresentation, "w", stderr)) setvbuf(stderr, NULL, _IOLBF, 0);
-    // Environment switch files (for on-device diagnostics: a sideloaded app cannot be given environment variables from outside): one KEY=VALUE per line, # starts a comment; Documents/env.txt takes precedence over dm/env.txt in the bundle (put there by build_ipa.sh's DM_ENV_FILE)
-    NSMutableArray<NSString *> *from_file = [NSMutableArray array], *from_launch = [NSMutableArray array];
+    // Environment switch files (for on-device diagnostics: a sideloaded app cannot be given environment variables from outside): one KEY=VALUE per line, # starts a comment (env_file.h). What sets a
+    // variable, first to last, each only where nothing earlier did: the launch environment; the player's env.txt (Documents, Library/Caches on tvOS: hand edits); on the Apple TV, the choices SwitchTV's
+    // Options page saved (SourcesTV/TVOptions.m); the bundle's dm/env.txt (build_ipa.sh's DM_ENV_FILE: the build's own values, TVPort's build choices among them); then the game's defaults
+    NSMutableArray<NSString *> *from_file = [NSMutableArray array], *from_launch = [NSMutableArray array], *from_player = [NSMutableArray array], *from_switchtv = [NSMutableArray array];
     for (char **e = environ; *e; e++) {   // set at launch (Xcode, devicectl): before the env files, and the launcher keeps them
         const char *eq = strchr(*e, '='); NSString *k = eq && !strncmp(*e, "DM_", 3) ? [[NSString alloc] initWithBytes:*e length:(NSUInteger)(eq - *e) encoding:NSUTF8StringEncoding] : nil;
         if (k) [from_launch addObject:k];
@@ -171,20 +175,19 @@ static int boot_env(void) {
     NSData *settings_data = [NSData dataWithContentsOfFile:[res stringByAppendingPathComponent:@"dm/launcher.json"]];
     NSDictionary *settings_file = settings_data ? [NSJSONSerialization JSONObjectWithData:settings_data options:0 error:nil] : nil;
     for (NSDictionary *row in settings_file[@"settings"]) if ([row[@"env"] isKindOfClass:NSString.class]) [launcher_keys addObject:row[@"env"]];
+    BOOL (^skip)(NSString *) = ^BOOL(NSString *k) {
+        return dm_player_diagnostic_key(k.UTF8String) || [launcher_keys containsObject:k] || ([launcher_keys containsObject:@"DM_METAL_HUD"] && [k isEqualToString:@"MTL_HUD_ENABLED"]);
+    };
+#else
+    BOOL (^skip)(NSString *) = nil;
 #endif
-    for (NSString *ef in @[[doc stringByAppendingPathComponent:@"env.txt"], [[res stringByAppendingPathComponent:@"dm"] stringByAppendingPathComponent:@"env.txt"]]) {
-        NSString *txt = [NSString stringWithContentsOfFile:ef encoding:NSUTF8StringEncoding error:nil];
-        for (NSString *raw in [txt componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
-            NSString *ln = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet]; NSRange eq = [ln rangeOfString:@"="];
-            if (!ln.length || [ln hasPrefix:@"#"] || eq.location == NSNotFound || !eq.location) continue;
-            NSString *k = [ln substringToIndex:eq.location], *v = [ln substringFromIndex:eq.location + 1];
-#if DM_PLAYER_BUILD
-            if (dm_player_diagnostic_key(k.UTF8String) || [launcher_keys containsObject:k] ||
-                ([launcher_keys containsObject:@"DM_METAL_HUD"] && [k isEqualToString:@"MTL_HUD_ENABLED"])) continue;
+    NSString *(^winner)(NSString *) = ^NSString *(NSString *k) { return dm_env_source(k, from_launch, from_player, from_switchtv); };   // for the log: what set a variable an env file finds set
+    dm_env_file_apply([doc stringByAppendingPathComponent:@"env.txt"], "env.txt", from_player, skip, winner);   // the player's
+    [from_file addObjectsFromArray:from_player];
+#if TARGET_OS_TV
+    [from_switchtv addObjectsFromArray:tv_apply_switchtv_options([NSSet setWithArray:from_launch])];   // the Apple TV has no launcher screen: SwitchTV's Options page is its saved choices, and they win over the build's
 #endif
-            if (!getenv(k.UTF8String)) { setenv(k.UTF8String, v.UTF8String, 0); [from_file addObject:k]; fprintf(stderr, "boot: env %s=%s (%s)\n", k.UTF8String, v.UTF8String, ef.lastPathComponent.UTF8String); }
-        }
-    }
+    dm_env_file_apply([[res stringByAppendingPathComponent:@"dm"] stringByAppendingPathComponent:@"env.txt"], "dm/env.txt", from_file, skip, winner);   // the build's
     setenv("DM_ENV_FILE_KEYS", [from_file componentsJoinedByString:@" "].UTF8String, 1);   // the launcher keeps what an env file set (LauncherSettings.swift)
     setenv("DM_ENV_LAUNCH_KEYS", [from_launch componentsJoinedByString:@" "].UTF8String, 1);   // and what the launch environment set (docs/frontends.md, Saved choices)
     dm_diag_start(doc.fileSystemRepresentation);   // DM_MEMSTAT / DM_THRCPU: only now are env.txt's values visible; a relative name goes into the data directory (Caches on tvOS)
