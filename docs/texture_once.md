@@ -55,6 +55,13 @@ For each plane the pack covers and the tool chooses to tag (storage length >= 16
 Mip levels the runtime never loads (above the texture cap, nvn_bc_skip_levels) are all zero, untagged. Planes shorter than 16 bytes, planes the
 pack does not hold, and planes whose layout the runtime would see differently (layout_differs) are left untouched.
 
+Native ASTC (Switch 2 textures that are ASTC in the file, so not in the pack): under a cap (`--max-dim`, TVPort's texture cap = DM_BC_MAX_DIM) the runtime never reads the levels
+`nvn_astc_skip_levels` drops (nvn_mtl.m `bc_skip`: 2D and 2D-array textures only, the first level whose longest side fits, the last level when none does; a texture in a sparse virtual pool is
+left whole, so the tool never cuts a texture of 64 MB or more). `tex_once.py` zeroes exactly those levels, untagged: each dropped level's range [its offset, the next level's offset) in every layer,
+from the engine's layout (a level lies wholly inside it, so no kept level and no mip tail is touched; the GOB order inside a level, Switch or Switch 2, does not move the range). A texture whose
+BNTX mip offsets differ from the engine's layout is skipped (`layout_differs`). report.json: `astc_native_cap` {levels_zeroed, bytes_zeroed}; the log line gives the GB. `--native-astc-cap off` keeps them.
+The cap is baked in, as for BC: another cap needs a rebuild and resend.
+
 Run time, per plane, before deswizzling and hashing: if length >= 16, bytes [0,8) are not all zero and bytes [8, length) are all zero, look the
 8-byte prefix up in the pack's sorted index. Exactly one entry whose ASTC payload size matches the plane's expected ASTC size -> use it
 (no deswizzle, no hash). Otherwise fall back to today's path (deswizzle + hash + lookup). Only if that also misses AND the plane looked

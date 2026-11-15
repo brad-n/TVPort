@@ -9,7 +9,7 @@ pack is embedded unchanged. The runtime resolves a tagged plane straight to its 
 
 A plane's "length" for the tag rule is its stored length as the runtime computes it (nvn_astc_plane_storage: whole GOBs, ceil(row bytes / 64) wide x the block rows x block size) at its storage
 offset; exactly [offset, offset + length) is overwritten (a plane under 16 bytes is never touched), so [8, length) reads as zeros.
-The levels above the texture cap (the runtime never loads them) are zeroed whole and carry no tag.
+The levels above the texture cap (the runtime never loads them) are zeroed whole and carry no tag; that includes the levels of a texture the Switch 2 ships in native ASTC (plan_native, not in the pack at all).
 
 Usage: tex_once.py <RomFS.img | build folder> --pack astc-ro.pack --out DIR [--max-dim N] [--block 4|6] [--bc1-block 4|5|6] [--compress auto|on|off] [--zlevel N] [--workers N] [--json]
        tex_once.py <RomFS.img | build folder> --no-pack --out DIR [--zlevel N] [--workers N] [--json]     (docs/texture_once.md 7c: a compressed DMSPARS1 v2 of a game without a texture pack, nothing stripped)
@@ -39,7 +39,7 @@ import bntx_astc as B
 import sparse_image as S
 import tex_once_zstd as Z
 
-TOOL_VERSION = 2
+TOOL_VERSION = 3
 DEFAULT_ZLEVEL = 9
 TASK_BYTES = 64 << 20
 ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
@@ -47,6 +47,11 @@ SKIPPABLE_FIRST = 0x184d2a50
 YAZ0_CHAIN = 64
 ZSTD_LEVELS = (3, 10, 19)
 TABLE_LEVELS = (22,)      # Smash's data.arc table is stored at the strongest level: a weaker one does not fit its slot (level 19: 142 KB too big, level 22: 146 KB to spare)
+SPARSE_MIN = 64 << 20     # the runtime leaves a native ASTC texture whole when it lives in a sparse virtual pool (nvn_mtl.m bc_skip), and only textures of at least this many bytes go there (SP_MIN): never cut those
+NATIVE_KEYS = ('astc_native_levels', 'astc_native_bytes')   # counters of the native-ASTC cut: levels zeroed (per layer), bytes zeroed
+# Native ASTC (the Switch 2 ships these, they are not in the pack): BNTX format (block type 0x2d..0x3a << 8 | 1 unorm / 6 sRGB) -> NVN format 0x79.. (unorm) / 0x87.. (sRGB), the 14 block sizes 4x4 .. 12x12
+ASTC_NATIVE = {(k + 0x2d) << 8 | dt: 0x79 + k + (14 if dt == 6 else 0) for k in range(14) for dt in (1, 6)}
+NATIVE = -1               # the `astc` field of a plan entry for a level of a native ASTC texture above the cap (a BC level above the cap has 0)
 MIN_PLANE = 16            # planes whose stored length (nvn_astc_plane_storage) is under this are never tagged (a tag is 8 bytes)
 BC1_FORMATS = (0x1a01, 0x1a06)
 NATIVE_SOURCE = os.path.join(HERE, 'tex_once_native.c')
@@ -154,6 +159,15 @@ class NvnTexdesc(ctypes.Structure):   # nvn_texdesc, dm/gfx/nvn/nvn_tex.h
                 ('depth', ctypes.c_uint32), ('levels', ctypes.c_uint32), ('stride', ctypes.c_uint32), ('pkg_block_h', ctypes.c_int)]
 
 
+def astc_skip_levels(L, desc, cap):
+    """The finest levels the runtime leaves out of a native ASTC texture under the cap: the runtime's own nvn_astc_skip_levels (dm/gfx/tex/nvn_astc_planes.c, what nvn_mtl.m bc_skip calls), straight
+    from the engine library (it is exported there: no change to the library's sources, so no pack is invalidated)"""
+    f = L.nvn_astc_skip_levels
+    f.argtypes = [ctypes.POINTER(NvnTexdesc), ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+    f.restype = ctypes.c_uint
+    return f(ctypes.byref(desc), cap, None)
+
+
 def plane_storage(L, desc, level, layer):
     """(offset in the texture's storage, length) of a plane's stored bytes: the runtime's own nvn_astc_plane_storage (dm/gfx/tex/nvn_astc_planes.c) when the library has it; until it is merged,
     the same computation from the engine's geometry functions (whole GOBs: ceil(row bytes / 64) x ceil(rows / block height) blocks). None for a texture that cannot be deswizzled"""
@@ -212,9 +226,10 @@ def sarc_ranges(d):
 
 # ---- the walker: strip and check share the container dispatch and the texture plan -----------------------------------------------------------------------------------------------
 class Walker:
-    def __init__(self, lib, native, block, max_dim, pack, dicts, bc1_block=None, fmt_blocks=None, gob=0):
+    def __init__(self, lib, native, block, max_dim, pack, dicts, bc1_block=None, fmt_blocks=None, gob=0, native_cap=True):
         self.L, self.N = B.lib_open(lib, gob), native_open(native)   # gob: the GOB order the runtime reads this game's storage in (bntx_astc.gob_switch2)
         self.block, self.max_dim, self.pack, self.dicts = block, max_dim, pack, dicts
+        self.native_cap = native_cap     # --native-astc-cap: zero the native ASTC levels above the cap (plan_native)
         self.bc1_block = bc1_block or block
         self.fmt_blocks = B.norm_fmt_blocks(*(fmt_blocks or ()))   # BC4 / BC5 / BC6H blocks (0: the pack does not hold the format)
         self.c = collections.Counter(); self.errors = []; self.new_csz = None
@@ -229,7 +244,7 @@ class Walker:
         L = self.L
         if 'bad' in t: return None
         eligible = B.BC_ELIGIBLE.get(t['fmt'])
-        if not eligible: return None
+        if not eligible: return self.plan_native(t)
         if not B.block_of(eligible[0], self.block, self.bc1_block, self.fmt_blocks): return None   # a format the pack was built without (--bc4-block 0 and the like)
         tg = B.target_of(t)
         if tg is None or t['samples'] > 1 or t['dimension'] == 2: return ('skip', 'ineligible_shape', 0)
@@ -273,6 +288,39 @@ class Walker:
             for layer in range(layers): mods.append((start + layer * ls + lo, hi - lo, None, 0))
         return ('ok', mods, small)
 
+    def plan_native(self, t):
+        """A texture the Switch 2 ships in ASTC (not in the pack): the levels the runtime never loads under the cap are zeroed whole, no tag. The runtime's rule is nvn_astc_skip_levels (nvn_mtl.m bc_skip,
+        DM_BC_MAX_DIM on a GPU without BC): only 2D and 2D array textures, the first level whose longest side fits the cap (the last level when none does), never a texture in a sparse virtual pool.
+        The range of a level is [its offset, the next level's offset) in each layer, from the engine's own layout: it holds that level's blocks and its alignment padding, nothing of a kept level
+        (levels are laid out one after another; the GOB order inside a level, Switch or Switch 2, moves bytes within the level only). -> None (nothing to cut), ('skip', reason, 0) or ('ok', mods, 0)"""
+        nvn = ASTC_NATIVE.get(t['fmt'])
+        if not nvn or self.max_dim <= 0 or not self.native_cap: return None
+        tg = B.target_of(t)
+        if tg is None or tg[0] not in (1, 4) or t['samples'] > 1 or t['dimension'] == 2: return None
+        target, depth = tg
+        w, h, mips = t['w'], t['h'], t['mips']
+        if mips < 2 or w == 0 or h == 0 or not t['offs'] or w > 16384 or h > 16384: return None
+        L = self.L
+        skip = astc_skip_levels(L, NvnTexdesc(target, nvn, 0, 0, w, h, depth, mips, 0, 0), self.max_dim)
+        if not skip: return None
+        pkg = (t['layout'] & 0xff) + 1
+        start, size = t['start'], t['size']
+        if start + size > t['end']: return ('skip', 'short', 0)
+        total = L.dm_texture_size(target, nvn, w, h, depth, mips, pkg)
+        offs = [L.dm_level_offset(target, nvn, w, h, depth, mips, pkg, i) for i in range(mips)]
+        if [o - t['offs'][0] for o in t['offs']] != offs: return ('skip', 'layout_differs', 0)
+        if not total or total > size: return ('skip', 'layout_failed', 0)
+        if total >= SPARSE_MIN: return ('skip', 'sparse_size', 0)
+        layers = depth if target == 4 else 1
+        if total % layers: return ('skip', 'layout_failed', 0)
+        ls = total // layers
+        mods = []
+        for level in range(skip):
+            lo, hi = offs[level], offs[level + 1]
+            if not 0 <= lo < hi <= ls: return ('skip', 'layout_failed', 0)
+            for layer in range(layers): mods.append((start + layer * ls + lo, hi - lo, None, NATIVE))
+        return ('ok', mods, 0)
+
     def leaf(self, d, texs):
         """Strip the textures of d (a BNTX file, a BFRES with BNTX inside, a NUTEXB). -> the new bytes, or None when nothing changes"""
         c = self.c
@@ -302,6 +350,7 @@ class Walker:
                 if tag is None: buf[off:off + span] = bytes(span)
                 else: buf[off:off + 8] = tag; buf[off + 8:off + span] = bytes(span - 8)
                 c['planes_zeroed_cap' if tag is None else 'planes_tagged'] += 1
+                if astc == NATIVE: c['astc_native_levels'] += 1; c['astc_native_bytes'] += span
                 if tag is not None: self.mf.append((tag.hex(),) + self.meta[off] + (self.item,))
             for off, span, tag in fresh:
                 bisect.insort(taken, (off, off + span)); exact[off] = (span, tag)
@@ -328,6 +377,8 @@ class Walker:
             if kinds and 'same' not in kinds:
                 v['textures_changed'] += 1
                 v['planes_tagged'] += kinds.count('tag'); v['planes_zeroed_cap'] += kinds.count('zero')
+                for (off, span, tag, astc), kind in zip(p[1], kinds):
+                    if astc == NATIVE and kind == 'zero': v['astc_native_levels'] += 1; v['astc_native_bytes'] += span
         if bytes(exp) != n: raise Mismatch('bytes changed outside the covered planes')
 
     # -- containers
@@ -426,7 +477,7 @@ class Walker:
         for k, v in delta.items():
             if k in ('planes_tagged', 'planes_zeroed_cap'): self.c['planes_skipped:' + reason] += v
             elif k == 'textures_changed': self.c['textures_skipped:' + reason] += v
-            elif k.startswith(('recompressed:',)): continue
+            elif k.startswith(('recompressed:',)) or k in NATIVE_KEYS: continue
             else: self.c[k] += v
 
     def _strip(self, d, name, depth, hint, top):
@@ -536,7 +587,7 @@ _W = {}
 def worker_init(cfg):
     if cfg.get('zstd_work'): Z.configure(cfg['zstd_work'])
     pack = PackIndex(cfg['pack'])
-    _W.update(cfg=cfg, w=Walker(cfg['lib'], cfg['native'], cfg['block'], cfg['max_dim'], pack, cfg['dicts'], cfg.get('bc1_block'), cfg.get('fmt_blocks'), cfg.get('gob', 0)), fd=os.open(cfg['romfs'], os.O_RDONLY))
+    _W.update(cfg=cfg, w=Walker(cfg['lib'], cfg['native'], cfg['block'], cfg['max_dim'], pack, cfg['dicts'], cfg.get('bc1_block'), cfg.get('fmt_blocks'), cfg.get('gob', 0), cfg.get('native_cap', True)), fd=os.open(cfg['romfs'], os.O_RDONLY))
     if cfg.get('sparse'): _W['sparse'] = S.SparseImage(cfg['sparse'])
 
 
@@ -715,6 +766,7 @@ def split_counters(c):
     skipped_t = {k.split(':', 1)[1]: v for k, v in c.items() if k.startswith('textures_skipped:')}
     cont = {k: v for k, v in c.items() if k in ('zstd', 'yaz0', 'sarc', 'bntx', 'nutexb', 'other_files', 'container_errors', 'too_deep') or k.startswith(('recompressed:', 'recompress_failed:'))}
     return dict(
+        astc_native_cap=dict(levels_zeroed=c.get('astc_native_levels', 0), bytes_zeroed=c.get('astc_native_bytes', 0)),
         planes=dict(tagged=c.get('planes_tagged', 0), zeroed_above_cap=c.get('planes_zeroed_cap', 0), untouched_under_16_bytes=c.get('planes_small_untouched', 0), skipped=skipped_p),
         textures=dict(seen=c.get('textures', 0), changed=c.get('textures_changed', 0), skipped=skipped_t), containers=cont)
 
@@ -756,6 +808,7 @@ def run(args):
     out = os.path.abspath(args.out); pack = os.path.abspath(args.pack)
     os.makedirs(out, exist_ok=True)
     zl = zlevel_of(args)
+    native_cap = getattr(args, 'native_astc_cap', 'on') != 'off'
     have = B.read_pack_header(pack)
     if not have: log(f'[RED] {pack} is no complete ASTC pack'); return 2
     fp_args = {} if bc1 == block else {'bc1_block': bc1}      # a pack built without --bc1-block is the pack of today: same fingerprint
@@ -772,7 +825,7 @@ def run(args):
     img = romfs_mod.Image(romfs)
     logical = os.path.getsize(romfs)
     fp = hashlib.sha256(b'tex_once %d\0' % TOOL_VERSION + tool_hash() + b'size %d\0max_dim %d\0block %d\0bc1 %d\0arc %s\0dbg %s\0' % (logical, max_dim, block, bc1, args.arc_mode.encode(), dbg.encode())
-                        + hashlib.sha256(img.index).digest() + have['fingerprint'] + b'%d' % have['bytes'] + (b'zstd %d\0' % zl if zl is not None else b'')).hexdigest()
+                        + hashlib.sha256(img.index).digest() + have['fingerprint'] + b'%d' % have['bytes'] + (b'zstd %d\0' % zl if zl is not None else b'') + (b'' if native_cap else b'no native astc cap\0')).hexdigest()
     target, rep_path = os.path.join(out, 'romfs.img'), os.path.join(out, 'report.json')
     old = read_report(rep_path)
     if old.get('input_fingerprint') == fp and old.get('self_check', {}).get('passed') and not args.force:
@@ -808,7 +861,7 @@ def run(args):
     if arc and arc.table: marks.append((arc.table_off, arc.table_size, None, 'table'))
     marks.sort(key=lambda m: m[0])
     tasks = partition(logical, marks)
-    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, fmt_blocks=fb, max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs, zstd_work=os.path.join(out, 'lib'), zlevel=zl, gob=gob)
+    cfg = dict(lib=lib, native=native, block=block, bc1_block=bc1, fmt_blocks=fb, max_dim=max_dim, pack=pack, dicts=dicts, romfs=romfs, zstd_work=os.path.join(out, 'lib'), zlevel=zl, gob=gob, native_cap=native_cap)
     writer = S.SparseWriter(target, logical, version=2 if zl is not None else 1)
     totals = collections.Counter(); errors = []; n_errors = 0
     updates, mods_by_task, table_new = {}, {}, None
@@ -920,7 +973,7 @@ def run(args):
     encoder_rep = dict(encoder='level detected per frame: zstd v1.3.5 streaming (Smash), v1.4.4 one-shot (Ocarina)', oneshot=enc.pop('encoder_oneshot', 0), matched=enc.pop('encoder_matched', 0), unmatched=enc.pop('encoder_unmatched', 0), unusable=enc.pop('encoder_exact_unusable', 0), stronger_level=enc.pop('encoder_stronger_level', 0),
                        levels={k.split(':', 1)[1]: enc.pop(k) for k in [k for k in enc if k.startswith('encoder_level:')]}, table=dict(arc.encoder or {}, identical_to_original=table_same, identity_checked=table_identity) if arc else None,
                        identity_check=enc_check)
-    writer_c = collections.Counter({k: totals[k] for k in ('planes_tagged', 'planes_zeroed_cap', 'textures_changed')})
+    writer_c = collections.Counter({k: totals[k] for k in ('planes_tagged', 'planes_zeroed_cap', 'textures_changed') + NATIVE_KEYS})
     for k in writer_c:
         if writer_c[k] != vtotals.get(k, 0): problems.append(f'{k}: the strip counted {writer_c[k]}, the check found {vtotals.get(k, 0)}')
     if n_errors: log(f'{n_errors} containers could not be read and were left as they are, first: {errors[:3]}')
@@ -936,7 +989,7 @@ def run(args):
         log(f'[RED] self-check failed ({len(problems)} problems): {problems[:3]}')
         os.unlink(target)
     with open(rep_path, 'w') as f: json.dump(tidy(rep), f, indent=1)
-    if passed: log(f'self-check passed; {rep["planes"]["tagged"]} planes tagged, {rep["planes"]["zeroed_above_cap"]} zeroed above the cap; {time.monotonic() - t0:.0f} s')
+    if passed: log(f'self-check passed; {rep["planes"]["tagged"]} planes tagged, {rep["planes"]["zeroed_above_cap"]} zeroed above the cap (native ASTC: {rep["astc_native_cap"]["levels_zeroed"]} levels, {rep["astc_native_cap"]["bytes_zeroed"] / 1e9:.2f} GB zeroed); {time.monotonic() - t0:.0f} s')
     if args.json: print(json.dumps(rep, indent=1))
     return 0 if passed else 1
 
@@ -1091,6 +1144,7 @@ def main():
     ap.add_argument('--gob', choices=('auto', 'switch', 'switch2'), default='auto', help="the order inside a GOB the textures are read in (default: the game's sdk module, as the runtime decides; the pack must have been built with it)")
     for nm in ('bc4', 'bc5', 'bc6h'): ap.add_argument('--%s-block' % nm, type=int, default=None, choices=(0, 4, 5, 6), help='ASTC block of the %s textures (default 6 / 4 / 4 for BC4 / BC5 / BC6H); the pack must have been built with it' % nm.upper())
     ap.add_argument('--bc1-block', type=int, default=None, choices=(4, 5, 6), help='ASTC block of BC1 textures when it differs from --block (default: --block); the pack must have been built with it')
+    ap.add_argument('--native-astc-cap', choices=('on', 'off'), default='on', help='zero the mip levels above the cap of textures the Switch 2 ships in native ASTC (the runtime never loads them; needs --max-dim); off = keep them whole')
     ap.add_argument('--no-pack-check', action='store_true', help=argparse.SUPPRESS)   # tests only: a pack made by hand
     ap.add_argument('--arc-mode', choices=('table', 'pad'), default='table', help="Smash's data.arc: update the table's stored sizes (default), or pad entries with skippable frames and leave the table")
     ap.add_argument('--force', action='store_true', help='rewrite even if the inputs are unchanged')
