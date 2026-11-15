@@ -43,6 +43,9 @@ TEXTURE_CAPS = (0, 1024, 512, 256)
 UPSCALER_ENV = {'game': None, 'metalfx': 'metalfx', 'off': 'bilinear'}   # --upscaler to DM_UPSCALER; the game's own leaves it unset
 
 
+ANISO_CHOICES = (0, 2, 4, 8, 16)   # DM_ANISO: 0 is the game's own anisotropic filtering, a number the least the game's smoothly filtered samplers get
+
+
 def res_scale_arg(text: str) -> float:
     """0.5 to 2.0, the range the engine-wide resolution scale accepts (DM_RES_SCALE)"""
     value = float(text)
@@ -819,7 +822,7 @@ def restore_saves(game: Game, device: str, bundle: str) -> int:
     return len(sources)
 
 
-def write_env(game: Game, mode: str, texture_cap: int, players: str = '', render_scale: float = 1.0, thermal_cap: bool = True, fps_target: int = 0, swap_ab_xy: bool = False, swap_ab: Optional[bool] = None, swap_xy: Optional[bool] = None, pso_mtl4: bool = False, extra_env: Optional[list] = None, guest_file: Optional[str] = None, astc_block: Optional[int] = None, bc1_block: Optional[int] = None, upscaler: str = 'game', res_scale: float = 1.0) -> Path:
+def write_env(game: Game, mode: str, texture_cap: int, players: str = '', render_scale: float = 1.0, thermal_cap: bool = True, fps_target: int = 0, swap_ab_xy: bool = False, swap_ab: Optional[bool] = None, swap_xy: Optional[bool] = None, pso_mtl4: bool = False, extra_env: Optional[list] = None, guest_file: Optional[str] = None, astc_block: Optional[int] = None, bc1_block: Optional[int] = None, upscaler: str = 'game', res_scale: float = 1.0, aniso: int = 0) -> Path:
     """The switches the app reads at launch (main.m, dm/env.txt)."""
     path = game.build / 'tvport-env.txt'
     lines = ['# Written by TVPort', f'DM_OPMODE={0 if mode == "handheld" else 1}', f'DM_BC_MAX_DIM={texture_cap}']
@@ -827,6 +830,8 @@ def write_env(game: Game, mode: str, texture_cap: int, players: str = '', render
         lines.append(f'DM_RENDER_SCALE={render_scale:g}')
     if res_scale != 1.0:   # every scaled render target at that many times the game's size (nvn_rscale.inc); a game whose shaders lack the rescale code logs [res-scale] off
         lines.append(f'DM_RES_SCALE={res_scale:g}')
+    if aniso:   # at least that much anisotropic filtering on the game's mipmapped linear samplers (nvn_mtl.m aniso_for); 0 is the game's own
+        lines.append(f'DM_ANISO={aniso}')
     if UPSCALER_ENV.get(upscaler):   # the game's upscaler network drawn with MetalFX, or off for plain bilinear scaling (DM_UPSCALER); unset is the game's own
         lines.append(f'DM_UPSCALER={UPSCALER_ENV[upscaler]}')
     if fps_target:   # the profile's fps_target replaced (30 or 60): the frame step's cap, or the engine limit the host sets (hle_fpslock.c)
@@ -1014,7 +1019,7 @@ def generate_project(game: Game, args, team: str, bundle: str, python: str, romf
     env = profile_env(game)
     aoc = game.build / 'aoc'
     env.update(GAME=game.title_id, W=str(game.build), PATCHED=str(game.build / f'patched_{game.package}'), ROMFS=str(romfs or game.romfs), MSL_IOS=str(game.shaders), AOC=str(aoc) if aoc.is_dir() and game.prepared_content().get('dlc', True) else '',
-               DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players, args.render_scale, not args.no_thermal_cap, args.fps_target, args.swap_ab_xy, args.swap_ab, args.swap_xy, pso_mtl4, getattr(args, 'extra_env', None), getattr(args, 'guest_file', None), astc_block(args), astc_blocks(args)[1], getattr(args, 'upscaler', 'game'), getattr(args, 'res_scale', 1.0))), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
+               DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players, args.render_scale, not args.no_thermal_cap, args.fps_target, args.swap_ab_xy, args.swap_ab, args.swap_xy, pso_mtl4, getattr(args, 'extra_env', None), getattr(args, 'guest_file', None), astc_block(args), astc_blocks(args)[1], getattr(args, 'upscaler', 'game'), getattr(args, 'res_scale', 1.0), getattr(args, 'aniso', 0))), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
                DM_XCODE_PROJECT_DIR=str(game.build / 'tvport-xcode'), DM_XCODE_DERIVED_DATA=str(game.build / 'tvport-derived'), FONT_PY=python)
     env.update(artwork_env(args))
     control = game.extract / 'control.nacp' if game.extract else None
@@ -1417,7 +1422,7 @@ def cmd_build(args) -> None:
     project = generate_project(game, args, team, bundle, python, None)
     bundle_shaders(game, project)
     compile_app(game, project, args.device)
-    game.save_state(bundle_id=bundle, art=str(args.art) if args.art else None, mode=args.mode, texture_cap=args.texture_cap, render_scale=args.render_scale, res_scale=getattr(args, 'res_scale', 1.0), upscaler=getattr(args, 'upscaler', 'game'), source_signature=signature, profile_signature=profile_signature(game))
+    game.save_state(bundle_id=bundle, art=str(args.art) if args.art else None, mode=args.mode, texture_cap=args.texture_cap, render_scale=args.render_scale, res_scale=getattr(args, 'res_scale', 1.0), aniso=getattr(args, 'aniso', 0), upscaler=getattr(args, 'upscaler', 'game'), source_signature=signature, profile_signature=profile_signature(game))
     if args.device:
         install(game, args.device, bundle, pack, once)
         restored = restore_saves(game, args.device, bundle)
@@ -1836,6 +1841,7 @@ def main() -> int:
     build.add_argument('--mode', choices=('handheld', 'docked'), default='handheld')
     build.add_argument('--texture-cap', type=int, choices=TEXTURE_CAPS, default=512)
     build.add_argument('--render-scale', type=render_scale_arg, default=1.0)
+    build.add_argument('--aniso', type=int, choices=ANISO_CHOICES, default=0)   # DM_ANISO: anisotropic filtering, at least that much; 0 is the game's own
     build.add_argument('--res-scale', type=res_scale_arg, default=1.0)   # DM_RES_SCALE: the engine-wide resolution scale, for a game whose shaders have the rescale code
     build.add_argument('--no-thermal-cap', action='store_true')
     build.add_argument('--upscaler', choices=tuple(UPSCALER_ENV), default='game')   # game: the game's own; metalfx: MetalFX spatial scaler; off: bilinear, the most GPU headroom

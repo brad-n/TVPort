@@ -95,6 +95,34 @@ void dm_focus_set(int st) {
 }
 static int opmode(void) { return dm_opmode(); }
 
+// DM_TV_OUTPUT: the picture size a docked game is told the TV has. 1080 (default) or 2160 (4K); 2160 only on a Mac, where the screen can show it: the Apple TV keeps 1080p
+// (DM_TV_MAX_WIDTH, dm/ios/Sources/DmDisplayCap.h: memory and a full-screen upscale a frame). Handheld mode is 1280x720 whatever it says. Every place the host tells a game the
+// display size reads this: oe::GetDefaultDisplayResolution (here), vi::QueryDisplayBufferMaxResolution and vi::ListDisplays (dm/gfx/hle_vi.c), the Vulkan surface (hle_vk.m)
+int dm_tv_output_parse(const char *e, int mac) { return mac && e && atoi(e) == 2160 ? 2160 : 1080; }
+int dm_tv_output(void) {
+    static _Atomic int v;
+    int r = v;
+    if (!r) {
+#if TARGET_OS_OSX
+        const int mac = 1;
+#else
+        const int mac = 0;
+#endif
+        const char *e = getenv("DM_TV_OUTPUT"); r = dm_tv_output_parse(e, mac);
+        if (e && *e && atoi(e) == 2160 && !mac) LOG("DM_TV_OUTPUT=2160 is only for a Mac: the Apple TV keeps 1080p (DM_TV_MAX_WIDTH)");
+        else if (r == 2160) LOG("DM_TV_OUTPUT=2160: docked games are told the TV is 3840x2160");
+        v = r;
+    }
+    return r;
+}
+// The size a game is told for an operation mode (0 handheld, 1 docked) and a TV output (1080 or 2160)
+void dm_display_size_for(int op, int tv_output, int *w, int *h) {
+    int con = op == 1, uhd = con && tv_output == 2160;
+    if (w) *w = uhd ? 3840 : con ? 1920 : 1280;
+    if (h) *h = uhd ? 2160 : con ? 1080 : 720;
+}
+void dm_display_size(int *w, int *h) { dm_display_size_for(dm_opmode(), dm_tv_output(), w, h); }
+
 // Screenshot / video recording switches: the host has no system screenshot service, no-op
 // Star Fox (SDK 21): the game marks the sections where it shows the player's own photographs (GameChat's camera pictures on screen); the system keeps those out of captures. No captures here
 HLE_FORCE("_ZN2nn2oe32BeginPresentPhotographedContentsEv", "photographed contents on screen: noted nowhere (no capture service)", void, h_oe_PhotoBegin, void) {}
@@ -307,8 +335,8 @@ HLE_FORCE("_ZN2nn2gs3sdk26SetGraphicsFrameLengthModeENS1_23GraphicsFrameLengthMo
           void, h_gs_FrameLength, int mode) {
     static int last = -1; if (mode != last) { LOG("gs: graphics frame length mode %d (0 auto, 1 30 fps, 2 60 fps, 3 120 fps)", mode); last = mode; }
 }
-HLE_FORCE("_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_", "default display resolution: 1920x1080 docked, 1280x720 handheld", void, h_oe_DefRes, int *w, int *h) {
-    int con = opmode() == 1; if (w) *w = con ? 1920 : 1280; if (h) *h = con ? 1080 : 720;
+HLE_FORCE("_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_", "default display resolution: 1920x1080 docked (3840x2160 with DM_TV_OUTPUT=2160), 1280x720 handheld", void, h_oe_DefRes, int *w, int *h) {
+    dm_display_size(w, h);
 }
 HLE_FORCE("_ZN2nn2oe38GetDefaultDisplayResolutionChangeEventEPNS_2os11SystemEventE", "default display resolution change event: bound, never signaled (the operation mode notification carries the change)",
           void, h_oe_DefResEv, void *ev) { hle_bind_system_event(ev, 0); }

@@ -107,6 +107,8 @@ Each run is one play session from a fresh build. The memory column is the highes
 | 16 | 2,080 MB | Crashed as Saria walked up |
 | 17 | 2,073 MB | Past Saria's close-up, then out of memory. That build had shipped without its texture pack, which is why a failed pack now stops the build |
 | **18** | **1,978 MB** | **The whole opening, control of Link, and across Kokiri Forest. No crash** |
+| 19 | 2,048 MB | Run 18's settings plus compressed render targets and the texture view cache: about 20 fps nearly everywhere (30 in Saria's close-up and tight areas), 16 minutes, then out of memory entering the Kokiri training area |
+| **20** | **1,877 MB** | **The build with memory relief (render-target memory given back when the TV runs short) and unused attachments left out, driven by script with no one at the TV: 18.5 minutes in Kokiri Forest with no crash, 20 fps in the village (GPU 34–38 ms), 25–30 on the east side. The relief stepped in 48 times. The training area itself wasn't reached** |
 
 Frame rate in run 18, scene by scene:
 
@@ -122,6 +124,10 @@ Frame rate in run 18, scene by scene:
 | Walking across Kokiri Forest | a steady 14 |
 
 At its peak, run 18 used 358 MB for the textures the game draws (1,578 of them as ASTC, 215 MB) and 198 MB for render targets. Another 399 MB held render-target memory that gets recycled. In 16.5 minutes it read 12.7 GB from storage, as tvOS paged the game's memory in and out.
+
+In a second session of run 20 (compressed render targets off, the TV already hot after 35 minutes of play) the Apple TV itself restarted with a kernel panic, 3.5 minutes into play, with 461 MB of headroom: not the game running out of memory. Whether the heat or the game caused it is not known yet.
+
+Runs can now be driven without anyone at the TV: `DM_CTL`'s `shot` command works on tvOS, so a script can look at the screen and press buttons, with its own save copy (`DM_SAVE`) so the player's saves are never touched.
 
 ## What it took
 

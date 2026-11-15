@@ -10,7 +10,17 @@ What changes in this fork, release by release, in plain terms. The full descript
 
 ## Unreleased (on `switch2-experimental`)
 
-Nothing yet: everything that was here is in build 1654.
+Nothing yet: everything that was here is in build 1660.
+
+## 1.3.0 build 1660 (2026-11-14)
+
+**TV output: 4K** (Mac, Advanced settings)
+- **TV output** (`DM_TV_OUTPUT=1080|2160`, "TV output" under Advanced in the Mac launcher): with 4K, a docked game is told the TV is 3840x2160 through every way a game can ask (the default display resolution, the largest display buffer, the display list, the Vulkan surface), so Switch 2 games that have a 4K mode can take it. Star Fox reads the largest display buffer and has a 4K mode (its 3D upscaled to 3072x1728); Ocarina of Time asks none of these and is unchanged. 1080p stays the default, and the Apple TV stays at 1080p for its memory. Not yet tried in a game that switches to 4K.
+
+## 1.3.0 build 1656 (2026-11-14)
+
+**Anisotropic filtering for every game** (Advanced settings)
+- **Anisotropic filtering** (`DM_ANISO`, Auto / 2x / 4x / 8x / 16x, "Anisotropic filtering" under Advanced in the Mac and Apple TV launchers and in TVPort): sharper textures on ground and walls seen at a shallow angle. Switch games ask for very little to save the console's GPU: Ocarina of Time asks for none on 148 of its 154 sampler settings in Kokiri Forest, Mario Kart 8 Deluxe for none on all 64 in a race. At 16x, Mario Kart's road keeps its grain much further toward the horizon. Cost on a Mac mini M2 Pro: about 0.7 ms a frame in Mario Kart, within the noise in Ocarina of Time. Auto (the game's own choice) is the default; a game that asks for more keeps its own value, and point-filtered, mipless, shadow and the engine's own samplers are never changed.
 
 ## 1.3.0 build 1654 (2026-11-14)
 

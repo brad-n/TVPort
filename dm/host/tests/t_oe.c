@@ -155,5 +155,18 @@ int main(void) {
     h_oe_SetFocusMode(3); dm_applet_enter("test");
     CHECK(empty() && h_oe_GetFocus() == 2, "focus mode 3: an applet changes the state without a notification");
     dm_applet_leave(); CHECK(empty() && h_oe_GetFocus() == 1, "focus mode 3: back to 1 without a notification");
+    // DM_TV_OUTPUT: the display size a game is told per operation mode (expected sizes written by hand)
+    { int w = -1, h = -1;
+      CHECK(dm_tv_output_parse(NULL, 1) == 1080 && dm_tv_output_parse("", 1) == 1080 && dm_tv_output_parse("1080", 1) == 1080 && dm_tv_output_parse("2160", 1) == 2160, "DM_TV_OUTPUT: unset, empty and 1080 are 1080; 2160 is 2160 on a Mac");
+      CHECK(dm_tv_output_parse("2160", 0) == 1080 && dm_tv_output_parse("garbage", 1) == 1080 && dm_tv_output_parse("4320", 1) == 1080, "DM_TV_OUTPUT: 2160 off a Mac, and any other value, stay 1080");
+      dm_display_size_for(1, 1080, &w, &h); CHECK(w == 1920 && h == 1080, "docked at 1080: 1920x1080");
+      dm_display_size_for(1, 2160, &w, &h); CHECK(w == 3840 && h == 2160, "docked at 2160: 3840x2160");
+      dm_display_size_for(0, 1080, &w, &h); CHECK(w == 1280 && h == 720, "handheld at 1080: 1280x720");
+      dm_display_size_for(0, 2160, &w, &h); CHECK(w == 1280 && h == 720, "handheld at 2160: still 1280x720");
+      dm_display_size_for(1, 2160, NULL, NULL); CHECK(1, "null outputs are allowed");
+      unsetenv("DM_TV_OUTPUT"); CHECK(dm_tv_output() == 1080, "no DM_TV_OUTPUT: 1080");
+      g_opmode = 1; h_oe_DefRes(&w, &h); CHECK(w == 1920 && h == 1080, "GetDefaultDisplayResolution docked, default: 1920x1080");
+      g_opmode = 0; h_oe_DefRes(&w, &h); CHECK(w == 1280 && h == 720, "GetDefaultDisplayResolution handheld: 1280x720");
+      g_opmode = 1; }
     printf("== oe %d checks, %d failed ==\n", checks, fails); return fails != 0;
 }

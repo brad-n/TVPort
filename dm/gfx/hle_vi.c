@@ -107,10 +107,11 @@ HLE_FORCE("_ZN2nn2vi32GetDefaultDisplayPanelIdentifierEPNS0_15PanelIdentifierE",
 }
 // The Great Ace Attorney Chronicles (SDK 10) lists up to 10 displays before opening the default one (main+0x808f08) and does not read the list. DisplayInfo is 0x60 bytes:
 //   name[0x40], bool has a layer limit at +0x40, then u64 layer count limit, largest layer width and height. One display, "Default", as Horizon lists for an application
+__attribute__((weak)) int dm_tv_output(void) { return 1080; }   // hle_oe.c; graphics unit tests have none
 HLE_FORCE("_ZN2nn2vi12ListDisplaysEPNS0_11DisplayInfoEi", "list displays; the host has one, \"Default\"", int, h_vi_ListDisp, void *out, int n) {
     if (n <= 0 || !out) return 0;
     uint8_t *p = out; memset(p, 0, 0x60); strcpy((char *)p, "Default");
-    p[0x40] = 1; uint64_t lim[3] = {1, 1920, 1080}; memcpy(p + 0x48, lim, sizeof lim);
+    p[0x40] = 1; uint64_t lim[3] = {1, 1920, 1080}; if (dm_opmode() == 1 && dm_tv_output() == 2160) { lim[1] = 3840; lim[2] = 2160; }   // DM_TV_OUTPUT memcpy(p + 0x48, lim, sizeof lim);
     return 1;
 }
 HLE_FORCE("_ZN2nn2vi12DestroyLayerEPNS0_5LayerE", "destroy layer; host static object", void, h_vi_DestroyLayer, void *layer) { (void)layer; }
@@ -139,7 +140,8 @@ HLE_FORCE("_ZN2nn2vi31QueryDisplayBufferMaxResolutionEPNS0_19BufferMaxResolution
           Result, h_vi_BufMaxRes, uint32_t *out, const void *disp) {
     (void)disp; static const int k[4][2] = {{1280, 720}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
     uint32_t r = 1; int w = 0, h = 0;
-    if (dm_opmode() == 1 && front_display_pixels(&w, &h)) {
+    if (dm_opmode() == 1 && dm_tv_output() == 2160) { r = 3; w = 3840; h = 2160; }   // DM_TV_OUTPUT=2160: the 4K the game is told the TV has, whatever the screen
+    else if (dm_opmode() == 1 && front_display_pixels(&w, &h)) {
         if (w < h) { int t = w; w = h; h = t; }
         r = 0; for (uint32_t i = 0; i < 4; i++) if (w >= k[i][0] && h >= k[i][1]) r = i;
     }
