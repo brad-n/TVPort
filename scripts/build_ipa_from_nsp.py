@@ -2965,18 +2965,18 @@ def prewarm_script_libraries(out, scripts, lib_dir, po):
     return real
 
 
-def other_gpu_prewarm(repo, out, arch, others, logs, lib_dir, env):
+def other_gpu_prewarm(repo, out, arch, others, logs, lib_dir, env, platform='macos'):
     """The prewarm pipelines for the GPUs --gpu named besides this Mac's (arch): the host's tool wrote each flush period also as a pipelines script (prewarm-<NN>.mtl4-json, prewarm_script), which
     metal-tt builds for each of them as <GPU>-prewarm-<NN>.mtl4a, as pso_offline.py builds the pairs' bases, with this Mac's index of the same period (the same pipelines, so the same keys).
     A period whose build fails for a GPU is left out for it (that GPU's first start builds those pipelines), the others are kept. Returns False when one was left out, so the stage keeps
-    no key and the next build tries again"""
+    no key and the next build tries again. platform: pso_offline.py's (macos: other Macs, this Mac's major version; tvos: the Apple TV app's, scripts/tv_prewarm.py, the SDK's major version)"""
     for old in out.glob('applegpu_*-prewarm-*'):   # the other GPUs' files of an earlier build, made again here
         if not old.name.startswith(f'{arch}-'): old.unlink()
     if not others: return True
     scripts = sorted(out.glob('prewarm-*.mtl4-json'))
     if not scripts: say(f'[RED] prewarm pipelines for {", ".join(others)}: the host wrote no pipelines script; those GPUs build them on their first start'); return False
     sys.path.insert(0, str(repo / 'dm/gfx/tools')); import pso_offline as po
-    osmin = po.os_min_default('macos')
+    osmin = po.os_min_default(platform)
     try: prewarm_script_libraries(out, scripts, lib_dir, po)
     except (BuildError, OSError) as e: say(f'[RED] prewarm pipelines for {", ".join(others)}: {e}; those GPUs build them on their first start'); return False
     ok = True
@@ -2984,7 +2984,7 @@ def other_gpu_prewarm(repo, out, arch, others, logs, lib_dir, env):
         made, failed = [], []
         for js in scripts:
             dst = out / f'{gpu}-{js.stem}.mtl4a'
-            if run(['xcrun', '-sdk', 'macosx', 'metal-tt', '-arch', gpu, '-macos-version-min', osmin, js, '-o', dst], logs / f'pso_prewarm_{gpu}_{js.stem}.log', env=env, fatal=False):
+            if run(['xcrun', '-sdk', po.sdk(platform), 'metal-tt', '-arch', gpu, f'-{platform}-version-min', osmin, js, '-o', dst], logs / f'pso_prewarm_{gpu}_{js.stem}.log', env=env, fatal=False):
                 dst.unlink(missing_ok=True); failed.append(js.name); ok = False; continue
             made.append(dst)
             keys = out / f'{arch}-{js.stem}.keys'

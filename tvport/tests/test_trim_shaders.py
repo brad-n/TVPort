@@ -120,7 +120,7 @@ class Project(unittest.TestCase):
 class Build(unittest.TestCase):
     def test_cmd_build_trims_after_the_tv_list_is_merged_and_hands_the_folder_to_the_project(self):
         args = SimpleNamespace(folder='/g', team='T', keys=None, device='dev', texture_cap=512, astc='off', texture_once='auto', compress_data='off', icloud=False, art=None, mode='handheld',
-                               render_scale=1, trim_shaders='on')
+                               render_scale=1, trim_shaders='on', gpu='g14p')   # named: no paired-device lookup
         game = SimpleNamespace(build=Path('/b'), romfs=Path('/r'), app=Path('/a'), prepared=True, addons=[], input_signature=lambda: 's', state=lambda: {'source_signature': 's'},
                                bundle_id=lambda team: 'b', save_state=lambda **kw: None)
         for trimmed in (None, Path('/b/tvport-shadertrim')):
@@ -129,13 +129,15 @@ class Build(unittest.TestCase):
                  patch.object(backend, 'BUNDLED', False), patch.object(backend, 'engine_python', return_value='python3'), patch.object(backend, 'one_build_at_a_time'), \
                  patch.object(backend, 'engine_change', return_value=None), patch.object(backend, 'astc_blocks', return_value=(0, None)), patch.object(backend, 'astc_format_blocks', return_value=None), \
                  patch.object(backend, 'remember_shaders', side_effect=lambda *a: order.append('remember')), patch.object(backend, 'backup_saves', return_value={'state': 'none', 'files': 0}), \
-                 patch.object(backend, 'generate_project') as generate, patch.object(backend, 'bundle_shaders'), patch.object(backend, 'compile_app'), patch.object(backend, 'install'), \
-                 patch.object(backend, 'restore_saves', return_value=0), patch.object(backend, 'provisioning', return_value={}), \
+                 patch.object(backend, 'generate_project') as generate, patch.object(backend, 'bundle_shaders', side_effect=lambda *a: order.append('bundle')), \
+                 patch.object(backend, 'prewarm_pipelines', side_effect=lambda *a: order.append('prewarm')) as prewarm, patch.object(backend, 'compile_app', side_effect=lambda *a: order.append('compile')), \
+                 patch.object(backend, 'install'), patch.object(backend, 'restore_saves', return_value=0), patch.object(backend, 'provisioning', return_value={}), \
                  patch.object(backend, 'trim_shaders', side_effect=lambda *a: order.append('trim') or trimmed) as trim, redirect_stdout(io.StringIO()):
                 backend.cmd_build(args)
             self.assertEqual(generate.call_args.args[1].shader_trim_dir, trimmed)
             self.assertEqual(trim.call_args.args[2], 'python3')
-            self.assertEqual(order, ['remember', 'trim'])   # the Apple TV's list is merged before the lists are read
+            self.assertEqual(order, ['remember', 'trim', 'bundle', 'prewarm', 'compile'])   # the Apple TV's list is merged before the lists are read; the prewarm pipelines are made from the app's whole list
+            self.assertEqual(prewarm.call_args.args[2].shader_trim_dir, trimmed)
 
 
 if __name__ == '__main__':

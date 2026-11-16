@@ -16,7 +16,7 @@ Numbers are decimal GB (10^9) unless marked GiB. `devicectl` prints GiB: Mario K
 | Shader libraries `msl/b-<chain>.img` (in the app) | 5.92 | 2.09 |
 | Code (`DmIOS` binary) | 0.11 | est. 0.04 |
 | Tables and assets (`dm/`, `Assets.car`, manual html) | 0.05 | est. 0.12 |
-| Pipeline archive in the app | none (no `--gpu` archive is built) | none |
+| Pipeline archive in the app | none (no `--gpu` archive is built; since then 0.97, [below](#pipeline-archive-for-the-a15)) | none |
 | Run-time Metal caches the OS keeps (`com.apple.metal`) | 0.46 and growing | 0.08 |
 | Run-time ASTC cache (`astc-cache/`, 3,774 files) | 0.07 | about 0 |
 | Debug leftovers (screenshots, logs) | 0.05 | 0.01 |
@@ -245,3 +245,26 @@ So a cold miss is a stall on the thread that draws, about 1 ms on the Mac, and n
 4. The picture and the frame times equal an untrimmed build's on the same route (house, balcony, forest), and memory (the footprint lines) does not rise.
 5. The cache folder's size after a session (`devicectl device info files`), and that `Library/Caches/shader-trim` survives a relaunch.
 6. After a reinstall, the shaders inflated before ship as they are (`tvport-shaders.tsv` names them: the pipelines drawn with them are its R rows).
+
+## Pipeline archive for the A15
+
+Built 2026-11-16 on branch `tv-all-tvpso` (on tvport 3d615fd2, chain `f1f54db8499f`), Ocarina of Time with *Trim shaders* on, on the hub's M2 Pro (loaded: a transcode ran beside it). TVPort makes it by default (`--gpu`, empty: the paired Apple TV's GPU, the A15's `applegpu_g14p`), and turns the Metal 4 path on with it: the `MTLDevice` path reads no archive.
+
+The A15's name: the TV's own logs from run 21 name its kernel driver `AGXAcceleratorG14P` ("Apple A15 GPU"), and Metal names the architecture `applegpu_g14p`; `metal-tt` from the Metal toolchain 27.2 (`xcrun -sdk appletvos metal-tt -arch applegpu_g14p -tvos-version-min 27.0`) builds it from the app's iOS libraries, which this Mac's Metal also loads.
+
+| Part | Contents | Size (decimal) | Build time |
+|---|---|---|---|
+| Pair archive `applegpu_g14p.mtl4a` (`pso_offline.py --platform tvos`) | 2,281 pulling bases (401 MB) and 4,125 compute pipelines (216 MB) | 0.60 GB | 313 s (3 base groups, 258 compute groups) |
+| Prewarm pipelines `applegpu_g14p-prewarm-<NN>.mtl4a` (`scripts/tv_prewarm.py`) | the TV's list (14,853 lines): 2,787 render pipelines (2,483 bases), 333 compute, 164 mesh; 8 files | 0.38 GB | 342 s in the TVPort build (the host's capture 82 s, `metal-tt` the rest; 301 s in an earlier run) |
+| **In the app** (`pso/`, 929 MiB; the app 4.5 GiB, against 3.89 GB before) | | **0.97 GB** | **about 11 minutes**, again only when the libraries, the lists or the toolchain change |
+| Left out: the 7,199 pairs `pso_offline.py` leaves to the device (function constants) | the app runs with `DM_PSO_PREBUILD=0`; drawn pairs build at their draws | est. 1.2-1.5 GB (about 175-215 KB a base) | |
+| Left out: the packed shaders' pairs (full library: 5,245 bases, 843 MB, 405 s) | built at their first draw, as before | +0.44 GB | |
+
+Trim shaders: the archive is made from the library the app ships, so the pairs of packed shaders are not in it and their pipelines are built at their first draw, as before. They would add 0.44 GB for no first-start time: the first start builds only the prewarm list's pipelines, whose shaders the trim keeps (run 21's route met no packed shader).
+
+Mario Kart 8 Deluxe: its RomFS is gone and its library is of an older chain (`1d619d0f520b`, whole, not trimmed), so only its pair archive could be made: 21,413 bases and 28 compute pipelines, 608 MB in 514 s; its prewarm pipelines need a library of the host's chain.
+
+**Apple TV run 22a** (2026-11-16 13:41 ET, the first launch after the install of this build, the run 21a environment, `DM_SAVE` copy): `pipeline archive bundled with the app: …/applegpu_g14p.mtl4a, 570.7 MB, opened in 558.2 ms`, `prewarm archive bundled with the app: 8 of 8 files, 8 with an index of 2973 bases, 358.3 MB, opened in 359.2 ms`, then `pipeline prepare: 14853 lines (11569 shaders, 2787 render pipelines, 333 compute pipelines) in 6.33 s … bases 0 compiled, 2483 from the archive, 291 reused; 2774 specializations`; the 164 mesh and 333 compute pipelines came from the archive too. Run 21a took 258.4 s for the same list. The title was on screen 45 s later, the save loaded into Kokiri Forest; memory peak 1,659 MB, lowest headroom 438 MB in its 245 s (run 21a: 1,715 MB and 382 MB over 991 s); the two red lines are run 21a's too.
+
+The first start after an install it replaces: run 21's prepare step, 14,853 lines (11,569 shaders, 2,787 render, 333 compute and 164 mesh pipelines) in 258 s on the A15 before the first frame (the relaunch: 3 s). The OS's own Metal cache, 0.48-0.60 GB on the TV after run 21, holds what the `MTLDevice` path compiled; the Metal 4 path takes those pipelines from the archive instead.
+

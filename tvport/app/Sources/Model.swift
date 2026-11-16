@@ -61,7 +61,7 @@ struct Game: Codable, Identifiable, Hashable {
     var compressGameData: String?     // "on" / "off"; nil = Automatic (on). Lossless zstd compression of the game files sent to the Apple TV (a DMSPARS1 v2 romfs.img)
     var convertMovies: String?        // "on" / "off"; nil = Automatic (on). Convert movies: the game's AV1 movies also as HEVC, which the Apple TV decodes in hardware (backend --movies)
     var trimShaders: Bool?            // Trim shaders (backend --trim-shaders on): the shaders the game has not used packed for first use; nil = off, until an Apple TV run confirms it
-    var pipelineGPU: String?          // GPU architectures for the pipeline archive (build script --gpu); empty = none
+    var pipelineGPU: String?          // GPU architectures for the pipeline archive (backend --gpu); empty = the paired Apple TV's (the A15's, g14p); none = no archive
     var extraEnvironment: String?     // KEY=VALUE lines for the app's env file
     var aniso: Int?                   // anisotropic filtering, at least this much (backend --aniso, DM_ANISO: 2, 4, 8, 16); nil = Auto, the game's own
     var resScale: Double?             // the engine-wide resolution scale (backend --res-scale, DM_RES_SCALE); nil = 1, off. Offered only where the game's shaders have the rescale code

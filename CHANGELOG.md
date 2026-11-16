@@ -13,6 +13,16 @@ What changes in this fork, release by release, in plain terms. The full descript
 **Movies on the Apple TV: Convert movies** (option, on by default)
 - **Convert movies** (a TVPort build option, Automatic = on): Switch 2 movies are AV1, which the Apple TV decoded on its CPU, so the picture fell behind the sound. The build now converts them to HEVC on the Mac (VideoToolbox, through Homebrew's ffmpeg; without ffmpeg the build goes on as before) and sends them beside the game files, and the Apple TV decodes them in hardware. The game's own movies stay in the game files, as the fallback. Ocarina of Time: 26 movies, 1.64 GB of AV1 as 1.00 GB of HEVC, about 8 minutes added to the first build. `DM_MOVIE_HEVC=0` turns it off on the Apple TV without a rebuild.
 
+## 1.3.0 build 2000 (2026-11-16)
+
+**A first launch in seconds on the Apple TV**
+- **Apple TV builds ship their graphics pipelines, built on the Mac** for the Apple TV 4K's A15 (`applegpu_g14p`): TVPort builds the game's pipeline archive for tvOS with `metal-tt`, plus the pipelines the game's first start prepares before its first frame (new `scripts/tv_prewarm.py`). Ocarina of Time's first launch after an install prepared its pipelines in 6.3 s instead of 258 s (Apple TV 4K, run 22a: 2,483 pipelines from the archive, none compiled on the TV). Relaunches were already fast and are unchanged.
+- Only the Metal 4 pipeline path reads the archive, so Apple TV builds with one now run it (`DM_PSO_MTL4=1`), with the TV's own up-front prebuild of every shader pair off (`DM_PSO_PREBUILD=0`). Pipelines the archive doesn't hold are built at first draw, as before.
+- The GPU comes from the paired Apple TV's model, and is the A15's when the model can't be read. Older Apple TVs (A12, A10X, A8) have no Metal 4 and get no archive. The game page's pipeline archive setting now reaches Apple TV builds; `none` builds without one, as before. If the archive build fails, the app runs as it did without one.
+- It adds about 1 GB to the app (Ocarina of Time: a 0.60 GB archive and 0.38 GB of first-start pipelines, for a 4.5 GB app) and about 11 minutes to the first build, redone only when the shaders change. With Trim shaders on, the archive covers the shaders the app ships; a packed shader's pipelines are still built at first draw.
+- New engine switch `DM_PSO_PREBUILD_PAIRS=0`: the prebuild tool builds the prewarm lists' pipelines alone.
+- Tested in a 4-minute session on an Apple TV 4K, from boot to Kokiri Forest, rendering normally; memory peaked at 1,659 MB.
+
 **Docs**
 - [Switch 2 games on the Apple TV](docs/switch2-apple-tv.md): Ocarina of Time on the Apple TV is finished. The page has the final results (run 21: 23.2 GB on the TV, no crash, about 20 fps), where it ended, and what carries over to every game.
 

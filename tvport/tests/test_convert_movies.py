@@ -147,7 +147,7 @@ class Build(unittest.TestCase):
                  patch.object(backend, 'BUNDLED', False), patch.object(backend, 'engine_python', return_value='python3'), patch.object(backend, 'one_build_at_a_time'), \
                  patch.object(backend, 'engine_change', return_value=None), patch.object(backend, 'astc_blocks', return_value=(0, None)), patch.object(backend, 'astc_format_blocks', return_value=None), \
                  patch.object(backend, 'remember_shaders'), patch.object(backend, 'backup_saves', return_value={'state': 'none', 'files': 0}), patch.object(backend, 'generate_project'), \
-                 patch.object(backend, 'bundle_shaders'), patch.object(backend, 'compile_app'), patch.object(backend, 'install') as install, patch.object(backend, 'trim_shaders', return_value=None), \
+                 patch.object(backend, 'bundle_shaders'), patch.object(backend, 'compile_app'), patch.object(backend, 'install') as install, patch.object(backend, 'trim_shaders', return_value=None), patch.object(backend, 'prewarm_pipelines'), \
                  patch.object(backend, 'restore_saves', return_value=0), patch.object(backend, 'provisioning', return_value={}), \
                  patch.object(backend, 'convert_movies', return_value=pack) as convert, redirect_stdout(io.StringIO()):
                 backend.cmd_build(args)

@@ -12974,7 +12974,9 @@ static int pre_bundle_out(NSString *out, long lines) {
 // content. DM_PSO_PREBUILD_THREADS=<n> workers (default: compile_tasks).
 // The bundle form, DM_PSO_PREBUILD_OUT=<folder> (the NSP script's --prebake, after pso_offline.py's pair archive): DM_PSO_ARCHIVE is a work folder, each flush period is also written
 // as a pipelines script (prewarm_script), and the work folder's files go into <folder> for the app (pre_bundle_out). With the pair archive as DM_PSO_BUNDLE, the pairs build only those
-// pso_offline.py left to the device (rest_pairs.tsv: function constants). Returns 0 when not asked for, 1 done, 2 failed (the bundle form's output incomplete or missing what it needs)
+// pso_offline.py left to the device (rest_pairs.tsv: function constants). DM_PSO_PREBUILD_PAIRS=0 builds no pair base, the prewarm lists alone: TVPort's Apple TV app runs without the
+// device's prebuild (DM_PSO_PREBUILD=0), so the pairs' bases would only make its app larger (scripts/tv_prewarm.py). Returns 0 when not asked for, 1 done, 2 failed (the bundle form's output
+// incomplete or missing what it needs)
 int mtl_pso_prebuild_tool(void) {
     const char *e = getenv("DM_PSO_PREBUILD"); if (!e || strcmp(e, "tool")) return 0;
     g_pre_tool = 1;
@@ -12988,7 +12990,9 @@ int mtl_pso_prebuild_tool(void) {
     mtl_init(); const char *z = getenv("DM_PSO_PREBUILD_DEPTH"); if (z && !strcmp(z, "zero")) atomic_store(&g_depth_zero, 1);
     int threads = getenv("DM_PSO_PREBUILD_THREADS") ? atoi(getenv("DM_PSO_PREBUILD_THREADS")) : 0;
     if (threads <= 0) threads = compile_tasks();
-    if (pso_prebuild(threads, 1, QOS_CLASS_USER_INITIATED) < 0) MLOG("pipeline prebuild: no pairs to build (no archive, no shader_pairs.tsv, prebuilt.tsv says it is done, or the archive bundled with the app holds every base)");
+    const char *pairs = getenv("DM_PSO_PREBUILD_PAIRS");
+    if (pairs && !strcmp(pairs, "0")) { shmap_load(); pso4_init(); MLOG("pipeline prebuild: DM_PSO_PREBUILD_PAIRS=0: no pair base, the prewarm lists alone"); }   // what pso_prebuild opens first
+    else if (pso_prebuild(threads, 1, QOS_CLASS_USER_INITIATED) < 0) MLOG("pipeline prebuild: no pairs to build (no archive, no shader_pairs.tsv, prebuilt.tsv says it is done, or the archive bundled with the app holds every base)");
     NSArray<NSString *> *lists = warm ? warm_paths(manifest) : nil; free(manifest);
     long lines = 0;
     if (lists && g_comp4 && g_arch_cap) lines = pre_warm_lists(lists, threads);

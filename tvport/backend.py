@@ -822,7 +822,7 @@ def restore_saves(game: Game, device: str, bundle: str) -> int:
     return len(sources)
 
 
-def write_env(game: Game, mode: str, texture_cap: int, players: str = '', render_scale: float = 1.0, thermal_cap: bool = True, fps_target: int = 0, swap_ab_xy: bool = False, swap_ab: Optional[bool] = None, swap_xy: Optional[bool] = None, pso_mtl4: bool = False, extra_env: Optional[list] = None, guest_file: Optional[str] = None, astc_block: Optional[int] = None, bc1_block: Optional[int] = None, upscaler: str = 'game', res_scale: float = 1.0, aniso: int = 0, fmt_blocks: Optional[tuple] = None) -> Path:
+def write_env(game: Game, mode: str, texture_cap: int, players: str = '', render_scale: float = 1.0, thermal_cap: bool = True, fps_target: int = 0, swap_ab_xy: bool = False, swap_ab: Optional[bool] = None, swap_xy: Optional[bool] = None, pso_mtl4: bool = False, extra_env: Optional[list] = None, guest_file: Optional[str] = None, astc_block: Optional[int] = None, bc1_block: Optional[int] = None, upscaler: str = 'game', res_scale: float = 1.0, aniso: int = 0, fmt_blocks: Optional[tuple] = None, pso_archive: bool = False) -> Path:
     """The switches the app reads at launch (main.m, dm/env.txt)."""
     path = game.build / 'tvport-env.txt'
     lines = ['# Written by TVPort', f'DM_OPMODE={0 if mode == "handheld" else 1}', f'DM_BC_MAX_DIM={texture_cap}']
@@ -847,8 +847,10 @@ def write_env(game: Game, mode: str, texture_cap: int, players: str = '', render
             lines.append('DM_PAD_SWAP_XY=1')
     if players.strip():
         lines.append('DM_TV_PLAYERS=' + ' '.join(players.split()))
-    if pso_mtl4:   # the Metal 4 pipelines; the build keeps the pulling libraries they need (IOS_PULL, generate_project)
+    if pso_mtl4 or pso_archive:   # the Metal 4 pipelines (the only path that reads the pipeline archive); the build keeps the pulling libraries they need (IOS_PULL, generate_project)
         lines.append('DM_PSO_MTL4=1')
+    if pso_archive:   # the app's pipeline archive for the TV's GPU (pipeline_gpu): no device prebuild of every pair's base before the first frame, as before the archive (prewarm_pipelines)
+        lines.append('DM_PSO_PREBUILD=0')
     if guest_file in ('on', 'off'):   # Game memory paging (hle_svc.c guest_file_wanted); unset leaves the engine's per-target default
         lines.append(f'DM_GUEST_FILE={1 if guest_file == "on" else 0}')
     if astc_block is not None:   # Compressed textures: BC1/2/3/7 stored as ASTC from the prebuilt pack (dm/gfx/tex/README.md); 0 = off
@@ -905,14 +907,42 @@ def restore_tables(game: Game) -> None:
 
 
 GPU_LIST = re.compile(r'(applegpu_)?g\w+(,(applegpu_)?g\w+)*')
+# The GPU of each Apple TV as Metal names it (MTLDevice.architecture, without applegpu_): the file the app opens in its pso/ folder (pso_bundle_open). The A15 of the Apple TV 4K
+# (3rd generation) is applegpu_g14p: its kernel driver is AGXAcceleratorG14P (Apple TV run 21's logs) and metal-tt builds tvOS archives for it. The older Apple TVs (A12, A10X, A8)
+# have no Metal 4, the only path that reads the archive: none. A model not listed gets the A15's, the newest Apple TV.
+TV_GPU = 'g14p'
+TV_GPUS = {'AppleTV14,1': 'g14p', 'AppleTV11,1': 'none', 'AppleTV6,2': 'none', 'AppleTV5,3': 'none'}
+
+
+def device_gpu(device: Optional[str]) -> str:
+    """The paired Apple TV's GPU from its model (devicectl's productType), TV_GPU when it cannot be read or is not listed."""
+    if not device:
+        return TV_GPU
+    try:
+        listing = devicectl_json('list', 'devices', timeout=30)
+    except (Failure, json.JSONDecodeError, OSError):
+        return TV_GPU
+    for item in listing.get('result', {}).get('devices', []):
+        hardware = item.get('hardwareProperties', {})
+        if device in (hardware.get('udid'), item.get('identifier')):
+            return TV_GPUS.get(hardware.get('productType') or '', TV_GPU)
+    return TV_GPU
 
 
 def pipeline_gpu(args) -> str:
-    """--gpu of the build script: none (no pipeline archive, as always) unless the game page names GPU architectures."""
+    """The GPU architectures the TV app's pipeline archive is made for (build_ipa.sh DM_PSO_GPUS, pso_offline.py --platform tvos; scripts/tv_prewarm.py): what the game page names
+    (none: no archive, as before), else the paired Apple TV's (cmd_build: device_gpu), else the A15's."""
     gpu = (getattr(args, 'gpu', '') or '').strip().replace(' ', '')
     if gpu and gpu != 'none' and not GPU_LIST.fullmatch(gpu):
-        raise Failure(f'Pipeline archive GPU "{gpu}" is not a GPU architecture such as g18p (or several, separated by commas)')
-    return gpu or 'none'
+        raise Failure(f'Pipeline archive GPU "{gpu}" is not a GPU architecture such as g14p (or several, separated by commas), or none')
+    return gpu or getattr(args, 'tv_gpu', None) or TV_GPU
+
+
+def pipeline_archive(game: Game, gpus: str) -> Optional[Path]:
+    """The pipeline archive build_ipa.sh made for the app (<build>/build/ios/pso/bundle, with an archive for each GPU), or None"""
+    bundle = game.build / 'build/ios/pso/bundle'
+    names = [g if g.startswith('applegpu_') else 'applegpu_' + g for g in gpus.split(',') if g and g != 'none']
+    return bundle if names and all((bundle / f'{name}.mtl4a').is_file() for name in names) else None
 
 
 def extractor_options(args) -> list:
@@ -980,7 +1010,8 @@ def prepare_game(game: Game, keys: Optional[Path], team: str, python: str, args=
     # A provisional survey contains build-specific addresses and memory settings.
     # Different inputs must not reuse it; keep each survey so switching back is safe.
     profile = profiles.get(signature, f'profiles/{signature}') if game.build else None
-    command = [python, REPO / 'scripts/build_ipa_from_nsp.py', game.folder, *(['-k', keys] if keys else []), '--prepare-xcode', '--keep-extracted', '--gpu', pipeline_gpu(args), '--romfs', 'separate', '--allow-other-metal', '--progress', 'lines']
+    # --gpu none: the TV app's pipeline archive is made with the project, for tvOS (generate_project); one made here would be an iOS one, made for nothing
+    command = [python, REPO / 'scripts/build_ipa_from_nsp.py', game.folder, *(['-k', keys] if keys else []), '--prepare-xcode', '--keep-extracted', '--gpu', 'none', '--romfs', 'separate', '--allow-other-metal', '--progress', 'lines']
     command += extractor_options(args)
     if game.title_id:
         command += ['--title-id', game.title_id]
@@ -1019,22 +1050,50 @@ def generate_project(game: Game, args, team: str, bundle: str, python: str, romf
     stage('Generating the Apple TV project')
     restore_tables(game)
     pso_mtl4 = bool(getattr(args, 'pso_mtl4', False))
+    gpus = pipeline_gpu(args)
+    archive = gpus != 'none'   # the archive and the Metal 4 path that reads it, with the device's prebuild off (write_env); made by build_ipa.sh (DM_PSO_GPUS, DM_TVOS: --platform tvos)
     env = profile_env(game)
     aoc = game.build / 'aoc'
     env.update(GAME=game.title_id, W=str(game.build), PATCHED=str(game.build / f'patched_{game.package}'), ROMFS=str(romfs or game.romfs), MSL_IOS=str(getattr(args, 'shader_trim_dir', None) or game.shaders), AOC=str(aoc) if aoc.is_dir() and game.prepared_content().get('dlc', True) else '',
-               DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players, args.render_scale, not args.no_thermal_cap, args.fps_target, args.swap_ab_xy, args.swap_ab, args.swap_xy, pso_mtl4, getattr(args, 'extra_env', None), getattr(args, 'guest_file', None), astc_block(args), astc_blocks(args)[1], getattr(args, 'upscaler', 'game'), getattr(args, 'res_scale', 1.0), getattr(args, 'aniso', 0), astc_format_blocks(args))), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
+               DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players, args.render_scale, not args.no_thermal_cap, args.fps_target, args.swap_ab_xy, args.swap_ab, args.swap_xy, pso_mtl4, getattr(args, 'extra_env', None), getattr(args, 'guest_file', None), astc_block(args), astc_blocks(args)[1], getattr(args, 'upscaler', 'game'), getattr(args, 'res_scale', 1.0), getattr(args, 'aniso', 0), astc_format_blocks(args), archive)), DM_PSO_GPUS=gpus, DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
                DM_XCODE_PROJECT_DIR=str(game.build / 'tvport-xcode'), DM_XCODE_DERIVED_DATA=str(game.build / 'tvport-derived'), FONT_PY=python)
     env.update(artwork_env(args))
     control = game.extract / 'control.nacp' if game.extract else None
     if not (control and control.is_file() and nacp_text(control)):
         env['DM_DISPLAY_NAME'] = game.name()   # a Switch 2 NUP has no control data; build_ipa.sh needs a name
-    if pso_mtl4:
+    if pso_mtl4 or archive:
         env['IOS_PULL'] = '1'   # keep the pulling vertex libraries (_bp) the Metal 4 pipelines read; without it DM_PSO_MTL4=1 cannot fully enable them
     art = args.art or game.icon or args.shelf_art or store_artwork(game)
     if art:
         env['DM_ICON'] = str(art)
     stream(['bash', REPO / 'dm/ios/tools/build_ipa.sh', '--prepare-xcode'], env=env, cwd=REPO)
-    return game.build / 'tvport-xcode'
+    project = game.build / 'tvport-xcode'
+    if archive and not pipeline_archive(game, gpus):
+        without_archive(project, pso_mtl4)
+    return project
+
+
+def without_archive(project: Path, pso_mtl4: bool) -> None:
+    """build_ipa.sh made no pipeline archive (pso_offline.py failed: its [RED] line is above): the app goes back to the pipelines it had without one, through the MTLDevice, unless the
+    game page turned Metal 4 on, so its first start does not build every pair's base and the prewarm list's bases on the Metal 4 path."""
+    path = project / 'Gen/dm/env.txt'
+    drop = ('DM_PSO_PREBUILD=',) + (() if pso_mtl4 else ('DM_PSO_MTL4=',))
+    if path.is_file():
+        path.write_text(''.join(line for line in path.read_text().splitlines(keepends=True) if not line.startswith(drop)))
+    emit('log', line='No pipeline archive for the Apple TV (see the lines above): the app builds its pipelines on its first start, as before.')
+
+
+def prewarm_pipelines(game: Game, project: Path, args, python: str) -> None:
+    """The pipelines the app's first start builds before its first frame (the prewarm list's, after bundle_shaders), made on this Mac for the TV's GPU and put beside its pipeline archive
+    (scripts/tv_prewarm.py): Ocarina of Time's first start after an install prepared 14,853 lines for 258 s on the A15 without them. Nothing to do without an archive."""
+    gpus = pipeline_gpu(args)
+    bundle = pipeline_archive(game, gpus) if gpus != 'none' else None
+    if not bundle:
+        return
+    stage('Building the pipelines for the Apple TV')
+    gen = project / 'Gen/dm'
+    stream([python, REPO / 'scripts/tv_prewarm.py', '--game', game.title_id, '--work', game.build, '--msl', getattr(args, 'shader_trim_dir', None) or game.shaders,
+            '--manifest', gen / 'pso_manifest.tsv', '--shader-map', gen / 'shader_map.tsv', '--bundle', bundle, '--gpu', gpus], env=profile_env(game), cwd=REPO)
 
 
 def merged_rows(*texts: str) -> list:
@@ -1553,6 +1612,9 @@ def relocate_build(game: Game) -> Game:
 
 def cmd_build(args) -> None:
     extra_env_pairs(getattr(args, 'extra_env', None) or [])   # a bad switch stops the build before anything slow
+    if not (getattr(args, 'gpu', '') or '').strip():
+        args.tv_gpu = device_gpu(getattr(args, 'device', None))   # the paired Apple TV's GPU for its pipeline archive (the A15's without one)
+    emit('log', line=f'Pipeline archive: {pipeline_gpu(args)}' + (' (none: the app builds its pipelines on its first start)' if pipeline_gpu(args) == 'none' else ' (made on this Mac; Metal 4 pipelines on)'))
     lock = one_build_at_a_time()   # held until this process exits
     game = Game(args.folder)
     team = args.team or known_team()
@@ -1601,6 +1663,7 @@ def cmd_build(args) -> None:
     args.shader_trim_dir = trim_shaders(game, args, python)   # Trim shaders: None keeps the whole library
     project = generate_project(game, args, team, bundle, python, None)
     bundle_shaders(game, project)
+    prewarm_pipelines(game, project, args, python)   # after the list is complete: the pipelines its first start would build, for the TV's GPU
     compile_app(game, project, args.device)
     game.save_state(bundle_id=bundle, art=str(args.art) if args.art else None, mode=args.mode, texture_cap=args.texture_cap, render_scale=args.render_scale, res_scale=getattr(args, 'res_scale', 1.0), aniso=getattr(args, 'aniso', 0), upscaler=getattr(args, 'upscaler', 'game'), source_signature=signature, profile_signature=profile_signature(game))
     if args.device:
