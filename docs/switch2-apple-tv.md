@@ -109,6 +109,7 @@ Each run is one play session from a fresh build. The memory column is the highes
 | **18** | **1,978 MB** | **The whole opening, control of Link, and across Kokiri Forest. No crash** |
 | 19 | 2,048 MB | Run 18's settings plus compressed render targets and the texture view cache: about 20 fps nearly everywhere (30 in Saria's close-up and tight areas), 16 minutes, then out of memory entering the Kokiri training area |
 | 20 | 1,877 MB | The build with memory relief (render-target memory given back when the TV runs short) and unused attachments left out, driven by script with no one at the TV: 18.5 minutes in Kokiri Forest with no crash, 20 fps in the village (GPU 34–38 ms), 25–30 on the east side. The relief stepped in 48 times. The training area itself wasn't reached |
+| 23 | 1,745 MB | Convert movies (the AV1 movies as HEVC, decoded in hardware), with the pipeline archive: from a new file, the title and the whole opening movie, its picture at the sound's pace (150 s of pictures in 157 s, 60 fps) where the AV1 in the same session took 258 s at 30 fps; the peak is the new file's first scene after the movie. No crash |
 | **21** | **1,715 MB** | **The build after the upstream sync (306 commits), with the three size cuts: 23.2 GB on the TV instead of 31.4. Driven by script: 16.5 minutes in Kokiri Forest without a crash, 382 MB of headroom at the tightest point, 20 fps in the forest. Textures look right, and the plaid ground never appeared. SwitchTV's Options page set anisotropic filtering on the TV, and the game applied it** |
 
 Frame rate in run 18, scene by scene:
@@ -156,7 +157,7 @@ Everything here is on by default for the Apple TV unless the row says otherwise.
 
 - **Frame rate.** The Apple TV shows a new picture on whole screen refreshes: a frame needs under 33.3 ms of GPU time for 30 fps, and just over that drops it to 20. Kokiri Forest needs 35 to 46 ms on the A15. The time goes to the game's own lighting shaders, which hold more values than the GPU has registers for; translation changes, geometry options and cuts in memory traffic didn't close the gap. Compressed render targets were the one change that lifted the TV (13 to 17 fps up to about 20).
 - **Heat.** After about 35 minutes of play the TV reaches its serious thermal state and slows to 13 or 14 fps; once, in run 20, it restarted with a kernel panic.
-- **The opening movie.** It is AV1, decoded in software on the A15, and the picture falls behind the sound.
+- **The opening movie.** It is AV1, decoded in software on the A15, and the picture fell behind the sound: in run 23's AV1 baseline, 150 s of the opening took 258 s at 30 fps. Convert movies (run 23) ships the movies as HEVC, which the A15 decodes in hardware: 157 s at 60 fps, the title movie's decode 3.9 ms a picture instead of 12.2, 2 late pictures instead of 274. See [AV1 movies as HEVC sidecars on the Apple TV](reference/movies.md#av1-movies-as-hevc-sidecars-on-the-apple-tv).
 
 ## What carries over to every game
 
@@ -164,6 +165,7 @@ Everything here is on by default for the Apple TV unless the row says otherwise.
 - **Smaller installs on the Apple TV:** texture detail above the TV's cap is left out, colour and lighting textures are packed at ASTC 6x6, and Trim shaders ships only the shaders a game uses. Ocarina of Time went from 31.4 to 23.2 GB. See [What fills a game on the Apple TV](reference/tv-size.md).
 - **Options on the TV:** SwitchTV's Options page sets a game's picture and performance settings, including Ocarina of Time's own (grass, ground mist, reflections, simpler models, shadow cascades), so none of the settings above need `env.txt`.
 - **Frame pacing that keeps checking for 60 fps** (`DM_FPS_REPROBE`), so a GPU clock that drops at a steady 30 fps doesn't push games down to 20.
+- **Convert movies:** every Switch 2 game's AV1 movies are converted to HEVC on the Mac at build time and decoded in hardware on the TV (Ocarina of Time: +1.00 GB; the AV1 stays as the fallback).
 - **Scripted test sessions on the TV** with no one there, using `DM_CTL` and a save copy (`DM_SAVE`).
 
 ## Research branches
