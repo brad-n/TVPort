@@ -7831,11 +7831,12 @@ static const img_ent *msl_image_file(NSString *path, romfs_img **img) {
     *img = m;
     return m ? msl_image_find(m, path.lastPathComponent.UTF8String) : NULL;
 }
+#include "nvn_shader_trim.inc"   // a trimmed library's packed shaders, inflated at first use (dm/gfx/tools/shader_trim.py)
 static NSData *msl_data(NSString *path) {   // a file of the library, nil when it has none
     NSData *d = [NSData dataWithContentsOfFile:path];
     if (d) return d;
     romfs_img *m; const img_ent *x = msl_image_file(path, &m);
-    if (!x) return nil;
+    if (!x) { char tp[1300]; return trim_path_ns(path, tp, sizeof tp) > 0 ? [NSData dataWithContentsOfFile:@(tp)] : nil; }   // a packed shader's file: from the cache folder
     NSMutableData *o = [NSMutableData dataWithLength:(NSUInteger)x->b];
     return romfs_image_read(m, o.mutableBytes, (size_t)x->b, x->a) ? o : nil;
 }
@@ -8089,7 +8090,13 @@ static id<MTLLibrary> lib_from_file(NSString *path, NSError **err) {
             dispatch_data_t d = dispatch_data_create(f.data, f.size, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ munmap(base, base_len); });
             return lib_tag([g_dev newLibraryWithData:d error:err], lib_digest(f.data, f.size));
         }
-        if (!x) errno = open_errno;
+        if (!x) {   // a packed shader of a trimmed library: its file in the cache folder, mapped as a folder's file is
+            char tp[1300]; int tr = trim_path_ns(path, tp, sizeof tp);
+            if (tr > 0) fd = open(tp, O_RDONLY);
+            if (fd < 0) { if (err && tr) *err = [NSError errorWithDomain:NSPOSIXErrorDomain code:ENOENT userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"cannot open %@: a packed shader of the trimmed library %s", path,
+                                                 tr > 0 ? "that was inflated but is gone from the cache folder" : tr == -1 ? "that is not inflated yet" : "whose frame does not inflate (the shader trimming line above)"]}];
+                          if (tr) return nil; errno = open_errno; }
+        }
     }
     if (fd < 0 || fstat(fd, &st) || st.st_size <= 0) { if (fd >= 0) close(fd); if (err) *err = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"cannot open %@", path]}]; return nil; }
     size_t len = (size_t)st.st_size; void *m = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, 0); close(fd);
@@ -12312,7 +12319,8 @@ static _Atomic int g_pre_known_n;   // pairs left to the draws because they fail
 // run, a name in the library, under g_pre_fail_lock
 static _Atomic int g_pre_nolib; static NSString *g_pre_nolib_file;
 // Whether the library has the file: in its folder or in its image (msl_image_file), as msl_data and lib_from_file read it
-static int msl_has(NSString *path) { romfs_img *m; return !access(path.fileSystemRepresentation, F_OK) || msl_image_file(path, &m) != NULL; }
+// A packed shader of a trimmed library counts once it has been inflated (by a draw, now or on an earlier start), not before: the pipeline prebuild walks every pair and must not unpack them all
+static int msl_has(NSString *path) { romfs_img *m; return !access(path.fileSystemRepresentation, F_OK) || msl_image_file(path, &m) != NULL || trim_have(path); }
 // 1 (and the file noted) when the library lacks <key><suffix>
 static int pre_lib_absent(NSString *key, NSString *suffix) {
     NSString *name = [key stringByAppendingString:suffix];
@@ -12345,7 +12353,13 @@ static MTL4FunctionDescriptor *pre_fn(id<MTLLibrary> lib, NSString *name) {   //
 }
 static NSDictionary *pre_json(NSString *key) { NSData *d = msl_data([NSString stringWithFormat:@"%@/%@_b.json", g_msl_dir, key]); return d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil; }
 // The base of one pair as the draws make it (pso_desc_pull / pso_desc), or nil when the pair is left to the draws. Call inside an autorelease pool
-static MTL4RenderPipelineDescriptor *pre_desc(NSString *vk, NSString *fk, int zero) {
+static MTL4RenderPipelineDescriptor *pre_desc_(NSString *vk, NSString *fk, int zero);
+static MTL4RenderPipelineDescriptor *pre_desc(NSString *vk, NSString *fk, int zero) {   // the prebuild walks every pair: it takes a packed shader only once a draw has inflated it (msl_has)
+    int q = t_trim_quiet; t_trim_quiet = 1;
+    MTL4RenderPipelineDescriptor *m = pre_desc_(vk, fk, zero);
+    t_trim_quiet = q; return m;
+}
+static MTL4RenderPipelineDescriptor *pre_desc_(NSString *vk, NSString *fk, int zero) {
     NSDictionary *vj = pre_json(vk), *fj = pre_json(fk);
     if ((!vj && pre_lib_absent(vk, @"_b.json")) || (!fj && pre_lib_absent(fk, @"_b.json"))) return nil;
     if (!vj || !fj || ![vj[@"chain"] isEqual:@DMSH_CHAIN] || ![fj[@"chain"] isEqual:@DMSH_CHAIN]) return nil;
@@ -12795,6 +12809,7 @@ static void warm_finish(void) {
                       (const char *[]){"not asked for yet", "returned retained", "returned autoreleased"}[atomic_load(&g_spec_own) % 3], (unsigned long long)g_pb_legacy);
     if (g_arch_bundle || g_arch_cap) MLOG("compute pipelines so far: %llu from the archive bundled with the app, %llu from this device's archive, %llu built (%.1f ms looking up, %.1f ms building)",
                                          (unsigned long long)g_cps_arch, (unsigned long long)g_cps_run, (unsigned long long)g_cps_built, g_cps_look_ns / 1e6, g_cps_build_ns / 1e6);
+    trim_log_stats("after the prewarm");
     // All warm tasks have joined. WarmItems retain published shaders until the submit thread claims them.
     // Drop negative results too: demand loading keeps its existing retry behavior, independent of the warm dictionary.
     g_warm_dict = nil; g_warm_loads = nil;
@@ -17167,7 +17182,7 @@ void mtl_prog_prefetch(const prog_t *cp) { @autoreleasepool {   // a game thread
         NSString *stage = g_shmap[k]; int st = stage ? stage_of(stage) : -1;
         if (st < 0) continue;   // not in the package: a built-in kernel (prog_get)
         NSString *pc = [k stringByAppendingString:@"_b"];
-        if (!progpf_first(pc)) continue;
+        if (trim_prefetch_skip(pc) || !progpf_first(pc)) continue;   // a packed shader of a trimmed library: inflated when a draw needs it, not for every program the game makes
         dispatch_async(pp_bg_queue(), ^{ @autoreleasepool {
             NvShader *sh = shader_load(pc, st, 0);
             if (sh && st == 0 && sh->has_pull && !sh->layer_out && hybrid_on()) pull_load(sh);   // its pulling entry too, as the prewarm does (warm_shader)
@@ -19657,6 +19672,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
              g_bp_up_bytes / 1048576.0, g_pkg_uploads, g_pkg_reuploads,
              g_up_total_ns / 1e6, g_bp_first_present / 1e9);
     }
+    if (g_present_n % 600 == 0) trim_log_stats("so far");   // a trimmed library: what its packed shaders cost, when that changed
     PD("X ser=%llu", t->serial);
     id<MTLTexture> src = tex_mtl(t);
     if (!src) { RED_ONCE(8, "present texture could not get an MTLTexture"); return 0; }

@@ -1021,7 +1021,7 @@ def generate_project(game: Game, args, team: str, bundle: str, python: str, romf
     pso_mtl4 = bool(getattr(args, 'pso_mtl4', False))
     env = profile_env(game)
     aoc = game.build / 'aoc'
-    env.update(GAME=game.title_id, W=str(game.build), PATCHED=str(game.build / f'patched_{game.package}'), ROMFS=str(romfs or game.romfs), MSL_IOS=str(game.shaders), AOC=str(aoc) if aoc.is_dir() and game.prepared_content().get('dlc', True) else '',
+    env.update(GAME=game.title_id, W=str(game.build), PATCHED=str(game.build / f'patched_{game.package}'), ROMFS=str(romfs or game.romfs), MSL_IOS=str(getattr(args, 'shader_trim_dir', None) or game.shaders), AOC=str(aoc) if aoc.is_dir() and game.prepared_content().get('dlc', True) else '',
                DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players, args.render_scale, not args.no_thermal_cap, args.fps_target, args.swap_ab_xy, args.swap_ab, args.swap_xy, pso_mtl4, getattr(args, 'extra_env', None), getattr(args, 'guest_file', None), astc_block(args), astc_blocks(args)[1], getattr(args, 'upscaler', 'game'), getattr(args, 'res_scale', 1.0), getattr(args, 'aniso', 0), astc_format_blocks(args))), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
                DM_XCODE_PROJECT_DIR=str(game.build / 'tvport-xcode'), DM_XCODE_DERIVED_DATA=str(game.build / 'tvport-derived'), FONT_PY=python)
     env.update(artwork_env(args))
@@ -1201,6 +1201,76 @@ def embeds_pack(image: Path) -> bool:
     except OSError:
         return False
     return len(head) == 64 and head[:8] == b'DMSPARS1' and int.from_bytes(head[48:56], 'little') != 0
+
+
+TRIM_CHOICES = ('off', 'on')
+TRIM_DIR = 'tvport-shadertrim'
+
+
+def trim_inputs(game: Game) -> Optional[dict]:
+    """What dm/gfx/tools/shader_trim.py packs: the app's shader library (shader/ios/b-<chain>, an image or a folder), the shader map, and the lists of the shaders the game has used: the Apple
+    TV's (tvport-shaders.tsv, kept by remember_shaders), the profile's prewarm list (pso_manifest.tsv) and its playtests' list (shader_seen.tsv). None without a library or a map"""
+    if not (game.build and game.title_id and game.shaders):
+        return None
+    lib = game.shaders / f'b-{chain()}'
+    profile = game.profile_root / game.title_id
+    if not (profile / 'shader_map.tsv').is_file():
+        profile = REPO / 'dm/games' / game.title_id
+    if not (profile / 'shader_map.tsv').is_file():
+        return None
+    lists = [path for path in (game.build / SHADER_LIST, profile / 'pso_manifest.tsv', profile / 'shader_seen.tsv') if path.is_file()]
+    return {'lib': lib, 'map': profile / 'shader_map.tsv', 'lists': lists}
+
+
+def trim_fingerprint(tool: Path, inputs: dict) -> str:
+    """The inputs of a trimmed library: the library (its file's or stamp's size and time), the tool, the map and the lists"""
+    h = hashlib.sha256()
+    lib = inputs['lib']
+    for path in (lib.with_name(lib.name + '.img'), lib / 'inputs.tsv'):
+        if path.is_file():
+            st = path.stat()
+            h.update(f'{path.name}:{st.st_size}:{st.st_mtime_ns}\n'.encode())
+    for path in (tool, inputs['map'], *inputs['lists']):
+        h.update(path.name.encode() + b'\0' + path.read_bytes() + b'\0')
+    return h.hexdigest()
+
+
+def trim_shaders(game: Game, args, python: str) -> Optional[Path]:
+    """Trim shaders (docs/reference/tv-size.md, "Cut 2 as built"): a folder with the app's shader library in which every vertex and pixel shader the game's lists do not name is packed into a
+    zstd frame that the Apple TV inflates the first time it needs it, or None for the whole library (Off, the default until a TV run confirms it; a build folder without what it needs; a failure:
+    the build goes on as it always did). Kept beside the build and made again only when an input changes."""
+    if (getattr(args, 'trim_shaders', None) or 'off') != 'on':
+        return None
+    tool = REPO / 'dm/gfx/tools/shader_trim.py'
+    inputs = trim_inputs(game) if tool.is_file() else None
+    if not inputs:
+        emit('log', line='Shaders are not trimmed: this build folder has no shader library and map to trim.')
+        return None
+    if not inputs['lists']:
+        emit('log', line='Shaders are not trimmed: there is no list of the shaders this game uses yet (play it on the Apple TV once, or a profile with pso_manifest.tsv).')
+        return None
+    out, name = game.build / TRIM_DIR, f'b-{chain()}.img'
+    key = trim_fingerprint(tool, inputs)
+    if (out / 'trim.key').is_file() and (out / 'trim.key').read_text() == key and (out / name).is_file():
+        emit('log', line='Trim shaders: the trimmed shader library from the last build still fits.')
+        return out
+    stage('Trimming shaders')
+    shutil.rmtree(out, ignore_errors=True)
+    command = [python, '-I', tool, 'split', '--lib', inputs['lib'], '--map', inputs['map'], '--out', out]
+    for path in inputs['lists']:
+        command += ['--used', path]
+    try:
+        stream(command, cwd=REPO)
+        report = json.loads((out / 'trim_report.json').read_text())
+        if not (out / name).is_file():
+            raise Failure('the tool finished without a library')
+        (out / 'trim.key').write_text(key)
+    except (Failure, OSError, ValueError) as error:
+        shutil.rmtree(out, ignore_errors=True)
+        emit('log', line=f'Shaders are not trimmed: they could not be ({str(error).splitlines()[-1][:300] if str(error) else "no reason given"}). The app carries the whole library.')
+        return None
+    emit('log', line=f'Trim shaders: {report["packed"]:,} of {report["shaders"]:,} shaders packed for first use, {report["image_bytes"] / 1e9:.2f} GB of shaders instead of {report["library_bytes"] / 1e9:.2f} GB.')
+    return out
 
 
 def compress_game_data(game: Game, python: str) -> Optional[Path]:
@@ -1444,6 +1514,7 @@ def cmd_build(args) -> None:
     # The Xcode project reads the PLAIN RomFS.img (resources it copies, romfs.id identity): its build-phase scripts run on the system
     # Python (3.9, no zstd module), which cannot read a compressed DMSPARS1 v2 image. Stripping and compressing never change the
     # logical index or size, so the identity is the same and the app accepts the stripped/compressed image install() sends.
+    args.shader_trim_dir = trim_shaders(game, args, python)   # Trim shaders: None keeps the whole library
     project = generate_project(game, args, team, bundle, python, None)
     bundle_shaders(game, project)
     compile_app(game, project, args.device)
@@ -1895,6 +1966,7 @@ def main() -> int:
     build.add_argument('--guest-file', choices=('on', 'off'))   # unset: the engine's default for the target
     build.add_argument('--astc', choices=ASTC_CHOICES, default='auto')   # Compressed textures: auto is on for the Apple TV
     build.add_argument('--compress-data', choices=COMPRESS_CHOICES, default='auto')   # Compress game data: auto is on
+    build.add_argument('--trim-shaders', choices=TRIM_CHOICES, default='off')   # Trim shaders: the unused shaders packed for first use; off until an Apple TV run confirms it
     build.add_argument('--texture-once', choices=TEXTURE_ONCE_CHOICES, default='auto')   # Store textures once: auto is on whenever Compressed textures is
     build.add_argument('--astc-block', choices=ASTC_BLOCK_CHOICES, default='matched')   # matched to the original (BC1 6x6, the rest 4x4), or 4x4 / 6x6 for every format
     build.add_argument('--astc-bc7-block', choices=ASTC_FORMAT_CHOICES, default='auto')   # the block of BC2/3/7 alone (auto: --astc-block)

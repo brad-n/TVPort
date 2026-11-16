@@ -573,6 +573,8 @@ struct SettingsForm: View {
                             Text("Off").tag("off")
                         }
                         note("On, and Automatic, which is on, compresses the game files on this Mac while building (lossless: the game reads exactly the same data) and sends them in that form, which can save several GB on the Apple TV. It takes a few minutes more to build. If that can't be done the build carries on and sends the files as they are.")
+                        Toggle("Trim shaders", isOn: flagBinding(\.trimShaders))
+                        note("Packs the shaders this game has not used yet (on this Apple TV or in the game's own lists) so they take about a third of the room; the Apple TV unpacks each one, in about a millisecond, the first time a scene needs it, and keeps it. Can save a few GB for a large game. Experimental: off until it has been tried on an Apple TV.")
                         if library.info?.res_scale == true {
                             Picker("Resolution scale", selection: resScaleBinding) {
                                 ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { Text("\(Int($0 * 100)) %").tag($0) }

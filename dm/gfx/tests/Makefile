@@ -49,6 +49,12 @@ check_test_dmsh_pull:
 	python3 test_dmsh_pull.py
 check_test_tbdr_budget:
 	DM_GAME=$(GAME) python3 test_tbdr_budget.py
+# Shader trimming (nvn_shader_trim.inc): a trimmed library from test_shader_trim.py's fixture, loaded, drawn with, and loaded again by a second start over the same cache folder
+t_shader_trim: t_shader_trim.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_shader_trim.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_shader_trim
+check_t_shader_trim: t_shader_trim
+	@set -e; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; python3 test_shader_trim.py --fixture "$$work"; MTL_DEBUG_LAYER=1 ./t_shader_trim "$$work"; MTL_DEBUG_LAYER=1 ./t_shader_trim "$$work" again
 t_transform_feedback: t_transform_feedback.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_transform_feedback.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_transform_feedback
