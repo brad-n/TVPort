@@ -10,7 +10,13 @@ What changes in this fork, release by release, in plain terms. The full descript
 
 ## Unreleased (on `switch2-experimental`)
 
-Nothing yet: everything that was here is in build 2007.
+Nothing yet: everything that was here is in build 2010.
+
+## 1.3.0 build 2010 (2026-11-16)
+
+**Trim shaders: faster installs, and a way to time an unpack**
+- **The install pass no longer repeats the trim:** installing a game refreshes its list of played shaders from the Apple TV, and that counted as a new input, so the trim ran again with the same result (271 s for Ocarina of Time in Apple TV run 21). The trim now runs again only when the game's shader library (checked by its content, not its file time), the trim tool or the shader map changed, or when the lists name a shader the trimmed library packed away. Trimmed libraries made before this build are trimmed once more.
+- **`DM_SHADER_TRIM_BENCH=<n>`** (diagnostic, off by default): at launch, unpacks n packed shaders into a scratch folder, loads them as Metal libraries the way a first draw does, logs each step's time and deletes the scratch copies; the game's own cache is untouched. On a Mac mini M2 Pro a shader took about 1.3 ms (0.4 decompress, 0.7 write, 0.2 load). The Apple TV measurement is next; Trim shaders stays off by default until then.
 
 ## 1.3.0 build 2007 (2026-11-16)
 
