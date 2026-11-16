@@ -421,6 +421,15 @@ class Build(unittest.TestCase):
             self.assertEqual(po.main(['--game', '0100000000001000', '--msl', str(self.lib), '--out', str(self.out), '--work', str(self.work), '--platform', 'macos', '--gpu', 'g16s']), 0)
         self.assertEqual(self.calls[0][:8], ['xcrun', '-sdk', 'macosx', 'metal-tt', '-arch', 'applegpu_g16s', '-macos-version-min', '26.0'])
 
+    def test_tvos_takes_the_apple_tv_sdk(self):   # TVPort's Apple TV app: a tvOS archive for the A15 (applegpu_g14p), the SDK's major version; an iOS one is another platform's
+        self.assertEqual(self.main('--platform', 'tvos', '--gpu', 'g14p'), 0)
+        self.assertEqual(self.calls[0][:8], ['xcrun', '-sdk', 'appletvos', 'metal-tt', '-arch', 'applegpu_g14p', '-tvos-version-min', '27.0'])
+        self.assertEqual((self.out / 'applegpu_g14p.mtl4a').read_bytes(), b'archive applegpu_g14p')
+        self.assertIn('platform\ttvos\t27.0\n', (self.out / 'archive.tsv').read_text())
+        self.main('--platform', 'ios', '--gpu', 'g14p')   # the same libraries for iOS: another key, built again
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.calls[1][:3], ['xcrun', '-sdk', 'iphoneos'])
+
     def test_depth_override_and_bad_key(self):
         self.main('--depth', 'gl', '--script-only')
         self.assertIn('depth\tnear=-w\n', (self.out / 'prebuilt.tsv').read_text()); self.assertEqual(self.calls, [])
@@ -698,14 +707,14 @@ class Build(unittest.TestCase):
 class IpaFallback(unittest.TestCase):
     """build_ipa.sh's own archive step with a pso_offline.py that fails: a [RED] line, no archive folder, and the build goes on (an optimization: the device builds the bases)"""
 
-    def step(self, python):
+    def step(self, python, **extra):
         lines = (REPO / 'dm/ios/tools/build_ipa.sh').read_text().splitlines()
         i = next(n for n, ln in enumerate(lines) if ln.startswith('if [ "$GFXAPI" = nvn ] && [ -n "$GPUS" ]'))
         j = next(n for n, ln in enumerate(lines) if n > i and ln.startswith('else [ "$GFXAPI" != nvn ]'))
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / 'bin').mkdir(); stub = Path(d) / 'bin/python3'; stub.write_text('#!/bin/sh\n' + python); stub.chmod(0o755)
             (Path(d) / 'shader_pairs.tsv').write_text('v\tf\n')
-            env = dict(os.environ, PATH=f'{d}/bin:{os.environ["PATH"]}', W=d, GD=d, GAME='G', DM='dm', MSL_IOS='m', V='0', GPUS='g18p', GFXAPI='nvn')
+            env = dict({k: v for k, v in os.environ.items() if k != 'DM_TVOS'}, PATH=f'{d}/bin:{os.environ["PATH"]}', W=d, GD=d, GAME='G', DM='dm', MSL_IOS='m', V='0', GPUS='g18p', GFXAPI='nvn', **extra)
             script = 'die() { echo "FAIL: $*"; exit 1; }\nt() { echo "$*"; }\nDM_PSO_IOS_MIN=\n' + '\n'.join(lines[i:j]) + '\nfi\necho "PSO=[$PSO]"\n[ -d "$W/build/ios/pso/bundle" ] && echo folder\necho went on\n'
             return subprocess.run(['bash', '-c', 'set -u\n' + script], env=env, capture_output=True, text=True).stdout
 
@@ -717,6 +726,12 @@ class IpaFallback(unittest.TestCase):
     def test_made_archive_goes_into_the_app(self):
         out = self.step('mkdir -p "$W/build/ios/pso/bundle"; exit 0\n')
         self.assertNotIn('[RED]', out); self.assertIn('/build/ios/pso/bundle]', out); self.assertIn('folder', out)
+
+    def test_an_apple_tv_project_gets_a_tvos_archive(self):   # DM_TVOS=1 (TVPort): pso_offline.py --platform tvos; an iPhone's stays ios
+        args = 'echo "ARGS $*"; mkdir -p "$W/build/ios/pso/bundle"; exit 0\n'
+        self.assertIn('--gpu g18p --platform tvos\n', self.step(args, DM_TVOS='1'))
+        self.assertIn('--gpu g18p --platform ios\n', self.step(args))
+        self.assertIn('--gpu g18p --platform ios\n', self.step(args, DM_TVOS='0'))
 
 
 class Default(unittest.TestCase):

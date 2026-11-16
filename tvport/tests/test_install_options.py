@@ -363,7 +363,7 @@ class StoreTexturesOnce(unittest.TestCase):
                                bundle_id=lambda team: 'b', save_state=lambda **kw: None)
         out = io.StringIO()
         with patch.object(backend, 'Game', return_value=game), patch.object(backend, 'known_team', return_value='T'), patch.object(backend, 'relocate_build', return_value=game), \
-             patch.object(backend, 'BUNDLED', False), patch.object(backend, 'engine_python', return_value='python3'), patch.object(backend, 'one_build_at_a_time'), \
+             patch.object(backend, 'BUNDLED', False), patch.object(backend, 'engine_python', return_value='python3'), patch.object(backend, 'one_build_at_a_time'), patch.object(backend, 'device_gpu', return_value='g14p'), \
              patch.object(backend, 'prebuild_astc', return_value=options.get('pack', self.pack)), patch.object(backend, 'remember_shaders'), \
              patch.object(backend, 'backup_saves', return_value={'state': 'none', 'files': 0}), patch.object(backend, 'generate_project') as generate, patch.object(backend, 'bundle_shaders'), \
              patch.object(backend, 'compile_app'), patch.object(backend, 'install') as install, patch.object(backend, 'restore_saves', return_value=0), patch.object(backend, 'provisioning', return_value={}), \
@@ -606,7 +606,7 @@ class PackRequired(unittest.TestCase):
         mocks = {name: patch.object(backend, name, return_value=values.get(name)) for name in names}
         out = io.StringIO()
         with patch.object(backend, 'Game', return_value=self.game), patch.object(backend, 'known_team', return_value='T'), patch.object(backend, 'relocate_build', return_value=self.game), \
-             patch.object(backend, 'BUNDLED', False), patch.object(backend, 'engine_python', return_value='python3'), patch.object(backend, 'one_build_at_a_time'), \
+             patch.object(backend, 'BUNDLED', False), patch.object(backend, 'engine_python', return_value='python3'), patch.object(backend, 'one_build_at_a_time'), patch.object(backend, 'device_gpu', return_value='g14p'), \
              patch.object(backend, 'provisioning', return_value={}), patch.object(backend, 'TARGET_BC_FORMATS', bc_formats), \
              patch.object(backend, 'stream', side_effect=backend.Failure('bntx_astc.py stopped\nclang: error: unable to execute command: Killed')) as stream, redirect_stdout(out):
             started = {name: mock.start() for name, mock in mocks.items()}
@@ -654,9 +654,24 @@ class Advanced(unittest.TestCase):
             game = self.make_game(folder)
             self.assertEqual(backend.write_env(game, 'handheld', 512).read_text(), backend.write_env(game, 'handheld', 512, pso_mtl4=False, extra_env=[]).read_text())
             self.assertNotIn('DM_PSO_MTL4', backend.write_env(game, 'handheld', 512).read_text())
-        self.assertEqual(backend.pipeline_gpu(SimpleNamespace()), 'none')
-        self.assertEqual(backend.pipeline_gpu(SimpleNamespace(gpu='  ')), 'none')
         self.assertEqual(backend.extractor_options(SimpleNamespace(allow_damaged_manual=False, nx_extract_arg=[])), [])
+
+    def test_the_apple_tv_gets_a_pipeline_archive_for_its_gpu_by_default(self):
+        self.assertEqual(backend.pipeline_gpu(SimpleNamespace()), 'g14p')   # the A15 of the Apple TV 4K (3rd generation): applegpu_g14p
+        self.assertEqual(backend.pipeline_gpu(SimpleNamespace(gpu='  ')), 'g14p')
+        self.assertEqual(backend.pipeline_gpu(SimpleNamespace(gpu='none')), 'none')   # no archive, as before
+        self.assertEqual(backend.pipeline_gpu(SimpleNamespace(gpu='', tv_gpu='none')), 'none')   # a paired Apple TV without Metal 4
+        self.assertEqual(backend.pipeline_gpu(SimpleNamespace(gpu='g18p', tv_gpu='none')), 'g18p')   # the game page wins
+
+    def test_the_paired_apple_tvs_gpu(self):
+        listing = {'result': {'devices': [{'identifier': 'ID1', 'hardwareProperties': {'udid': 'U1', 'productType': 'AppleTV14,1'}},
+                                          {'identifier': 'ID2', 'hardwareProperties': {'udid': 'U2', 'productType': 'AppleTV11,1'}},
+                                          {'identifier': 'ID3', 'hardwareProperties': {'udid': 'U3', 'productType': 'AppleTV99,9'}}]}}
+        with patch.object(backend, 'devicectl_json', return_value=listing):
+            self.assertEqual([backend.device_gpu(d) for d in ('U1', 'ID1', 'U2', 'U3', 'gone')], ['g14p', 'g14p', 'none', 'g14p', 'g14p'])   # A15; A12 (no Metal 4); a newer model; not paired
+        self.assertEqual(backend.device_gpu(None), 'g14p')
+        with patch.object(backend, 'devicectl_json', side_effect=backend.Failure('The Apple TV did not answer.')):
+            self.assertEqual(backend.device_gpu('U1'), 'g14p')
 
     def test_metal4_and_extra_switches_reach_the_env_file(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -668,6 +683,12 @@ class Advanced(unittest.TestCase):
         self.assertEqual(text.count('DM_OPMODE'), 1)   # the player's own value replaces the generated one
         self.assertIn('DM_OPMODE=1', text)
         self.assertNotIn('note', text)
+        self.assertNotIn('DM_PSO_PREBUILD', text)   # Metal 4 alone keeps the device's prebuild
+
+    def test_the_archive_turns_metal4_on_and_the_device_prebuild_off(self):
+        with tempfile.TemporaryDirectory() as folder:
+            text = backend.write_env(self.make_game(folder), 'handheld', 512, pso_archive=True).read_text()
+        self.assertIn('DM_PSO_MTL4=1\nDM_PSO_PREBUILD=0\n', text)
 
     def test_game_memory_paging_is_a_three_way_choice(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -707,7 +728,7 @@ class Advanced(unittest.TestCase):
                         pass   # nothing was really built
             return seen[0]
         command = prepare(SimpleNamespace(gpu='g18p', allow_damaged_manual=True, nx_extract_arg=['--q']))
-        self.assertEqual(command[command.index('--gpu') + 1], 'g18p')
+        self.assertEqual(command[command.index('--gpu') + 1], 'none')   # the TV's archive is made with the project, for tvOS (generate_project)
         self.assertIn('--allow-damaged-manual', command)
         self.assertIn('--nx-extract-arg=--q', command)
         command = prepare()
@@ -719,7 +740,7 @@ class Advanced(unittest.TestCase):
             game = self.make_game(folder)
             for on in (False, True):
                 args = SimpleNamespace(fps=False, mode='handheld', texture_cap=512, players='', render_scale=1, no_thermal_cap=False, fps_target=0, swap_ab_xy=False, swap_ab=None, swap_xy=None,
-                                       art=None, art_scale=0, art_x=0, art_y=0, shelf_art=None, shelf_scale=0, shelf_x=0, shelf_y=0, pso_mtl4=on, extra_env=['DM_X=1'])
+                                       art=None, art_scale=0, art_x=0, art_y=0, shelf_art=None, shelf_scale=0, shelf_x=0, shelf_y=0, pso_mtl4=on, extra_env=['DM_X=1'], gpu='none')
                 with patch.object(backend, 'restore_tables'), patch.object(backend, 'stream') as stream:
                     backend.generate_project(game, args, 'TEAM', 'test.game', sys.executable)
                 env = stream.call_args.kwargs['env']
@@ -727,6 +748,42 @@ class Advanced(unittest.TestCase):
                 text = Path(env['DM_ENV_FILE']).read_text()
                 self.assertEqual('DM_PSO_MTL4=1' in text, on)
                 self.assertIn('DM_X=1', text)
+
+    def test_the_project_gets_the_archive_and_falls_back_without_one(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game = self.make_game(folder)
+            gen = game.build / 'tvport-xcode/Gen/dm'; gen.mkdir(parents=True)
+            bundle = game.build / 'build/ios/pso/bundle'
+            for made in (False, True):
+                (gen / 'env.txt').write_text('DM_OPMODE=0\nDM_PSO_MTL4=1\nDM_PSO_PREBUILD=0\n')   # what build_ipa.sh copied from DM_ENV_FILE
+                if made: bundle.mkdir(parents=True); (bundle / 'applegpu_g14p.mtl4a').write_bytes(b'archive')
+                args = SimpleNamespace(fps=False, mode='handheld', texture_cap=512, players='', render_scale=1, no_thermal_cap=False, fps_target=0, swap_ab_xy=False, swap_ab=None, swap_xy=None,
+                                       art=None, art_scale=0, art_x=0, art_y=0, shelf_art=None, shelf_scale=0, shelf_x=0, shelf_y=0, pso_mtl4=False, extra_env=[])
+                with patch.object(backend, 'restore_tables'), patch.object(backend, 'stream') as stream, patch.object(backend, 'store_artwork', return_value=None), redirect_stdout(io.StringIO()):
+                    backend.generate_project(game, args, 'TEAM', 'test.game', sys.executable)
+                env = stream.call_args.kwargs['env']
+                self.assertEqual((env['DM_PSO_GPUS'], env.get('IOS_PULL')), ('g14p', '1'))   # build_ipa.sh makes it (--platform tvos with DM_TVOS) with the pulling libraries
+                self.assertIn('DM_PSO_MTL4=1\nDM_PSO_PREBUILD=0\n', Path(env['DM_ENV_FILE']).read_text())
+                # pso_offline.py failed: the app goes back to the MTLDevice path, as without an archive
+                self.assertEqual((gen / 'env.txt').read_text(), 'DM_OPMODE=0\nDM_PSO_MTL4=1\nDM_PSO_PREBUILD=0\n' if made else 'DM_OPMODE=0\n')
+
+    def test_prewarm_pipelines_for_the_tvs_gpu_beside_the_archive(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game = self.make_game(folder)
+            project, trimmed = game.build / 'tvport-xcode', Path(folder) / 'trim'
+            def call(args):
+                with patch.object(backend, 'stream') as stream, redirect_stdout(io.StringIO()):
+                    backend.prewarm_pipelines(game, project, args, 'python3')
+                return [str(c) for c in stream.call_args.args[0]] if stream.called else None
+            args = SimpleNamespace(gpu='', shader_trim_dir=trimmed)
+            self.assertIsNone(call(args))   # build_ipa.sh made no archive: nothing to add to
+            bundle = game.build / 'build/ios/pso/bundle'; bundle.mkdir(parents=True); (bundle / 'applegpu_g14p.mtl4a').write_bytes(b'archive')
+            command = call(args)
+            self.assertTrue(command[1].endswith('scripts/tv_prewarm.py'))
+            opt = lambda k: command[command.index(k) + 1]
+            self.assertEqual((opt('--msl'), opt('--manifest'), opt('--shader-map'), opt('--bundle'), opt('--gpu')),
+                             (str(trimmed), str(project / 'Gen/dm/pso_manifest.tsv'), str(project / 'Gen/dm/shader_map.tsv'), str(bundle), 'g14p'))   # the library and the list the app ships
+            self.assertIsNone(call(SimpleNamespace(gpu='none')))
 
     def test_parser_takes_the_options(self):
         with patch.object(sys, 'argv', ['backend.py', 'build', '/x', '--allow-damaged-manual', '--nx-extract-arg=--a', '--nx-extract-arg=b', '--pso-mtl4', '--gpu', 'g18p', '--extra-env', 'A=1']):
