@@ -5,10 +5,12 @@
 // configuration for AV1, so the sequence header comes from the stream, where every key frame carries one (AV1 5.5); a changed one makes a new session. A temporal unit goes in whole, its OBUs in
 // the low-overhead format WebM and the SDK's demuxer keep them in (each with its size). Decoding is synchronous and a temporal unit shows at most one frame, in presentation order, so no queue.
 // dav1d decodes several frames at once (frame threads), so its pictures come out later than their units go in, each with its unit's time (mav1_next)
+// With a pack of HEVC sidecars (DM_MOVIE_HEVC, the Apple TV: hle_movie_hevc.c), each unit the pack holds is shown from its HEVC picture instead, decoded in hardware
 #include "hle.h"
 #include <VideoToolbox/VideoToolbox.h>
 #include "dav1d/dav1d.h"
 #include "hle_movie_av1.h"
+#include "hle_movie_hevc.h"
 
 struct mav1 {
     uint8_t seq[512]; size_t nseq;
@@ -20,10 +22,12 @@ struct mav1 {
     int draining;                 // a drain gave a picture and has not reached its end (dav1d_step)
     uint8_t *y8, *uv; size_t ny8, nuv;   // dav1d's picture as NV12: the chroma interleaved, and the luma of a 10- or 12-bit stream shifted to 8 bits
     int red;
+    mhevc *hevc;                  // the HEVC sidecars (hle_movie_hevc.c) when the app names a pack: each unit the pack holds is decoded from it, the rest by the backends above
+    int hevc_off, hevc_used, hevc_wait;   // this stream left the pack (until mav1_reset); the pack gave it a picture; the AV1 decoder waits for a sequence header
 };
 static int hw_av1(void) { const char *e = getenv("DM_AV1_DAV1D"); return !(e && *e && *e != '0') && VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1); }
-mav1 *mav1_new(void) { mav1 *a = calloc(1, sizeof *a); if (!a) die("movie: AV1 decoder allocation failed"); a->soft = !hw_av1(); return a; }
-const char *mav1_backend(const mav1 *a) { return a->soft ? "dav1d" : "VideoToolbox"; }
+mav1 *mav1_new(void) { mav1 *a = calloc(1, sizeof *a); if (!a) die("movie: AV1 decoder allocation failed"); a->soft = !hw_av1(); a->hevc = mhevc_new(); return a; }
+const char *mav1_backend(const mav1 *a) { return a->hevc ? (a->soft ? "HEVC sidecars, else dav1d" : "HEVC sidecars, else VideoToolbox") : a->soft ? "dav1d" : "VideoToolbox"; }
 static void unlock_picture(mav1 *a) {
     if (a->locked) { CVPixelBufferUnlockBaseAddress(a->locked, kCVPixelBufferLock_ReadOnly); CVPixelBufferRelease(a->locked); a->locked = NULL; }
     if (a->has_pic) { dav1d_picture_unref(&a->pic); a->has_pic = 0; }
@@ -33,8 +37,11 @@ static void av1_close(mav1 *a) {
     if (a->fd) { CFRelease(a->fd); a->fd = NULL; }
     if (a->got) { CVPixelBufferRelease(a->got); a->got = NULL; }
 }
-void mav1_reset(mav1 *a) { unlock_picture(a); av1_close(a); a->nseq = 0; if (a->in.sz) dav1d_data_unref(&a->in); if (a->dav1d) dav1d_flush(a->dav1d); a->draining = 0; a->soft = !hw_av1(); }
-void mav1_free(mav1 *a) { if (a) { mav1_reset(a); if (a->dav1d) dav1d_close(&a->dav1d); free(a->y8); free(a->uv); free(a); } }
+void mav1_reset(mav1 *a) {
+    unlock_picture(a); av1_close(a); a->nseq = 0; if (a->in.sz) dav1d_data_unref(&a->in); if (a->dav1d) dav1d_flush(a->dav1d); a->draining = 0; a->soft = !hw_av1();
+    mhevc_reset(a->hevc); a->hevc_off = a->hevc_used = a->hevc_wait = 0;
+}
+void mav1_free(mav1 *a) { if (a) { mav1_reset(a); if (a->dav1d) dav1d_close(&a->dav1d); mhevc_free(a->hevc); free(a->y8); free(a->uv); free(a); } }
 
 // ---- The sequence header (AV1 5.5), read as far as the colour config ----
 typedef struct { const uint8_t *p; size_t n, bit; int bad; } av1_bits;
@@ -237,9 +244,22 @@ static int decode_dav1d(mav1 *a, const uint8_t *data, size_t n, int64_t ts, mav1
     memcpy(buf, data, n); a->in.m.timestamp = ts;
     return dav1d_step(a, 0, out);
 }
-int mav1_next(mav1 *a, int drain, mav1_picture *out) { return a->soft && a->dav1d ? dav1d_step(a, drain, out) : 0; }
+int mav1_next(mav1 *a, int drain, mav1_picture *out) { return a->soft && a->dav1d && (!a->hevc || a->hevc_off) ? dav1d_step(a, drain, out) : 0; }
 
 int mav1_decode(mav1 *a, const uint8_t *data, size_t n, int64_t ts, mav1_picture *out) {
+    if (a->hevc && !a->hevc_off) {   // the pack's picture of this unit, one a unit and synchronous as VideoToolbox's AV1: nothing for mav1_next
+        int r = mhevc_decode(a->hevc, data, n, ts, out);
+        if (r >= 0) { a->hevc_used |= r; return r; }
+        a->hevc_off = 1; a->hevc_wait = a->hevc_used;   // a unit the pack does not hold: the AV1 decoder from here, from a sequence header when the pack had begun the stream
+        if (a->hevc_used) LOG("[RED] movie: an AV1 temporal unit the HEVC sidecar pack does not hold, in a stream it was decoding: the AV1 decoder takes over at the next key frame");
+        else {   // with the unit's start and key, to compare with the pack's (movie_hevc.py read_pack)
+            static int once; size_t kn; uint64_t key = mhevc_key(data, n, &kn);
+            if (!once++) LOG("[movie] AV1: a movie the HEVC sidecar pack does not hold: decoded as AV1 (%s); its first unit %zu bytes (%zu keyed, key %016llx): %02x %02x %02x %02x %02x %02x %02x %02x",
+                             a->soft ? "dav1d" : "VideoToolbox", n, kn, (unsigned long long)key, n > 0 ? data[0] : 0, n > 1 ? data[1] : 0, n > 2 ? data[2] : 0, n > 3 ? data[3] : 0,
+                             n > 4 ? data[4] : 0, n > 5 ? data[5] : 0, n > 6 ? data[6] : 0, n > 7 ? data[7] : 0);
+        }
+    }
+    if (a->hevc_wait) { size_t sn; if (!find_seq(data, n, &sn)) return 0; a->hevc_wait = 0; }
     if (a->soft) return decode_dav1d(a, data, n, ts, out);
     unlock_picture(a);
     size_t seqn = 0; const uint8_t *seq = find_seq(data, n, &seqn);

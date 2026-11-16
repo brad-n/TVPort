@@ -10,6 +10,7 @@
 #include "../hle_codec_video.c"
 #include "../hle_movie_avc.c"
 #include "../hle_movie_av1.c"
+#include "../hle_movie_hevc.c"   // the AV1 decoder asks it for a pack: none here (DM_MOVIE_HEVC unset)
 #include <assert.h>
 #include <unistd.h>
 

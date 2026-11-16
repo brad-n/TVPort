@@ -573,6 +573,12 @@ struct SettingsForm: View {
                             Text("Off").tag("off")
                         }
                         note("On, and Automatic, which is on, compresses the game files on this Mac while building (lossless: the game reads exactly the same data) and sends them in that form, which can save several GB on the Apple TV. It takes a few minutes more to build. If that can't be done the build carries on and sends the files as they are.")
+                        Picker("Convert movies", selection: convertMoviesBinding) {
+                            Text("Automatic").tag("")
+                            Text("On").tag("on")
+                            Text("Off").tag("off")
+                        }
+                        note("Switch 2 games ship their movies as AV1, which the Apple TV has to decode on its CPU, so the picture can fall behind the sound. On, and Automatic, which is on, converts them on this Mac while building to HEVC, which the Apple TV decodes in hardware, and sends them beside the game files (the original movies stay, so it adds roughly their size again; Ocarina of Time: about 1 GB). Needs ffmpeg from Homebrew; without it the build carries on and the movies play as before. Off plays the original movies.")
                         Toggle("Trim shaders", isOn: flagBinding(\.trimShaders))
                         note("Packs the shaders this game has not used yet (on this Apple TV or in the game's own lists) so they take about a third of the room; the Apple TV unpacks each one, in about a millisecond, the first time a scene needs it, and keeps it. Can save a few GB for a large game. Experimental: off until it has been tried on an Apple TV.")
                         if library.info?.res_scale == true {
@@ -642,6 +648,14 @@ struct SettingsForm: View {
         return Binding(get: { library.games.first { $0.id == gameID }?.textureOnce ?? "" }, set: { value in
             guard library.selection == gameID else { return }
             library.update { $0.textureOnce = value.isEmpty ? nil : value }
+        })
+    }
+
+    private var convertMoviesBinding: Binding<String> {
+        let gameID = library.selection
+        return Binding(get: { library.games.first { $0.id == gameID }?.convertMovies ?? "" }, set: { value in
+            guard library.selection == gameID else { return }
+            library.update { $0.convertMovies = value.isEmpty ? nil : value }
         })
     }
 

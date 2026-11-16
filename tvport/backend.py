@@ -1321,6 +1321,88 @@ def store_textures_once(game: Game, pack: Optional[Path], block: int, python: st
     return image
 
 
+MOVIE_CHOICES = ('auto', 'on', 'off')
+MOVIE_PACK = 'movies-hevc.pack'   # beside romfs.img on the Apple TV, where the app looks for it (dm/ios/Sources/main.m: DM_MOVIE_HEVC)
+
+
+def movies_enabled(args) -> bool:
+    """Convert movies (docs/reference/movies.md, "AV1 movies as HEVC sidecars on the Apple TV"): Automatic is On."""
+    return (getattr(args, 'movies', None) or 'auto') != 'off'
+
+
+def convert_movies(game: Game, args, python: str) -> Optional[Path]:
+    """Convert movies: the game's AV1 movies as HEVC, which the Apple TV decodes in hardware where its chip has no AV1 decoder (dm/tools/movie_hevc.py), in one pack that install() sends
+    beside romfs.img. The movies in the game files stay as they are: the host falls back to them for any unit the pack does not hold. Returns the pack, or None (Off, no AV1 movie, or it could
+    not be made, with one log line): the feature never fails a build, and the movies then play as before, decoded on the CPU."""
+    if not movies_enabled(args):
+        return None
+    tool = REPO / 'dm/tools/movie_hevc.py'
+    if not tool.is_file():
+        emit('log', line='Movies are left as they are: this engine has no movie_hevc.py.')
+        return None
+    if not game.romfs or not Path(game.romfs).exists():
+        emit('log', line='Movies are left as they are: there is no RomFS image.')
+        return None
+    stage('Converting movies')
+    out = game.build / 'tvport-movies'
+    try:
+        stream([python, '-I', tool, game.romfs, '--out', out, '--reuse'], cwd=REPO)   # --reuse: unchanged movies, settings and ffmpeg keep the last pack
+    except Failure as failure:
+        emit('log', line=f'Movies are left as they are: they could not be converted ({str(failure).splitlines()[-1][:300] if str(failure) else "no reason given"}).')
+        return None
+    pack = out / MOVIE_PACK
+    try:
+        report = json.loads((out / 'report.json').read_text())
+    except (OSError, ValueError):
+        report = None
+    if not pack.is_file() or not report:
+        emit('log', line='Movies are left as they are: the tool finished without a pack.')
+        return None
+    if not report.get('converted'):
+        return None   # no AV1 movie (most games): nothing to send
+    emit('log', line=f'Movies: {report["converted"]} AV1 movies as HEVC for the hardware decoder of the Apple TV, {report["hevc_bytes"] / 1e9:.2f} GB beside the game files '
+                     f'(their AV1, {report["av1_bytes"] / 1e9:.2f} GB, stays in them).')
+    return pack
+
+
+def install_movies(pack: Optional[Path], device: str, bundle: str, there: Optional[int], off: bool = False) -> None:
+    """Send the movie pack beside romfs.img, unless the copy that last arrived whole is there. With Convert movies off, empty the pack an earlier build left (devicectl cannot delete
+    it; the host ignores a file shorter than the pack's header, hle_movie_hevc.c); a pack that could not be made this time leaves the one there, which still serves every unit it holds
+    (the host knows them by their bytes). Never fatal: without the pack the movies play as AV1."""
+    if not pack:
+        if not off or not there:
+            return
+        empty = Path(tempfile.mkdtemp(prefix='tvport-movies.')) / 'empty'
+        empty.write_bytes(b'')
+        try:
+            send_file('the empty file', empty, MOVIE_PACK, device, bundle)
+            emit('log', line='The converted movies of an earlier build are emptied on the Apple TV: its movies play as AV1.')
+        except Failure as failure:
+            emit('log', line=f'The converted movies of an earlier build could not be emptied ({str(failure).splitlines()[-1][:200] if str(failure) else "no reason given"}): the game still plays them.')
+        finally:
+            shutil.rmtree(empty.parent, ignore_errors=True)
+        return
+    size = pack.stat().st_size
+    stamp = pack.with_name(pack.name + '.sent')
+    mine = f'{device} {bundle} {size} {pack.stat().st_mtime_ns}'
+    if there == size and stamp.is_file() and stamp.read_text() == mine:
+        emit('log', line='The converted movies are already on the Apple TV.')
+        return
+    emit('log', line=f'Sending the converted movies ({size / 2**30:.1f} GB).')
+    stamp.unlink(missing_ok=True)
+    try:
+        send_file('the converted movies', pack, MOVIE_PACK, device, bundle)
+    except Failure as failure:
+        emit('log', line=f'The converted movies could not be sent ({str(failure).splitlines()[-1][:200] if str(failure) else "no reason given"}): the movies play as AV1. Build & Install again to resend them.')
+        return
+    arrived = installed_files(device, bundle).get(MOVIE_PACK)
+    if arrived != size:
+        emit('log', line=f'The converted movies did not arrive whole ({arrived if arrived is not None else "no"} bytes of {size}): the movies play as AV1. Build & Install again to resend them.')
+        return
+    stamp.write_text(mine)
+    emit('log', line='The converted movies on the Apple TV match this Mac.')
+
+
 def pack_fingerprint(pack: Path) -> str:
     """The input fingerprint in an astc-ro.pack's header (dm/gfx/tex/nvn_astc_cache.m): which game files, engine and block size made it; '' for a file that is not a pack"""
     with pack.open('rb') as file:
@@ -1358,7 +1440,7 @@ def send_file(what: str, source: Path, name: str, device: str, bundle: str) -> N
     with_retries(f'Sending {what}', attempt)
 
 
-def install(game: Game, device: str, bundle: str, astc_pack: Optional[Path] = None, once: Optional[Path] = None) -> None:
+def install(game: Game, device: str, bundle: str, astc_pack: Optional[Path] = None, once: Optional[Path] = None, movies: Optional[Path] = None, movies_off: bool = False) -> None:
     """once: the sparse image of Store textures once, or the compressed image of Compress game data. It goes as romfs.img. When it carries the ASTC pack, astc_pack is not sent and a stale astc-ro.pack is emptied; a compressed image without a pack (embeds_pack) goes with astc_pack beside it, as before."""
     stage('Installing on the Apple TV')
     if not game.app or not (game.app / 'embedded.mobileprovision').is_file():
@@ -1393,6 +1475,7 @@ def install(game: Game, device: str, bundle: str, astc_pack: Optional[Path] = No
         empty_stale_pack(once, device, bundle, files.get('astc-ro.pack'))
     elif astc_pack:
         install_astc_pack(astc_pack, device, bundle, files.get('astc-ro.pack'))
+    install_movies(movies, device, bundle, files.get(MOVIE_PACK), movies_off)
 
 
 def empty_stale_pack(once: Path, device: str, bundle: str, there: Optional[int]) -> None:
@@ -1514,13 +1597,14 @@ def cmd_build(args) -> None:
     # The Xcode project reads the PLAIN RomFS.img (resources it copies, romfs.id identity): its build-phase scripts run on the system
     # Python (3.9, no zstd module), which cannot read a compressed DMSPARS1 v2 image. Stripping and compressing never change the
     # logical index or size, so the identity is the same and the app accepts the stripped/compressed image install() sends.
+    movies = convert_movies(game, args, python)   # Convert movies: the AV1 movies as HEVC beside the game files, None leaves them as they are
     args.shader_trim_dir = trim_shaders(game, args, python)   # Trim shaders: None keeps the whole library
     project = generate_project(game, args, team, bundle, python, None)
     bundle_shaders(game, project)
     compile_app(game, project, args.device)
     game.save_state(bundle_id=bundle, art=str(args.art) if args.art else None, mode=args.mode, texture_cap=args.texture_cap, render_scale=args.render_scale, res_scale=getattr(args, 'res_scale', 1.0), aniso=getattr(args, 'aniso', 0), upscaler=getattr(args, 'upscaler', 'game'), source_signature=signature, profile_signature=profile_signature(game))
     if args.device:
-        install(game, args.device, bundle, pack, once)
+        install(game, args.device, bundle, pack, once, movies=movies, movies_off=not movies_enabled(args))
         restored = restore_saves(game, args.device, bundle)
         if restored:
             emit('log', line=f'The Apple TV had lost its saves: {restored} files put back from this Mac.')
@@ -1966,6 +2050,7 @@ def main() -> int:
     build.add_argument('--guest-file', choices=('on', 'off'))   # unset: the engine's default for the target
     build.add_argument('--astc', choices=ASTC_CHOICES, default='auto')   # Compressed textures: auto is on for the Apple TV
     build.add_argument('--compress-data', choices=COMPRESS_CHOICES, default='auto')   # Compress game data: auto is on
+    build.add_argument('--movies', choices=MOVIE_CHOICES, default='auto')   # Convert movies: the AV1 movies as HEVC for the Apple TV's hardware decoder; auto is on
     build.add_argument('--trim-shaders', choices=TRIM_CHOICES, default='off')   # Trim shaders: the unused shaders packed for first use; off until an Apple TV run confirms it
     build.add_argument('--texture-once', choices=TEXTURE_ONCE_CHOICES, default='auto')   # Store textures once: auto is on whenever Compressed textures is
     build.add_argument('--astc-block', choices=ASTC_BLOCK_CHOICES, default='matched')   # matched to the original (BC1 6x6, the rest 4x4), or 4x4 / 6x6 for every format
