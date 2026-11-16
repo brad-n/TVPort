@@ -5,7 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -143,16 +143,16 @@ class Build(unittest.TestCase):
                                    mode='handheld', render_scale=1, movies=choice)
             game = SimpleNamespace(build=Path('/b'), romfs=Path('/r'), app=Path('/a'), prepared=True, addons=[], input_signature=lambda: 's', state=lambda: {'source_signature': 's'},
                                    bundle_id=lambda team: 'b', save_state=lambda **kw: None)
-            with patch.object(backend, 'Game', return_value=game), patch.object(backend, 'known_team', return_value='T'), patch.object(backend, 'relocate_build', return_value=game), \
-                 patch.object(backend, 'BUNDLED', False), patch.object(backend, 'engine_python', return_value='python3'), patch.object(backend, 'one_build_at_a_time'), \
-                 patch.object(backend, 'engine_change', return_value=None), patch.object(backend, 'astc_blocks', return_value=(0, None)), patch.object(backend, 'astc_format_blocks', return_value=None), \
-                 patch.object(backend, 'remember_shaders'), patch.object(backend, 'backup_saves', return_value={'state': 'none', 'files': 0}), patch.object(backend, 'generate_project'), \
-                 patch.object(backend, 'bundle_shaders'), patch.object(backend, 'compile_app'), patch.object(backend, 'install') as install, patch.object(backend, 'trim_shaders', return_value=None), patch.object(backend, 'prewarm_pipelines'), \
-                 patch.object(backend, 'restore_saves', return_value=0), patch.object(backend, 'provisioning', return_value={}), \
-                 patch.object(backend, 'convert_movies', return_value=pack) as convert, redirect_stdout(io.StringIO()):
+            names = {'Game': game, 'known_team': 'T', 'relocate_build': game, 'engine_python': 'python3', 'engine_change': None, 'astc_blocks': (0, None), 'astc_format_blocks': None,
+                     'backup_saves': {'state': 'none', 'files': 0}, 'trim_shaders': None, 'restore_saves': 0, 'provisioning': {}, 'convert_movies': pack}
+            plain = ('one_build_at_a_time', 'remember_shaders', 'generate_project', 'bundle_shaders', 'prewarm_pipelines', 'compile_app', 'install')
+            with ExitStack() as stack:
+                mocks = {name: stack.enter_context(patch.object(backend, name, return_value=value)) for name, value in names.items()}
+                mocks.update({name: stack.enter_context(patch.object(backend, name)) for name in plain})
+                stack.enter_context(patch.object(backend, 'BUNDLED', False)); stack.enter_context(redirect_stdout(io.StringIO()))
                 backend.cmd_build(args)
-            self.assertEqual(convert.call_args.args[1:], (args, 'python3'))
-            self.assertEqual(install.call_args.kwargs, {'movies': pack, 'movies_off': choice == 'off'})
+            self.assertEqual(mocks['convert_movies'].call_args.args[1:], (args, 'python3'))
+            self.assertEqual(mocks['install'].call_args.kwargs, {'movies': pack, 'movies_off': choice == 'off'})
 
 
 if __name__ == '__main__':
