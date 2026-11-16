@@ -10,6 +10,9 @@ What changes in this fork, release by release, in plain terms. The full descript
 
 ## Unreleased (on `switch2-experimental`)
 
+**Movies on the Apple TV: Convert movies** (option, on by default)
+- **Convert movies** (a TVPort build option, Automatic = on): Switch 2 movies are AV1, which the Apple TV decoded on its CPU, so the picture fell behind the sound. The build now converts them to HEVC on the Mac (VideoToolbox, through Homebrew's ffmpeg; without ffmpeg the build goes on as before) and sends them beside the game files, and the Apple TV decodes them in hardware. The game's own movies stay in the game files, as the fallback. Ocarina of Time: 26 movies, 1.64 GB of AV1 as 1.00 GB of HEVC, about 8 minutes added to the first build. `DM_MOVIE_HEVC=0` turns it off on the Apple TV without a rebuild.
+
 **Docs**
 - [Switch 2 games on the Apple TV](docs/switch2-apple-tv.md): Ocarina of Time on the Apple TV is finished. The page has the final results (run 21: 23.2 GB on the TV, no crash, about 20 fps), where it ended, and what carries over to every game.
 
