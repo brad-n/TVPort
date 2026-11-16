@@ -46,6 +46,7 @@ static uint64_t trim_dir_bytes(const char *dir, int remove) {   // the files' by
     if (remove == 2) rmdir(dir);
     return total;
 }
+static void trim_bench_start(void);
 static int trim_cmp(const void *a, const void *b) { return memcmp(((const trim_ent *)a)->key, ((const trim_ent *)b)->key, 16); }
 // Reads the image's trim.tsv and trim.dict once. Not an error when the library packs nothing (every library before this, and a trimmed one of a game whose lists name every shader)
 static void trim_open(void) {
@@ -89,6 +90,7 @@ static void trim_open(void) {
         atomic_store(&g_trim.state, 2);
         MLOG("shader trimming: %zu vertex and pixel shaders of this library are packed (trim.tsv %s, %s), inflated at first use into %s (%.1f MB there from earlier runs)",
              n, g_trim.id, g_trim.dd ? "with its dictionary" : "no dictionary", g_trim.dir, have / 1048576.0);
+        trim_bench_start();
     } });
 }
 // The packed shader a library file name belongs to, NULL when the library packs no such file
@@ -105,16 +107,17 @@ static trim_ent *trim_find(const char *name) {
     }
     return NULL;
 }
-static int trim_cached(const trim_ent *t) {   // every file of the shader is in the cache folder (inflated by an earlier run)
+static int trim_cached_in(const trim_ent *t, const char *dir) {   // every file of the shader is in the folder (inflated by an earlier run)
     char p[1300]; struct stat st;
     for (const char *f = t->files; *f; ) {
         const char *c = strchr(f, ','); int l = c ? (int)(c - f) : (int)strlen(f);
-        snprintf(p, sizeof p, "%s/%s%.*s", g_trim.dir, t->key, l, f);
+        snprintf(p, sizeof p, "%s/%s%.*s", dir, t->key, l, f);
         if (stat(p, &st) || !S_ISREG(st.st_mode)) return 0;
         if (!c) break; f = c + 1;
     }
     return 1;
 }
+static int trim_cached(const trim_ent *t) { return trim_cached_in(t, g_trim.dir); }
 static int trim_write(const char *path, const uint8_t *p, size_t n) {   // a file whole or not at all: written beside it, then renamed
     char tmp[1400]; snprintf(tmp, sizeof tmp, "%s.%d.%llx.part", path, getpid(), (unsigned long long)(uintptr_t)pthread_self());
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) return 0;
@@ -122,8 +125,9 @@ static int trim_write(const char *path, const uint8_t *p, size_t n) {   // a fil
     if (close(fd) || rename(tmp, path)) { unlink(tmp); return 0; }
     return 1;
 }
-// Inflates the shader's frame into the cache folder. → NULL, or why not
-static const char *trim_inflate(const trim_ent *t, uint64_t *out_bytes, int *out_files) {
+// Inflates the shader's frame into dir (the cache folder). tm, when given: {ns reading the frame and inflating it, ns writing the files}. → NULL, or why not
+static const char *trim_inflate(const trim_ent *t, const char *dir, uint64_t *out_bytes, int *out_files, uint64_t tm[2]) {
+    uint64_t t_start = bp_now(), t_write = 0;
     char name[32]; snprintf(name, sizeof name, "%s.trim", t->key);
     const img_ent *x = msl_image_find(g_trim.img, name);
     if (!x || !x->b) return "its frame is not in the library";
@@ -138,6 +142,7 @@ static const char *trim_inflate(const trim_ent *t, uint64_t *out_bytes, int *out
     ZSTD_freeDCtx(dc);
     if (!dc || ZSTD_isError(r) || r != n) { why = dc && ZSTD_isError(r) ? ZSTD_getErrorName(r) : "the frame inflates to the wrong size"; goto done; }
     if (memcmp(out, "DMT1", 4)) { why = "not a shader_trim frame"; goto done; }
+    if (tm) tm[0] = bp_now() - t_start;
     uint32_t count; memcpy(&count, out + 4, 4); size_t at = 8; int files = 0;
     for (uint32_t i = 0; i < count; i++) {
         uint16_t nl; uint32_t sz;
@@ -145,12 +150,14 @@ static const char *trim_inflate(const trim_ent *t, uint64_t *out_bytes, int *out
         memcpy(&nl, out + at, 2); memcpy(&sz, out + at + 2, 4); at += 6;
         if (at + nl + (uint64_t)sz > n || nl < 17 || nl > 200 || memcmp(out + at, t->key, 16)) { why = "a file of another shader, or the frame ends inside one"; goto done; }
         char fn[256], path[1300]; memcpy(fn, out + at, nl); fn[nl] = 0; at += nl;
-        snprintf(path, sizeof path, "%s/%s", g_trim.dir, fn);
-        if (!trim_write(path, out + at, sz)) { why = "the cache folder cannot be written (a full disk?)"; goto done; }
+        snprintf(path, sizeof path, "%s/%s", dir, fn);
+        uint64_t w0 = bp_now(); int wrote = trim_write(path, out + at, sz); t_write += bp_now() - w0;
+        if (!wrote) { why = "the cache folder cannot be written (a full disk?)"; goto done; }
         at += sz; files++;
     }
     if (at != n) why = "bytes after the last file";
-    else if (!trim_cached(t)) why = "the frame lacks a file its index names";
+    else if (!trim_cached_in(t, dir)) why = "the frame lacks a file its index names";
+    if (tm) tm[1] = t_write;
     *out_bytes = n; *out_files = files;
 done:
     free(in); free(out);
@@ -171,7 +178,7 @@ static int trim_path(const char *name, char *path, size_t pn) {
         if (s == TRIM_NONE && atomic_compare_exchange_strong(&t->state, &z, TRIM_BUSY)) {
             char tn[64] = ""; pthread_getname_np(pthread_self(), tn, sizeof tn);
             uint64_t t0 = bp_now(), bytes = 0; int files = 0, sub = on_sub_thread() || (tn[0] && strncmp(tn, "com.apple.", 10));   // sub: a thread a frame waits on (the submit thread, a game thread), not a worker
-            const char *why = trim_inflate(t, &bytes, &files);
+            const char *why = trim_inflate(t, g_trim.dir, &bytes, &files, NULL);
             uint64_t dt = bp_now() - t0;
             pthread_mutex_lock(&g_trim.mu); atomic_store(&t->state, why ? TRIM_FAILED : TRIM_READY); pthread_cond_broadcast(&g_trim.cv); pthread_mutex_unlock(&g_trim.mu);
             if (why) { uint64_t f = atomic_fetch_add(&g_trim.failed, 1) + 1; if (f <= 16) MLOG("[RED] shader trimming: shader %s cannot be inflated (%s): it does not load, its draws go without it", t->key, why); return -2; }
@@ -205,6 +212,47 @@ static int trim_prefetch_skip(NSString *pc) {
     trim_ent *t = trim_find([pc stringByAppendingString:@".json"].UTF8String);   // pc: <key>_b
     if (!t || atomic_load(&t->state) != TRIM_NONE || trim_cached(t)) return 0;
     atomic_fetch_add(&g_trim.deferred, 1); return 1;
+}
+// DM_SHADER_TRIM_BENCH=<n>: what a first use of a packed shader costs on this device, measured and logged at launch (nothing here touches the cache folder). n packed shaders, spread through the
+// library, are inflated into a scratch folder, and each of their libraries is loaded as Metal library as the first draw would (lib_from_file: mapped, newLibraryWithData); the times of each (the frame read
+// and inflated, the files written, the libraries loaded) and their totals are logged, and the scratch folder is removed. Metal may keep a library it has met before, so a repeat on one device loads faster
+static id<MTLLibrary> lib_from_file(NSString *path, NSError **err);
+static void trim_bench(int want) {
+    char scratch[1400]; snprintf(scratch, sizeof scratch, "%s/nxnative-trim-bench-%d", NSTemporaryDirectory().fileSystemRepresentation, getpid());
+    mkdir(scratch, 0755);
+    size_t n = g_trim.n, take = (size_t)want < n ? (size_t)want : n, done = 0, failed = 0, libs = 0; uint64_t sum[3] = {0, 0, 0}, bytes_total = 0, t_all = bp_now();
+    for (size_t i = 0; i < take; i++) {
+        const trim_ent *t = &g_trim.e[i * n / take];
+        uint64_t bytes = 0, tm[2] = {0, 0}; int files = 0;
+        const char *why = trim_inflate(t, scratch, &bytes, &files, tm);
+        if (why) { failed++; MLOG("shader trim bench: shader %s cannot be inflated (%s)", t->key, why); continue; }
+        uint64_t lib_ns = 0; int loaded = 0, bad = 0;
+        for (const char *f = t->files; *f; ) {
+            const char *c = strchr(f, ','); int l = c ? (int)(c - f) : (int)strlen(f);
+            if (l > 9 && !strncmp(f + l - 9, ".metallib", 9)) {
+                @autoreleasepool {
+                    NSError *e = nil; uint64_t l0 = bp_now();
+                    id<MTLLibrary> lib = lib_from_file([NSString stringWithFormat:@"%s/%s%.*s", scratch, t->key, l, f], &e);
+                    lib_ns += bp_now() - l0; if (lib) loaded++; else bad++;
+                }
+            }
+            if (!c) break; f = c + 1;
+        }
+        sum[0] += tm[0]; sum[1] += tm[1]; sum[2] += lib_ns; bytes_total += bytes; libs += (size_t)loaded; done++; failed += bad ? 1 : 0;
+        MLOG("shader trim bench: shader %s (%d files, %.0f KB inflated): decompress %.3f ms, write %.3f ms, library load %.3f ms (%d libraries%s)", t->key, files, bytes / 1024.0, tm[0] / 1e6, tm[1] / 1e6, lib_ns / 1e6, loaded, bad ? ", some failed" : "");
+    }
+    trim_dir_bytes(scratch, 2);
+    double d = done ? done : 1;
+    MLOG("shader trim bench: %zu shaders measured, %zu failed (of %zu asked for, %zu packed), %zu libraries, %.1f KB inflated; totals: decompress %.2f ms, write %.2f ms, library load %.2f ms; per shader: %.3f + %.3f + %.3f = %.3f ms; %.1f ms in all; scratch folder removed",
+         done, failed, (size_t)want, n, libs, bytes_total / 1024.0, sum[0] / 1e6, sum[1] / 1e6, sum[2] / 1e6, sum[0] / 1e6 / d, sum[1] / 1e6 / d, sum[2] / 1e6 / d, (sum[0] + sum[1] + sum[2]) / 1e6 / d, (bp_now() - t_all) / 1e6);
+}
+static void trim_bench_start(void) {   // from trim_open, once the index is read: on a thread of its own, once the Metal device exists
+    const char *e = getenv("DM_SHADER_TRIM_BENCH"); int want = e && *e ? atoi(e) : 0;
+    if (want <= 0 || !g_trim.n) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        for (int i = 0; !g_dev && i < 600; i++) usleep(100000);
+        if (g_dev) trim_bench(want); else MLOG("shader trim bench: no Metal device after 60 s");
+    });
 }
 static void trim_log_stats(const char *when) {
     if (atomic_load(&g_trim.state) != 2) return;

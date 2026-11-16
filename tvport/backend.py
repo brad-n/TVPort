@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import plistlib
@@ -1282,16 +1283,34 @@ def trim_inputs(game: Game) -> Optional[dict]:
 
 
 def trim_fingerprint(tool: Path, inputs: dict) -> str:
-    """The inputs of a trimmed library: the library (its file's or stamp's size and time), the tool, the map and the lists"""
+    """The inputs of a trimmed library that decide which shaders can be packed: the library's bytes (the image's content, not its time; a folder's stamp), the tool and the map. The lists are
+    not in it: trim_still_fits asks whether they name a shader the trimmed library packs"""
     h = hashlib.sha256()
     lib = inputs['lib']
-    for path in (lib.with_name(lib.name + '.img'), lib / 'inputs.tsv'):
-        if path.is_file():
-            st = path.stat()
-            h.update(f'{path.name}:{st.st_size}:{st.st_mtime_ns}\n'.encode())
-    for path in (tool, inputs['map'], *inputs['lists']):
+    image, stamp = lib.with_name(lib.name + '.img'), lib / 'inputs.tsv'
+    if image.is_file():
+        with image.open('rb') as f:
+            for block in iter(lambda: f.read(1 << 24), b''):
+                h.update(block)
+    elif stamp.is_file():
+        h.update(stamp.read_bytes())
+    for path in (tool, inputs['map']):
         h.update(path.name.encode() + b'\0' + path.read_bytes() + b'\0')
     return h.hexdigest()
+
+
+def trim_still_fits(out: Path, name: str, tool: Path, inputs: dict, key: str) -> bool:
+    """The trimmed library in out was made from this library, tool and map, and the lists name no shader it packs (a shader the lists dropped stays unpacked, which is harmless)"""
+    try:
+        if (out / 'trim.key').read_text() != key or not (out / name).is_file():
+            return False
+        packed = set(json.loads((out / 'trim_report.json').read_text())['packed_keys'])
+        spec = importlib.util.spec_from_file_location('shader_trim', tool)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return not packed & module.read_used(inputs['lists'])[0]
+    except (OSError, ValueError, KeyError, AttributeError, ImportError):
+        return False
 
 
 def trim_shaders(game: Game, args, python: str) -> Optional[Path]:
@@ -1310,7 +1329,7 @@ def trim_shaders(game: Game, args, python: str) -> Optional[Path]:
         return None
     out, name = game.build / TRIM_DIR, f'b-{chain()}.img'
     key = trim_fingerprint(tool, inputs)
-    if (out / 'trim.key').is_file() and (out / 'trim.key').read_text() == key and (out / name).is_file():
+    if trim_still_fits(out, name, tool, inputs, key):
         emit('log', line='Trim shaders: the trimmed shader library from the last build still fits.')
         return out
     stage('Trimming shaders')

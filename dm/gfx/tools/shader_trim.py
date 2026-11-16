@@ -175,7 +175,7 @@ def split(lib, map_path, used_paths, out_dir, level=19, jobs=None, dict_kb=1024,
     finally: bf.close(); os.unlink(blob_path)
     before, after = sum(sizes.values()), os.path.getsize(img)
     kept_bytes = sum(sizes[n] for n in sizes if n not in gone)
-    rep = {'lib': os.fspath(lib), 'id': tid, 'shaders': len(by_key), 'used_named': len(used & set(by_key)), 'packed': len(packed), 'packed_files': len(gone),
+    rep = {'lib': os.fspath(lib), 'id': tid, 'shaders': len(by_key), 'used_named': len(used & set(by_key)), 'packed': len(packed), 'packed_keys': packed, 'packed_files': len(gone),
            'library_bytes': before, 'image_bytes': after, 'kept_bytes': kept_bytes, 'packed_raw_bytes': raw_total[0], 'packed_frame_bytes': raw_total[1], 'dict_bytes': len(d_bytes),
            'level': level, 'seconds': round(time.time() - t0), 'lists': [os.fspath(p) for p in used_paths]}
     with open(os.path.join(out_dir, 'trim_report.json'), 'w') as f: json.dump(rep, f, indent=1)

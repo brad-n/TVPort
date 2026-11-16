@@ -2,6 +2,7 @@
 fallbacks, and the trimmed library reaching build_ipa.sh through MSL_IOS."""
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -15,6 +16,15 @@ import backend  # noqa: E402
 
 CHAIN = 'abc123def456'
 TITLE = '0400486024DEC000'
+TOOL = '''# a stand-in for shader_trim.py: read_used gives the second column of an S row, else the first column
+def read_used(paths):
+    keys = set()
+    for path in paths:
+        for line in __import__("pathlib").Path(path).read_text().splitlines():
+            c = line.split('\\t')
+            keys.add(c[1] if c[0] == 'S' else c[0])
+    return keys, None
+'''
 
 
 class Choice(unittest.TestCase):
@@ -38,7 +48,7 @@ class Run(unittest.TestCase):
         (profile / 'shader_map.tsv').write_text('package\tindex\tstage\tdm_ctl_sha16\tsource\n')
         (profile / 'pso_manifest.tsv').write_text('S\tother_b\t1\n')
         (profile / 'shader_seen.tsv').write_text('0123456789abcdef\tpixel\n')
-        self.repo = self.root / 'repo'; tool = self.repo / 'dm/gfx/tools/shader_trim.py'; tool.parent.mkdir(parents=True); tool.write_text('# tool')
+        self.repo = self.root / 'repo'; tool = self.repo / 'dm/gfx/tools/shader_trim.py'; tool.parent.mkdir(parents=True); tool.write_text(TOOL)
         self.game = SimpleNamespace(build=self.build, title_id=TITLE, profile_root=self.build / 'profile', shaders=self.build / 'shader/ios')
         self.calls = []
 
@@ -50,7 +60,7 @@ class Run(unittest.TestCase):
             if make:
                 out = Path(str(argv[argv.index('--out') + 1])); out.mkdir(parents=True)
                 (out / f'b-{CHAIN}.img').write_bytes(b't' * 1000)
-                (out / 'trim_report.json').write_text(json.dumps({'packed': 3, 'shaders': 5, 'image_bytes': 1000, 'library_bytes': 5000}))
+                (out / 'trim_report.json').write_text(json.dumps({'packed': 3, 'packed_keys': ['packed_a', 'packed_b', 'packed_c'], 'shaders': 5, 'image_bytes': 1000, 'library_bytes': 5000}))
         out = io.StringIO()
         with patch.object(backend, 'REPO', self.repo), patch.object(backend, 'chain', return_value=CHAIN), patch.object(backend, 'stream', side_effect=fake_stream), redirect_stdout(out):
             result = backend.trim_shaders(game or self.game, SimpleNamespace(trim_shaders=choice), 'python3')
@@ -90,12 +100,31 @@ class Run(unittest.TestCase):
         result, text = self.run_trim()
         self.assertIsNone(result); self.assertIn('no list', text)
 
-    def test_an_unchanged_build_reuses_the_trimmed_library_and_a_new_tv_list_makes_it_again(self):
+    def test_an_unchanged_build_reuses_the_trimmed_library_even_when_the_tv_list_is_refreshed(self):
         first, _ = self.run_trim()
         self.calls.clear()
         again, text = self.run_trim()
         self.assertEqual(again, first); self.assertEqual(self.calls, []); self.assertIn('still fits', text)
-        (self.build / backend.SHADER_LIST).write_text('S\tkey_b\t0\nS\tnew_b\t1\n')   # the Apple TV recorded more
+        (self.build / backend.SHADER_LIST).write_text('S\tkey_b\t0\n')   # refreshed from the TV: a new file time
+        (self.build / backend.SHADER_LIST).write_text('S\tkey_b\t0\nS\tkept_b\t1\n')   # and a shader the library keeps as it is
+        self.run_trim()
+        self.assertEqual(self.calls, [])
+
+    def test_a_listed_shader_the_trimmed_library_packs_makes_it_again(self):
+        self.run_trim()
+        self.calls.clear()
+        (self.build / backend.SHADER_LIST).write_text('S\tkey_b\t0\nS\tpacked_b\t1\n')   # the Apple TV used a packed shader
+        self.run_trim()
+        self.assertEqual(len(self.calls), 1)
+
+    def test_a_changed_library_makes_it_again_by_content_not_by_time(self):
+        self.run_trim()
+        self.calls.clear()
+        lib = self.build / f'shader/ios/b-{CHAIN}.img'
+        lib.write_bytes(b'c' * 5000); os.utime(lib, (1, 1))   # the same bytes at another time: still fits
+        self.run_trim()
+        self.assertEqual(self.calls, [])
+        lib.write_bytes(b'd' * 5000)   # the same size, other bytes
         self.run_trim()
         self.assertEqual(len(self.calls), 1)
 
