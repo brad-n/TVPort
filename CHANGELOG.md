@@ -10,7 +10,20 @@ What changes in this fork, release by release, in plain terms. The full descript
 
 ## Unreleased (on `switch2-experimental`)
 
-Nothing yet: everything that was here is in build 1677.
+Nothing yet: everything that was here is in build 1994.
+
+## 1.3.0 build 1994 (2026-11-15)
+
+**Synced to upstream nxnative `730738e7`** (306 commits since `ced36121`). Among them: long render passes split while the GPU idles, frame pacing that recovers after a hitch, render targets released after 3 s unused, MetalFX and upscaler input fixes, a new owner for the engine's textures and objects, docked games rendered at full size on a Mac, and profiles for many more games. Our own changes were carried onto upstream's new code.
+
+**What changes for you**
+- **Every game's shaders are rebuilt on its next build** (the shader translator changed). Expect a longer first build after updating.
+- **Resolution scale now shows for every game** (Advanced): the scaling code is in the shaders from this rebuild on.
+- **Frame pacing keeps checking for 60 fps** (`DM_FPS_REPROBE`, every 250 frames by default; `0` is upstream's behaviour): upstream's new pacing stops checking after two failed tries, and at a steady 30 fps a Mac's GPU clock dropped and games fell to 20 fps for about 8 seconds at a time. The periodic check keeps the clock up: Ocarina of Time's GPU time stays flat (docked 25.2 ms p50 / 26.0 ms p95, against 27.2 / 43.8 without it).
+- **Spare render-target memory** follows upstream's new recycling on Macs; the Apple TV and iPhone keep the fork's tighter limits (64 MB, 1 s).
+- **Compute dispatches** follow upstream's stricter ordering by default (`DM_NVN_DISPATCH_OVERLAP=1` brings back the fork's overlap).
+- **A faster exact translation** of one byte-shuffle instruction (`shader_prmt_runs`, on): about 3% off the game upscaler's pass.
+- **Removed with upstream's changes:** `DM_NVN_ARGS_CACHE`, `DM_NVN_ENC_ASYNC`, `DM_NVN_STORE_ELIDE`, `DM_NVN_LOAD_ELIDE`, `DM_NVN_BARRIER_HEAP`, `DM_NVN_VIEW_BY_TEX` and the `render_cond` profile key (upstream's barrier model and view cache replace them).
 
 ## 1.3.0 build 1677 (2026-11-15)
 
