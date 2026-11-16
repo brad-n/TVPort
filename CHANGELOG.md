@@ -10,7 +10,12 @@ What changes in this fork, release by release, in plain terms. The full descript
 
 ## Unreleased (on `switch2-experimental`)
 
-Nothing yet: everything that was here is in build 1994.
+Nothing yet: everything that was here is in build 1996.
+
+## 1.3.0 build 1996 (2026-11-16)
+
+**Smaller games on the Apple TV: Trim shaders** (option, off by default)
+- **Trim shaders** (a TVPort build option): the Apple TV copy of a game keeps every shader the game is known to use (its played and listed shaders, with their variants, and every compute, geometry, tessellation, task and mesh shader); the other vertex and pixel shaders ship as one compressed archive of the build's own compiled shaders. The first time a draw needs one, the game unpacks it into its caches (about 1 ms a shader on a Mac) and keeps it there for later launches. Nothing is compiled on the device, so the build's compiler settings still apply. Ocarina of Time's TV shader library goes from 5.92 to 3.38 GB (2.5 GB less; about 2.8 GB on the new shader chain), Mario Kart 8 Deluxe's from 2.09 to 1.21 GB. Off by default until a session on an Apple TV confirms it; tested on a Mac with the same library and every packed shader verified.
 
 ## 1.3.0 build 1994 (2026-11-15)
 
