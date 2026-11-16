@@ -138,6 +138,7 @@ struct LauncherView: View {
             }
             .padding([.horizontal, .top], 20)
             Form {
+                if !m.presets.isEmpty { Section { PresetRow(m: m) } }
                 settingSections(basic: true)
                 CloudSavesSection()
                 Section {
@@ -319,7 +320,7 @@ public func dmMacLauncher() -> Int32 {
         fputs("launcher: settings window off (hold Option at launch to show it)\n", stderr)
         return SaveCheck.withoutWindow() ? 2 : 0
     }
-    let model = LauncherModel(file.settings)
+    let model = LauncherModel(file.settings, presets: file.presets ?? [])
     let app = NSApplication.shared, launcher = Launcher(model)
     app.setActivationPolicy(.regular)
     app.delegate = launcher

@@ -1,0 +1,31 @@
+# Settings presets: Performance, Balanced and Quality, as values of settings.tsv rows for each device class. A launcher shows a Preset row; choosing one sets these settings
+# (dm/games/settings.py writes the preset lists into launcher.json for the app's device class). Only values with a measurement behind them are here; a setting a preset does not name keeps
+# its default (a preset resolves to every setting any preset of the device names, so choosing it also puts those back to the default). A setting a game does not offer is skipped;
+# a value its row does not accept is an error. A preset that ends up equal to the defaults is not offered, except Balanced. Docs: docs/settings.md, Presets.
+# Columns, separated by tabs:
+#   device  tv (Apple TV 4K, A15), phone (iPhone and iPad), mac
+#   preset  Performance, Balanced or Quality
+#   game    * for every game that has the setting, or one title ID
+#   variable, value  a setting of settings.tsv and the value the preset gives it (the value the variable takes: a toggle's on/off words as its row says)
+#   source  the measurement the value comes from (docs/settings.md, Presets, has the details)
+tv	Performance	*	DM_FOLIAGE	off	dm/games/0400486024DEC000/README.md Foliage: about 3.5 ms a frame (docs/switch2-apple-tv.md)
+tv	Performance	*	DM_GROUND_MIST	off	dm/games/0400486024DEC000/README.md Ground mist: about 2 ms a frame, the largest saving (docs/switch2-apple-tv.md)
+tv	Performance	*	DM_REFLECTION_INTERVAL	8	dm/games/0400486024DEC000/README.md Reflection probes: about 1 ms a frame at 8; run 18 on the Apple TV used 8
+tv	Performance	*	DM_MODEL_LOD	4	dm/games/0400486024DEC000/README.md Model level of detail: about 3 ms a frame at factor 4 on a Mac mini M2 Pro; the TV performance set
+tv	Performance	*	DM_SHADOW_CASCADES	1	dm/games/0400486024DEC000/README.md Shadow cascades: about 0.3 ms a frame on a Mac mini M2 Pro
+phone	Performance	*	DM_FOLIAGE	off	dm/games/0400486024DEC000/README.md Foliage: about 3.5 ms a frame (docs/switch2-apple-tv.md); effect costs measured on an A15 TV and an M2 Pro, not on a phone
+phone	Performance	*	DM_GROUND_MIST	off	dm/games/0400486024DEC000/README.md Ground mist: about 2 ms a frame, the largest saving (docs/switch2-apple-tv.md); effect costs measured on an A15 TV and an M2 Pro, not on a phone
+phone	Performance	*	DM_REFLECTION_INTERVAL	8	dm/games/0400486024DEC000/README.md Reflection probes: about 1 ms a frame at 8; run 18 on the Apple TV used 8; effect costs measured on an A15 TV and an M2 Pro, not on a phone
+phone	Performance	*	DM_MODEL_LOD	4	dm/games/0400486024DEC000/README.md Model level of detail: about 3 ms a frame at factor 4 on a Mac mini M2 Pro; the TV performance set; effect costs measured on an A15 TV and an M2 Pro, not on a phone
+phone	Performance	*	DM_SHADOW_CASCADES	1	dm/games/0400486024DEC000/README.md Shadow cascades: about 0.3 ms a frame on a Mac mini M2 Pro; effect costs measured on an A15 TV and an M2 Pro, not on a phone
+mac	Performance	*	DM_FOLIAGE	off	dm/games/0400486024DEC000/README.md Foliage: about 3.5 ms a frame (docs/switch2-apple-tv.md)
+mac	Performance	*	DM_GROUND_MIST	off	dm/games/0400486024DEC000/README.md Ground mist: about 2 ms a frame, the largest saving (docs/switch2-apple-tv.md)
+mac	Performance	*	DM_REFLECTION_INTERVAL	8	dm/games/0400486024DEC000/README.md Reflection probes: about 1 ms a frame at 8; run 18 on the Apple TV used 8
+mac	Performance	*	DM_MODEL_LOD	4	dm/games/0400486024DEC000/README.md Model level of detail: about 3 ms a frame at factor 4 on a Mac mini M2 Pro; the TV performance set
+mac	Performance	*	DM_SHADOW_CASCADES	1	dm/games/0400486024DEC000/README.md Shadow cascades: about 0.3 ms a frame on a Mac mini M2 Pro
+tv	Balanced	*	DM_GROUND_MIST	off	dm/games/0400486024DEC000/README.md Recommended for the Apple TV 4K: the mist off, the largest saving
+tv	Balanced	*	DM_REFLECTION_INTERVAL	4	dm/games/0400486024DEC000/README.md Recommended for the Apple TV 4K: an interval of 4, most of the probe saving
+tv	Quality	*	DM_ANISO	16	README.md Options for each game: run 21 on an Apple TV set 16x and the game applied it; everything else stays on, no resolution scale above 100%
+mac	Quality	*	DM_ANISO	16	CHANGELOG.md Anisotropic filtering: about 0.7 ms a frame in Mario Kart 8 Deluxe on a Mac mini M2 Pro, within the noise in Ocarina of Time
+mac	Quality	0100152000022000	DM_RES_SCALE	1.5	CHANGELOG.md Resolution scale: Mario Kart 8 Deluxe races hold 60 fps at 1.5x on a Mac mini M2 Pro (Ocarina of Time at 1.5x has an open picture bug: not named for other games)
+mac	Quality	0400E88025B1A000	DM_RENDER_SCALE	2.0	CHANGELOG.md Render scale: Star Fox at 2.0 (1536x864) holds 60 fps on a Mac mini M2

@@ -86,6 +86,30 @@ import Foundation
         launched.reset(); launched.apply()
         expect(launched.values["DM_OPMODE"] == "0" && d.string(forKey: "launcher.DM_OPMODE") == "1", "Reset then Play keeps the saved choice of a setting fixed at launch")
         unsetenv("DM_OPMODE"); setenv("DM_ENV_LAUNCH_KEYS", "", 1); d.removeObject(forKey: "launcher.DM_OPMODE")
+        // Presets: choosing one sets its values, any single change after it reads Custom, the defaults read Default (or the preset equal to them), and a fixed setting stays
+        let pjson = #"{"settings":[{"env":"DM_ANISO","kind":"choice","label":"A","note":"","default":"0","options":[["0","Auto"],["16","16x"]]},{"env":"DM_FOLIAGE","kind":"toggle","label":"F","note":"","default":"on","on":"on","off":"off"},{"env":"DM_RES_SCALE","kind":"range","label":"R","note":"","default":"1.0","min":0.5,"max":2.0,"step":0.25},{"env":"DM_RUMBLE","kind":"toggle","label":"U","note":"","default":"1"}],"presets":[{"name":"Performance","values":{"DM_FOLIAGE":"off"}},{"name":"Quality","values":{"DM_ANISO":"16","DM_FOLIAGE":"on","DM_RES_SCALE":"1.5"}}]}"#
+        let pf = try! JSONDecoder().decode(SettingsFile.self, from: Data(pjson.utf8))
+        setenv("DM_ENV_LAUNCH_KEYS", "", 1); setenv("DM_ENV_FILE_KEYS", "", 1)
+        let pm = LauncherModel(pf.settings, presets: pf.presets ?? [], defaults: d)
+        expect(pm.presetName == "Default", "settings at their defaults, no preset equal to them: Default")
+        pm.choosePreset("Quality")
+        expect(pm.values["DM_ANISO"] == "16" && pm.values["DM_RES_SCALE"] == "1.5" && pm.presetName == "Quality", "choosing Quality sets its values and shows it")
+        pm.values["DM_RES_SCALE"] = "1.50"
+        expect(pm.presetName == "Quality", "a range compares as numbers (a slider writes 1.50)")
+        pm.values["DM_RES_SCALE"] = "1.75"
+        expect(pm.presetName == "Custom", "changing one setting afterwards shows Custom")
+        pm.values["DM_RUMBLE"] = "0"; pm.choosePreset("Performance")
+        expect(pm.presetName == "Performance" && pm.values["DM_FOLIAGE"] == "off" && pm.values["DM_ANISO"] == "0" && pm.values["DM_RUMBLE"] == "0", "Performance sets what it names, puts what only another preset names back to its default, and leaves the others")
+        pm.reset()
+        expect(pm.presetName == "Default", "Reset shows Default")
+        pm.choosePreset("Nonsense")
+        expect(pm.presetName == "Default", "an unknown preset changes nothing")
+        setenv("DM_ENV_FILE_KEYS", "DM_ANISO", 1); setenv("DM_ANISO", "0", 1)
+        let fixedM = LauncherModel(pf.settings, presets: pf.presets ?? [], defaults: d)
+        fixedM.choosePreset("Quality")
+        expect(fixedM.values["DM_ANISO"] == "0" && fixedM.values["DM_RES_SCALE"] == "1.5" && fixedM.presetName == "Custom", "a setting fixed by an env file stays; the preset then reads Custom")
+        unsetenv("DM_ANISO"); setenv("DM_ENV_FILE_KEYS", "", 1)
+        expect(LauncherModel(pf.settings, defaults: d).presetName == nil, "a list without presets has no Preset row")
         // The cloud-save dialog's answers name the cloud's save (save_sync.c read_choice), whichever side the player keeps
         let lh = String(repeating: "a", count: 32), ch = String(repeating: "b", count: 32)
         let both = SaveSyncReport(line: "sync=1 cloud=1 local=\(lh) saved=1 files=1 size=1 chash=\(ch) csaved=2 cfiles=1 csize=1 cdevice=iPhone17,1 sametitle=1 conflict=1 pull=0")!

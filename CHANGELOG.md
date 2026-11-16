@@ -10,6 +10,10 @@ What changes in this fork, release by release, in plain terms. The full descript
 
 ## Unreleased (on `switch2-experimental`)
 
+**Settings presets** ([Presets](docs/settings.md#presets))
+- **A Preset row (Performance, Balanced, Quality)** at the top of the Mac settings window, the iPhone launcher and SwitchTV's Options page for a game on the Apple TV: one choice sets the right group of settings for the device. Changing any of them afterwards shows Custom, and a game starts with the same defaults as before until you choose one.
+- The values are in one table, `dm/games/presets.tsv` (per device class, preset, game and setting, each with its measurement), written into `dm/launcher.json` as an optional `presets` list. Only measured values are in it: on the Apple TV Performance turns off Ocarina of Time's ground mist, grass and slow-changing reflections and uses simpler models and one shadow cascade; Quality sets anisotropic filtering 16x. On a Mac, Quality also raises Mario Kart 8 Deluxe's resolution scale to 150 % and Star Fox's render scale to 2.0, where 60 fps was measured.
+
 Nothing yet: everything that was here is in build 2010.
 
 ## 1.3.0 build 2010 (2026-11-16)

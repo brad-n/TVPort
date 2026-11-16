@@ -2,7 +2,7 @@
 # The iOS launcher's settings for one game, from settings.tsv (its header describes the columns): the rows whose condition holds for the game, with the game's defaults, as JSON.
 # build_ipa.sh writes it into the app as dm/launcher.json; Launcher.swift draws the screen from it (an app without the file starts the game at once).
 # Usage: settings.py <game id> <rewritten modules dir> <control.nacp> <out.json>   (DM_GAMES_DIR finds provisional profiles, as in game.py; build:<VAR> defaults come from the environment;
-#   GFXAPI is the packer's graphics API, SETTINGS_PLATFORM the app's platform: ios (default) or mac, whose launcher is the Mac front end, SETTINGS_MSL the NVN shader library b-<chain> packed with it)
+#   GFXAPI is the packer's graphics API, SETTINGS_PLATFORM the app's platform: ios (default) or mac, whose launcher is the Mac front end, SETTINGS_DEVICE the device class of presets.tsv (tv, phone or mac; default phone for ios, mac for mac), SETTINGS_MSL the NVN shader library b-<chain> packed with it)
 import json, os, re, sys
 from pathlib import Path
 
@@ -11,6 +11,8 @@ sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent / 'tools'))
 import game, nacp, shader_lib
 
 SECTIONS = ('Game', 'Controls', 'Performance', 'Game options')   # headings on the single settings screen; Game options: a game's own (settings.tsv)
+DEVICES = ('tv', 'phone', 'mac')   # presets.tsv's device classes: the Apple TV, the iPhone and iPad, the Mac
+PRESET_NAMES = ('Performance', 'Balanced', 'Quality')   # in the order a front end lists them
 SCHEMA = 1   # launcher.json's version (docs/launcher.schema.json); it grows only by optional fields, so a reader of 1 reads every 1
 # The meta column's keys, each with the pattern its value must match. A key is added here, in docs/frontends.md and in
 # docs/launcher.schema.json together (test_launcher_settings.py checks that the three agree); a reader ignores keys it does not know
@@ -49,6 +51,49 @@ def rows():
         if len(c) not in (7, 8, 9): sys.exit(f'settings.tsv:{n}: 7 to 9 columns expected, {len(c)} found')
         if c[5] not in SECTIONS: sys.exit(f'settings.tsv:{n}: unknown section: {c[5]}')
         yield n, c + [''] * (9 - len(c))
+
+
+def preset_rows():
+    """presets.tsv as (line, device, preset, game, variable, value) tuples"""
+    for n, line in enumerate((HERE / 'presets.tsv').read_text(encoding='utf-8').splitlines(), 1):
+        if not line.strip() or line.startswith('#'): continue
+        c = line.split('\t')
+        if len(c) != 6 or not all(c): sys.exit(f'presets.tsv:{n}: 6 columns expected (device, preset, game, variable, value, source), found {len(c)}')
+        if c[0] not in DEVICES: sys.exit(f'presets.tsv:{n}: unknown device {c[0]} (devices: {", ".join(DEVICES)})')
+        if c[1] not in PRESET_NAMES: sys.exit(f'presets.tsv:{n}: unknown preset {c[1]} (presets: {", ".join(PRESET_NAMES)})')
+        yield (n, c[0], c[1], c[2], c[3], c[4])
+
+
+def accepts(s, v):
+    """Whether a built settings row (as written to launcher.json) takes the value v"""
+    if s['kind'] == 'choice': return v in [o[0] for o in s['options']]
+    if s['kind'] == 'toggle': return v in (s['on'], s['off'])
+    try: return s['min'] - 1e-9 <= float(v) <= s['max'] + 1e-9
+    except ValueError: return False
+
+
+def same(s, a, b):   # a range compares as numbers
+    return abs(float(a) - float(b)) < 1e-6 if s['kind'] == 'range' else a == b
+
+
+def presets(device, gid, rows_out):
+    """The game's presets for a device class, [{"name", "values": {VAR: value}}]: the values each preset names for the settings this game offers. A front end sets the settings any
+    preset of the list names, the ones a preset does not name at its own default. A preset whose values equal the defaults is left out, except Balanced; none when no preset names a setting of this game."""
+    by = {s['env']: s for s in rows_out}
+    named = {}   # preset -> {VAR: value}, for this game's rows
+    managed = []   # the settings any preset names
+    for n, dev, preset, game, var, value in preset_rows():
+        if dev != device or game not in ('*', gid) or var not in by: continue
+        if not accepts(by[var], value): sys.exit(f'presets.tsv:{n}: {var}={value} is not a value of the {gid} row (settings.tsv)')
+        named.setdefault(preset, {})[var] = value
+        if var not in managed: managed.append(var)
+    if not managed: return []
+    out = []
+    for name in PRESET_NAMES:
+        values = named.get(name, {})
+        if name != 'Balanced' and all(same(by[v], values.get(v, by[v]['default']), by[v]['default']) for v in managed): continue
+        out.append({'name': name, 'values': values})
+    return out
 
 
 def fixups_keys(path):   # '# KEY<TAB>value' header rows of a rewriter table, as {KEY: value}
@@ -134,7 +179,10 @@ def build(gid, patched, control):
             s.update(on=on_off[0], off=on_off[1], default=on_off[0] if s['default'] == '1' else on_off[1])   # the default as the value the variable takes
         else: sys.exit(f'settings.tsv:{n}: unknown kind {kind}')
         out.append(s)
-    return {'schema': SCHEMA, 'game': g.id, 'settings': out}
+    device = os.environ.get('SETTINGS_DEVICE') or ('mac' if platform == 'mac' else 'phone')
+    if device not in DEVICES: sys.exit(f'SETTINGS_DEVICE must be one of {", ".join(DEVICES)}: {device}')
+    found = presets(device, g.id, out)
+    return {'schema': SCHEMA, 'game': g.id, 'settings': out, **({'presets': found} if found else {})}
 
 
 if __name__ == '__main__':

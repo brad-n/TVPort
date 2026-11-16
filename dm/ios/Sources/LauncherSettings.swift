@@ -32,10 +32,13 @@ struct Setting: Decodable, Identifiable {
     }
     enum CodingKeys: String, CodingKey { case env, kind, label, note, def = "default", section, needs, level, base, options, min, max, step, on, off }
 }
-struct SettingsFile: Decodable { let settings: [Setting] }
+/// A settings preset (dm/games/presets.tsv through settings.py): the values it names; a setting another preset of the list names but this one does not is set to its default
+struct Preset: Decodable { let name: String; let values: [String: String] }
+struct SettingsFile: Decodable { let settings: [Setting]; let presets: [Preset]? }
 
 final class LauncherModel: ObservableObject {
     let settings: [Setting]
+    let presets: [Preset]       // dm/launcher.json's presets for this device class; none for a game with nothing a preset sets
     let fixed: Set<String>      // set by an env file or by the launch environment: shown, not changed
     let fromLaunch: Set<String>   // of those, the ones the launch environment set (a front end's launch overrides, Xcode; DM_ENV_LAUNCH_KEYS from launcher.c or main.m)
     let ignoreSaved: Bool   // DM_SAVED_CHOICES=0: start from the defaults, and leave the saved choices as they are
@@ -43,9 +46,10 @@ final class LauncherModel: ObservableObject {
 
     private let defaults: UserDefaults
 
-    init(_ settings: [Setting], defaults: UserDefaults = .standard) {
+    init(_ settings: [Setting], presets: [Preset] = [], defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.settings = settings
+        self.presets = presets
         let env = ProcessInfo.processInfo.environment
         fromLaunch = Set((env["DM_ENV_LAUNCH_KEYS"] ?? "").split(separator: " ").map(String.init))
         fixed = fromLaunch.union((env["DM_ENV_FILE_KEYS"] ?? "").split(separator: " ").map(String.init))
@@ -85,6 +89,29 @@ final class LauncherModel: ObservableObject {
         return "\(Int((Double(size[0]) * v).rounded())) × \(Int((Double(size[1]) * v).rounded())) (\(p))"
     }
     var changed: Bool { settings.contains { !fixed.contains($0.env) && !$0.isDefault(values[$0.env] ?? $0.def) } }
+
+    // Presets: choosing one sets its values (each a value its row accepts; a setting fixed by an env file or the launch stays). Any single change afterwards no longer matches it
+    func current(_ s: Setting) -> String { values[s.env] ?? s.def }
+    /// The settings the presets name, which choosing one sets
+    var managed: [Setting] { let named = Set(presets.flatMap { $0.values.keys }); return settings.filter { named.contains($0.env) } }
+    func wants(_ p: Preset, _ s: Setting) -> String { p.values[s.env] ?? s.def }
+    func matches(_ p: Preset) -> Bool {
+        managed.allSatisfy { s in
+            let v = wants(p, s)
+            return s.kind == "range" ? abs((Double(current(s)) ?? .nan) - (Double(v) ?? .nan)) < 1e-6 : current(s) == v
+        }
+    }
+    /// The preset the settings match (the first, in the list's order), else "Default" when every setting the presets name is at its default, else "Custom"; nil without presets
+    var presetName: String? {
+        guard !presets.isEmpty else { return nil }
+        if let p = presets.first(where: matches) { return p.name }
+        return managed.allSatisfy { $0.isDefault(current($0)) } ? "Default" : "Custom"
+    }
+    func choosePreset(_ name: String) {
+        guard let p = presets.first(where: { $0.name == name }) else { return }
+        for s in managed where !fixed.contains(s.env) { let v = wants(p, s); if s.accepts(v) { values[s.env] = v } }
+        fputs("launcher: preset \(name)\n", stderr)
+    }
 
     // Reset every launcher choice to the game's defaults on the screen; values fixed by an env file or at launch stay. The saved choices are forgotten when Play applies
     // the defaults (apply() keeps no default), so Quit after Reset keeps them, and a choice a launch override hides is kept

@@ -6,6 +6,24 @@ extension LauncherModel {
     func binding(_ s: Setting) -> Binding<String> { Binding(get: { self.values[s.env] ?? s.def }, set: { self.values[s.env] = $0 }) }
 }
 
+/// The Preset row at the top of the list: a menu of the game's presets; it reads Default or Custom while the settings match none of them
+struct PresetRow: View {
+    @ObservedObject var m: LauncherModel
+    var body: some View {
+        let shown = m.presetName ?? ""
+        Picker(selection: Binding(get: { m.presetName ?? "" }, set: { m.choosePreset($0) })) {
+            if !m.presets.contains(where: { $0.name == shown }) { Text(shown).tag(shown) }
+            ForEach(m.presets, id: \.name) { Text($0.name).tag($0.name) }
+        } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Preset")
+                Text("Sets several settings at once for this device. Changing any of them afterwards shows Custom.").font(.footnote).foregroundStyle(.secondary)
+            }
+        }
+        .pickerStyle(.menu)
+    }
+}
+
 struct SettingRow: View {
     let s: Setting
     @ObservedObject var m: LauncherModel

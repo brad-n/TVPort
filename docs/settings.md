@@ -3,6 +3,7 @@
 The screen before the game starts shows the settings the game supports. A setting that only matters while another is on appears under it and disappears when that one is turned off. Tap **Play** to start; the app remembers your choices for the next start. All settings are on one scrollable screen, under **Game**, **Controls** and **Performance**, and **Game options** for a game that has options of its own. Tap a menu or move a slider there; no settings page needs opening. **Upscaling** is in **Game**, beside **Console mode**. A Mac app shows the same settings in a [window of its own](#the-mac-settings-window).
 
 - [Tested defaults](#tested-defaults)
+- [Presets](#presets)
 - [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Resolution scale](#resolution-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Game language](#game-language), [Picture](#picture), [Frame-rate counter](#frame-rate-counter)
 - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff), [Press a button to join](#press-a-button-to-join)
 - [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
@@ -20,6 +21,25 @@ Each game comes with the settings it was tested with: its profile in this reposi
 When you change a setting and tap **Play**, the app keeps your choice, also when a later build of the app ships other defaults. A setting you leave at its default is not stored: it follows the defaults of the build you have, so a newer build's tested settings reach you without doing anything. **Reset to tested defaults** at the bottom sets every setting back to its default, and **Play** then forgets your choices, so the game's defaults apply again. For testing, a line in `Documents/env.txt` overrides any setting ([Settings in a file](#settings-in-a-file)).
 
 A Mac app carries the same list (`Contents/Resources/dm/launcher.json`), without the iPhone's own Frame-rate counter and Touch feedback, for a front end that starts the app with the chosen values ([Front ends](frontends.md)).
+
+## Presets
+
+A **Preset** row at the top of the list (the Mac window, the iPhone screen and the **Options** page in SwitchTV on the Apple TV) sets a group of settings in one choice: **Performance**, **Balanced** or **Quality**. Choose one and the settings it names change; change any one of those settings afterwards and the row reads **Custom**. Nothing changes until you choose a preset: a game starts with the same tested defaults as before. While the settings are at their defaults and no preset is the same as them, the row reads **Default**. A preset names only the settings it has a measurement for; a setting it does not name keeps its default (choosing a preset also puts back to the default a setting another preset names). A game only gets the settings it has: Ocarina of Time's grass, mist and reflections are in its presets, another game's are not, and a game none of the presets name has no Preset row.
+
+The values are in [`dm/games/presets.tsv`](../dm/games/presets.tsv), one row each for a device class (`tv` is the Apple TV 4K, an A15; `phone` an iPhone or iPad; `mac`), a preset, a game (`*` for every game that has the setting) and a setting, with the measurement it comes from. `dm/games/settings.py` writes the ones this game and device have into `launcher.json` ([Front ends](frontends.md#the-settings-list)).
+
+| Device | Preset | Sets | Measured |
+| --- | --- | --- | --- |
+| Apple TV | Performance | Ocarina of Time: grass off, ground mist off, reflections every 8th frame, model detail Low, sun shadows Low | Grass about 3.5 ms a frame and mist about 2 ms, reflections about 1 ms ([switch2-apple-tv.md](switch2-apple-tv.md), run 18 on the Apple TV used this set); model detail 4 about 3 ms and one shadow cascade about 0.3 ms on a Mac mini M2 Pro, the Apple TV set of [the game's notes](../dm/games/0400486024DEC000/README.md) (an estimate on the TV, not a run) |
+| Apple TV | Balanced | Ocarina of Time: ground mist off, reflections every 4th frame | The notes' "Recommended for the Apple TV 4K": the mist is the largest saving, an interval of 4 most of the probe saving |
+| Apple TV | Quality | Anisotropic filtering 16x; everything else stays on | Run 21 on an Apple TV set 16x and the game applied it ([README](../README.md)). No resolution scale above 100 %: there is no measurement of one on the TV |
+| iPhone and iPad | Performance | The same Ocarina of Time set | The costs above, measured on an Apple TV and an M2 Pro, not on a phone |
+| iPhone and iPad | Balanced | Nothing named: the defaults | No Quality: nothing is measured on a phone |
+| Mac | Performance | The same Ocarina of Time set | The costs above, measured on a Mac mini M2 Pro |
+| Mac | Balanced | Nothing named: the defaults | |
+| Mac | Quality | Anisotropic filtering 16x; Mario Kart 8 Deluxe at resolution scale 150 %; Star Fox at render scale 2.0 | 16x costs about 0.7 ms a frame in Mario Kart 8 Deluxe and is within the noise in Ocarina of Time; Mario Kart 8 Deluxe holds 60 fps at 1.5x on a Mac mini M2 Pro ([CHANGELOG](../CHANGELOG.md)); Star Fox at 2.0 (1536x864) holds 60 fps on a Mac mini M2 |
+
+On the Apple TV the defaults are not Balanced, so a game with Ocarina of Time's options shows **Default** until you choose a preset. On the iPhone and the Mac Balanced is the defaults, so the row reads Balanced. The resolution scale is named for Mario Kart 8 Deluxe only: at 1.5x Ocarina of Time still has a picture bug ([Engine-wide resolution scale](reference/rendering.md#engine-wide-resolution-scale-dm_res_scale)).
 
 ## Game
 

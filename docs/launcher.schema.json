@@ -8,7 +8,8 @@
   "properties": {
     "schema": {"description": "The list's version; a list without it is schema 1 written before the field existed.", "type": "integer", "const": 1},
     "game": {"description": "The base game's title ID.", "type": "string", "pattern": "^[0-9A-F]{16}$"},
-    "settings": {"type": "array", "items": {"$ref": "#/$defs/setting"}}
+    "settings": {"type": "array", "items": {"$ref": "#/$defs/setting"}},
+    "presets": {"description": "Optional. Settings presets for this app's device class (dm/games/presets.tsv): each sets the values it names in one choice; a setting another preset of the list names but this one does not goes to its default; a front end shows the preset whose values all match the current ones, else Default when every one of those settings is at its default, else Custom.", "type": "array", "items": {"type": "object", "required": ["name", "values"], "properties": {"name": {"type": "string"}, "values": {"description": "Setting env name to a value its row accepts.", "type": "object", "additionalProperties": {"type": "string"}}}}}
   },
   "$defs": {
     "size": {"description": "[width, height] in pixels.", "type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
