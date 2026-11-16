@@ -601,7 +601,7 @@ class PackRequired(unittest.TestCase):
         """cmd_build with the real prebuild_astc over a failing engine tool and everything after it replaced: returns (the Failure raised or None, the mocks after the prebuild)"""
         args = SimpleNamespace(folder=str(self.root), team='T', keys=None, device='dev', texture_cap=256, astc=astc, astc_block='matched', texture_once=once, compress_data='auto', icloud=False,
                                art=None, mode='handheld', render_scale=1)
-        names = ('remember_shaders', 'backup_saves', 'store_textures_once', 'compress_game_data', 'generate_project', 'bundle_shaders', 'compile_app', 'install', 'restore_saves')
+        names = ('remember_shaders', 'backup_saves', 'store_textures_once', 'compress_game_data', 'convert_movies', 'generate_project', 'bundle_shaders', 'compile_app', 'install', 'restore_saves')
         values = {'backup_saves': {'state': 'none', 'files': 0}, 'restore_saves': 0}
         mocks = {name: patch.object(backend, name, return_value=values.get(name)) for name in names}
         out = io.StringIO()
