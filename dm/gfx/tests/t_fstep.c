@@ -22,6 +22,16 @@ static void run(sim *m, int n, double w, int kmin, int kmax, int fixed) {
 // frames among frames on time are paid back by the step and keep hold 1 (below)
 static void hitch(sim *m) { run(m, 7, 1.6, 1, 3, 0); }
 
+// The GPU clock follows the hold (an M2 Pro's GPU, an iPhone's): the same work costs w1 vsyncs while frames are held 1 vsync and wk at a longer hold
+static void run_clock(sim *m, int n, double w1, double wk, int kmin, int kmax) {
+    for (int i = 0; i < n; i++) {
+        int k = m->s.k ? m->s.k : kmin, step = m->next ? m->next : kmin; double w = k <= 1 ? w1 : wk;
+        double shown = w > k ? w : k;
+        m->real += shown; m->game += step;
+        m->next = nvn_fstep_next(&m->s, shown, w, kmin, kmax, 0, m->slow);
+    }
+}
+
 int main(void) {
     {   // 120 fps (hle_nvn.c fps_high): kmin 1, kmax 2, in ticks of 1/120 s. The target follows the hold, so a hold above what frames take is the game at the right speed
         sim m = {0}; m.s.per_vsync = 2; m.s.no_payback = 1;
@@ -558,6 +568,30 @@ int main(void) {
         pw = 2; check(nvn_fstep_drain_cut(33, 17, 0, 16, &pw) == 17 && pw == 2, "a drain in a later acquire of the previous frame: the time, not the pacing wait");
         pw = 3; check(nvn_fstep_drain_cut(40, 17, 9, 0, &pw) == 37 && pw == 0, "a drain counted no larger than the pacing wait it was part of");
         pw = 0; check(nvn_fstep_drain_cut(0, 17, 0, 5, &pw) == 0, "the first frame (no previous start): nothing to cut");
+    }
+    {   // The fork's periodic re-probe (nvn_fstep.reprobe, DM_FPS_REPROBE): a probe after reprobe frames at a longer hold, which upstream's rules alone do not start
+        sim u = {0}; run(&u, 600, 0.5, 1, 3, 0); run(&u, 3000, 1.6, 1, 3, 0);   // hold 1 held 10 s at 0.5, then a scene of 1.6 vsyncs that does not fit it
+        check(u.s.k == 2 && u.s.probes == 0, "re-probe 0 (upstream): a scene of 1.6 vsyncs stays at hold 2 with no probe");
+        sim r = {0}; r.s.reprobe = 250; run(&r, 600, 0.5, 1, 3, 0);
+        int gap_min = 1 << 30, at2 = 0, back2 = 1; uint64_t p0 = r.s.probes;
+        for (int i = 0; i < 3000; i++) {
+            uint64_t p = r.s.probes; run(&r, 1, 1.6, 1, 3, 0);
+            if (r.s.probes != p) { if (p != p0 && at2 < gap_min) gap_min = at2; at2 = 0; }
+            else if (r.s.k == 2) at2++;
+            if (r.s.k > 2) back2 = 0;
+        }
+        snprintf(b, sizeof b, "re-probe 250: %llu probes in 3000 frames, at least %d frames at hold 2 between them", (unsigned long long)(r.s.probes - p0), gap_min);
+        check(r.s.probes - p0 >= 8 && r.s.probes - p0 <= 12 && gap_min >= 250, b);
+        check(back2 && r.s.k == 2, "re-probe 250: each failed probe returns to hold 2, not a longer hold");
+        check(r.s.failed >= r.s.probes - p0 - 1, "re-probe 250: the probes of a scene that does not fit fail");
+        sim c = {0}; run(&c, 600, 0.5, 1, 3, 0); hitch(&c); run_clock(&c, 3000, 0.9, 1.6, 1, 3);   // 0.9 vsyncs at hold 1's clock, 1.6 at hold 2's
+        check(c.s.k == 2 && c.s.probes == 0, "clock follows the hold, re-probe 0: hold 2 for good after a hitch (no probe starts)");
+        sim d = {0}; d.s.reprobe = 250; run(&d, 600, 0.5, 1, 3, 0); hitch(&d); run_clock(&d, 400, 0.9, 1.6, 1, 3);
+        check(d.s.k == 1 && d.s.probes == 1, "clock follows the hold, re-probe 250: one probe brings hold 1 back");
+        run_clock(&d, 3000, 0.9, 1.6, 1, 3);
+        check(d.s.k == 1 && d.s.probes == 1, "...and hold 1 stays (no probe while at hold 1)");
+        sim z = {0}; z.s.reprobe = 250; run(&z, 3000, 0.5, 1, 3, 0);
+        check(z.s.k == 1 && z.s.probes == 0 && z.s.rframes == 0, "re-probe 250: steady 60 never probes");
     }
     printf("== %d checks, %d failed ==\n", checks, fail);
     return fail != 0;

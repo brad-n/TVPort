@@ -90,6 +90,9 @@ typedef struct {
     double last_cost[3];      // the last three frames' costs, oldest first
     int smax;                 // set by the caller: the largest step the game takes (its stub's STEP_MAX; 0 = FSTEP_MAX)
     int no_payback;           // set by the caller: 1 = the game does not take the step (120 fps: it steps by its target), so three late frames raise the hold whatever the average
+    int reprobe;              // set by the caller (kept): frames at a hold above kmin after which a probe starts on its own (the fork's periodic re-probe, below; the host's
+                              // DM_FPS_REPROBE, 250 by default); 0 = only the probes upstream's rules start
+    int rframes, reprobed;    // frames at a hold above kmin since the last probe (0 at kmin); 1 = the last probe was started by the re-probe alone (for the log)
     uint64_t late, paid, ups, downs, failed, probes; double dropped;   // statistics for the log
 } nvn_fstep;
 
@@ -123,7 +126,7 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     if (!s->hold) s->hold = hold0;
     if (fixed > 0) {   // the game's own step: speed is right by construction, nothing to pay back
         s->k = s->step = fixed < smax ? fixed : smax;
-        s->debt = 0; s->late_run = s->fit_run = s->trial = s->probe = s->grace = s->tpend = 0; s->run = 0;
+        s->debt = 0; s->late_run = s->fit_run = s->trial = s->probe = s->grace = s->tpend = 0; s->run = 0; s->rframes = 0;
         s->kmin = FSTEP_MAX + 1;   // when it ends, k starts again from kmin
         return s->step;
     }
@@ -140,10 +143,11 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     if (s->tpend && s->tsince >= hold_max) { s->tpend = 0; s->hold = hold0; }   // the trial's run lasted
     int cap_probe = kmin < s->kmin && s->kmin <= FSTEP_MAX && s->k > kmin;
     if (cap_probe) {   // the cap rose: a probe at once, whose grace covers the clocks still set for the longer hold
-        s->k = kmin; s->probes++; s->trial = FSTEP_RUN; s->probe = 1; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;
+        s->k = kmin; s->probes++; s->trial = FSTEP_RUN; s->probe = 1; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0; s->rframes = 0; s->reprobed = 0;
     } else if (kmin < s->kmin || s->k < kmin) s->k = kmin;   // the game's own step ended, or the cap fell
     if (s->k > kmax) s->k = kmax;
     s->kmin = kmin;
+    s->rframes = s->k > kmin ? s->rframes + 1 : 0;
     int scr = s->screen; s->screen = 0;
     int late = scr ? scr == 2 : shown > held + FSTEP_LATE + s->shown_slack || cost > held + FSTEP_LATE, grace = s->grace > 0;
     if (grace && !cap_probe) {   // the completed frame at the old cap does not consume the new hold's grace
@@ -190,8 +194,14 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     double fitc = s->ck == s->k && s->cn && s->ccur < cost ? s->ccur : cost;
     if (!late) s->fit_run = s->k > kmin && fitc <= FSTEP_FIT * (s->k - 1) ? s->fit_run + 1 : 0;
     if (s->fit_run >= FSTEP_RUN && s->since >= s->hold && !s->trial) { s->k--; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
-    else if ((slow || nvn_fstep_same(s)) && s->k > kmin && s->since >= s->hold && !s->trial) {   // probe: straight to kmin, so the controller sees the whole deadline
-        s->k = kmin; s->downs++; s->probes++; s->trial = FSTEP_RUN; s->probe = 1; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;
+    // The fork's periodic re-probe (DM_FPS_REPROBE): after reprobe frames at a longer hold a probe starts whatever slow and the cost say, the hold-off still applying. Upstream's
+    // rules start none for a scene whose failed probes showed it does not fit kmin, and where the GPU clock follows the hold that scene then slows down at the longer hold:
+    // Ocarina of Time docked on an M2 Pro, 2 failed probes, about 900 frames at hold 2 without one, the GPU time from 24 to 43 ms as the clock fell (every pass about 30% slower,
+    // the same work), hold 3 (20 fps) for 160 frames until a probe. A probe every 250 frames, as the fork's frame step made before the merge, keeps the clock from settling
+    // (docs/reference/frame-rate.md, The frame step stopped probing and the GPU clock fell)
+    else if ((slow || nvn_fstep_same(s) || (s->reprobe > 0 && s->rframes >= s->reprobe)) && s->k > kmin && s->since >= s->hold && !s->trial) {   // probe: straight to kmin, so the controller sees the whole deadline
+        s->reprobed = !slow && !nvn_fstep_same(s);
+        s->k = kmin; s->downs++; s->probes++; s->trial = FSTEP_RUN; s->probe = 1; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0; s->rframes = 0;
     }
     s->step = s->k + (s->debt >= 1 && s->k < smax);
     s->paid += s->step > s->k;

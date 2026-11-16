@@ -2556,6 +2556,16 @@ static int fstep_hold(void) {
     }
     return h;
 }
+// The fork's periodic re-probe (nvn_fstep.h reprobe; DM_FPS_REPROBE=<frames>, 250 by default, 0 = upstream's probes only): frames at a longer hold after which a probe starts on its own
+static int fstep_reprobe(void) {
+    static int r = -1;
+    if (r < 0) {
+        const char *e = getenv("DM_FPS_REPROBE"); r = e ? atoi(e) : 250; if (r < 0) r = 0;
+        if (r) LOG("[nvn] frame step: a probe every %d frames at a longer hold, whatever upstream's rules say (DM_FPS_REPROBE; 0 = their probes only)", r);
+        else LOG("[nvn] frame step: no periodic re-probe (DM_FPS_REPROBE=0): only the probes upstream's rules start");
+    }
+    return r;
+}
 // Once per present, before this frame's period is taken: the time since the previous frame's start (shown) and the frame's cost decide this frame's hold and the next frame's step.
 // Cost = max(CPU: the time between the frames' starts without the pacing wait, GPU: the latest finished frame's GPU time), in vsyncs
 static void fstep_tick(const win_t *o, int c) {
@@ -2598,6 +2608,7 @@ static void fstep_tick(const win_t *o, int c) {
     g_fs.ramp = mtl_probe_ramp_on();
     g_fs.per_vsync = fstep_hz() / 60;
     g_fs.smax = dm_fps_step_max;   // the stub's largest step (Mario Kart World: 2): frames held longer than the game steps would play in slow motion
+    g_fs.reprobe = fstep_reprobe();
     g_fs.no_payback = fps_high();   // at 120 fps the game steps by its target, not by the step: a late frame is slow motion, so three raise the hold whatever the average
     int n = nvn_fstep_next(&g_fs, shown, cost, kmin, kmax, fixed, cslow || gslow);
     if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)n, __ATOMIC_RELAXED);
@@ -2612,7 +2623,8 @@ static void fstep_tick(const win_t *o, int c) {
         double gr = nvn_fgpu_ratio(&g_fg);   // the failed probes' ratio: the scene's time at kmin is cur over it
         if (gslow && gr > 0) w += snprintf(why + w, sizeof why - w, ", GPU %.2f at hold %d, %.2f at hold %d by the failed probes", g_fg.cur, g_fg.k, g_fg.cur / gr, kmin);
         else if (gslow) w += snprintf(why + w, sizeof why - w, ", GPU %.2f× its time at hold %d", g_fg.cur / g_fg.ref, kmin);
-        if (nvn_fstep_same(&g_fs)) snprintf(why + w, sizeof why - w, ", cost %.2f× the cost that held hold %d", g_fs.ccur / g_fs.cref, kmin);
+        if (nvn_fstep_same(&g_fs)) w += snprintf(why + w, sizeof why - w, ", cost %.2f× the cost that held hold %d", g_fs.ccur / g_fs.cref, kmin);
+        if (g_fs.reprobed && w < (int)sizeof why) snprintf(why + w, sizeof why - w, ", the re-probe after %d frames (DM_FPS_REPROBE)", g_fs.reprobe);
         if (g_fs.k > k0 && g_fs.cref > 0) snprintf(held, sizeof held, "; hold %d held at %.2f", kmin, g_fs.cref);   // what a probe compares the longer hold's cost with
         LOG("[nvn] frame step: hold %d → %d %s at present %llu (%s; cost %.2f, GPU %.2f%s)%s", k0, g_fs.k, fps_high() ? "ticks of 1/120 s" : "vsyncs", (unsigned long long)o->presents,
             fixed ? "the game's own step" : kmin0 > FSTEP_MAX ? "the game's own step ended" : kmin != kmin0 ? "the cap changed" : g_fs.k > k0 ? "3 late frames" : g_fs.probes != probes0 ? why : "trial", cost, gpu, held, ++nlog == 40 ? "; further changes only counted below" : "");
