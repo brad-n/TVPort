@@ -1,10 +1,10 @@
 # Switch 2 games on the Apple TV (experimental)
 
-This fork is the first to run a Switch 2 game on an Apple TV. **The Legend of Zelda: Ocarina of Time** (the Switch 2 edition, `0400486024DEC000`, update v131072) plays on an Apple TV 4K (3rd generation) from the title screen through the whole opening, where you get control of Link and cross Kokiri Forest, without crashing. It runs at about 14 to 28 frames a second. It doesn't hold 30 yet.
+This fork is the first to run a Switch 2 game on an Apple TV. **The Legend of Zelda: Ocarina of Time** (the Switch 2 edition, `0400486024DEC000`, update v131072) plays on an Apple TV 4K (3rd generation) from the title screen through the whole opening, where you get control of Link and cross Kokiri Forest, without crashing. It runs at about 20 frames a second through most of it (30 in lighter spots) and takes 23.2 GB on the TV. **This work is finished** (November 2026): 30 frames a second isn't within reach on the A15, whose GPU needs 35 to 46 ms for a Kokiri Forest frame where 30 fps needs under 33.3.
 
 This page explains what you need and which settings to use. It also covers what it took to get here, what is still wrong, and what comes next. For how the game runs on a Mac, where it plays at about 60 fps, see the game's own page: [Ocarina of Time](../dm/games/0400486024DEC000/README.md).
 
-**Where the work lands:** Switch 2 Apple TV work is tried first on the [`switch2-experimental`](https://github.com/brad-n/TVPort/tree/switch2-experimental) branch. It moves to the default branch, `tvport`, once a session on the Apple TV shows it helps. The experimental branch also carries the diagnostic switches and benchmarks used to measure the TV.
+**Status:** everything on this page is in the default branch, `tvport` ([TVPort 1.3.0 build 1996](https://github.com/brad-n/TVPort/releases/tag/v1.3.0-build.1996) or later). What was learned here carries on as general engine work for every game; see [What carries over](#what-carries-over-to-every-game).
 
 ## Why this is hard
 
@@ -108,7 +108,8 @@ Each run is one play session from a fresh build. The memory column is the highes
 | 17 | 2,073 MB | Past Saria's close-up, then out of memory. That build had shipped without its texture pack, which is why a failed pack now stops the build |
 | **18** | **1,978 MB** | **The whole opening, control of Link, and across Kokiri Forest. No crash** |
 | 19 | 2,048 MB | Run 18's settings plus compressed render targets and the texture view cache: about 20 fps nearly everywhere (30 in Saria's close-up and tight areas), 16 minutes, then out of memory entering the Kokiri training area |
-| **20** | **1,877 MB** | **The build with memory relief (render-target memory given back when the TV runs short) and unused attachments left out, driven by script with no one at the TV: 18.5 minutes in Kokiri Forest with no crash, 20 fps in the village (GPU 34–38 ms), 25–30 on the east side. The relief stepped in 48 times. The training area itself wasn't reached** |
+| 20 | 1,877 MB | The build with memory relief (render-target memory given back when the TV runs short) and unused attachments left out, driven by script with no one at the TV: 18.5 minutes in Kokiri Forest with no crash, 20 fps in the village (GPU 34–38 ms), 25–30 on the east side. The relief stepped in 48 times. The training area itself wasn't reached |
+| **21** | **1,715 MB** | **The build after the upstream sync (306 commits), with the three size cuts: 23.2 GB on the TV instead of 31.4. Driven by script: 16.5 minutes in Kokiri Forest without a crash, 382 MB of headroom at the tightest point, 20 fps in the forest. Textures look right, and the plaid ground never appeared. SwitchTV's Options page set anisotropic filtering on the TV, and the game applied it** |
 
 Frame rate in run 18, scene by scene:
 
@@ -151,23 +152,19 @@ Everything here is on by default for the Apple TV unless the row says otherwise.
 | Ground mist kept (`shader_select_guards 0`) | With upstream's guarded reads as selects, the ground mist shader drew nothing on the A15's GPU family. The game keeps them as branches |
 | Fewer submissions (upstream) | Each frame went from 37 to 23 command buffers after the upstream sync of November 10 |
 
-## Not yet
+## Where it ended
 
-- **30 frames a second.** The Apple TV shows a new picture on whole screen refreshes. A frame that needs under 33.3 ms of GPU time runs at 30 fps, and one that needs just over runs at 20. During Navi's flight the GPU needs 34 to 36 ms a frame, so it sits just over the line.
-- **Memory margin.** At the tightest moment of run 18, tvOS allowed only 119 MB more. Entering a new area pages memory in from storage, which shows up as the drops to 5 fps.
-- **The opening movie.** It is AV1, decoded in software on the A15. The audio finishes before the picture.
-- **The launcher.** There is no Apple TV preset yet. The settings above go in `env.txt` by hand.
+- **Frame rate.** The Apple TV shows a new picture on whole screen refreshes: a frame needs under 33.3 ms of GPU time for 30 fps, and just over that drops it to 20. Kokiri Forest needs 35 to 46 ms on the A15. The time goes to the game's own lighting shaders, which hold more values than the GPU has registers for; translation changes, geometry options and cuts in memory traffic didn't close the gap. Compressed render targets were the one change that lifted the TV (13 to 17 fps up to about 20).
+- **Heat.** After about 35 minutes of play the TV reaches its serious thermal state and slows to 13 or 14 fps; once, in run 20, it restarted with a kernel panic.
+- **The opening movie.** It is AV1, decoded in software on the A15, and the picture falls behind the sound.
 
-## Next
+## What carries over to every game
 
-In the order they're planned:
-
-1. **Compressed render targets** (`DM_NVN_RT_LOSSY`). Metal's lossy compression for render targets, to free memory and some GPU bandwidth. In progress.
-2. **ASTC 6x6 for the texture pack.** Less than half the bits of 4x4 (3.56 against 8 a pixel), with some loss of detail. Planned for one Apple TV session to see whether it helps the frame rate as well as memory.
-3. **Lower-detail geometry.** The game's own level-of-detail, draw distance and shadow cascade settings. Two switches so far, measured on a Mac mini and not yet run on the TV: `DM_MODEL_LOD=4` (models take their simpler meshes sooner: by estimate it brings the Deku Tree's dialogue to 30 fps, but the tree's beard of roots becomes a flat sheet, and it hardly helps Navi's flight) and `DM_SHADOW_CASCADES=1` (about half a millisecond, softer shadows). Details: [Quality options](../dm/games/0400486024DEC000/README.md#quality-options-for-slower-gpus).
-4. **Loading ahead.** Reading an area's data before it's needed, against the drops while an area loads.
-5. **A Performance preset** in TVPort's game settings, so none of this needs `env.txt`.
-6. **The movie.** Holding the movie to the audio, or converting it to a format the Apple TV decodes in hardware.
+- **Memory relief** (`DM_NVN_MEM_RELIEF`): cached render-target memory is given back before tvOS ends an app. It ended the out-of-memory crashes here.
+- **Smaller installs on the Apple TV:** texture detail above the TV's cap is left out, colour and lighting textures are packed at ASTC 6x6, and Trim shaders ships only the shaders a game uses. Ocarina of Time went from 31.4 to 23.2 GB. See [What fills a game on the Apple TV](reference/tv-size.md).
+- **Options on the TV:** SwitchTV's Options page sets a game's picture and performance settings, including Ocarina of Time's own (grass, ground mist, reflections, simpler models, shadow cascades), so none of the settings above need `env.txt`.
+- **Frame pacing that keeps checking for 60 fps** (`DM_FPS_REPROBE`), so a GPU clock that drops at a steady 30 fps doesn't push games down to 20.
+- **Scripted test sessions on the TV** with no one there, using `DM_CTL` and a save copy (`DM_SAVE`).
 
 ## Research branches
 

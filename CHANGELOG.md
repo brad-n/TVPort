@@ -10,7 +10,8 @@ What changes in this fork, release by release, in plain terms. The full descript
 
 ## Unreleased (on `switch2-experimental`)
 
-Nothing yet: everything that was here is in build 1996.
+**Docs**
+- [Switch 2 games on the Apple TV](docs/switch2-apple-tv.md): Ocarina of Time on the Apple TV is finished. The page has the final results (run 21: 23.2 GB on the TV, no crash, about 20 fps), where it ended, and what carries over to every game.
 
 ## 1.3.0 build 1996 (2026-11-16)
 
